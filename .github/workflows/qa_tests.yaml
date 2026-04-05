@@ -1,0 +1,144 @@
+name: QA Test Suite
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  qa:
+    name: Unit + E2E Smoke
+    runs-on: [gs-inv-mgmt-runner]
+    timeout-minutes: 30
+    env:
+      COVERAGE_FAIL_UNDER: "30"
+      COVERAGE_FAIL_UNDER_CORE: "85"
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install coverage
+
+      - name: Run unit tests with coverage
+        id: unit_coverage
+        run: |
+          python -m coverage run --source=app -m unittest discover -s tests -p "test_*.py"
+          python -m coverage report -m --fail-under="${COVERAGE_FAIL_UNDER}"
+          python -m coverage report -m \
+            --include="app/repository.py,app/services/*.py,app/auth.py,app/page_common.py,app/config.py" \
+            --fail-under="${COVERAGE_FAIL_UNDER_CORE}"
+          python -m coverage xml -o coverage.xml
+          python -m coverage json -o coverage.json
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            .coverage
+            coverage.xml
+            coverage.json
+          if-no-files-found: ignore
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright deps
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Prepare CI .env
+        run: |
+          cp .env.example .env
+          echo "APP_REQUIRE_PASSWORD_AUTH=false" >> .env
+          echo "DB_AUTO_MIGRATE=false" >> .env
+
+      - name: Start app stack
+        run: docker compose up -d db migrate app
+
+      - name: Wait for app
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8501 >/dev/null; then
+              echo "App is reachable."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App failed to become ready."
+          docker compose logs --tail=200 app db migrate || true
+          exit 1
+
+      - name: Run Playwright smoke
+        id: playwright
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
+        run: npx playwright test --project=chromium --reporter=line,json
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          if-no-files-found: ignore
+
+      - name: Upload Playwright test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: test-results
+          if-no-files-found: ignore
+
+      - name: Build QA evidence artifact
+        if: always()
+        run: |
+          python scripts/build_qa_evidence.py \
+            --coverage-json coverage.json \
+            --playwright-json playwright-results.json \
+            --output-dir qa-evidence \
+            --unit-outcome "${{ steps.unit_coverage.outcome }}" \
+            --playwright-outcome "${{ steps.playwright.outcome }}" \
+            --summary-out qa-evidence-summary.md
+          cat qa-evidence-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload QA evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-evidence
+          path: |
+            qa-evidence
+            qa-evidence-summary.md
+            playwright-results.json
+          if-no-files-found: ignore
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --tail=300 app db migrate || true
+
+      - name: Shutdown stack
+        if: always()
+        run: docker compose down -v

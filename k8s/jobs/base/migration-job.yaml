@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gs-inv-migrate
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 4
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.db.migrate", "upgrade"]
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi

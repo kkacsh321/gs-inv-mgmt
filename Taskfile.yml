@@ -1,0 +1,162 @@
+version: "3"
+
+vars:
+  IMAGE_VERSION: "v0.0.1"
+  DOCKER_REGISTRY_URL: "harbor.kacsh.com"
+  IMAGE_NAME: "gs-inv-mgmt"
+
+tasks:
+  default:
+    desc: "Display available tasks"
+    cmds:
+      - task --list
+
+  actionlint:
+    desc: "Run actionlint"
+    cmds:
+      - echo "Running actionlint"
+      - actionlint -config-file ./.github/actionlint.yml
+
+  markdownlint:
+    desc: "Run markdownlint"
+    cmds:
+      - echo "Running markdownlint"
+      - markdownlint-cli2 "**/*.md"
+
+  shellcheck:
+    desc: "Run shellcheck"
+    cmds:
+      - echo "Running shellcheck"
+      - shellcheck scripts/setup.sh
+
+  yamllint:
+    desc: "Run yamllint"
+    cmds:
+      - echo "Running yamllint"
+      - yamllint -c .linters/yaml-linter.yml .
+
+  pylint:
+    desc: "Run pylint"
+    cmds:
+      - echo "Running pylint"
+      - pylint **/*.py
+
+  buildx:
+    desc: Setup buildx
+    cmds:
+      - docker buildx create --name devops --use --bootstrap
+
+  docker-build:
+    desc: Build Docker Container
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile  --platform linux/amd64 --platform linux/arm64 -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:{{.IMAGE_VERSION}} .
+
+  docker-build-dev:
+    desc: Build Docker Container for Development
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile  --platform linux/amd64 --platform linux/arm64 -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:dev-{{.IMAGE_VERSION}} .
+
+  docker-load:
+    desc: Build Docker Container
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile --load -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:{{.IMAGE_VERSION}} .
+
+  docker-load-dev:
+    desc: Build Docker Container for Development
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile --load -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:dev-{{.IMAGE_VERSION}} .
+
+  docker-push:
+    desc: Build and Push Docker Container
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build --push -f Dockerfile --platform linux/amd64 -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:{{.IMAGE_VERSION}} .
+
+  docker-push-dev:
+    desc: Build and Push Docker Container for Development
+    # deps:
+    #   - task: buildx
+    cmds:
+      - DOCKER_BUILDKIT=1 docker buildx build --push -f Dockerfile --platform linux/amd64 -t {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:dev-{{.IMAGE_VERSION}} .
+
+  docker-run:
+    desc: Run Docker Container
+    cmds:
+      - docker run -p 8501:8501 {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:{{.IMAGE_VERSION}}
+
+  docker-run-dev:
+    desc: Run Docker Container for Development
+    cmds:
+      - docker run -p 8501:8501 {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:dev-{{.IMAGE_VERSION}}
+
+  docker-run-it:
+    desc: Run Docker Container
+    cmds:
+      - docker run -it -p 8501:8501 {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:{{.IMAGE_VERSION}} /bin/sh
+
+  docker-run-it-dev:
+    desc: Run Docker Container for Development
+    cmds:
+      - docker run -it -p 8501:8501 {{.DOCKER_REGISTRY_URL}}/library/{{.IMAGE_NAME}}:dev-{{.IMAGE_VERSION}} /bin/sh
+
+  run:
+    desc: Run the Streamlit app
+    cmds:
+      - streamlit run app/main.py
+
+  qa-unit:
+    desc: Run unit tests with coverage and generate coverage artifacts
+    cmds:
+      - python -m coverage run --source=app -m unittest discover -s tests -p "test_*.py"
+      - python -m coverage report -m --fail-under=30
+      - python -m coverage report -m --include="app/repository.py,app/services/*.py,app/auth.py,app/page_common.py,app/config.py" --fail-under=85
+      - python -m coverage xml -o coverage.xml
+      - python -m coverage json -o coverage.json
+
+  qa-unit-fast:
+    desc: Run fast unittest suite (excludes tagged integration modules)
+    cmds:
+      - python scripts/run_test_suites.py --suite fast --verbosity 1
+
+  qa-unit-integration:
+    desc: Run integration unittest suite (tagged integration modules)
+    cmds:
+      - python scripts/run_test_suites.py --suite integration --verbosity 1
+
+  qa-e2e:
+    desc: Run Playwright chromium suite with JSON output
+    cmds:
+      - PLAYWRIGHT_JSON_OUTPUT_NAME=playwright-results.json npx playwright test --project=chromium --reporter=line,json
+
+  qa-evidence:
+    desc: Run local QA suite and build sign-off evidence artifacts
+    deps:
+      - task: qa-unit
+      - task: qa-e2e
+    cmds:
+      - python scripts/build_qa_evidence.py --coverage-json coverage.json --playwright-json playwright-results.json --output-dir qa-evidence --unit-outcome success --playwright-outcome success --summary-out qa-evidence-summary.md
+
+  qa-evidence-build:
+    desc: Build QA evidence artifacts from existing coverage/playwright result files
+    cmds:
+      - python scripts/build_qa_evidence.py --coverage-json coverage.json --playwright-json playwright-results.json --output-dir qa-evidence --unit-outcome unknown --playwright-outcome unknown --summary-out qa-evidence-summary.md
+
+  version:
+    desc: Return the version
+    cmds:
+      - echo {{.IMAGE_VERSION}}
+
+  secret:
+    desc: Create Kubernetes Secret from .env
+    cmds:
+      - kubectx rke-app-cluster
+      - kubectl create secret generic env-secret --from-env-file=.env -n goldenstackers

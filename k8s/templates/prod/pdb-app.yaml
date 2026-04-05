@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gs-inv-app-pdb
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    env: prod
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: gs-inv-app

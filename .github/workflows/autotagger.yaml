@@ -1,0 +1,28 @@
+name: AutoTag
+on:
+  push:
+    branches:
+      - "main"
+
+jobs:
+  tag:
+    name: Autotag
+    runs-on: [gs-inv-mgmt-runner]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+
+      - uses: butlerlogic/action-autotag@1.1.2
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        with:
+          strategy: package
+          root: "./"

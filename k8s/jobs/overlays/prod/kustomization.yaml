@@ -1,0 +1,8 @@
+namespace: gs-inv-prod
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - patch-job.yaml
+images:
+  - name: ghcr.io/goldenstackers/gs-inv-mgmt
+    newTag: stable

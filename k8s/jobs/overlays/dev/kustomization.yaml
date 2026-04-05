@@ -1,0 +1,8 @@
+namespace: gs-inv-dev
+resources:
+  - ../../base
+patchesStrategicMerge:
+  - patch-job.yaml
+images:
+  - name: ghcr.io/goldenstackers/gs-inv-mgmt
+    newTag: dev

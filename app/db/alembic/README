@@ -1,0 +1,2 @@
+Single database migration source of truth for GoldenStackers inventory.
+Use Alembic commands from the repo root.

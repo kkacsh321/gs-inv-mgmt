@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: gs-inv
+  namespace: argocd
+spec:
+  description: GoldenStackers inventory environments
+  sourceRepos:
+    - https://github.com/REPLACE_ME/REPLACE_INFRA_REPO.git
+  destinations:
+    - namespace: gs-inv-dev
+      server: https://kubernetes.default.svc
+    - namespace: gs-inv-prod
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"

@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gs-inv-migrate
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    app.kubernetes.io/component: migrate
+    env: dev
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  ttlSecondsAfterFinished: 1800
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: gs-inv-migrate
+        app.kubernetes.io/name: gs-inv-mgmt
+        app.kubernetes.io/component: migrate
+        env: dev
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.db.migrate", "upgrade"]
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          env:
+            - name: DB_AUTO_MIGRATE
+              value: "false"
+          resources:
+            requests:
+              cpu: 150m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi

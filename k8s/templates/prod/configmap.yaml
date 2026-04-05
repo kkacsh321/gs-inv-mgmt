@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gs-inv-config
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    env: prod
+data:
+  APP_NAME: GoldenStackers Inventory
+  APP_ENV: prod
+  APP_BUILD_VERSION: stable
+  APP_BUILD_SHA: unknown
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: goldenstackers
+  STORAGE_PROVIDER: s3
+  AWS_REGION: us-east-1
+  SYNC_RUNNER_ENABLED: "true"
+  SYNC_RUNNER_INTERVAL_SECONDS: "300"
+  SYNC_RUNNER_ACTOR: sync-worker
+  SYNC_RUNNER_RUN_ONCE: "false"
+  SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_ENABLED: "true"
+  SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_LIMIT: "100"
+  SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_OFFSET: "0"
+  SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED: "true"
+  SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED: "false"
+  SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED: "false"

@@ -1,0 +1,88 @@
+.DEFAULT_GOAL := help
+PACKAGE_VERSION = $(shell cat package.json| jq -r '.version')
+SHA ?= ${PACKAGE_VERSION}
+TAG ?= ${PACKAGE_VERSION}
+GIT_TAG = $(shell git describe --tags $(git rev-list --tags --max-count=1) | sed s/v//g)
+PACKAGE_VERSION = $(shell cat package.json| jq -r '.version')
+IMAGE_TAG := ${REGISTRY_URL}/library/robotf:${PACKAGE_VERSION}
+BUILD_NUMBER ?= 1
+
+buildx: ## Create the builders
+	docker buildx create --name wordpress --use --bootstrap
+.PHONY: buildx
+
+build: ## Build the docker container
+	DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile \
+		--platform linux/amd64 --platform linux/arm64 -t \
+		${IMAGE_TAG} \
+		.
+.PHONY: build
+
+load: ## Loads container into docker for local testing
+	DOCKER_BUILDKIT=1 docker buildx build -f Dockerfile --load -t ${IMAGE_TAG} .
+.PHONY: load
+
+shell: load ## Build the docker container and then run in interaction mode
+	DOCKER_BUILDKIT=1 docker run -it ${IMAGE_TAG} /bin/bash
+.PHONY: shell
+
+run: load ## Builds and runs the container locally
+	DOCKER_BUILDKIT=1 docker run -it -p 8001:8001 ${IMAGE_TAG} /bin/bash
+.PHONY: run
+
+run-dev:
+	DOCKER_BUILDKIT=1 docker run -it --rm --platform linux/x86_64 -p 8080:8080 --name wordpress ${IMAGE_TAG} /bin/bash
+.PHONY: run-dev
+
+apply: ## Applies changes to cluster
+	kubectx rke-app-cluster
+	kubectl apply -f deployment.yaml -n kacsh
+.PHONY: apply
+
+rolling-update: ## Rolling restart of deployment
+	kubectl rollout restart deployment nginx -n kacsh
+.PHONY: rolling-update
+
+push: ## Pushes container to ECR
+	DOCKER_BUILDKIT=1 docker buildx build --push -f Dockerfile \
+		--platform linux/amd64 --platform linux/arm64 -t \
+		${IMAGE_TAG} \
+		.
+.PHONY: push
+
+tag: ## Tag the docker image
+	docker tag ${IMAGE_TAG}:${SHA} ${IMAGE_TAG}:${TAG}
+.PHONY: tag
+
+build-tag-manifest: ## Runs tagging for manifest for deployment
+	sed -i '' 's/latest/${BUILD_NUMBER}/g' deployment.yaml 
+.PHONY: build-tag-manifest	
+
+grype: load ## Runs grype locally - you need to have it installed first (https://github.com/anchore/grype)
+	grype ${IMAGE_TAG}
+.PHONY: grype
+
+hadolint: ## Runs hadolint locally - you need to have it installed first (https://github.com/hadolint/hadolint)
+	hadolint Dockerfile
+.PHONY: hadolint
+
+check-version: ## Checks for the required version bump
+	@echo "\033[36m"Checking Version"\033[0m"; \
+	if [ "${GIT_TAG}" == "${PACKAGE_VERSION}" ]; then \
+	echo "\033[0;31mVersion is equal to current tag, please update it!\033[0m"; \
+	else \
+	echo "\033[0;32mVersion is not equal to current tag, good to go\033[0m"; \
+	fi
+	@echo "\033[36m"Version Check Complete"\033[0m"
+.PHONY: check-version
+
+prepare-pr: hadolint load grype check-version ## Runs grype, and hadolint to check for issues with container before your PR
+	@echo "\033[36m"Done Running PR Checks"\033[0m"
+.PHONY: prepare-pr
+
+version:
+	@cat package.json| jq -r '.version'
+
+help: ## show this usage
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+.PHONY: help

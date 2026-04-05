@@ -1,0 +1,244 @@
+name: Build and Publish Docker
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*.*.*"
+
+env:
+  IMAGE_NAME: gs-inv-mgmt
+
+jobs:
+  docker:
+    name: Docker Build, Validate, and Push
+    runs-on: [gs-inv-mgmt-runner]
+
+    permissions:
+      id-token: write
+      actions: write
+      checks: write
+      contents: write
+      pull-requests: write
+      deployments: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install app dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Static compile smoke-check
+        run: python -m compileall -q app
+
+      - name: Unit test suite
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Compute image refs
+        id: image_refs
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+        run: |
+          if [ -z "$DOCKER_REGISTRY" ]; then
+            echo "DOCKER_REGISTRY secret is required."
+            exit 1
+          fi
+          IMAGE_REF="${DOCKER_REGISTRY}/library/${IMAGE_NAME}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            if ! echo "${TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Tag ${TAG} is not strict semver (vX.Y.Z)."
+              exit 1
+            fi
+            TAGS="${IMAGE_REF}:${TAG},${IMAGE_REF}:sha-${GITHUB_SHA}"
+            BUILD_VERSION="${TAG}"
+          else
+            SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+            TAGS="${IMAGE_REF}:main,${IMAGE_REF}:main-${SHORT_SHA},${IMAGE_REF}:sha-${GITHUB_SHA}"
+            BUILD_VERSION="main-${SHORT_SHA}"
+          fi
+          echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
+          echo "tags_human=${TAGS//,/\\n}" >> "${GITHUB_OUTPUT}"
+          echo "build_version=${BUILD_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "build_sha=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.image_refs.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish job summary
+        run: |
+          {
+            echo "### Docker image publish complete"
+            echo ""
+            echo "**Published tags**"
+            echo ""
+            echo "${{ steps.image_refs.outputs.tags_human }}"
+            echo ""
+            echo "**Build metadata**"
+            echo ""
+            echo "APP_BUILD_VERSION=${{ steps.image_refs.outputs.build_version }}"
+            echo "APP_BUILD_SHA=${{ steps.image_refs.outputs.build_sha }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Argo handoff plan summary
+        run: |
+          {
+            echo "### Argo handoff plan"
+            echo ""
+            echo "- ref: ${GITHUB_REF}"
+            echo "- deploy repo configured: $([[ -n '${{ vars.ARGO_DEPLOY_REPO }}' ]] && echo yes || echo no)"
+            echo "- dev manifest configured: $([[ -n '${{ vars.ARGO_DEV_MANIFEST_PATH }}' ]] && echo yes || echo no)"
+            echo "- dev configmap configured: $([[ -n '${{ vars.ARGO_DEV_CONFIGMAP_PATH }}' ]] && echo yes || echo no)"
+            echo "- prod manifest configured: $([[ -n '${{ vars.ARGO_PROD_MANIFEST_PATH }}' ]] && echo yes || echo no)"
+            echo "- prod configmap configured: $([[ -n '${{ vars.ARGO_PROD_CONFIGMAP_PATH }}' ]] && echo yes || echo no)"
+            echo ""
+            echo "Expected behavior:"
+            if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+              echo "- main branch build: create/update Dev promotion PR branch"
+            elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              echo "- release tag build: create/update Prod promotion PR branch"
+            else
+              echo "- no Argo manifest handoff for this ref"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Mark Github deploy start
+      - name: Mark Deployment Start
+        uses: bobheadxi/deployments@v1
+        id: deployment
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          step: start
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          env: production
+
+      ## Update Argo Deployment repo with new version for automatic deployment
+      - name: Checkout Target Repository
+        if: |
+          vars.ARGO_DEPLOY_REPO != '' &&
+          (
+            (github.ref == 'refs/heads/main' && vars.ARGO_DEV_MANIFEST_PATH != '') ||
+            (startsWith(github.ref, 'refs/tags/') && vars.ARGO_PROD_MANIFEST_PATH != '')
+          )
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ARGO_DEPLOY_REPO }}
+          path: argo-deployments
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Update Dev Image Version in Manifest
+        uses: fjogeleit/yaml-update-action@v0.13.1
+        if: github.ref == 'refs/heads/main' && vars.ARGO_DEPLOY_REPO != '' && vars.ARGO_DEV_MANIFEST_PATH != ''
+        with:
+          valueFile: ${{ vars.ARGO_DEV_MANIFEST_PATH }}
+          repository: ${{ vars.ARGO_DEPLOY_REPO }}
+          branch: deployment/dev-${{ steps.image_refs.outputs.build_version }}-${{ github.sha }}
+          targetBranch: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          masterBranchName: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          createPR: "true"
+          labels: ${{ vars.ARGO_DEV_PR_LABELS || vars.ARGO_PR_LABELS || 'automerge' }}
+          description: "Promote GoldenStackers dev image to ${{ steps.image_refs.outputs.build_version }}"
+          message: "Dev image -> ${{ steps.image_refs.outputs.build_version }}"
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          workDir: argo-deployments
+          changes: |
+            {
+              "spec.template.spec.containers[0].image": "${{ steps.image_refs.outputs.image_ref }}:${{ steps.image_refs.outputs.build_version }}"
+            }
+
+      - name: Update Dev Build Metadata in ConfigMap (optional)
+        uses: fjogeleit/yaml-update-action@v0.13.1
+        if: github.ref == 'refs/heads/main' && vars.ARGO_DEPLOY_REPO != '' && vars.ARGO_DEV_CONFIGMAP_PATH != ''
+        with:
+          valueFile: ${{ vars.ARGO_DEV_CONFIGMAP_PATH }}
+          repository: ${{ vars.ARGO_DEPLOY_REPO }}
+          branch: deployment/dev-${{ steps.image_refs.outputs.build_version }}-${{ github.sha }}
+          targetBranch: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          masterBranchName: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          createPR: "false"
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          workDir: argo-deployments
+          changes: |
+            {
+              "data.APP_BUILD_VERSION": "${{ steps.image_refs.outputs.build_version }}",
+              "data.APP_BUILD_SHA": "${{ steps.image_refs.outputs.build_sha }}"
+            }
+
+      - name: Update Prod Image Version in Manifest
+        uses: fjogeleit/yaml-update-action@v0.13.1
+        if: startsWith(github.ref, 'refs/tags/') && vars.ARGO_DEPLOY_REPO != '' && vars.ARGO_PROD_MANIFEST_PATH != ''
+        with:
+          valueFile: ${{ vars.ARGO_PROD_MANIFEST_PATH }}
+          repository: ${{ vars.ARGO_DEPLOY_REPO }}
+          branch: deployment/prod-${{ github.ref_name }}-${{ github.sha }}
+          targetBranch: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          masterBranchName: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          createPR: "true"
+          labels: ${{ vars.ARGO_PROD_PR_LABELS || vars.ARGO_PR_LABELS || 'automerge' }}
+          description: "Promote GoldenStackers prod image to ${{ github.ref_name }}"
+          message: "Prod image -> ${{ github.ref_name }}"
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          workDir: argo-deployments
+          changes: |
+            {
+              "spec.template.spec.containers[0].image": "${{ steps.image_refs.outputs.image_ref }}:${{ github.ref_name }}"
+            }
+
+      - name: Update Prod Build Metadata in ConfigMap (optional)
+        uses: fjogeleit/yaml-update-action@v0.13.1
+        if: startsWith(github.ref, 'refs/tags/') && vars.ARGO_DEPLOY_REPO != '' && vars.ARGO_PROD_CONFIGMAP_PATH != ''
+        with:
+          valueFile: ${{ vars.ARGO_PROD_CONFIGMAP_PATH }}
+          repository: ${{ vars.ARGO_DEPLOY_REPO }}
+          branch: deployment/prod-${{ github.ref_name }}-${{ github.sha }}
+          targetBranch: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          masterBranchName: ${{ vars.ARGO_TARGET_BRANCH || 'main' }}
+          createPR: "false"
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          workDir: argo-deployments
+          changes: |
+            {
+              "data.APP_BUILD_VERSION": "${{ steps.image_refs.outputs.build_version }}",
+              "data.APP_BUILD_SHA": "${{ steps.image_refs.outputs.build_sha }}"
+            }
+
+      # Mark Github deploy finish
+      - name: Mark Deployment Finish
+        uses: bobheadxi/deployments@v1
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        with:
+          step: finish
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          status: ${{ job.status }}
+          env: production
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}

@@ -1,0 +1,149 @@
+name: Deployment Config Plan Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which promotion target to validate"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - dev
+          - prod
+      require_argo_updates:
+        description: "Fail if Argo update variables are missing for selected targets"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  validate:
+    name: Validate deployment configuration
+    runs-on: [gs-inv-mgmt-runner]
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ inputs.target }}
+      REQUIRE_ARGO: ${{ inputs.require_argo_updates }}
+      DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      ARGO_DEPLOY_REPO: ${{ vars.ARGO_DEPLOY_REPO }}
+      ARGO_TARGET_BRANCH: ${{ vars.ARGO_TARGET_BRANCH }}
+      ARGO_DEV_MANIFEST_PATH: ${{ vars.ARGO_DEV_MANIFEST_PATH }}
+      ARGO_DEV_CONFIGMAP_PATH: ${{ vars.ARGO_DEV_CONFIGMAP_PATH }}
+      ARGO_PROD_MANIFEST_PATH: ${{ vars.ARGO_PROD_MANIFEST_PATH }}
+      ARGO_PROD_CONFIGMAP_PATH: ${{ vars.ARGO_PROD_CONFIGMAP_PATH }}
+    steps:
+      - name: Summarize selected mode
+        run: |
+          {
+            echo "### Deployment Config Plan Check"
+            echo ""
+            echo "- target: ${TARGET}"
+            echo "- require_argo_updates: ${REQUIRE_ARGO}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Validate required Docker secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+
+          check_secret() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "${value}" ]]; then
+              echo "❌ Missing required secret: ${name}"
+              missing=1
+            else
+              echo "✅ ${name} configured"
+            fi
+          }
+
+          check_secret "DOCKER_REGISTRY" "${DOCKER_REGISTRY}"
+          check_secret "DOCKER_USERNAME" "${DOCKER_USERNAME}"
+          check_secret "DOCKER_PASSWORD" "${DOCKER_PASSWORD}"
+
+          if [[ "${missing}" -ne 0 ]]; then
+            echo "Docker secret validation failed."
+            exit 1
+          fi
+
+      - name: Validate Argo variable plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+
+          require_var() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "${value}" ]]; then
+              echo "❌ Missing required variable: ${name}"
+              missing=1
+            else
+              echo "✅ ${name} configured: ${value}"
+            fi
+          }
+
+          optional_var() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "${value}" ]]; then
+              echo "ℹ️ Optional variable not set: ${name}"
+            else
+              echo "✅ Optional variable configured: ${name}=${value}"
+            fi
+          }
+
+          if [[ "${REQUIRE_ARGO}" != "true" ]]; then
+            echo "Argo variable validation is optional in this run (require_argo_updates=false)."
+            optional_var "ARGO_DEPLOY_REPO" "${ARGO_DEPLOY_REPO}"
+            optional_var "ARGO_TARGET_BRANCH" "${ARGO_TARGET_BRANCH}"
+            optional_var "ARGO_DEV_MANIFEST_PATH" "${ARGO_DEV_MANIFEST_PATH}"
+            optional_var "ARGO_DEV_CONFIGMAP_PATH" "${ARGO_DEV_CONFIGMAP_PATH}"
+            optional_var "ARGO_PROD_MANIFEST_PATH" "${ARGO_PROD_MANIFEST_PATH}"
+            optional_var "ARGO_PROD_CONFIGMAP_PATH" "${ARGO_PROD_CONFIGMAP_PATH}"
+            exit 0
+          fi
+
+          require_var "ARGO_DEPLOY_REPO" "${ARGO_DEPLOY_REPO}"
+          optional_var "ARGO_TARGET_BRANCH" "${ARGO_TARGET_BRANCH}"
+
+          case "${TARGET}" in
+            all)
+              require_var "ARGO_DEV_MANIFEST_PATH" "${ARGO_DEV_MANIFEST_PATH}"
+              optional_var "ARGO_DEV_CONFIGMAP_PATH" "${ARGO_DEV_CONFIGMAP_PATH}"
+              require_var "ARGO_PROD_MANIFEST_PATH" "${ARGO_PROD_MANIFEST_PATH}"
+              optional_var "ARGO_PROD_CONFIGMAP_PATH" "${ARGO_PROD_CONFIGMAP_PATH}"
+              ;;
+            dev)
+              require_var "ARGO_DEV_MANIFEST_PATH" "${ARGO_DEV_MANIFEST_PATH}"
+              optional_var "ARGO_DEV_CONFIGMAP_PATH" "${ARGO_DEV_CONFIGMAP_PATH}"
+              ;;
+            prod)
+              require_var "ARGO_PROD_MANIFEST_PATH" "${ARGO_PROD_MANIFEST_PATH}"
+              optional_var "ARGO_PROD_CONFIGMAP_PATH" "${ARGO_PROD_CONFIGMAP_PATH}"
+              ;;
+            *)
+              echo "❌ Unknown target: ${TARGET}"
+              exit 1
+              ;;
+          esac
+
+          if [[ "${missing}" -ne 0 ]]; then
+            echo "Argo variable validation failed."
+            exit 1
+          fi
+
+      - name: Mark plan check success
+        run: |
+          {
+            echo ""
+            echo "### Result"
+            echo ""
+            echo "✅ Deployment configuration plan check passed."
+          } >> "${GITHUB_STEP_SUMMARY}"

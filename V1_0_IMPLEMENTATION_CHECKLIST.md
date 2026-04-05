@@ -1,0 +1,281 @@
+# V1.0 Implementation Checklist
+
+## GS-V10-001 Additional Channel Foundation (Deferred Until Account Readiness)
+- Status: `[~]`
+- Goal: keep a safe extension point for additional channels while focusing current execution on eBay/inventory workflows.
+- Tasks:
+  - [x] Add executable optional channel scaffold in dispatcher (currently `shopify_orders_pull`).
+  - [x] Persist scaffold executions as normal sync runs/events for parity with existing eBay telemetry.
+  - [x] Add Sync UI execute-now controls for dispatcher-supported jobs.
+  - [ ] Defer full Shopify API pull/upsert mapping until Shopify account onboarding is complete.
+  - [ ] Defer Shopify retry/error traceability enhancements until Shopify account onboarding is complete.
+  - [ ] Keep Shopify job disabled by default in all environments until explicitly enabled.
+
+## GS-V10-002 Label Buying Integration
+- Status: `[x]`
+- Goal: create labels and manage tracking lifecycle directly from app workflows.
+- Tasks:
+  - [x] Add carrier abstraction scaffold for eBay shipping and Pirate Ship queue execution.
+    - Added `integration_queue` support for `integration=shipping`, `action=purchase_label` with safe dry-run and sale-field update scaffold behavior.
+  - [x] Add purchase-label action from Shipping queues.
+    - Added Shipping `Label Purchase Queue` panel with bulk queueing, provider/service/package defaults, preset apply, process-due, and run-selected controls.
+  - [x] Persist label cost, service, and document artifacts.
+    - Added sale-level label artifact fields (`shipping_label_id/url/cost/currency/purchased_at`) with migration `0032_shipping_label_fields`.
+    - Extended Shipping queue/read-only/export tables plus queue payload inputs (cost/currency) so label artifacts are visible and tracked operationally.
+  - [x] Wire live provider API label purchase adapters behind explicit environment/runtime feature flags.
+    - Added runtime feature flags + Admin controls for shipping queue execution, purchase enablement, live-provider-call guardrail, and provider-level toggles.
+    - Added shipping-label adapter dispatcher with first Pirate Ship implementation (`mock` + `api` modes) and runtime-configured endpoint/key support.
+    - Added configurable Pirate Ship endpoint path/auth scheme/timeout and tolerant response parsing for nested label/tracking/cost payloads.
+    - Added Admin `Test Pirate Ship Adapter` action for pre-queue runtime validation with integration-event audit logging.
+    - Added Admin `Recent Shipping Adapter Test Events` table for quick success/failure triage without leaving Integrations.
+    - Added Admin `Live Provider Validation Run` workflow (acknowledged real-purchase gate, queue execution, standardized validation audit events, and CSV/history export) for Dev/Prod evidence capture.
+    - Added Admin `Validation Sign-Off (Dev/Prod)` records (owner/date/status/evidence link) plus CSV and go-live evidence-pack export (`shipping_provider_validation_signoffs.csv`) to close environment-level proof.
+
+## GS-V10-003 Event-Driven Automation
+- Status: `[x]`
+- Goal: reduce manual queue ops via safe automation rules.
+- Tasks:
+  - [x] Add rule model for status transitions and auto-actions.
+    - Added DB-backed `integration_automation_rules` domain (model + migration + repository CRUD + audit logging).
+    - Added Admin `Integrations` preview UI for create/edit/delete of automation rules with JSON validation.
+  - [x] Add approval gates for write-impacting automations.
+    - Added runtime execution controls: `integration_automation_dry_run_enabled` and `integration_automation_execute_approval_required_enabled`.
+    - Queue engine now evaluates rules pre-execution and treats `requires_approval` rules as approval-gated unless override is enabled.
+    - Added explicit automation approval records (`integration_automation_approvals`) with Admin create/revoke controls and optional expiry + queue-job scoping.
+    - Engine now requires active approval records for `requires_approval` rules when approval execution is enabled.
+  - [x] Add automation run history and failure triage views.
+    - Added Admin `Recent Automation Engine Events` telemetry table.
+    - Added Admin `Automation Failure Triage` quick actions for approve/retry/disable handling of blocked or approval-gated events.
+    - Added Admin `Rule Impact Preview` per selected automation rule (candidate/matched/match-rate + sample matching queue jobs) to estimate blast radius before enabling/editing rules.
+    - Added Admin triage `Replay Rule Simulation` (read-only) to re-evaluate a selected historical queue job against current rules and approval state.
+    - Added one-click `Approve Gated From Simulation` action so replayed rule-gates can be converted directly into job-scoped approval records.
+    - Added replay `Drift Check` (historical vs replay-now metrics + blocked-state change) and one-click drift event logging for go-live auditability.
+    - Added `Automation Hardening Sign-Off (Dev/Prod)` records in Admin Integrations (guardrails/approval-policy/runbook checks + owner/date/status/evidence).
+    - Added hardening sign-off CSV export and go-live evidence-pack artifact (`integration_automation_hardening_signoffs.csv`) with Dev/Prod status fields in summary/capture metadata.
+
+## GS-V10-004 Observability + SRE Baseline
+- Status: `[x]`
+- Goal: production-grade health and alerting for app + integrations.
+- Tasks:
+  - [~] Add structured app error capture + alert hooks.
+    - Queue execution now records structured integration error events on uncaught execute exceptions (`*_execute_exception`) with exception type and traceback preview.
+    - Terminal queue failures now support generalized Slack alert routing for all integrations via runtime key `slack_notify_integration_queue_failures`.
+    - Added System Health `Error Signals (24h)` metrics/table for queue execute exceptions, terminal failures, warnings, and recent samples.
+    - Added runtime-configurable thresholds and runbook URL support for those error signals (`health_*_24h` + `runbook_*_url`) to drive operator remediation.
+  - [x] Add service-level metrics and threshold alerts.
+    - Added threshold-based System Health evaluation for integration error signals (warn/critical runtime keys per metric).
+    - Added optional auto-alert pipeline for critical System Health signals with cooldown guard (`health_auto_alert_critical_enabled`, `health_auto_alert_cooldown_minutes`) and Slack routing/template controls.
+    - Added manual `Send Critical Health Alert Now` validation action in System Health to test routing/template/audit flow before release.
+    - Added `Critical Alert Evidence (Recent)` table in System Health showing last 7 days of manual/auto critical alerts and Slack dispatch outcomes (sent/queued/error, channel, queue job id).
+    - Added one-click CSV export for Critical Alert Evidence to support go-live evidence collection.
+    - Added System Health `Alert Routing Acceptance Sign-Off` records (Dev/Prod owner/date/status/evidence + channel/owner/escalation/runbook confirmations) with CSV export.
+    - Extended Go-Live Evidence Pack with `system_health_alert_routing_signoffs.csv` and Dev/Prod alert-routing sign-off status fields in summary/capture metadata.
+  - [x] Add runbook links from System Health to remediation actions.
+    - Added runbook quick-link panel in System Health with runtime URLs for queue execute exceptions, terminal queue failures, and integration warnings.
+    - Added Admin `Go-Live Evidence Pack (ZIP)` export bundling governance data, critical-alert evidence, queue snapshot, error-signal counts/samples, and checklist snapshot for release audit handoff.
+    - Added checklist readiness parsing in Admin export hub (done/in-progress/not-started + completion %) and included `go_live_checklist_status.csv` in Go-Live Evidence Pack.
+    - Added one-click `Record Evidence Capture Event` action in Admin with recent capture history table for immutable go-live evidence timing/actor tracking.
+    - Added `Go-Live Readiness Score` and state (green/yellow/red) in Admin evidence hub and persisted those fields into summary/capture artifacts.
+    - Added runtime-configurable readiness scoring weights/thresholds in Admin (`Readiness Scoring Config`) so each environment can tune strictness before release.
+    - Extended evidence bundle to include shipping provider validation history (`shipping_provider_validation_30d.csv`) and provider-validation run counts in summary/capture metadata.
+    - Added System Health `Calibration Sign-Off` records (Dev/Prod owner/date/status/evidence) with CSV export for threshold/scoring acceptance.
+    - Extended Go-Live Evidence Pack with `system_health_calibration_signoffs.csv` plus Dev/Prod health-calibration status fields in summary/capture metadata.
+
+## GS-V10-005 Backup/Restore Automation
+- Status: `[x]`
+- Goal: repeatable and auditable disaster recovery workflow.
+- Tasks:
+  - [x] Add scheduled backup policy controls.
+    - Added Admin `Backups` runtime-backed policy controls (`backup_policy_*`, drill interval, RTO target, owner).
+    - Added defaults for backup-policy runtime keys in runtime coverage/seed defaults and config-health required runtime set.
+  - [x] Add restore drill workflow tracking + evidence capture.
+    - Added `Restore Drill Evidence` workflow in Admin Backups with audit events (`backup_restore_drill`), SLA warning, recent-history table, and CSV export.
+    - Added restore-drill evidence (`backup_restore_drills.csv`) and summary counts to Admin `Go-Live Evidence Pack`.
+  - [x] Add environment-specific DR checklists and SLA reporting.
+    - Added Admin `DR Checklist + SLA Reporting` section with environment-targeted checklist snapshots (`backup_dr_checklist`) and downloadable checklist history.
+    - Added per-environment restore-drill SLA rollup (pass rate, latest pass age, SLA status) with CSV export.
+    - Added checklist snapshot export (`backup_dr_checklist_snapshots.csv`) and DR checklist summary metrics to go-live evidence package.
+
+## GS-V10-006 QA Automation + Coverage
+- Status: `[~]`
+- Goal: enforce repeatable regression protection across core business logic and critical UI flows.
+- Tasks:
+  - [x] Establish mandatory unit-test execution in CI build pipeline.
+    - Added unit-test step (`python -m unittest discover -s tests -p "test_*.py"`) to `docker_build.yaml`.
+  - [x] Add dedicated QA workflow for unit + browser smoke checks.
+    - Added `.github/workflows/qa_tests.yaml` (Python unit tests + Playwright smoke with compose startup and artifact upload).
+  - [x] Add Playwright e2e scaffold and initial smoke test.
+    - Added `playwright.config.ts` and `tests/e2e/smoke.spec.ts`.
+    - Added npm scripts/dev dependency in `package.json`.
+  - [x] Capture initial Python line-coverage baseline with `coverage.py` for scope sizing.
+    - Latest measured on 2026-04-02: global Python line coverage `~41.77%` (`--source=app`, `604` tests passing) and scoped-core coverage `~95.01%` (`repository` `~93.97%`, `auth` `~92.81%`, `page_common` `~95.63%`, `config` `100%`).
+  - [ ] Add test coverage reporting + enforceable CI quality gates.
+    - [x] Add `.coveragerc` + CI artifact publication (`coverage.xml`/summary) and fail-under threshold.
+      - `qa_tests.yaml` now runs unit tests under `coverage.py`, enforces fail-under, and uploads `.coverage`, `coverage.xml`, `coverage.json`.
+      - CI now enforces dual gates: global baseline `30%` plus scoped-core gate `>=85%` (`repository/services/auth/page_common/config`) while broad UI-heavy module tests are expanded.
+    - [x] Set initial global gate and fail PRs below threshold.
+      - `qa_tests.yaml` now enforces global `COVERAGE_FAIL_UNDER=30` and scoped-core `>=85%` gate.
+      - Gate ratchet verified locally against current suite (`41.43%` global, `93.56%` scoped-core).
+    - [x] Add threshold-ratchet policy and trend tracking in README/QA docs (`30% -> 40% -> 55%+`, scoped-core `85% -> 95%`).
+  - [ ] Expand unit/integration tests for scoped core business modules (near-100 target).
+    - [~] `app/repository.py` inventory/listing/sale/order edge-case coverage.
+      - Added listing review/publish policy tests (draft/pending defaults, active-without-approval block, two-person review enforcement, review-history persistence).
+      - Added repository edge-path tests for order update (`not found`, duplicate external ID, no-op update without new audit), listing/review guards (`listing not found`, invalid review decision, review-history truncation to latest 100), and sale update edges (`sale not found`, product reassignment inventory reconcile, same-sale tracking reuse, cross-sale tracking reuse block), raising `app/repository.py` to ~`42.02%`.
+      - Added repository coverage for media assets (create/list/filter/update/not-found), inventory sources (active filtering/update/not-found), lot assignment allocated-cost behavior, audit event + entity-filter helpers, app-user update/password not-found paths, and role-permission validation/no-op behavior, raising `app/repository.py` to ~`48.05%`.
+      - Added repository coverage for sync/integration domains: `sync_run` not-found update, integration automation rule CRUD/validation/not-found/delete-miss, automation approval creation/list/revoke/expiry checks, integration queue job create/list/update/not-found, and sync event/error queue + resolve paths, raising `app/repository.py` to ~`58.63%`.
+      - Added deeper repository coverage for AI provider config CRUD/default semantics/validation, runtime setting list/get/delete + validation, saved-filter admin ownership/delete paths, eBay listing template profile upsert/list/update validations, and document-template include-all filtering/not-found update; latest `app/repository.py` coverage is ~`73.55%`.
+    - [~] `app/services/sync_jobs.py`, `integration_queue.py`, `integration_automation.py` retry/state policy coverage.
+      - Added focused unit coverage for `sync_jobs` dispatcher/policy/parsing/guardrails and scaffold execution paths (`tests/test_sync_jobs.py`).
+      - Expanded `tests/test_sync_jobs.py` with catalog/enablement checks plus pull-import terminal-state and shipping-push multi-path tests.
+      - Added deeper unit tests for `_build_order_items` and `_upsert_ebay_order_into_local` (fallback line-item generation, legacy-listing create-failure recovery, ambiguous SKU candidate matching by title/price/status, existing-order update flow, existing-sale update flow, and fulfillment-enrichment failure handling), plus shipping-push API-exception partial-status path coverage, increasing `app/services/sync_jobs.py` coverage to ~`91.07%`.
+      - Expanded `tests/test_integration_queue.py` to cover bad payload decoding, slack/shipping/google action validation branches, live shipping provider path, process-job exception/not-found behavior, due-queue queued-vs-failed summary paths, terminal-alert guardrails, and shipping-provider-disabled branch, increasing `app/services/integration_queue.py` coverage to ~`93.09%`.
+      - Expanded `tests/test_integration_automation.py` for condition/operator edge cases, approval-enabled block/update effects, trigger/payload/effect JSON error handling, preview non-match/non-dict payload paths, and simulation replay edge-paths; `app/services/integration_automation.py` coverage is now `100%`.
+    - [~] `app/services/ai_orchestration.py` and `app/services/listing_orchestration.py` core orchestration helper coverage.
+      - Added new unit suites (`tests/test_ai_orchestration.py`, `tests/test_listing_orchestration.py`) for citation/result wiring, fallback metadata propagation, adapter capability matrix, and channel orchestration-state resolution; latest coverage: `app/services/ai_orchestration.py` `100%`, `app/services/listing_orchestration.py` ~`98.28%`.
+    - [~] `app/services/sync_runner.py` scheduler behavior coverage.
+      - Added focused scheduler tests for job-enable/token gating, governance snapshot due/not-due paths, and run-loop modes (`tests/test_sync_runner.py`), bringing module coverage to ~86.14%.
+    - [~] `app/services/google_workspace.py` Gmail/Calendar/Drive integration paths.
+      - Added focused validation/request/HTTP-error tests for Gmail send, Calendar create, and Drive upload plus runtime-config resolution (`tests/test_google_workspace.py`), bringing module coverage to ~95.56%.
+    - [~] `app/services/runtime_settings.py` DB-first/env-fallback behavior coverage.
+      - Added typed conversion/runtime-value/domain-toggle tests (`tests/test_runtime_settings.py`), bringing module coverage to ~95%.
+    - [~] `app/services/llm_runtime.py` runtime-resolution/fallback parsing coverage.
+      - Added tests for numeric/runtime helper conversion, DB-vs-env runtime profile resolution, fallback-chain dedupe/limit behavior, comp summary request/response parsing (chat/responses), multimodal validation/parsing/fallback behavior, model endpoint discovery, and runtime connectivity validation (`tests/test_llm_runtime.py`), raising `app/services/llm_runtime.py` to ~`96.52%`.
+    - [x] `app/services/config_health.py` coverage.
+      - Added tests for required-key copy behavior, health threshold states, and env/runtime missing-key detection; module now `100%`.
+    - [x] `app/services/coin_reference_sources.py` coverage.
+      - Added tests for disabled/greysheet adapters, prod/license/base-url/api-key validations, runtime-config resolution, and adapter selection fallback behavior; module now `100%`.
+    - [x] `app/services/env_manager.py` coverage.
+      - Added tests for env parsing/read masking/editability and upsert/default behavior (`tests/test_env_manager.py`); module now ~`96.70%`.
+    - [x] `app/services/db_backup.py` coverage.
+      - Added tests for PG dump/restore guards and subprocess paths, S3 enablement/key helpers, and upload/list/download wrapper error handling (`tests/test_db_backup.py`); module now `100%`.
+    - [x] `app/services/voice_runtime.py` coverage.
+      - Added tests for runtime config resolution, endpoint variant generation, STT/TTS guardrails, success paths, and endpoint-fallback error behavior (`tests/test_voice_runtime.py`); module now ~`97.96%`.
+    - [x] `app/services/listing_readiness.py` coverage.
+      - Added tests for fixed-price ready/blocked states, auction validation branches, unknown format handling, warning logic, and score/status outputs (`tests/test_listing_readiness.py`); module now ~`95.79%`.
+    - [x] `app/services/media_storage.py` coverage.
+      - Added tests for S3-enabled/disabled init behavior, bucket ensure flow, upload URL/content-type/error paths, and object fetch success/fallback/error handling (`tests/test_media_storage.py`); module now ~`96.25%`.
+    - [x] `app/services/chat_context_builders.py` coverage.
+      - Added tests for inventory/listing/sales/shipping/sync/orders/reports/admin snapshot builders plus fallback help and scan/money helpers (`tests/test_chat_context_builders.py`); module now ~`98.17%`.
+    - [~] `app/page_common.py` shared navigation/session glue coverage.
+      - Added tests for runtime UI-flag caching/DB fallback, navigation telemetry event recording, setup-page auth flow, repo/storage helpers, and command normalization (`tests/test_page_common.py`), bringing `app/page_common.py` to ~`59.52%`.
+    - [x] `app/main.py` entrypoint navigation coverage.
+      - Added tests for role-default landing redirects and non-redirect guardrails (`tests/test_main.py`), bringing `app/main.py` to ~`89.66%`.
+    - [x] `app/components/ui_helpers.py` coverage.
+      - Added tests for decimal/date/key helper behavior and product/listing option builders (`tests/test_ui_helpers.py`); module now `100%`.
+    - [~] `app/services/ebay.py` mapping and publish payload guardrails.
+      - Added API wrapper parsing/fallback/error tests for auth URLs, finding API retry behavior, inventory-location fallback, video ID extraction, listing URL mapping, offer/media wrappers, token exchange, policy endpoints, and fulfillment/order routes (`tests/test_ebay_service.py`), increasing `app/services/ebay.py` coverage to ~92.41%.
+      - Fixed a real fulfillment parsing defect in `app/services/ebay.py` where top-level list responses could raise an exception before list-type handling.
+    - [~] `app/services/shipping_labels.py` adapter parsing/guardrail coverage.
+      - Added mock/api-mode adapter tests and fixed live-response cost parsing fallback order (`cost.total` precedence) (`tests/test_shipping_labels.py`).
+    - [~] `app/auth.py`, `app/services/security.py`, `app/services/validation.py` auth/permission/validation paths.
+      - Added auth token/permission/session guardrail tests (`tests/test_auth.py`) and slack alert/config/channel/queue/connectivity tests (`tests/test_slack_notify.py`) to raise coverage for auth/integration-critical behavior.
+      - Expanded `tests/test_auth.py` with query-token read/write/clear fallback paths, cookie/query restore flows, invalid-token clear behavior, and remember-token refresh coverage.
+      - Added deeper auth helper tests for cookie-manager status paths, encrypted cookie token set/get/clear behavior, bootstrap auth-session gating, invalid token shape parsing, unknown-user restore rejection, and current-user defaults.
+      - Added security/hash/verify and validation rule tests (`tests/test_security_validation.py`) for tracking/listing/uniqueness guardrails.
+      - Latest module snapshot: `app/auth.py` ~`53.92%`, `app/services/slack_notify.py` ~`95.42%`, `app/services/validation.py` ~`94.93%`, `app/services/security.py` ~`90.91%`.
+    - [~] `app/services/slack_notify.py` alert routing/queue fallback/connectivity coverage.
+      - Added tests for channel-required and Slack API HTTP/error responses, override-channel precedence, template-format fallback behavior, queue max-retry clamping, and missing-token/missing-channel connectivity paths, increasing `app/services/slack_notify.py` coverage to ~`95.42%`.
+    - [~] `app/services/spot_price.py` provider and parsing coverage.
+      - Added tests for provider configuration paths, metals-api success/error/no-quote handling, Yahoo regular/previous-close/indicator-close extraction, request retry/rate-limit behavior, and conversion helpers, increasing `app/services/spot_price.py` coverage to ~`92.62%`.
+    - [x] `app/services/grading_standards.py` web-context parsing/building coverage.
+      - Added dedicated tests for HTML stripping/sentence extraction/pattern matching/compact helpers, page-fetch success/failure behavior, standards snapshot indicator extraction, and grading/comp context builders (fallback + snippet modes), increasing `app/services/grading_standards.py` to ~`97.16%`.
+    - [x] `app/page_common.py` shared navigation/session glue coverage hardening.
+      - Added quick-action/sidebar navigation tests for unified/legacy modes, unknown-command handling, and navigation error guardrails, increasing `app/page_common.py` to ~`91.67%`.
+    - [~] `app/auth.py` login/session UI branch coverage expansion.
+      - Added `init_user_context_sidebar` tests for password-auth success, invalid credentials, and non-password role-override path; `app/auth.py` now ~`71.07%`.
+    - [x] `app/services/ai_text.py` parsing/normalization coverage.
+      - Added tests for JSON extraction variants, description normalization fallbacks, structured coin-grader parsing, and text rendering output; `app/services/ai_text.py` now ~`87.77%`.
+    - [x] `app/services/media_storage.py` object deletion coverage.
+      - Added delete-object success + guardrail + provider-exception tests; `app/services/media_storage.py` now ~`96.77%`.
+    - [~] `app/repository.py` expanded coverage on document/AI/coin/admin slices.
+      - Added tests for `coin_ai_runs`, `purchase_documents`, `document_artifacts`, `dashboard_metrics`, `coin_reference` CRUD/list/validation, and `integration_event` audit logging; `app/repository.py` now ~`73.06%`.
+    - [~] `app/components/views/coin_intake_wizard.py` + `inventory_intake_wizard.py` helper coverage.
+      - Added `tests/test_intake_wizard_helpers.py` covering wizard JSON extraction, coin-reference summary formatting, buffered AI media normalization, and buffered upload wrappers; latest module coverage `coin_intake_wizard` ~`16.86%`, `inventory_intake_wizard` ~`10.18%`.
+    - [x] Reach scoped-core coverage target `>=95%` on core modules.
+  - [ ] Expand Playwright coverage to critical operator paths.
+    - [~] Auth/login + session restore behavior.
+      - Added auth-aware sign-in/sign-out e2e flow with remember-token URL check (`tests/e2e/auth_flow.spec.ts`).
+      - Spec skips when password auth is disabled or when `E2E_USERNAME`/`E2E_PASSWORD` are not provided locally.
+    - [~] Inventory intake wizard (generic and coin-assisted path).
+      - Added auth-aware e2e specs for `Inventory Intake Wizard` and `Coin Intake Wizard` product-create paths (`tests/e2e/intake_wizard.spec.ts`, `tests/e2e/coin_intake_wizard.spec.ts`).
+      - Specs run cleanly in CI auth-disabled mode and skip locally when auth is enabled but `E2E_USERNAME`/`E2E_PASSWORD` are not set.
+    - [~] Products create/edit + media attach path.
+      - Added auth-aware `Products` create/edit/media e2e flow (`tests/e2e/products_flow.spec.ts`) covering create product + optional media attach + side-panel edit save path.
+      - Spec runs in CI auth-disabled mode and skips locally when auth is enabled but `E2E_USERNAME`/`E2E_PASSWORD` are not set.
+    - [~] Listings draft/review/publish preflight flow.
+      - Added auth-aware `Listings` e2e flow (`tests/e2e/listings_flow.spec.ts`) covering create draft listing, readiness-preflight visibility, and review approval action in side panel.
+      - Spec skips locally when auth is enabled but `E2E_USERNAME`/`E2E_PASSWORD` are not set.
+    - [~] Shipping queue + label/tracking workflow.
+      - Added auth-aware `Shipping` e2e flow (`tests/e2e/shipping_flow.spec.ts`) covering queue tabs and label-purchase queue visibility.
+    - [~] Sync failure triage/retry flow.
+      - Added auth-aware `Sync` e2e flow (`tests/e2e/sync_flow.spec.ts`) covering job controls, execute-now visibility, and exception queue surface.
+    - [~] Admin sign-off/evidence-pack critical path.
+      - Added auth-aware `Admin` governance e2e flow (`tests/e2e/admin_golive_flow.spec.ts`) covering Go-Live readiness/sign-off/export surfaces.
+    - [x] Revalidate current critical Chromium suite stability after QA hardening changes.
+      - Local run result: `9/9` Playwright specs passing after deterministic local e2e role-permission seeding (`E2E_ENSURE_ROLE_PERMISSIONS=true`); sync/listings/shipping assertions now include execute/review/update-result checks.
+      - Added CI QA evidence packaging (`qa-evidence` artifact + GitHub job summary) to simplify release-candidate evidence-link capture in go-live checklist execution.
+  - [ ] Expand test architecture to improve maintainability and speed.
+    - [x] Introduce shared test fixtures/factories for repository/service tests.
+      - Added `tests/test_support.py` with reusable in-memory repository fixture (`in_memory_repo`) and product factory helper (`create_test_product`) to reduce repeated setup in integration-style repository tests.
+    - [x] Add deterministic seed helpers for repeatable integration tests.
+      - Added deterministic suffix helper (`deterministic_suffix`) and wired repository integration tests to stable SKU seeding inputs for repeatable, collision-safe records.
+    - [x] Add test markers/suites (`fast`, `integration`, `e2e`) for CI parallelization.
+      - Added segmented suite runner (`scripts/run_test_suites.py`) with `fast` and `integration` selectors and new local task targets (`make qa-unit-fast`, `make qa-unit-integration`, task equivalents) to enable CI fan-out.
+  - [x] Add unit tests for purchase-document extraction service (`app/services/purchase_doc_extraction.py`) including Textract payload mapping, line-item parsing, and merge behavior.
+
+## High-Priority Remaining (as of 2026-04-02)
+- [~] GS-V10-006 QA automation + coverage hardening is now P0:
+  - coverage baseline captured and improved (`~41.77%` global, `604` tests passing, scoped-core `~95.01%`);
+  - interim gates are now enforced (`>=30%` global, `>=85%` scoped-core); next ratchets and broad core/e2e expansion remain.
+- [x] GS-V10-002 implementation scope complete for now (live-provider execution validation remains tracked in `GO_LIVE_CHECKLIST.md`).
+- [x] GS-V10-003 implementation scope complete for now (ops execution/sign-off remains tracked in `GO_LIVE_CHECKLIST.md`).
+- [x] GS-V10-004 implementation scope complete for now (ops execution/sign-off remains tracked in `GO_LIVE_CHECKLIST.md`).
+- [x] GS-V10-005 backup/restore automation implementation complete (operational drill cadence tracked in `GO_LIVE_CHECKLIST.md`).
+- [ ] Complete and sign off `GO_LIVE_CHECKLIST.md` with owner/date/evidence links per section.
+  - Added Admin `Go-Live Section Sign-Off Tracker` (`go_live_section_signoff`) with checklist-item status/owner/date/evidence capture and evidence-pack export (`go_live_section_signoffs.csv`) to accelerate closure.
+  - Added a release-level `Go-Live Execution Board` table in `GO_LIVE_CHECKLIST.md` to assign owners/due dates/evidence links across QA, legal/compliance, shipping validation, observability, and release evidence tasks.
+
+## GS-V10-007 Production Commerce + Legal Readiness
+- Status: `[x]`
+- Goal: ensure the system is defensible for real-world selling operations (policy, tax, records, and traceability).
+- Tasks:
+  - [x] Add listing-based invoice generation path for local/off-platform workflows (before sale exists).
+    - Documents now supports `Listing` as source with editable qty/price/fees/shipping and tax calculations.
+  - [x] Add one-click posting path from listing invoice into transactional records.
+    - Added optional linked `Order + OrderItem` creation and linked `Sale` creation from Documents listing flow.
+    - Added `Post & Open Sales` redirect to created sale row.
+  - [x] Add explicit unsold handling in listing invoice flow.
+    - Added `Listing Outcome` (`Sold` vs `Not Sold / Remove Listing`) with end/archive actions that do not create sales.
+  - [x] Add inventory-classification and conversion controls to support material->sellable lifecycle.
+    - Added `products.inventory_class` and both single + multi-target conversion workflows with movement/audit lineage.
+  - [x] Add destructive media lifecycle controls for legal/operational hygiene.
+    - Added S3 + DB delete actions for media across Media/Products/Listings.
+  - [x] Add role/approval policy for financial posting from Documents.
+    - Enforced runtime-configurable gate for listing-invoice posting (`documents_listing_posting_enabled`) and allowed roles (`documents_listing_posting_roles_csv`, default `ops,admin`).
+  - [x] Add tax-treatment audit capture for document posting.
+    - Documents listing posting now persists explicit tax treatment audit context (`tax_mode`, `taxable_subtotal`, `tax_rate_percent`, `tax_jurisdiction`, `shipping_taxable`, `tax_exempt_categories`, `tax_exemption_basis`) on the sale audit event for downstream accounting/legal review.
+  - [x] Add immutable document artifact retention policy.
+    - Added DB-backed immutable `document_artifacts` retention with checksum (`sha256`) + storage reference and Documents UI visibility/download.
+    - Listing-invoice posting now stores rendered printable HTML artifacts at post-time and links artifact lineage in sale audit events.
+  - [x] Add go-live legal policy sign-off fields in checklist.
+    - Added Admin `Commerce Legal Sign-Off Tracker` with policy-specific owner/date/evidence capture for tax treatment, retention, marketplace policy, privacy/data handling, financial posting role controls, and legal/accounting reviewer sign-off per environment.
+    - Added one-click seeding of missing legal policy rows (`dev`/`prod`/`dev+prod`) plus coverage matrix so teams can fill sign-off status/evidence without manual row setup.
+    - Added `Quick Mark Approved` control in legal sign-off tracker for rapid policy-close actions.
+    - Included `commerce_legal_signoffs.csv` in the Go-Live Evidence Pack and go-live summary metrics.
+
+## GS-V10-008 Purchase Invoice Intake + AI Extraction
+- Status: `[x]`
+- Goal: store incoming purchase documents with AI-assisted extraction and traceability to acquisition entities.
+- Tasks:
+  - [x] Add purchase document persistence model with S3 reference + checksum.
+  - [x] Add Lots-page upload flow for PDF/image + camera capture.
+  - [x] Add optional AI extraction workflow for incoming purchase documents.
+  - [x] Link purchase documents to lot/product/source for downstream reconciliation.
+  - [x] Add one-click apply action to push extracted invoice fields (vendor/date/total/tax/shipping/handling) into linked lots.
+  - [x] Add “Create Lot + Link Document” flow from purchase-document details for unlinked incoming invoices.
+  - [x] Add “Create Product + Link Document” flow from purchase-document details with extracted line-item defaults and optional immediate lot assignment.
+  - [x] Add extracted line-item selector for product creation so operators can choose which invoice line to convert into a product.
+  - [x] Add extraction provider selector for purchase-document AI (`LLM Multimodal`, `AWS Textract`, or merged `Both`) with structured payload persistence.
+  - [x] Add bulk line-item product creation action from purchase-document details (editable per-row SKU/title/qty/cost with selective create toggles).
+  - [x] Add wizard media re-use controls to attach existing media assets to newly created products/listings (filter + select-all bulk controls).
+  - [x] Collapse direct camera panels by default across intake/tools/lots capture points to keep operator pages cleaner.

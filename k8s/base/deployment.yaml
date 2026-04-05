@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gs-inv-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gs-inv-app
+  template:
+    metadata:
+      labels:
+        app: gs-inv-app
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          env:
+            - name: DB_AUTO_MIGRATE
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi

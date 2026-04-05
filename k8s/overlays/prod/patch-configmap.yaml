@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gs-inv-config
+data:
+  APP_ENV: prod
+  SYNC_RUNNER_ENABLED: "true"

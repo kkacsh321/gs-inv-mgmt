@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gs-inv-app
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    app.kubernetes.io/component: app
+    env: dev
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: gs-inv-app
+  template:
+    metadata:
+      labels:
+        app: gs-inv-app
+        app.kubernetes.io/name: gs-inv-mgmt
+        app.kubernetes.io/component: app
+        env: dev
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+              name: http
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          env:
+            - name: DB_AUTO_MIGRATE
+              value: "false"
+            - name: LOCAL_MEDIA_ROOT
+              value: /var/gs-inv/media
+            - name: BACKUP_LOCAL_DIR
+              value: /var/gs-inv/backups
+          volumeMounts:
+            - name: media-data
+              mountPath: /var/gs-inv/media
+            - name: backups-data
+              mountPath: /var/gs-inv/backups
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 150m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+      securityContext:
+        fsGroup: 10001
+      volumes:
+        - name: media-data
+          persistentVolumeClaim:
+            claimName: gs-inv-media-pvc
+        - name: backups-data
+          persistentVolumeClaim:
+            claimName: gs-inv-backups-pvc

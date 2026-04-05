@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gs-inv-ingress
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    env: prod
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  tls:
+    - hosts:
+        - inventory.goldenstackers.com
+      secretName: gs-inv-prod-tls
+  rules:
+    - host: inventory.goldenstackers.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gs-inv-service
+                port:
+                  number: 80

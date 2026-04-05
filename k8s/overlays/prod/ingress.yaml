@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gs-inv-ingress
+spec:
+  rules:
+    - host: gs-inv.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gs-inv-service
+                port:
+                  number: 80

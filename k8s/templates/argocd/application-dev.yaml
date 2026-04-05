@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gs-inv-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    env: dev
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/REPLACE_ME/REPLACE_INFRA_REPO.git
+    targetRevision: main
+    path: apps/gs-inv/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gs-inv-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true

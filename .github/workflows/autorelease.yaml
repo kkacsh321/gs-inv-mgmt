@@ -1,0 +1,26 @@
+name: Publish release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+jobs:
+  publish:
+    runs-on: [gs-inv-mgmt-runner]
+
+    permissions:
+      contents: write
+
+    name: Publish release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate semver tag
+        run: |
+          if ! echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Tag ${GITHUB_REF_NAME} is not strict semver (vX.Y.Z)."
+            exit 1
+          fi
+      - name: Publish release
+        uses: eloquent/github-release-action@v3
+        with:
+          generateReleaseNotes: "true"

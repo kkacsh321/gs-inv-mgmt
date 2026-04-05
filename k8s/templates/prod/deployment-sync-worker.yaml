@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gs-inv-sync-worker
+  labels:
+    app.kubernetes.io/name: gs-inv-mgmt
+    app.kubernetes.io/component: sync-worker
+    env: prod
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: gs-inv-sync-worker
+  template:
+    metadata:
+      labels:
+        app: gs-inv-sync-worker
+        app.kubernetes.io/name: gs-inv-mgmt
+        app.kubernetes.io/component: sync-worker
+        env: prod
+    spec:
+      containers:
+        - name: sync-worker
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:stable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.services.sync_runner"]
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          env:
+            - name: LOCAL_MEDIA_ROOT
+              value: /var/gs-inv/media
+            - name: BACKUP_LOCAL_DIR
+              value: /var/gs-inv/backups
+          volumeMounts:
+            - name: media-data
+              mountPath: /var/gs-inv/media
+            - name: backups-data
+              mountPath: /var/gs-inv/backups
+          resources:
+            requests:
+              cpu: 300m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+      securityContext:
+        fsGroup: 10001
+      volumes:
+        - name: media-data
+          persistentVolumeClaim:
+            claimName: gs-inv-media-pvc
+        - name: backups-data
+          persistentVolumeClaim:
+            claimName: gs-inv-backups-pvc

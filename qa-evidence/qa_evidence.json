@@ -1,0 +1,26 @@
+{
+  "unit_outcome": "unknown",
+  "playwright_outcome": "unknown",
+  "coverage": {
+    "global_percent": 41.78,
+    "global_percent_display": "41.78",
+    "scoped_core_percent": 97.24,
+    "scoped_core_paths": [
+      "app/auth.py",
+      "app/config.py",
+      "app/page_common.py",
+      "app/repository.py",
+      "app/services/*"
+    ],
+    "covered_lines": 10675,
+    "num_statements": 24557,
+    "missing_lines": 13882
+  },
+  "playwright": {
+    "expected": 0,
+    "unexpected": 0,
+    "flaky": 0,
+    "skipped": 0,
+    "duration_ms": 0
+  }
+}

@@ -1,0 +1,853 @@
+# GoldenStackers Inventory Roadmap
+
+This roadmap is focused on operational reliability first, then channel integrations, then scale and automation.
+
+## Progress Snapshot (as of April 2, 2026)
+- v0.2 completed:
+  - Inventory ledger (`inventory_movements`)
+  - Source master data (`inventory_sources`)
+  - Orders domain (`orders`, `order_items`) with sales linkage
+  - Returns/refunds workflow (`returns`) with restock/non-restock handling
+  - Shipping queue enhancements (carrier presets, shipment exports, exception actions)
+  - Invoice/receipt generation page with multi-template branding and print/export support
+  - Saved document template profiles in DB with environment-scoped defaults
+  - Data quality validation layer (required fields, duplicate guards, tracking/amount checks)
+  - Role-based access basics (viewer/ops/admin adapter, UI write guardrails, user-attributed audit events)
+  - Admin page for managing users and role-permission mappings in-app
+  - Password-required user creation + login/logout gating when password auth is enabled
+  - Admin migration operations (upgrade + guarded downgrade)
+  - Admin maintenance operations (seed, operational data reset)
+  - Admin backup operations (SQL dump, S3 upload/list, guarded non-prod restore)
+  - Source master data now supports optional `account_id` and `payment_method` tracking
+  - Source master data now supports optional `source_url` links for vendor/dealer records
+- v0.2 in progress:
+  - No open v0.2 items
+- v0.3 completed:
+  - Sync queue foundation (`sync_runs`, `sync_events`, `sync_errors`) with initial Sync telemetry page
+  - Added background sync runner service (`app.services.sync_runner`) with scheduled eBay pull/import execution and automatic run/event/error lifecycle logging
+  - eBay pull stub now writes tracked sync runs/events/errors with queue state transitions
+  - eBay pull import now upserts local `orders`/`order_items`/`sales` (SKU/listing mapping still iterative)
+  - eBay pull import now enriches local sales with fulfillment tracking/provider/shipped/delivered updates from eBay shipping fulfillment APIs
+  - eBay pull line-item mapping now handles ambiguous multi-item SKU/listing edge cases with title/price/status disambiguation before linking
+  - Sync retries now supported with retry counters and parent-run linkage
+  - Retry flow can now execute eBay pull/import directly from Sync page
+  - Sync/eBay now show traceability metrics: `line_items_with_listing_link`, `line_items_unmapped_sku`, `auto_listings_created`
+  - Added v0.3 scope item for media visibility and product-driven eBay listing creation
+  - Product and Listing pages now include image/video preview galleries
+  - Media upload flows now support in-browser camera photo capture plus video/file picker capture paths across Media Library, Products, and Listings
+  - Added optional enhanced webcam capture mode via `streamlit-webrtc` (desktop frame capture + recorded webcam video import)
+  - Media Library, Product/Listing create media blocks, and Product/Listing media managers now run outside forms for live enhanced capture controls
+  - Media file access now includes single-file preview/download/open URL and bulk ZIP download for selected media rows
+  - Products page now supports “Create eBay Listing From Product” with optional media attachment linkage
+  - Listing workflows now enforce stricter publish/create validation for required fields and media when status is `active`
+  - Listings page now supports direct eBay publish (fixed price/auction) and writes back eBay listing ID/URL
+  - Added user/environment-scoped eBay publish presets for one-click policy/location/category defaults
+  - eBay publish flow now supports pushing selected images to eBay EPS and attaching one uploaded MP4 video
+  - Added in-app eBay listing lifecycle actions: revise, end, and relist for eBay-linked listings
+  - Added dedicated eBay Ops page with filtered tables and bulk end/relist/revise queue operations
+  - eBay Ops now includes `eBay API Listings` tab for live offer/listing status visibility from eBay API
+  - eBay Ops now supports bulk category/policy assignment helpers with optional immediate push to eBay offers
+  - eBay Ops now includes `Policies & Locations` tab for refreshing merchant locations/policies from eBay and applying defaults to ops workflows
+  - Added sandbox-aware seller-ops guardrails (`EBAY_ALLOW_SANDBOX_SELLER_OPS`) so unreliable sandbox policy/location behavior does not block day-to-day development
+  - Shipping page now supports pushing tracking updates to eBay orders and records push telemetry in sync runs/events/errors
+  - Sync page now includes an exception queue (unresolved-first) with resolve, retry-run, and retry+execute-now workflows for eBay order import failures
+  - Added dedicated `eBay Push History` tables/views in Shipping and eBay Ops for run/event/error audit triage
+  - Added eBay Push History quick actions: retry run, open in Sync, and resolve all unresolved errors for selected run
+  - Reports page now includes accounting-ready exports (sales + refunds/adjustments with COGS inputs), marketplace reconciliation totals, and accounting validation/discrepancy flags
+  - Reports now include FIFO + lot-weighted cost basis calculations and exportable margin analytics by SKU, marketplace, and month
+  - Started GS-V03-008 with new Operations Home page: role-aware quick actions and centralized queue cards (needs listing/shipment, sync failures, accounting exceptions)
+  - Added reusable saved filter presets across Products/Listings/Sales/Orders (session-scoped, user-specific)
+  - Upgraded saved filters to DB-backed profiles (persistent across restarts/devices per environment/user/scope)
+  - Added default-per-scope and team-shared saved filters for Products/Listings/Sales/Orders
+  - Added Admin governance controls for shared filters: ownership transfer and admin delete workflows
+  - Standardized row action UX (view/edit/sync/timeline) across Products/Listings/Sales/Orders and Operations Home queues
+  - Added entity timeline views combining audit log + sync lineage for product/listing/order/sale drill-down
+  - Added env-gated sync job controls so eBay pull/import and eBay tracking-push can be enabled/disabled safely per environment (worker + UI enforcement + status visibility)
+  - Added Admin `Sync Jobs` tab to centrally view sync job enablement and generate env snippets for safe toggle changes
+  - Hardened retry controls: disabled jobs now also block queued retry creation in Sync and eBay Push History quick actions
+  - Added Sync queue guardrail to detect and bulk-finalize queued runs for disabled jobs, with auto-closure notes for auditability
+  - Added sync job dispatcher scaffold (`execute_sync_job`) and job catalog with placeholder toggles for future QuickBooks/Shopify jobs
+- v0.3 in progress:
+  - No open v0.3 items
+- v0.4 in progress:
+  - Started GS-V04-001 Operations Home command-center consolidation
+  - Added marketplace/provider filters directly on Operations Home
+  - Added queue-router table with one-click navigation to execution pages
+  - Fixed Sync Failures queue field mapping (`job_name`, `completed_at`) for reliable run triage visibility
+  - Added inventory -> eBay -> shipping workflow stage table with direct page routing for daily operator flow
+  - Added SLA watch metrics (oldest needs shipment, failed sync, needs listing, eBay draft age) for queue prioritization
+  - Added dedicated eBay Listing Workflow queue tab so listing operations are separated from shipping/sync triage
+  - Added saved command-center presets for Operations Home filters/queue-view mode with team-shared and role-scoped sharing support
+  - Started GS-V04-002 by introducing a reusable table-toolbar UX (row count, active-filter summary, CSV/XLSX export) on Products, Listings, and eBay Ops tables
+  - Added v0.4 side-panel detail/edit UX first slice for Products + Listings to speed daily inventory and eBay listing corrections without page switching
+  - Extended side-panel detail/edit UX to Sales + Orders so core inventory->listing->sale->order correction workflows stay in-page
+  - Completed GS-V04-002 keyboard-friendly quick actions with global sidebar command palette shortcuts (type command + Enter navigation across core pages)
+  - Added first Comp Tool workflow (Tools tab) using inventory/title/image-hint queries to fetch eBay sold/completed comparables and summarize suggested pricing ranges
+  - Enhanced Comp Tool with optional web-search fallback and optional AI/LLM synthesis for pricing guidance when eBay sold comps are sparse
+  - Added Admin `AI Runtime` controls with DB-backed OpenAI/LocalAI profiles (base URL, model, endpoint type, key, timeout/tokens, default flag) so LLM routing can change live without environment-variable restarts
+  - Added Admin `Env Config` tab to view configured `.env` keys, edit safe non-DB settings, and sync missing keys from `.env.example`
+  - Added DB-backed `runtime_settings` with Admin management UI for live overrides (env fallback) and wired first runtime-overridable keys into Tools/eBay listing/ops defaults
+  - Extended runtime overrides to spot-price provider/symbol/base-url settings and sync job toggles/worker limits (DB-first with env fallback)
+  - Added live sync-toggle save action in Admin `Sync Jobs` and simplified `.env*` files by removing runtime-managed defaults
+  - Started comp-capture hardening track for web fallback: deeper price extraction from destination pages (app-state JSON, metadata, and tiered quantity pricing) with better price confidence telemetry
+  - Added web-fallback confidence scoring/labels with minimum-confidence filtering in Comp Tool to reduce noisy comp rows during pricing analysis
+  - Expanded Comp Tool web filtering controls with numeric confidence threshold, parser-source filter, and domain include/exclude filters for faster operator-quality triage
+  - Added domain-aware web extraction pass (JSON-LD, eBay/Amazon/common dealer templates, richer request headers) to reduce missed listed-price capture on fallback links
+  - Expanded comp web parsing for cents-based JSON fields and dealer-tier/superscript price markup; page-detail fetch now also enriches low-confidence single-price rows
+  - Added web parser telemetry in Comp Tool (domain and parser-source summaries) plus confidence weighting by extraction source to target underperforming domains faster
+  - Added web comp extraction fallback via `r.jina.ai` reader proxy when direct page fetch misses pricing (helps JS-heavy or bot-protected pages)
+  - Expanded web price parsing with keyword-led numeric capture (for layouts like `as low as 7.99` / `only 9.99` without explicit `$` token)
+  - Expanded comp extraction coverage for ecommerce metadata/JSON keys (`og:price`, `twitter:data1`, `priceString`/`formattedPrice`) to improve non-standard listing page capture
+  - Improved web comp listed-price selection from min-hint to representative median-hint, reducing low outlier skew from noisy snippets
+  - Broadened destination page-detail fetch targeting beyond only zero/one-hint snippets to improve recovery when snippet prices are incomplete
+  - Expanded domain-specific comp parsers for Etsy/Walmart and added broader class-based price-container fallback extraction
+  - Added bullion-dealer focused parser expansion (APMEX/JM/SD/Monument/Provident/Bold/BGASC/etc.) and domain-aware confidence weighting to improve comp ranking reliability by source
+  - Expanded dealer coverage again for comp extraction/weighting (BullionExchanges/HeroBullion/Silver.com/Kitco/USGoldBureau/LibertyCoin) to improve missed-price capture on key bullion domains
+  - Added Admin-managed runtime dealer-domain configuration (`comp_dealer_domains_csv`) so comp parser/weighting target domains can be updated live without deploys
+  - Added dedicated Admin `Comp Config` tab for dealer-domain management and normalized domain validation/cleaning on save
+  - Added AI-assisted `Coin Grader` and `Coin Identifier` tools (camera/upload image support, runtime-configured LLM, and optional web-hint fetch for identification follow-up)
+  - Added persistent `coin_ai_runs` history (grader/identifier) with optional product/listing links and recent-run views in Tools for auditable AI-assisted coin workflows
+  - Added obverse/reverse multi-image support for coin grading/identification prompts to improve AI confidence and reduce one-angle misclassification
+  - Added separate multimodal model configuration in Admin AI Runtime profiles, so image/camera tools can run a vision model independently from text/comps model
+  - Added full edit UX for existing AI runtime profiles (all fields editable from selected profile with proper state refresh on profile switch)
+  - Added inventory AI fields (`ai_graded`, `ai_grading_description`, `ai_description`) and tool-driven actions to create/update products from Coin Grader/Identifier/Comp outputs
+  - Added tool input media persistence so grader/identifier/comp hint images can be stored as media assets for future listing/inventory reuse
+  - Added LocalAI multimodal guardrails and clearer errors (vision-capability detection + endpoint guidance), plus identifier JSON truncation recovery/retry handling for more reliable structured results
+  - Updated Coin Grader prompt contract to include professional-grading recommendation (`YES/NO/CONDITIONAL`) with cost-threshold rationale
+  - Implemented async/cached web fallback page-detail fetch pipeline for comps (parallel fetch + LRU cache), improving coverage without serial UI latency spikes
+  - Started GS-V04-003 with reusable eBay listing readiness checks and a Listings-page readiness queue (`ready/blocked`, score, blockers/warnings) using default publish preset policy/location/category context
+  - Added first unified listing orchestration queue in Listings (`ready/blocked/published/error`) to centralize execution status for eBay listing workflows
+  - Added listing review gate: new listings are forced to `draft` with pending review, Listings page supports approve/reject/pending review actions, and active status transitions are blocked unless approved
+  - Added bulk listing review controls in Listings readiness queue (approve/reject/pending with notes) and readiness now explicitly blocks non-approved listings for publish flow
+  - Added Listings reviewer dashboard metrics (pending count, oldest pending age, approvals in 24h/7d, reviewer status breakdown) for review throughput visibility
+  - Added Admin-configurable two-person listing review policy (`listing_review_two_person_required` + channel list) and repository enforcement so active status can require reviewer/publisher separation on selected marketplaces
+  - Added listing review-history persistence and side-panel timeline visibility so approve/reject/pending decisions are traceable per listing over time
+  - Added review audit exports in Reports (`Listing Review Activity`, `Listing Review Summary`) with reviewer/date/channel visibility for compliance and coaching
+  - Added Listings bulk publish batch planner (dry-run validation + publishability reasoning + batch-ID tagging) to stage reviewed-ready eBay listings for grouped execution
+  - Added execute-batch publish from Listings queue with per-listing success/error results and persisted batch execution metadata for partial-failure triage
+  - Added Listings bulk publish execution history view (filterable/exportable) so completed batch runs are visible without leaving listing operations
+  - Expanded bulk publish execution history to persist/surface failed rows with status/message for direct operational triage
+  - Added quick retry action from bulk publish history failed rows (retry batch ID + immediate re-execution path)
+  - Started GS-V04-014 Coin Reference Database: added DB-backed `coin_reference_catalog` model + migration for in-app numismatic reference records
+  - Added Coin Database tools UI for searchable coin specs/value bands with create/edit and CSV export (free-source friendly, no paid dependency required)
+  - Added dev seed sample coin-reference records (Morgan/Peace/Standing Liberty) to accelerate local testing
+  - Added Coin Database CSV import/upsert workflow (dry-run/apply, key-based matching, and row-level error reporting) for free/public dataset ingestion
+  - Completed paid-source adapter contract guardrails for coin reference data (`none`/`greysheet`), including runtime feature toggles, license acknowledgment gate, and production-allow switch
+  - Added dedicated Admin `Comp Config` editor for paid-source adapter settings with validation status and safe-reset action (no generic runtime-table editing required)
+  - Started GS-V04-015 intake/listing UX flow: added explicit `products.coin_reference_id` linkage and UI support to tie inventory products to coin catalog records
+  - Products create flow now supports coin-reference-assisted prefill (title/category/metal/weight/description) for faster and cleaner inventory intake
+  - Listings create flow now supports auto-title from linked product/coin reference plus optional coin context + AI description/grading injection into listing details
+  - Product side-panel now includes one-click Smart eBay Draft creation (coin-reference + AI-aware details, markup-based draft pricing, optional auto-attach of unassigned product media)
+  - Added dedicated Coin Intake Wizard page (`pages/20_Coin_Intake_Wizard.py`) to run Reference -> AI assist -> Product -> optional draft eBay listing in one guided workflow
+  - Added Products/Listings -> Comp Tool integration: side-panel actions now open Tools with prefilled comp context (inventory/manual modes, query seeds, AI/listing notes)
+  - Added channel capability matrix UI (eBay/Shopify/Whatnot/Facebook/Craigslist) to make current vs planned automation scope explicit
+  - Comp Tool now accepts evidence screenshots and runs multimodal AI screenshot review against parsed comp rows for better human-auditable pricing context
+  - Sync page now includes run lineage table (root/source run, retry chain depth, parent linkage, terminal lineage status) for faster retry-chain triage
+  - Sync retry controls now enforce per-job `max_retries` policy from Runtime Settings and expose policy keys directly in Sync UI (`sync_job_<job_name>_max_retries`)
+  - Added per-job retry policy model in sync catalog/runtime (`max_retries`, `retry_backoff_seconds`, `retryable_statuses`, `terminal_statuses`) and enforced these rules in Sync retry actions
+  - Added sync dispatcher job metadata (`supports_execute_now`, `supports_retry_execute_now`, required args) and replaced hardcoded inline-retry job checks with metadata-driven compatibility logic
+  - Added unified entity timeline controls (source/action/status/date-range filters) across row-action timelines
+  - Added audit “change summary” diff cards (before/after field table) inside timeline detail for faster root-cause review
+  - Added timeline jump action from sync-event rows directly to focused Sync run detail
+  - Added timeline jump action from audit rows directly to Search & Edit for faster correction workflows
+  - Added product-side repurchase/restock workflow for existing SKUs: each repurchase now records inventory movement + optional lot assignment + audited weighted cost/quantity update
+  - Added product lifecycle snapshot panel (acquired/sold/on-hand metrics + lot assignment + movement history) to track repeated buy/sell cycles over time
+  - Started GS-V04-009 cycle reporting with new Reports export/view: `Inventory Cycles (Rebuy/Resell)` segments per-SKU zero-to-zero cycles and rolls up qty-in/out, sales, known acquisition cost, and estimated cycle margin
+  - Added GS-V04-009 weighted rebuy cost trend analysis in Reports (SKU-selectable line chart + event export) combining lot assignments with deduped acquisition stock-in events
+  - Completed GS-V04-009 with Product-side batch operator workflow for repeated SKU cycles (`Batch Receive` + `Batch Sale`) using shared batch reference linkage and optional listing association
+  - Started GS-V04-008 with DB-backed eBay listing template profiles and Listings create-form template apply controls (including placeholder-aware title/details templates for repetitive branded listing workflows)
+  - Completed GS-V04-008 HTML publish guardrails: Listings now previews sanitized HTML and blocks eBay publish/revise when disallowed markup remains
+  - Added GS-V04-008 template usage analytics in Listings (template usage counts + recent listings linked to tracked template markers)
+  - Added `products.inventory_class` (`sellable` / `raw_material` / `supply`) for cleaner stock classification and conversion workflows
+  - Added inventory conversion flows:
+    - single conversion (`conversion_out` + `conversion_in`)
+    - bulk multi-target conversion (one source SKU into multiple target SKUs in one audited transaction)
+  - Documents now supports `Listing` as a first-class source for local/off-platform invoice generation before a sale record exists
+  - Added one-click listing invoice posting path:
+    - optional linked `Order + OrderItem` creation
+    - linked `Sale` creation
+    - `Post & Open Sales` redirect to created sale row
+  - Added listing outcome branch in Documents (`Sold` vs `Not Sold / Remove Listing`) so no sale is posted when unsold
+  - Added media deletion controls (S3 object + DB row) in Media Library, Products media manager, and Listings media manager
+  - Added explicit tax-treatment audit payload for listing-invoice posting events (mode, taxable subtotal, rate, jurisdiction, shipping taxability, exempt categories, exemption basis) for legal/accounting traceability
+  - Added immutable document artifact retention:
+    - new `document_artifacts` store (checksum + storage reference + retained payload)
+    - listing-invoice posting now saves printable HTML artifact at post-time and links artifact lineage in sale audit events
+    - Documents page now shows retained artifacts with download access for legal/accounting retrieval
+- v0.5 scoped:
+  - Added AI-copilot workstream scope for domain-specific assistants across inventory, listings/eBay, sales/orders, shipping, sync, reports, and admin operations
+  - Added in-app data chat workstream scope for secure conversational access to DB-backed business data with RBAC, audit logging, and guardrails
+  - Started comp-tool embedding slice: Products/Listings now hand off context directly into Comp Tool with prefilled source/query/product metadata
+  - Started Ask GoldenStackers chat slice: added read-only in-app chat page with repository-backed intent routing, common prompt shortcuts, transcript export, and source citations
+  - Hardened Ask GoldenStackers chat with scoped memory by environment/user plus role-based domain allowlists (runtime-overridable `chat_allowed_domains_<role>_csv`)
+  - Added chat guardrails: prompt-length limit, row-scan caps, soft timeout warnings, and explicit write-intent denial for read-only mode
+  - Added AI chat audit trail in `audit_logs` (`entity_type=ai_chat`) with intent, scope, citations, denial flag, and elapsed time metadata
+  - Added System Health page (`pages/22_System_Health.py`) with runtime metrics, service checks, integration status, and manual live checks (eBay/spot)
+  - Expanded System Health with worker/queue diagnostics (queued/running/failed runs, unresolved sync errors, stale-running detection, and recent run table)
+  - Added fallback LLM scope: multi-provider/model failover strategy (primary + backup profiles/providers) for resilient AI operations
+  - Added Google Workspace integration scope (Gmail/Calendar/Drive) for invoice/send workflows, calendar scheduling, and document storage handoffs
+  - Added Slack integration scope for operational notifications, alert routing, and daily summaries
+  - Added voice interaction scope (speech-to-text + text-to-speech) for hands-free AI chat/copilot workflows
+  - Added "Goldy" scope for in-app AI tool actions with approvals, role checks, and audit trail
+  - Started GS-V05-008 first pass: Ask GoldenStackers now supports optional mic transcription + optional spoken response playback with Admin-configurable voice runtime settings and safe capability fallbacks
+  - Expanded GS-V05-008 voice runtime for LocalAI/OpenAI-compatible audio endpoint variants (`/audio/*` and `/v1/audio/*`) to improve provider compatibility without redeploys
+  - Completed GS-V05-008 audit extension: AI chat audit payload now records voice-origin prompt metadata and TTS playback generation events
+  - Enhanced AI Runtime Admin UX with endpoint-backed `/models` querying plus manual override fields for text and multimodal model selection
+  - Started GS-V05-005 AI Admin controls: added per-domain AI feature toggles in Admin (`chat`, `comp_tool`, `coin_grader`, `coin_identifier`) with runtime enforcement in Ask GoldenStackers and Tools actions
+  - Expanded GS-V05-005 role policy layer: added dedicated AI permissions (`ai_chat_use`, `ai_comp_use`, `ai_coin_grade`, `ai_coin_identify`) and enforced them in Ask/Comp/Grader/Identifier execution paths
+  - Added prompt template versioning/rollback controls in Admin AI Runtime by reading runtime-setting audit history and allowing key-level rollback to selected before/after values
+  - Completed GS-V05-005 usage telemetry dashboard in Admin AI Runtime (chat latency, denial/failure counts, top intents/users, voice-provider usage, coin AI tool usage, configured provider/model profile view)
+  - Started GS-V05-001 provider failover: Comp Tool and coin multimodal actions now attempt fallback across active AI runtime profiles (primary + backups), with runtime controls for enable/max profiles and per-run profile/fallback-attempt visibility
+  - Added GS-V05-001 response citation payloads for Tools AI outputs (comp summary/review, coin grader, coin identifier) with provider/model/fallback lineage and persisted citation metadata in stored coin AI run records
+  - Added GS-V05-001 shared AI orchestration layer (`app/services/ai_orchestration.py`) and migrated Tools comp/grader/identifier execution paths to use it for consistent fallback + citation behavior
+  - Added GS-V05-003 optional Ask GoldenStackers AI refinement mode (`chat_ai_refine_enabled`) that routes final chat answers through shared orchestration with fallback lineage citation while keeping chat read-only
+  - Added Admin AI Runtime controls for Ask refinement templates/toggle (`chat_ai_refine_enabled`, `chat_ai_refine_system_message`, `chat_ai_refine_instruction`) plus versioning support keys
+  - Added Ask chat UX refinement controls: per-session refine toggle and explicit `AI refined` badge on assistant responses when refinement path is used
+  - Extended AI chat audit metadata to capture refinement lineage (provider/model/endpoint/fallback attempts) for telemetry and governance reporting
+  - Expanded Admin AI telemetry to show refinement adoption and refinement provider/model/endpoint usage breakdown
+  - Added runtime-policy sensitive-data masking layer for Ask GoldenStackers responses (`chat_mask_sensitive_enabled` + email/phone/tracking toggles), applied before display and audit logging
+  - Started GS-V05-002 embedded domain copilots with Products-page Product Copilot assistant (AI suggestions for title/category/description/metal/weight applied directly to create-form defaults)
+  - Extended GS-V05-002 with Listings/eBay Copilot in Listings create flow (AI draft title/details/price suggestions plus readiness/risk preview and publish checklist)
+  - Extended GS-V05-002 with Sales/Orders side-panel copilots for exception triage, mismatch explanations, and refund/return guidance from selected records
+  - Extended GS-V05-002 with Shipping Copilot queue triage (prioritized queue plan, exception-resolution guidance, and recommended bulk actions from live shipping queues)
+  - Extended GS-V05-002 with Sync Copilot (failure clustering by job/error, retry recommendations, and lineage-aware root-cause next actions)
+  - Completed GS-V05-002 with Reports Copilot (margin anomaly narrative, reconciliation findings, recommended exports, and action plan from report aggregates)
+  - Started GS-V05-001 domain context builder extraction: added reusable chat context builder service for inventory/listings/sales/shipping/sync/orders snapshots and routed Ask GoldenStackers intent handlers through it
+  - Completed GS-V05-001 domain context coverage: Ask GoldenStackers now includes role-gated `reports` and `admin` snapshots via shared context builders and removed duplicated snapshot logic from chat view code
+  - Started GS-V05-007 foundation: added Admin `Integrations` tab with environment-scoped Google runtime settings (OAuth credentials/scopes/default sender/Drive root)
+  - Extended GS-V05-007 with first Gmail workflow: Documents page can now send invoice/receipt HTML via Gmail API using Admin-managed runtime credentials, with integration audit events for success/failure
+  - Extended GS-V05-007 with Calendar workflow: Documents page can now create follow-up reminder events in Google Calendar with runtime-default calendar/timezone and audited outcomes
+  - Extended GS-V05-007 with Drive workflow: Documents page can now upload generated document artifacts (HTML/CSV/XLSX) to Google Drive with runtime folder defaults and returned Drive links
+  - Completed GS-V05-007 reliability layer: failed Google Gmail/Calendar/Drive actions now auto-enqueue into DB-backed retry jobs with exponential backoff, plus Admin `Google Retry Queue` controls for due-run execution and manual failed-job retry
+  - Started GS-V05-010 foundation: added environment-scoped Slack runtime settings in Admin (token/channel/toggle/schedule) for upcoming delivery service and alert routing
+  - Extended GS-V05-010 with first delivery layer: added Slack notifier service, Admin test-send action, sync run failed/partial alerts, and terminal Google retry-queue failure alerts
+  - Extended GS-V05-010 observability: added System Health Slack connectivity checks/status plus Admin recent Slack delivery-event history for faster ops triage
+  - Extended GS-V05-010 delivery resilience: Slack alerts now use routed dispatch with optional channel overrides by event/severity/env and queue fallback/backoff with Admin Slack queue controls
+  - Completed GS-V05-010 polish: added runtime-editable Slack alert templates and one-click environment channel preset seeding in Admin Integrations
+  - Added Admin config-coverage dashboards for `.env` + runtime settings to track missing/empty/default/overridden keys and feature-flag-like toggles
+  - Expanded config-health governance: one-click required + bulk default repairs, drift detection for untracked env/runtime keys, top-level Admin health summary + JSON snapshot export, and shared config-health policy service reused by Admin/System Health
+  - Moved System Health access under Admin tab set (instead of dedicated sidebar page) to reduce sidebar length and centralize operational controls
+
+## Production Go-Live Re-Evaluation (April 2026)
+Target: get legally and operationally ready for production selling with this system as the system of record.
+
+Priority outcomes:
+- legal/compliance controls explicitly mapped to product behavior
+- reliable transaction posting (listing/order/item/sale/invoice consistency)
+- auditable tax + shipping + landed-cost records
+- evidence-backed release gates for Dev -> Prod promotion
+
+Critical readiness tracks:
+- Commerce legality + policy:
+  - marketplace policy conformance (eBay listing/payment/returns/shipping requirements)
+  - local/off-platform sale documentation standards (invoice/receipt retention)
+  - terms/privacy/record-retention controls for customer and transaction data
+- Tax + accounting correctness:
+  - jurisdiction-specific tax handling defaults and overrides (including bullion/coin exemptions where applicable)
+  - explicit auditability for tax treatment decisions per document/sale
+  - consistent order/item/sale/invoice linkage for reconciliation
+- Operational safety:
+  - production-only guardrails for destructive actions (bulk listing end/remove/media delete)
+  - stronger role separation for review/publish/financial posting
+  - backup/restore and incident rollback drills on current production-like data
+- Go-live evidence:
+  - signed owner/date/evidence links for each checklist section
+  - exportable evidence pack attached to release candidate
+
+## v0.2 (Operations Foundation)
+Target: stabilize daily inventory + fulfillment workflows
+
+Scope:
+- Inventory ledger (immutable quantity movements)
+- Source master data (dealers/vendors/acquisition channels)
+- Orders domain (order header + line items)
+- Returns/refunds workflow
+- Shipping queue improvements (bulk carrier/status operations, shipment exports)
+- Data quality rules (required fields, duplicate guards, tracking format checks)
+- Role-based access basics (admin/ops/viewer) with user-level audit attribution
+- Invoice/receipt document generation with branding templates and print-ready output
+
+Deliverables:
+- New tables: `inventory_movements`, `orders`, `order_items`, `returns`
+- UI pages: `Sources`, `Orders`, `Returns`, improved `Shipping`
+- Document template engine and print/export flows for invoices/receipts
+- Validation layer for creates/updates
+- Access guardrails by role
+
+Acceptance Criteria:
+- Every quantity change is traceable to a movement event
+- Purchase lots can reference standardized source records
+- Orders can represent multi-item sales
+- Returns update inventory + financial fields consistently
+- Shipping exceptions are visible and actionable in UI
+- Audit log includes real user identity on updates
+- Invoices/receipts can be generated from orders/sales using branded templates and printed/exported
+
+## v0.3 (Channel Sync + Accounting Readiness)
+Target: remove manual re-entry between marketplaces and bookkeeping
+
+Scope:
+- eBay sync jobs (listings/orders/tracking pull; status push where possible)
+- Sync queue with retries and failure dashboard
+- QuickBooks-ready exports (sales, fees, shipping, refunds, COGS inputs)
+- Cost basis engine (FIFO and lot-specific methods)
+- Margin analytics per SKU / channel / period
+- Media visibility in Products/Listings and single-action “create eBay listing from product” workflow
+- eBay seller operations console (publish/revise/end/relist + operational dashboards)
+- Environment-aware eBay operational guardrails for sandbox vs production execution
+
+Deliverables:
+- Background worker + scheduled sync jobs
+- Sync log tables: `sync_runs`, `sync_events`, `sync_errors`
+- Reconciliation reports for channel totals vs internal totals
+- Cost basis + profitability report views
+- Product/listing media gallery components and eBay listing composer from product records
+- eBay publish/revision operational controls and preset-driven listing workflows
+- eBay live listing status dashboards and operational control center workflows
+- Sandbox-safe UX behavior and explicit override path for seller operations during testing
+
+Acceptance Criteria:
+- eBay order/listing sync completes on schedule with retry behavior
+- Sync failures are visible with actionable error messages
+- Bookkeeping exports can be produced without manual spreadsheet shaping
+- Gross/net margin reports match sampled transactions
+- Users can preview product/listing media in-app and generate an eBay listing draft from product + media selections
+- Listing create/publish actions block invalid active listings (missing media or missing external listing reference URL/ID)
+- eBay operators can monitor live offer/listing status from eBay API directly in app and run core lifecycle actions without switching tools
+- Sandbox mode surfaces clear operational limits while keeping non-seller validation workflows available
+
+## v0.4 (UX Consolidation + Central Operations Hub)
+Target: make GoldenStackers the single daily workspace for inventory, marketplace, fulfillment, and bookkeeping operations.
+Execution tracking: `V0_4_IMPLEMENTATION_CHECKLIST.md`
+
+Scope:
+- UI cleanup and workflow consolidation (fewer clicks, clearer navigation, role-aware dashboards)
+- Unified command center pages (Today queue, Exceptions, Approvals, Reconciliation)
+- Global search + edit experience across products/listings/orders/sales/media with consistent inline actions
+- Cross-channel listing orchestration (publish templates, channel readiness checks, bulk publish)
+- Integration abstraction for marketplaces/accounting/shipping (provider adapters, queue dispatch, shared retry model)
+- Operational traceability hardening (entity timeline views, audit diffs, sync lineage across systems)
+- eBay listing template system (saved listing-body templates, branded HTML blocks, policy/category presets, repeat-listing acceleration)
+- Repeatable inventory lifecycle model for re-buys/re-sells of the same SKU across multiple lots and pricing periods
+
+Deliverables:
+- Consolidated IA/navigation and shared component patterns for forms/tables/filters/actions
+- “Operations Home” dashboard with SLA widgets (pending publish, unshipped, exceptions, failed syncs, margin anomalies)
+- Global search/edit surface with saved views and role-based shortcuts
+- Channel orchestration layer for eBay-first publish/sync flows, ready for Shopify/Whatnot/Facebook expansion
+- End-to-end activity timeline per SKU/order/listing (local events + external sync events)
+- eBay listing template profiles (including reusable branded HTML description sections) with one-click application during create/publish
+- SKU lifecycle ledger views showing repeated acquisition/sale cycles with lot-level and movement-level traceability
+
+Acceptance Criteria:
+- Core daily workflows (receive, list, sell, ship, reconcile) can be completed without switching external admin tools for normal cases
+- Teams can triage all exceptions from one queue-driven UI
+- Data edits are fast, auditable, and consistent across domains
+- New marketplace/accounting connectors can be added without redesigning app workflows
+- Repetitive eBay listings can be created from saved templates (including branded HTML body content) with minimal manual re-entry
+- Same SKU can be repurchased and sold repeatedly with clear period-over-period quantity/cost traceability
+
+## v0.5 (AI Operations Copilot + Data Chat)
+Target: embed AI-assisted workflows across every major service domain and provide a secure chat interface for operational insights from app data.
+Execution tracking: `V0_5_IMPLEMENTATION_CHECKLIST.md`
+
+Scope:
+- Domain copilots for Inventory, Coin Catalog, Products, Listings/eBay Ops, Sales/Orders, Shipping, Sync, and Reports
+- Action-oriented AI assistance (draft suggestions, anomaly detection, policy checks, workflow shortcuts) with human approval gates
+- In-app “Ask GoldenStackers” chat interface with role-aware access to business data
+- Fallback LLM routing across providers/models (OpenAI/LocalAI/etc.) with health-based failover controls
+- DB-aware retrieval/query orchestration (read-focused by default; write actions gated and explicit)
+- AI safety controls (prompt/version tracking, citations/row references, confidence labels, hard deny for restricted data)
+- Admin governance for AI runtime profiles, tool permissions, and usage controls by environment/role
+- Google Workspace integration layer for Gmail/Calendar/Drive operational workflows (invoice send, follow-up scheduling, document handoff)
+- Voice interaction layer (speech-to-text input + text-to-speech output) for chat and copilots
+- "Goldy" action framework to expose approved app tools for AI-assisted operational execution
+
+Deliverables:
+- Shared AI orchestration service layer with domain tool adapters and context builders
+- Per-domain copilot panels embedded in existing pages (not separate disconnected tools)
+- Unified chat page with conversation history, source citations, and exportable transcripts
+- Query safety layer for DB chat (RBAC filtering, table allowlists, row-limit defaults, timeout/cost controls)
+- AI interaction audit model (who asked what, data scopes touched, actions proposed/executed)
+- Voice UI controls for chat/copilot surfaces (mic capture/transcription + optional spoken responses)
+- Goldy tool registry and execution ledger for approved actions (inventory/listing/sync/report primitives)
+
+Acceptance Criteria:
+- Operators can complete common workflows faster using AI suggestions without bypassing required review/approval controls
+- Chat answers include traceable source context (table/row/time window references) and respect role permissions
+- Sensitive fields remain protected in chat and copilot responses according to role/environment policies
+- AI-generated write actions are never auto-executed without explicit user confirmation and audit trace
+- AI runtime/provider can be switched by admins without app redeploy
+- Voice interactions follow the same RBAC, guardrails, and audit requirements as typed prompts
+- Goldy action execution requires explicit approval, logs outcome/status, and never bypasses existing app permissions
+
+## v0.6 (UX Consolidation + Workflow Unification)
+Target: reduce page sprawl and make high-frequency operations flow through fewer, clearer, role-aware surfaces.
+Execution tracking: `V0_6_IMPLEMENTATION_CHECKLIST.md`
+Detailed planning artifact: `UX_CONSOLIDATION_PLAN.md`
+
+Scope:
+- Merge overlapping pages into domain workspaces (start with eBay + eBay Ops)
+- Standardize workspace layout (queues, filters, actions, detail panel, timeline, audit)
+- Consolidate service operations pages using the same interaction model (Listings/Sync/Shipping/Media/Orders)
+- Build a role-aware navigation model that groups pages by workflow stage (Intake, Listing, Fulfillment, Reconcile, Admin)
+- Add cross-workspace saved views and pinned operator presets
+- Preserve backward compatibility with existing routes while introducing unified pages
+- Add a generalized `Inventory Intake Wizard` for non-coin intake (bullion, collectibles, antiques, normal goods) with optional AI assist and listing handoff
+- Add image-first intake and general photo-based comps scope (non-coin): start from camera/uploaded image and generate reusable comp/intake suggestions for any inventory type
+- Add agentic workflow scope (`Goldy`) with single-agent and multi-agent modes for comps, listings, inventory, integrations, and finance support tasks
+- Expand branding templates across invoices/receipts and marketplace listings with Golden Stackers LLC identity defaults and reusable channel-specific HTML sections
+- Add tax-aware invoicing scope with jurisdiction/rule profiles (including Colorado bullion/coin exemption handling), with clear operator review controls
+- Add eBay Store operations scope (store category mappings, storefront metadata, and store-policy defaults) plus explicit listing-format workflows (Auction vs Buy It Now, duration, pricing rules, and review gates)
+- Add multi-environment delivery scope (versioned Docker release pipeline, Dev->Prod promotion gates, Kubernetes runtime parity checks, and ArgoCD GitOps handoff in separate infra repo)
+
+Deliverables:
+- Unified `eBay Workspace` replacing split `eBay` and `eBay Ops` daily operations flows
+- Shared workspace shell component for table + filters + quick actions + side-panel details
+- Migration plan for other services into consolidated workspaces (Shipping Ops, Sync Ops, Inventory Ops, Documents/Reports)
+- Legacy-page redirect/deprecation notices with rollout toggles
+- UX instrumentation for click-depth/time-to-complete baseline vs post-consolidation
+- `Inventory Intake Wizard` MVP page + workflow contract (source/lot/media/costing/AI assist -> product/listing-ready output)
+- eBay Store + listing-format control surface in eBay Workspace (store profile selection, auction/fixed-price templates, validation, and publish-preflight checks)
+- GitHub Actions release workflow that builds/tests and publishes versioned Docker images (semver tag + commit SHA tags)
+- Promotion contract for contained Dev and Prod Kubernetes environments (image tag pinning, required migration run, and rollback expectations)
+- ArgoCD integration contract for separate infra repo (app manifests reference published image tags and promote by GitOps PR/merge)
+
+Acceptance Criteria:
+- Daily eBay tasks (verify auth, monitor live listings, revise/end/relist, push tracking, inspect sync history) run from one workspace
+- Operators can complete top 10 repetitive workflows with fewer page switches and clearer state
+- Consolidated workspaces keep audit traceability and permissions unchanged
+- Navigation complexity is reduced without hiding critical controls
+- Intake flow supports both coin-specific and generic inventory onboarding without forcing operators through coin-only fields
+- Operators can create/review/publish eBay listings with explicit format intent (`auction` or `fixed-price`/Buy It Now) and store-default policy/category context from one workspace flow
+- Build artifact provenance is clear across environments (each running image is traceable to a git commit/version)
+- Dev promotion does not require manual image rebuilds, only tag/manifest updates
+- Prod promotion is controlled via GitOps workflow in ArgoCD-managed infra repo with auditable change history
+- Progress:
+  - Completed GS-V06-008 first pass in Ask GoldenStackers with a new `Goldy Orchestration (Preview)` panel (single/multi mode + agent-role selector), role-safe domain scoping, read-only write-intent guardrails, and recent orchestration trace visibility
+  - Added `ai_chat` orchestration trace enrichment (`event_type=goldy_orchestration`, mode/role/plan/status metadata) and repository-side trace query helper for operator/audit review
+  - Expanded workspace feedback capture coverage beyond Operations/eBay/Sync/Shipping/Intake/Listings into Products, Sales, Orders, Reports, Documents, and Tools for fuller operator UX signal collection
+  - Added explicit workflow task-completion telemetry capture (`workspace_task_completion`) in Operations Home, eBay Workspace, Listings, Sync, and Shipping to improve rollout baseline confidence for time-to-complete signals
+  - Hardened Admin parity/readiness checks with workflow task-completion evidence thresholds (`ux_parity_min_task_completion_events`) and task-gap readiness weighting (`ux_readiness_weight_task_gap`)
+  - Started GS-V06-001 with a new unified `eBay Workspace` page (`pages/22_eBay_Workspace.py`) combining integration + ops flows in one surface
+  - Added rollout flag scaffold `ux_workspace_ebay_enabled` (runtime + env fallback) and legacy-page redirect behavior for `eBay` and `eBay Ops`
+  - Updated ops navigation shortcuts/links to target the unified workspace path
+  - Added shared eBay workspace controls (token + Ops status/linked/search defaults) with apply/reset behavior to keep Integration and Operations tabs aligned
+  - Expanded shared eBay workspace controls with listed-date window defaults and wired Local Ops filtering/export state to the same date context for cross-tab consistency
+  - Added eBay Workspace account-context profile management (alias-based save/load/delete with optional token persistence) to support faster multi-account operational switching
+  - Added eBay Integration + eBay Ops in-tab profile quick switch action (`Apply Profile to Integration + Ops`) so account context can be swapped without reopening workspace controls
+  - Added a shared “Current Active Account Context” banner across eBay Workspace/Integration/Ops to show active profile and filter/date context before running operations
+  - Added an eBay Workspace pre-flight runbook checklist with Ops warning when not complete to reduce high-impact action mistakes
+  - Added optional runtime runbook enforcement (`ebay_require_runbook_for_bulk_ops`) to disable bulk eBay Ops controls until checklist completion
+  - Added Admin `UX Navigation Controls` checkbox for eBay runbook enforcement so teams can toggle guard behavior per environment quickly
+  - Added eBay Workspace quick-link panel (Listings, Sync, Shipping, Admin) for faster operational routing from a single surface
+  - Added context-preserving quick-link handoff from eBay Workspace into Listings/Sync/Shipping (preloaded eBay filters/provider focus) to reduce re-filtering friction
+  - Added explicit handoff-context banners with one-click reset on Listings/Sync/Shipping so preloaded eBay filters are visible and reversible
+  - Added navigation telemetry for workspace handoffs (`workspace_handoff_applied`/`workspace_handoff_cleared`) to quantify context-routing usefulness and reset frequency
+  - Added Admin System Health handoff telemetry card (applied/cleared counts and clear-rate by destination) for direct IA/workflow tuning
+  - Added `Recent Handoff Events` detail view in Admin telemetry for audit-friendly handoff troubleshooting (actor/action/target/payload summary)
+  - Added handoff-event filtering/export controls in Admin telemetry (action/target/actor filters + CSV) for weekly UX tuning reviews
+  - Added handoff KPI strip (`Top Actor`, `Top Target`, `Most Cleared Target`) for faster operational signal scanning
+  - Added one-click `Export Handoff Governance Bundle (ZIP)` in Admin telemetry (KPI snapshot + target aggregate + filtered/full handoff event exports)
+  - Added one-click `Export Workspace Feedback Governance Bundle (ZIP)` in Admin (feedback events, workspace/sentiment aggregates, notes, summary KPIs)
+  - Added one-click `Export Parity Governance Bundle (ZIP)` in Admin (readiness summary, workflow parity table, permission/audit gaps, recent snapshots, release decisions, filtered follow-ups)
+  - Added dedicated Admin `Governance Exports` tab to centralize one-click governance artifact exports (handoff, workspace feedback, parity/follow-up, photo-comp) plus combined all-in-one bundle
+  - Added manual `Governance Snapshot Runner` in Admin Governance Exports (audit-stamped `governance_export/snapshot` events + recent snapshot history export) for recurring governance review cadence
+  - Added sync-runner scheduled governance snapshot automation scaffold (runtime-gated `governance_snapshot_*` settings + interval-based snapshot recording in worker loop)
+  - Added Admin `Sync Job Controls` inputs for governance snapshot scheduling (enable toggle, interval hours, lookback days, max rows per scope)
+  - Added Admin `Sync Job Controls` one-click `Run Governance Snapshot Now` action for immediate snapshot capture/testing without waiting for worker interval
+  - Added Admin `Sync Job Controls` scheduler status readout (last worker snapshot, next due, and overdue indicator) for governance snapshot operational visibility
+  - Added Governance Exports snapshot-history filters (`source` + scheduled/manual mode) and filtered CSV export to speed governance triage by origin (`sync_runner`, `admin_sync_jobs`, `admin_governance_exports`)
+  - Expanded Sync Jobs scheduler status to show both latest worker snapshot and latest manual snapshot side-by-side (plus recency delta) for faster scheduler-vs-operator verification
+  - Added Sync Jobs scheduler source breakdown table (last 7d / last 30d counts by snapshot source) for quick governance-cadence monitoring
+  - Added Sync Jobs governance snapshot cadence health indicator (GREEN/YELLOW/RED) based on expected-vs-actual worker snapshot frequency for configured interval
+  - Added RED-cadence follow-up task creation in Sync Jobs (with owner/priority/due controls and duplicate-open-task guard) to route scheduler drift into tracked blocker workflow
+  - Added Operations Home `Governance Cadence Follow-ups` visibility (KPI, queue-router row, dedicated queue tab, and Admin quick-open action) so cadence blockers surface outside Admin
+  - Added direct resolve action for `governance_snapshot_cadence` follow-ups in Operations Home queue (with resolution note) to close cadence blockers without leaving command center
+  - Started image-first inventory intake: Inventory Intake Wizard now supports optional starter photo/upload analysis to prefill title/category/item type/description/AI description and comp-search seed
+  - Added first non-coin photo-comp starter in Tools: image-hint mode now supports camera/upload + AI-generated comp query seed for general-item comparable searches
+  - Added dedicated Photo-Comp one-click workflow controls in Tools (auto image query seed on run, optional always-on web fallback overlay, optional auto AI summary) for general non-coin comp execution
+  - Added Photo-Comp quality diagnostics and retry profiles in Tools (coverage/missing-price metrics + one-click retry presets for structured web, broad web, and broadened eBay reruns)
+  - Extended Photo-Comp retry presets with dealer-domain focus and missing-domain targeted reruns (derived from prior web rows missing prices)
+  - Added DB-backed saved Photo-Comp retry presets (mine/shared/default) so repeat comp-capture strategies can be reused across sessions/devices
+  - Added default Photo-Comp retry preset auto-load (once per user/env session) with explicit session clear control
+  - Added Photo-Comp retry telemetry trail and in-panel recent-run table (strategy/preset + coverage outcomes) to make comp-capture tuning data-driven
+  - Added Admin `Comp Config` photo-comp telemetry dashboard (strategy filters + no-result/coverage KPIs + CSV export) for centralized comp tuning
+  - Added Admin one-click `Promote Best To Default` action from photo-comp telemetry to create/update default retry presets from best-performing runs
+  - Added promotion guardrails for `Promote Best To Default` (minimum run threshold + confidence hint from sample size/no-result rate) to reduce premature default changes
+  - Added Admin strategy trend visuals for photo-comp telemetry (coverage % and no-result rate % by strategy over time)
+  - Added Admin top missing-price domain leaderboard (missing/priced counts + miss rate + top-10 chart) to target comp parser improvements
+  - Added Admin one-click dealer-domain recommendation apply flow (threshold-based add/remove from telemetry) to keep `comp_dealer_domains_csv` tuned without redeploys
+  - Added dealer-domain dry-run change preview (add/remove/all) and recommendation-apply audit trail for safer runtime domain tuning
+  - Added Admin recommendation-apply history with CSV export for dealer-domain governance traceability
+  - Added Admin undo flow for recommendation applies (restore prior domain set from snapshot + explicit undo audit event)
+  - Added undo telemetry and failed-attempt audit reasons for dealer-domain recommendation governance (with actor breakdown + CSV export)
+  - Added one-click `Export Photo-Comp Governance Bundle (ZIP)` in Admin Comp Config (strategy performance, domain leaderboard, recommendation apply history, undo telemetry, recommendation summary)
+  - Added direct handoff action from Comp Tool image-hint mode into Inventory Intake Wizard to prefill intake seed/title/description and jump into intake flow
+  - Added direct handoff action from Comp Tool image-hint mode to create a draft-ready Product record (AI-seeded fields + optional hint-media attach) for faster review before listing
+  - Extended Photo-Comp draft flow to optionally create multi-marketplace draft listings in one action, with review-first default behavior (`draft` + `pending`)
+  - Added Listings bulk draft creation workflow from selected products (marketplaces + price/qty strategy + existing-pair skip) for faster intake-to-review throughput
+  - Added Listings origin filter for `photo_comp_draft` lineage (derived from audit trail) to isolate AI-assisted intake listings during review
+  - Added one-click + team-save `Photo-Comp Review Queue` preset actions in Listings to standardize review filtering across operators
+  - Added Admin-controlled auto-apply option for Listings Photo-Comp Review Queue preset (`ux_listings_auto_photo_comp_review_preset`) for review-focused sessions
+  - Added Operations Home `Photo-Comp Pending Review` queue card/tab with direct jump into Listings prefiltered review state
+  - Extended Listings handoff banner to recognize Operations Home queue handoffs and clear/reset origin-aware filter context in one click
+  - Added first-pass Documents tax engine controls (jurisdiction, auto/manual/no-tax modes, category exemption rules, shipping-taxable toggle, tax row rendering, and tax-adjusted total option)
+  - Seeded tax runtime defaults (`invoicing_tax_jurisdiction`, `invoicing_tax_rate_percent_default`, `invoicing_tax_shipping_taxable_default`, `invoicing_tax_exempt_categories_csv`) for environment-level configuration
+  - Added first-pass Documents tax presets (`Golden Local Retail`, `Marketplace Shipped`, `Bullion/Coin Exempt`) plus one-click save of current tax controls to runtime defaults
+  - Added line-item taxability overrides in Documents auto-tax mode (per-line taxable toggles) to support mixed taxable/exempt invoice scenarios
+  - Added first-pass Reports tax analytics (`Tax Summary`, `Tax by Marketplace`, `Tax Detail`) with jurisdiction/rate/marketplace scope controls and exempt-category-aware estimates
+  - Added Reports tax preset quick-apply actions (`Golden Local Retail`, `Marketplace Shipped`, `Bullion Exempt Focus`) for repeatable finance review workflows
+  - Added Reports Tax Drilldown view (marketplace + taxable/exempt segment filters) with focused CSV/XLSX exports for monthly reconciliation
+  - Added Tax Drilldown handoff into Documents to create invoice drafts from selected sale rows with tax context preloaded
+  - Added shared Reports `Document Draft Handoff` panel supporting both `Sale` and `Order` source prefill into Documents (invoice/receipt)
+  - Added direct `Open in Documents` quick actions in Sales and Orders side panels (invoice/receipt prefill from selected row)
+  - Added eBay Workspace `Document Draft Quick Handoff` for recent eBay orders/sales (one-click invoice/receipt prefill into Documents)
+  - Added Listings side-panel `Open in Documents` action with auto-discovered related Sale/Order sources from listing links/order items
+  - Added Search/Edit `Open in Documents` quick actions on Listings and Sales tabs (including related-source resolution for listing-selected records)
+  - Added Documents `Recent Document Handoffs` panel with one-click reopen/clear to quickly restore recent Sale/Order draft contexts
+  - Upgraded `Recent Document Handoffs` to DB-backed per-user/per-environment persistence (cross-restart/device) with session merge + one-click clear
+  - Added Admin `Runtime Settings` panel for persisted Documents handoff history (team/user filters, open-in-documents action, and per-user clear)
+  - Added role guardrails for Admin handoff history panel (`admin` can manage all users; non-admin can only view/reopen/clear own history)
+  - Added explicit audit events for handoff-history clear actions (`documents_handoff_history/clear_history`) from Documents and Admin paths
+  - Added Admin clear-audit summary card/table for Documents handoff history governance (by actor/target + CSV export)
+  - Added date-range filters (`From Date` / `To Date`) to Documents handoff clear-audit summary for weekly/monthly governance slices
+  - Added date presets (`Last 7d`, `Last 30d`, `This Month`, `Custom`) for Admin Documents handoff clear-audit summary
+  - Added one-click `Export Governance Bundle (ZIP)` from Admin clear-audit summary (raw events + actor/target aggregate CSVs)
+  - Added governance clear-reason control: admin must enter reason when clearing another user; reason is captured in audit payload/export
+  - Standardized clear reasons with taxonomy (`reason_code`) plus optional note (`reason_note`), including required note for `other`
+  - Added clear-audit reason-code analytics (table + bar chart) and included reason-code aggregate CSV in governance bundle export
+  - Added clear-audit filters for `reason_code` and `scope` so governance metrics/tables/exports can be narrowed pre-download
+  - Added user-scoped saved governance view presets (save/load/delete) for clear-audit date/filter/lookback settings
+  - Added shared governance presets (`My Presets` vs `Shared Presets`) with admin-only shared save/delete and shared load for all users
+  - Added `Set as Team Default` shared governance preset and one-time auto-load of team default when entering clear-audit panel
+  - Added audit events for governance preset lifecycle (`save`, `load`, `delete`, `set_team_default`, `clear_team_default`)
+  - Added Admin governance-preset audit summary panel (event/action/actor metrics, recent events table, CSV export)
+  - Added date-range filters to governance-preset audit summary for period-scoped preset-governance review
+  - Added quick date presets (`Last 7d`, `Last 30d`, `This Month`, `Custom`) to governance-preset audit summary
+  - Added `Governance Review Mode` toggle so clear-audit and governance-preset-audit share one date preset/range during recurring review runs
+  - Added runtime-backed persistence for Governance Review Mode (`documents_handoff_governance_review_mode`) with explicit save action in Admin Runtime Settings
+  - Added saved governance date-window presets (`My Presets` / `Shared Presets`) for Governance Review Mode plus admin window team default controls
+  - Added audit telemetry for governance date-window lifecycle actions (`window_save/load/delete/set_default/clear_default`) in the Admin governance audit stream
+  - Added v0.6 scope planning item for eBay Store operations + listing-format workflows (Auction/Buy It Now) in unified eBay Workspace roadmap track
+  - Started GS-V06-010 with runtime-backed eBay Store profile controls in eBay Workspace (save/load/delete/default) including policy/category/format defaults and active-context visibility
+  - Added workspace apply option to persist selected store context into eBay runtime defaults (`ebay_*` keys) for cross-page listing/publish consistency
+  - Added format-aware readiness/validation for eBay listing workflows (`FIXED_PRICE` vs `AUCTION`) with format/duration surfaced in readiness queue and stricter auction/BIN guardrails
+  - Added fixed-price Best Offer support in Listings publish/revise payloads (`bestOfferTerms`) with runtime + store-profile defaults and context-banner visibility
+  - Added auction default controls (`start/reserve/buy-now`) to eBay store profiles/runtime keys and enforced reserve/start validation in readiness + publish/revise flows
+  - Expanded readiness queue with auction pricing context columns for format-specific review (`auction_start_price`, `auction_reserve_price`, `auction_buy_now_price`)
+  - Added readiness format triage controls in Listings (`all/fixed/auction`) with quick shortcuts for `Auction Blocked` and `Fixed Ready`
+  - Added one-click format template actions in Listings publish flow (`Fixed Price Standard` / `Auction Standard`) preloading store/runtime policy + format defaults
+  - Added format quick-hint visibility in Listings table (`format_type`, `format_hint`) to flag fixed/auction issues earlier in the workflow
+  - Added Listings `Format Issue Only` filter to quickly isolate rows with format setup issues (`format_hint`) for correction workflows
+  - Added one-click Listings `Format Fix Queue` preset controls (apply + team-save) for standardized format-correction triage
+  - Added Operations Home `Format Fix Needed` queue workflow (metric card, queue tab/router row, and one-click handoff to Listings with format-fix preset state)
+  - Added eBay Workspace quick-link `Open Format Fix Queue` to route straight into Listings with format-fix triage filters and handoff audit context
+  - Added eBay Workspace tab-level `Format Fix Needed` KPI/actions in both Integration and Operations tabs for pre-navigation triage awareness
+  - Added blocker-priority summaries for eBay listing readiness in Listings and eBay Workspace (top blocker/warning reason counts)
+  - Added Listings readiness reason filters (`Blocker Reason` and `Warning Reason`) for targeted remediation queues
+  - Added Listings top-blocker quick-action filters with automatic format targeting (auction/fixed) for one-click triage
+  - Added Listings blocker-driven follow-up task creation (audit-backed `workspace_followup` create events) to convert repeated readiness blockers into tracked remediation tasks
+  - Added Listings in-context recent blocker follow-up task panel (status/history snapshot + CSV export) to reduce Admin page context-switching during triage
+  - Added Listings in-context follow-up resolve action (`workspace_followup` resolve) to close blocker tasks directly from readiness workflow
+  - Added Operations Home blocker-followup command-center visibility: open-task KPI/button + `Listings Blocker Follow-ups` queue view with direct handoff into Listings remediation workflow
+  - Added blocker follow-up SLA tagging (`due_in_days`, `sla_status`) with urgency-first ordering in Listings and Operations Home blocker queues
+  - Added blocker follow-up SLA KPI summaries (`Open`, `Due Soon`, `Overdue`) in Listings and Operations Home queue views
+  - Added Operations Home blocker-followup queue filters (`status`/`owner`/`priority`/`SLA`) for focused command-center triage
+  - Added Listings blocker-followup filters (`status`/`owner`/`priority`/`SLA`) with filtered KPI/export/resolve behavior for workflow symmetry with Operations Home
+  - Added Listings blocker-followup quick filter presets (`Overdue Critical`, `My Open`, `High Priority Open`) for one-click triage context switching
+  - Added Operations Home blocker-followup quick queue presets (`Overdue Critical`, `My Open`, `High Priority Open`) to mirror Listings triage acceleration patterns
+  - Added DB-backed saved/shared blocker-followup presets in Listings and Operations Home for persistent team triage configurations
+  - Added default blocker-followup preset support (set/clear default + auto-load) for both Listings and Operations Home triage queues
+  - Enhanced Admin Saved Filters governance with scope filters and blocker-only focus mode for managing blocker preset ownership/deletion at scale
+  - Added Admin Saved Filters one-click scope presets (`All`/`Blocker Presets`/`Listings`/`Operations Home`) to speed governance triage
+  - Added Admin Saved Filters ownership presets (`My Owned`/`Shared Owned By Me`/`Shared Not Owned By Me`) for faster ownership transfer/delete workflows
+  - Added Admin Saved Filters one-click reset control for governance filters (scope + blocker-only + ownership) to quickly return to baseline view
+  - Added Admin Saved Filters governance filter-state summary metrics (active scope count, owner mode, blocker focus, visible rows)
+  - Added Admin Saved Filters CSV export for the filtered governance table to support audit handoff/reporting
+  - Added Admin Saved Filters filtered breakdown summaries (`By Owner`, `By Scope`) for faster governance triage patterns
+  - Added Admin Saved Filters default-only toggle and visible-default metrics to simplify default-preset governance checks
+  - Added v0.6 scope item GS-V06-011 for multi-environment release and GitOps delivery readiness (GitHub Actions versioned images, Dev/Prod Kubernetes promotion contract, ArgoCD infra-repo handoff)
+  - Started GS-V06-011 delivery implementation by updating GitHub workflows for strict semver release tags, main-branch prerelease image tags, multi-arch Docker publish, compile smoke-checks, and optional ArgoCD infra-repo PR handoff via configurable repo variables
+  - Added copy-ready Kubernetes manifest template packs for `dev` and `prod` (`k8s/templates/*`) including namespace/config/secret-template/PVC/deployments/service/ingress/migration-job/HPA/PDB/network-policy
+  - Added ArgoCD bootstrap templates (`k8s/templates/argocd/*`) for Dev/Prod Applications, optional root app-of-apps, and AppProject scaffold
+  - Added deployment runbook (`DEPLOYMENT_RUNBOOK.md`) documenting release artifact contract, Dev/Prod promotion gates, ArgoCD sync flow, smoke checks, and rollback procedure
+  - Added operator sign-off artifact `GO_LIVE_CHECKLIST.md` for pre-Dev/Prod promotion readiness tracking (owner/evidence/date fields)
+  - Hardened Kubernetes Dev/Prod template NetworkPolicies to scoped egress ports only (DNS/HTTP/HTTPS/Postgres/NTP) and constrained policy targeting to GoldenStackers app pods
+  - Completed GS-V06-011 by adding build metadata traceability support (`APP_BUILD_VERSION`, `APP_BUILD_SHA`, runtime keys `app_build_version`/`app_build_sha`) surfaced in Admin System Health
+  - Extended GS-V06-011 automation by adding optional Argo configmap metadata update in release workflow (`ARGO_CONFIGMAP_PATH`) so deployed manifests automatically carry `APP_BUILD_VERSION` and `APP_BUILD_SHA`
+  - Refined GS-V06-011 release automation with environment-specific Argo promotion variables (`ARGO_DEV_*`, `ARGO_PROD_*`) so `main` can drive Dev manifest PRs and semver tags can drive Prod manifest PRs independently
+  - Added deployment preflight workflow (`deploy_config_check.yaml`) to validate Docker secrets and Argo promotion variables before running live environment promotions
+  - Added eBay Workspace `Active Format Defaults Summary` (format/policy/defaults table + missing-policy indicator) for preflight verification before listing actions
+  - Completed GS-V06-010 reporting slice by adding Reports export/view `Listing Format Intent vs Publish Outcome` (intent format/duration, publish attempt/success/error counts, published id/timestamp, last publish error)
+  - Completed GS-V06-009 template expansion by adding reusable branded HTML blocks in Listings and one-click Golden Stackers starter marketplace templates (eBay/Craigslist/Facebook/Whatnot)
+  - Updated document business default to `Golden Stackers LLC` with website `https://goldenstackers.com`
+  - Added `Comp Tool: Photo Mode` handoff actions in Products/Listings side panels to open Tools in image-hint flow with product/listing context prefilled
+  - Added first-pass eBay Ops command rail with centralized day-to-day actions (end/relist/queue/open-sync/retry/resolve-errors)
+  - Added eBay listing side-panel detail tabs (detail + sync lineage + timeline) to reduce context switching during listing triage
+  - Began GS-V06-002 workspace shell extraction by moving command-rail UI into reusable component and applying it in eBay Ops
+  - Standardized queue status semantics (`needs_action`, `in_progress`, `blocked`, `done`) with shared helpers and applied them across Operations Home and eBay workspace/ops queue tables
+  - Completed GS-V06-002 by standardizing shared empty/error/loading workspace states across Operations Home, Sync, Shipping, and eBay Ops
+  - Completed GS-V06-003 planning by defining Inventory/Fulfillment/Sync/Revenue workspace scopes and publishing migration dependency sequence in `UX_CONSOLIDATION_PLAN.md`
+  - Started GS-V06-004 role-aware IA with sidebar pinned workflow pages and role-default landing behavior (`admin -> eBay Workspace`, `ops -> Operations Home`, `viewer -> Dashboard`)
+  - Completed GS-V06-004 workflow-stage navigation grouping with role-aware unified sidebar sections (`Intake`, `Listing`, `Fulfillment`, `Reconcile`, `Admin/Support`)
+  - Added GS-V06-004 rollout + telemetry controls: runtime navigation mode toggle (`ux_navigation_mode` unified/legacy), navigation telemetry audit events (`page_view`/`page_switch`), and Admin System Health nav analytics (top pages, switch paths, bounce counts)
+  - Expanded workspace rollout flags beyond eBay (`ux_workspace_inventory_enabled`, `ux_workspace_fulfillment_enabled`, `ux_workspace_sync_enabled`, `ux_workspace_revenue_enabled`) and wired them to unified sidebar visibility + Admin controls
+  - Added GS-V06-005 workflow baseline metrics in Admin (median switch latency, bounce rate, session click-depth, and workflow handoff transition medians)
+  - Added dedicated Admin `UX Navigation Controls` card (nav mode + telemetry/default-landing toggles) and telemetry-window reset/filter support for cleaner baseline measurement runs
+  - Started GS-V06-005 operator feedback capture with reusable workspace feedback control (thumbs + note) on Operations Home and eBay Workspace, persisted to audit events
+  - Added GS-V06-005 Admin parity checker in System Health to validate legacy-vs-workspace permission coverage and recent audit evidence before cutover
+  - Added parity snapshot controls (CSV export + audit-stamped `workspace_parity/snapshot` event) so each cutover decision can be documented with a timestamped artifact
+  - Added `Recent Parity Snapshots` review table in Admin System Health with snapshot inspect + workflow detail drill-down for faster release-readiness comparisons
+  - Added parity `Compare Two Snapshots` diff view (permission/audit delta metrics + workflow change table) to track rollout readiness improvements over time
+  - Added release decision capture on parity snapshots (`approved`/`rejected` + notes) with recent decision history for auditable go/no-go records
+  - Added release-readiness status layer in parity tooling (latest decision/approved snapshot metrics, rejected/stale/missing-decision warnings)
+  - Added aggregate rollout readiness scoring (`0-100` with GREEN/YELLOW/RED) from parity gaps, decision status, and overdue follow-up workload
+  - Added runtime-configurable readiness scoring weights (`ux_readiness_*`) and Admin controls so strictness can be tuned by environment/team policy
+  - Added one-click readiness policy presets (`conservative`, `balanced`, `aggressive`) for rapid environment-level scoring strategy changes
+  - Added parity follow-up task workflow for rollout blockers (create/resolve + open/resolved queue) so rejected gaps can be tracked and closed in-app
+  - Added follow-up queue operations controls (status/owner/priority filters + CSV export) to support weekly rollout blocker reviews
+  - Added follow-up SLA/urgency triage (overdue/due-soon flags, urgency-first sorting, and queue metrics) for rollout blocker management
+  - Added optional Slack alerting for rollout governance events (parity decision notifications and overdue follow-up alerts with templates/channels + audit dedupe)
+  - Removed duplicate legacy eBay pages from sidebar; consolidated navigation now points to `eBay Workspace` only
+  - Started row-action standardization in command surfaces by applying shared action pattern to Operations Home sync-failure queue
+  - Started GS-V06-006 with new `Inventory Intake Wizard` page (generalized intake for bullion/collectibles/antiques/normal goods, optional lot creation, media upload, and draft listing handoff)
+  - Added wizard audit/timeline integration and post-create action rail (open Products/Listings/Search + inline entity timeline review)
+  - Added in-wizard AI suggestion generator for title/category/description defaults using configured AI runtime profiles
+  - Expanded GS-V06-005 workspace feedback coverage beyond initial pages by adding the shared feedback control to Sync, Shipping, Inventory Intake Wizard, and Coin Intake Wizard
+  - Added GS-V06-005 baseline-metrics artifact controls in Admin (CSV export + audit-stamped `navigation_baseline/snapshot` event) to preserve measurable UX baselines per rollout window
+  - Added GS-V06-005 Admin `Workspace Feedback Insights` panel (lookback filters, workspace/sentiment breakdown, recent notes, CSV export) to turn operator feedback into triage-ready backlog signals
+  - Added GS-V06-005 feedback-to-action bridge: selected feedback notes can now create tracked rollout follow-up tasks directly in Admin System Health
+  - Advanced GS-V06-001 parity by moving eBay listing filters into one shared eBay Ops filter bar and reusing the same status/linked/date/search state for both `Local Ops` and `eBay API Listings` views
+  - Advanced GS-V06-001 side-panel parity by reusing a shared listing side-panel renderer across both `Local Ops` and `eBay API Listings` (Detail + Sync Lineage + Timeline)
+  - Advanced GS-V06-001 command-rail unification by adding `Unqueue Selected` and `Run Revise Queue` rail actions, then removing duplicate legacy bulk-action button/forms in eBay Ops
+  - Completed GS-V06-001 eBay Workspace Unification milestone (shared context/filtering, unified command rail, unified listing side-panel, and legacy eBay sidebar-page consolidation)
+  - Advanced GS-V06-010 template workflows with eBay Workspace quick actions for format intent (`Open Listings (Fixed Template)` / `Open Listings (Auction Template)`) that preseed listing publish defaults before handoff
+  - Advanced GS-V06-010 create-flow integration by persisting active workspace-store format/policy/category defaults into draft listing `ebay_publish` metadata during listing creation
+  - Advanced GS-V06-010 create UX with explicit `eBay Draft Publish Defaults` controls in Listings create flow and persisted those user-selected values into draft `ebay_publish` metadata
+  - Tightened GS-V06-010 create-flow validation for eBay draft defaults (fixed BIN > 0, auction duration/start/reserve/buy-now constraints) and normalized auction draft local `listing_price` to auction start when needed
+  - Added Listings `eBay Store Profile Context` apply controls for saved workspace profiles and completed GS-V06-010 end-to-end
+  - Completed GS-V06-006 by adding buffered image-first intake starter behavior (analyze photo -> prefill defaults -> optionally persist starter image into intake media upload at submit time)
+  - Advanced GS-V06-007 handoff depth by adding direct Comp Tool image-query seed handoff into Listings draft-create defaults with one-click navigation
+  - Completed GS-V06-009 tax + branding expansion scope (Documents tax controls/presets/line-level overrides, tax reports + drilldown + handoffs, branded listing templates, and compliance-oriented exports)
+  - Expanded GS-V06-005 feedback coverage by adding in-page Workspace Feedback capture on Listings
+
+## v1.0 (Scale + Automation)
+Target: production-grade resilience and multi-channel growth
+Execution tracking: `V1_0_IMPLEMENTATION_CHECKLIST.md`
+
+Scope:
+- Additional channels (deferred until account readiness; current focus remains eBay-first, then Whatnot/Craigslist/Facebook when enabled)
+- QA hardening and coverage expansion (P0) to protect inventory/listing/shipping/admin workflows before broader rollout
+- Label buying integration (eBay shipping and/or Pirate Ship API)
+- Event-driven automation (auto-create shipment, auto-close listing, auto-status transitions)
+- Observability and SRE baseline (error tracking, metrics, alerts)
+- Backup/restore automation and runbooks
+
+Deliverables:
+- Integration adapters by channel/provider
+- Coverage baselines + quality gates in CI with staged threshold ratchets
+- Expanded unit/integration suite for core business logic (`repository`, `services`, `auth`, `validation`)
+- Expanded Playwright suite for critical operator flows (auth, intake, listing review/publish, shipping, sync, admin sign-off)
+- Unified fulfillment API in app for label + tracking lifecycle
+- Monitoring dashboards + alert thresholds
+- Disaster recovery documentation + tested restore process
+
+Acceptance Criteria:
+- Multi-channel order ingestion works with no manual copy-paste
+- QA gates block regressions:
+  - mandatory unit + e2e smoke in CI on every PR
+  - enforced coverage thresholds configured and ratcheted upward by milestone
+- Core business logic reaches near-complete coverage target before full production cutover:
+  - target `>=95%` on scoped core modules (`repository`, `services`, `auth`, `validation`, `security`)
+  - target `>=70%` global Python line coverage as interim operational standard, then continue ratcheting
+- Labels and tracking can be created/updated from app workflows
+- SLA/health metrics and alerts are in place
+- Backup restore drill passes on schedule
+- Progress:
+  - Started GS-V10-001 Shopify ingestion foundation with executable sync-job scaffold (`shopify_orders_pull`) that creates normal sync runs/events and completes safely as a no-op pull while adapter mapping is built
+  - Added Sync `Execute Job Now` controls for dispatcher-supported jobs so Shopify scaffold (and future adapters) can be triggered directly from UI with immediate run telemetry
+  - Deferred Shopify-first implementation until account onboarding; Shopify remains disabled-by-default while v1.0 execution shifts to eBay/inventory/fulfillment priorities
+  - Started GS-V10-002 label-buying integration scaffold: Shipping now includes `Label Purchase Queue` controls that create/process shipping queue jobs (`purchase_label`) for eBay Shipping/Pirate Ship style workflows with dry-run-safe execution and audit trace
+  - Extended GS-V10-002 label artifacts and visibility: sale records now track `shipping_label_id/url/cost/currency/purchased_at` and Shipping queue/export/read-only views expose those fields for faster fulfillment audit
+  - Added GS-V10-002 runtime guardrails in Admin + execution path: shipping queue enablement, label purchase enablement, live-provider-call toggle, and provider-specific toggles are now runtime-configurable per environment
+  - Added GS-V10-002 provider adapter foundation: shipping queue now dispatches live label purchase through provider adapters, with Pirate Ship `mock/api` mode and runtime-configured base URL/API key controls
+  - Hardened GS-V10-002 Pirate Ship adapter runtime contract: configurable endpoint path/auth scheme/timeout plus tolerant nested-response mapping for label/tracking/cost fields
+  - Added GS-V10-002 Admin adapter test action (`Test Pirate Ship Adapter`) so runtime configuration can be validated with audit traces before queue execution
+  - Started GS-V10-003 event-driven automation foundation with DB-backed `integration_automation_rules` and Admin CRUD preview (conditions/effects JSON + audit trail)
+  - Extended GS-V10-003 execution foundation: queued integration jobs now run automation-rule evaluation pre-execution with dry-run mode, approval gating, and integration-event telemetry for matched/applied/blocked outcomes
+  - Added GS-V10-003 explicit approval records (`integration_automation_approvals`) and Admin approval controls; requires-approval rules now need active non-expired approvals (optionally job-scoped) before execution
+  - Added GS-V10-003 automation failure triage panel in Admin with quick actions to approve gated rules, retry queue jobs, and disable matched rules
+  - Added GS-V10-003 rule impact preview controls in Admin Automation Rules to estimate candidate/matched queue jobs (with sample rows) before saving/enabling rule changes
+  - Added GS-V10-003 triage replay simulation (read-only) so operators can re-evaluate a historical queue job against current rule set + approval state and compare drift from original event outcome
+  - Added GS-V10-003 simulation-to-action bridge: replay panel now supports one-click approval creation for currently gated rules (job-scoped, TTL-controlled) to reduce triage handoff steps
+  - Added GS-V10-003 replay drift detection and logging: triage now shows historical-vs-replay metric deltas (`matched/applied/gated/blocked`) and supports one-click drift event audit records
+  - Extended GS-V10-003 with `Automation Hardening Sign-Off (Dev/Prod)` in Admin Integrations (guardrails/approval-policy/runbook checks + owner/date/status/evidence)
+  - Extended GS-V10-003 go-live artifact packaging with `integration_automation_hardening_signoffs.csv` and hardening sign-off status fields in summary/capture payloads
+  - Closed GS-V10-003 implementation scope for now (remaining execution evidence/sign-off remains a go-live operations activity)
+  - Started GS-V10-004 observability baseline with structured queue execute-exception capture (`*_execute_exception` integration events with exception type + traceback preview) and generalized terminal queue failure Slack alert hook (`slack_notify_integration_queue_failures`)
+  - Extended GS-V10-004 System Health with `Error Signals (24h)` (queue execute exceptions, terminal queue failures, warning counts, and recent integration warning/error samples)
+  - Extended GS-V10-004 with runtime-configurable error-signal thresholds and remediation links (`health_*_24h`, `runbook_*_url`) surfaced directly in System Health error details
+  - Extended GS-V10-004 with optional critical-state auto-alerting from System Health (cooldown-guarded Slack alert + integration event evidence) and direct runbook quick-link actions for remediation
+  - Extended GS-V10-004 with manual critical-alert validation action in System Health (`Send Critical Health Alert Now`) to verify Slack channel/template/audit behavior pre-go-live
+  - Extended GS-V10-004 with `Critical Alert Evidence (Recent)` view in System Health for recent manual/auto health alerts and Slack dispatch outcomes (sent/queued/error)
+  - Extended GS-V10-004 with CSV export for `Critical Alert Evidence` to streamline go-live evidence packaging and audit handoff
+  - Extended GS-V10-004 with Admin `Go-Live Evidence Pack (ZIP)` export containing governance, system-health alert evidence, queue snapshot, config-missing summaries, and checklist snapshot in one artifact
+  - Extended GS-V10-004 evidence packaging with checklist readiness scoring in Admin (done/in-progress/not-started/completion%) and exported `go_live_checklist_status.csv`
+  - Extended GS-V10-004 evidence controls with audit-stamped `Record Evidence Capture Event` action and recent capture history in Admin Governance Exports
+  - Extended GS-V10-004 with composite `Go-Live Readiness Score` (green/yellow/red) shown in Admin and included in `go_live_summary.csv` plus evidence-capture audit payloads
+  - Extended GS-V10-004 readiness controls with runtime-configurable scoring weights/thresholds in Admin so go-live strictness can be tuned per environment
+  - Extended GS-V10-004 with System Health `Calibration Sign-Off` capture (Dev/Prod status + owner/date/evidence) and CSV export
+  - Extended GS-V10-004 go-live artifact packaging with `system_health_calibration_signoffs.csv` and calibration sign-off status fields in summary/capture payloads
+  - Extended GS-V10-004 with System Health `Alert Routing Acceptance Sign-Off` capture (Dev/Prod status + owner/date/evidence + ownership/escalation/runbook confirmations) and CSV export
+  - Extended GS-V10-004 go-live artifact packaging with `system_health_alert_routing_signoffs.csv` and alert-routing sign-off status fields in summary/capture payloads
+  - Closed GS-V10-004 implementation scope for now (remaining calibration/alert-routing execution evidence remains a go-live operations activity)
+  - Extended GS-V10-002 with guided `Live Provider Validation Run` flow in Admin Integrations (safety checks + queue execution + standardized audit evidence + CSV export + recent validation history)
+  - Extended GS-V10-004 Go-Live Evidence Pack with `shipping_provider_validation_30d.csv` and provider-validation run counts for release audit completeness
+  - Extended GS-V10-002 with Admin `Validation Sign-Off (Dev/Prod)` tracking (owner/date/status/evidence link), exportable CSV, and go-live artifact inclusion (`shipping_provider_validation_signoffs.csv`)
+  - Closed GS-V10-002 implementation scope for now (remaining live validation execution/sign-off remains an operational go-live checklist activity)
+  - Started GS-V10-005 backup/restore automation with runtime-backed backup policy controls in Admin (`backup_policy_*`, drill interval, RTO target, owner)
+  - Extended GS-V10-005 with Admin `Restore Drill Evidence` workflow (audit event capture + SLA age warning + recent history table + CSV export)
+  - Extended GS-V10-005 go-live evidence packaging with `backup_restore_drills.csv` and restore-drill summary fields in go-live metadata/capture payloads
+  - Extended GS-V10-005 with Admin `DR Checklist + SLA Reporting` (environment-targeted checklist snapshots, per-env SLA rollup, and CSV exports)
+  - Extended GS-V10-005 go-live package with `backup_dr_checklist_snapshots.csv` and DR checklist metrics in summary/capture payloads
+  - Closed GS-V10-005 implementation scope (backup policy controls, restore-drill evidence, DR checklist/SLA reporting, and go-live artifact packaging are complete in-app)
+  - Extended go-live operations tooling with Admin `Go-Live Section Sign-Off Tracker` (per-checklist-item owner/date/evidence/status records + `go_live_section_signoffs.csv` in evidence pack)
+  - Extended go-live legal readiness tooling with Admin `Commerce Legal Sign-Off Tracker` (policy-level owner/date/evidence/status for tax treatment, retention, marketplace policy, privacy, financial role controls, and legal/accounting reviewer sign-off) and evidence-pack export (`commerce_legal_signoffs.csv`)
+  - Added legal sign-off coverage matrix and one-click `Seed Missing Legal Sign-Off Items` action (`prod` / `dev` / `dev+prod`) to accelerate go-live checklist population
+  - Added legal sign-off quick action (`Quick Mark Approved`) from coverage controls for faster policy closure workflows
+  - Added purchase-document intake foundation in Lots:
+    - upload PDF/image or use camera capture
+    - optional AI extraction of invoice fields
+    - extraction mode selector (`LLM Multimodal`, `AWS Textract`, or merged `Both`) for per-document OCR/AI strategy
+    - immutable original storage in S3 with checksum
+    - link documents to lot/product/source for acquisition traceability
+  - Added one-click “Apply AI Data To Linked Lot” from purchase-document details to populate lot vendor/date/total/tax/shipping/handling from extracted invoice fields
+  - Added “Create Lot + Link Document” flow from purchase-document details for unlinked invoice uploads, prefilled by AI-extracted fields
+  - Added “Create Product + Link Document” flow from purchase-document details, prefilled by extracted line-item fields and supporting optional immediate lot assignment
+  - Added extracted line-item selector in purchase-document product creation so operators can explicitly choose invoice rows for conversion
+  - Added bulk line-item product creation grid in purchase-document details (select/edit multiple extracted rows and create products in one action)
+  - Added intake-wizard existing-media attach selectors (product/listing) with quick filter, media-type filter, and select-all/clear controls for bulk reuse
+  - Standardized camera UX by collapsing direct camera capture panels by default across intake wizards, tools, and lots
+  - Started GS-V10-006 QA automation baseline: added mandatory unit-test step in Docker build workflow and dedicated `qa_tests.yaml` workflow (unit + Playwright smoke on compose app stack with artifact upload)
+  - Added GS-V10-006 Playwright scaffolding (`playwright.config.ts`, `tests/e2e/smoke.spec.ts`) and npm QA scripts for local/CI execution
+  - Established GS-V10-006 local coverage baseline (`coverage.py`, unit-test run): global Python line coverage is currently `~5%` (2026-03-30 baseline), with expansion plan now prioritized
+  - Extended GS-V10-006 QA workflow with enforced dual coverage gates (global baseline `15%` + scoped-core `>=25%` on repository/services/auth/page_common/config) and artifact export (`.coveragerc`, `coverage.xml`, `coverage.json`, `.coverage`) to prevent regression while ratcheting upward
+  - Added Playwright intake critical-path coverage with `Inventory Intake Wizard` e2e create-product flow (`tests/e2e/intake_wizard.spec.ts`)
+  - Added Playwright `Coin Intake Wizard` critical-path create-product flow (`tests/e2e/coin_intake_wizard.spec.ts`) with auth-aware local skip behavior
+  - Added Playwright `Products` critical-path create/edit/media flow (`tests/e2e/products_flow.spec.ts`) with auth-aware local skip behavior
+  - Added Playwright auth critical-path sign-in/sign-out flow with remember-token URL assertion (`tests/e2e/auth_flow.spec.ts`) and auth-aware local skip behavior
+  - Added Playwright `Listings` critical-path draft/review preflight flow (`tests/e2e/listings_flow.spec.ts`) covering create draft listing + readiness preview + review approval with auth-aware local skip behavior
+  - Added Playwright `Shipping` critical-path queue surface flow (`tests/e2e/shipping_flow.spec.ts`) covering shipping queue tabs and label-purchase queue controls with auth-aware local handling
+  - Added Playwright `Sync` critical-path triage surface flow (`tests/e2e/sync_flow.spec.ts`) covering sync controls/execute-now visibility and exception queue presence with auth-aware local handling
+  - Added Playwright `Admin` go-live governance surface flow (`tests/e2e/admin_golive_flow.spec.ts`) covering readiness/sign-off/evidence UI entry points with auth-aware local handling
+  - Stabilized local Playwright execution for shared-auth flows by defaulting to serialized workers (`workers=1`, `fullyParallel=false`) and preserving query-auth token on cross-page navigation in specs
+  - Verified Playwright Chromium operator suite green locally (`9 passed`) after auth-form/session selector hardening
+  - Added unit-test coverage for purchase-document extraction service (`tests/test_purchase_doc_extraction.py`) covering Textract summary/line-item mapping and LLM+Textract merge behavior
+  - Expanded GS-V10-006 core test suite with new `sync_jobs`, `integration_queue`, `integration_automation`, `runtime_settings`, `ebay`, `shipping_labels`, `auth`, `slack_notify`, `security/validation`, `google_workspace`, `sync_runner`, `spot_price`, `ai_orchestration`, `listing_orchestration`, `llm_runtime`, `config_health`, `coin_reference_sources`, `env_manager`, `db_backup`, `voice_runtime`, `listing_readiness`, `media_storage`, `chat_context_builders`, `db` helper wrappers, `utils.time`, `page_common`, `main` entrypoint, and `ui_helpers` unit tests plus deeper repository edge-case tests for orders/listings/reviews/sales/media/sources/users/sync-automation queues, improving measured global coverage to ~20.17% (`314` tests passing)
+  - Added deeper `sync_jobs` coverage for order-item mapping and eBay upsert/shipping-push edge paths (`_build_order_items` + `_upsert_ebay_order_into_local` + shipping API exception partial-status path), raising `app/services/sync_jobs.py` coverage to ~91.07%
+  - Added deeper auth helper coverage (cookie-manager status and encrypted-cookie token flows, bootstrap/session guard rails, invalid token shape parsing, and restore/user-default paths), raising `app/auth.py` coverage to ~53.92%
+  - Added deeper Slack + queue-failure coverage (Slack API validation/error/connectivity branches and integration terminal-alert/provider-disabled branches), raising `app/services/slack_notify.py` to ~95.42% and `app/services/integration_queue.py` to ~93.09%
+  - Added full spot-price provider coverage (metals-api + Yahoo parsing/retry/rate-limit paths), raising `app/services/spot_price.py` to ~92.62%
+  - Added deeper repository helper coverage (media/source/lot/audit/user/role-permission branches plus sync/integration CRUD and queue resolution paths), raising `app/repository.py` to ~58.63%
+  - Added additional repository runtime/admin domain coverage (AI provider config CRUD/defaults, runtime settings CRUD/list/get/delete, saved-filter admin transfer/delete, eBay listing template profile CRUD/validation, and document-template include-all filtering), raising `app/repository.py` to ~73.55%
+  - Added orchestration helper coverage for AI and channel adapters, bringing `app/services/ai_orchestration.py` to `100%` and `app/services/listing_orchestration.py` to ~`98.28%`
+  - Added deeper `llm_runtime` coverage for runtime connectivity validation, model endpoint discovery, multimodal validation/parsing/vision-capability guardrails, and multimodal fallback sequencing, raising `app/services/llm_runtime.py` to ~`83.61%`
+  - Added full coverage for `config_health` and `coin_reference_sources` service modules (both now `100%`) to harden runtime governance and paid-source adapter guardrails
+  - Added `env_manager` parsing/masking/upsert/default coverage, raising `app/services/env_manager.py` to ~`96.70%`
+  - Added `db_backup` coverage for pg_dump/psql guards and S3 backup wrapper paths, raising `app/services/db_backup.py` to `100%`
+  - Added `voice_runtime` coverage for config resolution, endpoint candidates, STT/TTS success/guardrails, and fallback errors, raising `app/services/voice_runtime.py` to ~`97.96%`
+  - Added `listing_readiness` coverage for fixed-price/auction blocker rules, status warnings, and scoring outcomes, raising `app/services/listing_readiness.py` to ~`95.79%`
+  - Added `media_storage` coverage for S3 init/ensure/upload/fetch flows with URL/content-type/error branches, raising `app/services/media_storage.py` to ~`96.25%`
+  - Added `chat_context_builders` coverage for domain snapshot aggregation (inventory/listings/sales/shipping/sync/orders/reports/admin) and fallback-help paths, raising `app/services/chat_context_builders.py` to ~`98.17%`
+  - Added dedicated `grading_standards` service coverage (helper parsing, web snapshot indicators, grading/comp context builders), raising `app/services/grading_standards.py` to ~`97.16%`
+  - Added quick-action/sidebar navigation coverage for `page_common` (unified/legacy flows, command handling, navigation guardrails), raising `app/page_common.py` to ~`91.67%`
+  - Added `auth` sidebar/login branch coverage for password-auth success/invalid and non-password override flows, raising `app/auth.py` to ~`71.07%`
+  - Added `ai_text` parser/normalizer coverage and `media_storage` delete-object branch coverage (`ai_text` ~`87.77%`, `media_storage` ~`96.77%`)
+  - Added repository coverage for document/artifact/coin-reference/dashboard/integration-event domains (including validation/error branches), raising `app/repository.py` to ~`73.06%`
+  - Latest measured QA baseline on 2026-04-02: global Python line coverage `~41.77%` (`604` tests), scoped-core `~95.01%`
+  - Ratcheted QA workflow coverage gates to global `>=30%` and scoped-core `>=85%` (`repository/services/auth/page_common/config`) for stronger regression protection
+  - Added focused seed/compatibility coverage tests (`app/db/seed.py`, `app/views.py`) to reduce blind spots in local dev bootstrap and legacy import paths
+  - Added stubbed migration CLI tests (`app/db/migrate.py`) to validate command dispatch and strengthen migration tool reliability in CI without requiring external Alembic runtime
+  - Expanded repurchase/inventory-cycle repository coverage (`record_product_repurchase` weighted-cost and lot-assignment branches), improving core data-path confidence
+  - Expanded conversion/update product repository coverage (`update_product` eBay/coin-ref validation and single/bulk inventory conversion flows), raising `app/repository.py` coverage to `~82.62%`
+  - Added deeper auth edge-path coverage (cookie/query token error and fallback branches, remember-token mismatch handling, RBAC load success/failure paths, and auth-session warning path), raising `app/auth.py` coverage to `~92.81%` and `app/repository.py` to `~85.32%`
+  - Raised shipping/scheduler service coverage with new edge-path tests (`shipping_labels` now `~99.17%`, `sync_runner` now `~98.02%`) and improved suite baseline to `411` passing tests
+  - Completed deep `integration_automation` branch coverage (approval/execution gates, payload/effect parse error paths, preview/simulate edge handling), bringing `app/services/integration_automation.py` to `100%`
+  - Expanded `llm_runtime` branch/error-path tests (DB/env resolution fallback branches, endpoint/model parsing variants, multimodal fallback failures, and chat/responses no-text guards), raising `app/services/llm_runtime.py` coverage to `~91.80%`
+  - Added dedicated shared-view helper coverage suite (`tests/test_views_shared.py`) covering media capture/gallery/access, handoff/export helpers, byte-loading paths, and eBay push history actions, raising `app/components/views/shared.py` to `~64.62%`
+  - Added a broad view-module import-coverage suite (`tests/test_views_module_imports.py`) that safely boots and imports core workspace pages under stubbed external dependencies, lifting global baseline while preserving test determinism
+  - Added behavioral view tests for Orders/Sales side-panel flows (`tests/test_views_small.py`), lifting `app/components/views/orders.py` to `~65.70%` and `app/components/views/sales.py` to `~71.36%`
+  - Added helper-level parsing/runtime tests for Lots and System Health modules (`tests/test_lots_helpers.py`, `tests/test_system_health_helpers.py`) to harden utility branches and lift global baseline further
+  - Added helper/utility coverage for Sync + Shipping + Operations Home (`tests/test_sync_shipping_helpers.py`, `tests/test_operations_home_helpers.py`) and a minimal Sync render-flow execution path in `tests/test_views_small.py`, lifting `app/components/views/sync.py` to ~`33.79%`
+  - Added focused render-path tests for Shipping read-only permission flow, shipping queue/export helper flows, and Operations Home queue rendering plus shipping export format checks (`tests/test_views_small.py`, `tests/test_sync_shipping_helpers.py`), lifting `app/components/views/shipping.py` to ~`31.29%`, `app/components/views/operations_home.py` to ~`48.06%`, and global coverage above `30%`
+  - Added dedicated `workspace_shell` helper coverage (`tests/test_workspace_shell.py`) for status semantics, feedback/task completion logging, and eBay command-rail state handling, lifting `app/components/views/workspace_shell.py` to ~`90.00%` and global coverage to ~`30.72%`
+  - Added populated Sync render-path + copilot tests (`tests/test_views_small.py`, `tests/test_sync_shipping_helpers.py`) covering run detail/exception queue/coplilot summarization paths; raised `app/components/views/sync.py` to ~`63.30%` and global coverage to ~`31.19%`
+  - Added System Health render guard tests (`tests/test_system_health_helpers.py`) for permission-stop and refresh-rerun paths, lifting `app/components/views/system_health.py` to ~`11.11%` while maintaining deterministic non-Streamlit-run execution
+  - Added full System Health render smoke coverage with stubbed Streamlit/repo integrations (`tests/test_system_health_helpers.py`), lifting `app/components/views/system_health.py` to ~`54.75%` and global coverage to ~`32.06%`
+  - Added dedicated reports-helper coverage suite (`tests/test_reports_helpers.py`) for tax presets and cycle/rebuy/review/publish-outcome builders, lifting `app/components/views/reports.py` to ~`48.43%` and global coverage to ~`33.60%`
+  - Added documents-helper coverage suite (`tests/test_documents_helpers.py`) for logo resolution, item/tax derivation, and retained-artifact render/download branches, lifting `app/components/views/documents.py` to ~`13.77%` and global coverage to ~`33.87%`
+  - Added tools-helper coverage suite (`tests/test_tools_helpers.py`) for coin CSV normalization, parsing/repair, comp math/confidence, domain/price extraction, and AI media persistence helpers, lifting `app/components/views/tools.py` to ~`20.00%` and global coverage to ~`35.47%`
+  - Added AI Chat helper coverage suite (`tests/test_ai_chat_helpers.py`) for domain token parsing, role/domain allowlist resolution, write-intent detection, sensitive masking rules, router domain gating, and Goldy planner helpers, lifting `app/components/views/ai_chat.py` to ~`35.08%` and global coverage to ~`35.86%`
+  - Added eBay Ops helper coverage suite (`tests/test_ebay_ops_helpers.py`) for offer/details parsing, defaults merge, offer-id resolution fallback logic, policy/location labeling, and listing filter logic, lifting `app/components/views/ebay_ops.py` to ~`16.86%` and global coverage to ~`36.22%`
+  - Added eBay Integration render-path coverage (`tests/test_ebay_view.py`) for not-configured guard and pull/import success flow with sync execution assertions, lifting `app/components/views/ebay.py` to ~`57.89%` and global coverage to ~`36.46%`
+  - Added Documents render-path coverage (`tests/test_documents_view.py`) for source-type early-return branches (`Order`/`Sale`/`Listing` when empty), lifting `app/components/views/documents.py` to ~`23.45%` and global coverage to ~`36.71%`
+  - Added intake-wizard helper coverage (`tests/test_intake_wizard_helpers.py`) for coin/inventory JSON extraction, media-buffer handling, and buffered upload wrappers, lifting `coin_intake_wizard.py` to ~`16.86%`, `inventory_intake_wizard.py` to ~`10.18%`, and global coverage to ~`37.17%`
+  - Expanded documents-helper coverage (`tests/test_documents_helpers.py`) for classic-default logo resolution, tax-basis edge modes, and retained-artifact missing-selection handling, lifting `app/components/views/documents.py` to ~`24.85%` and global coverage to ~`37.21%`
+  - Expanded eBay Ops helper coverage (`tests/test_ebay_ops_helpers.py`) for no-offer/no-match/cache-hit resolution and fallback label parsing, lifting `app/components/views/ebay_ops.py` to ~`17.55%` and global coverage to ~`37.23%`
+  - Added listing outcome mutation-path coverage in `tests/test_documents_view.py` (Documents `Listing` -> `Not Sold` end/archive actions), lifting `app/components/views/documents.py` to ~`40.84%` and global coverage to ~`37.65%`
+  - Added sold-posting and runtime-policy-blocked coverage in `tests/test_documents_view.py` (Documents `Listing` -> `Sold` create-order/sale/artifact path and blocked-post guardrail), lifting `app/components/views/documents.py` to ~`52.04%` and global coverage to ~`37.95%`
+  - Added Google integration failure-queue coverage in `tests/test_documents_view.py` (Gmail/Calendar/Drive submit failure -> queue retry job branches), lifting `app/components/views/documents.py` to ~`62.19%` and global coverage to ~`38.21%`
+  - Added eBay Ops profile-apply render-path coverage (`tests/test_ebay_ops_helpers.py`) for saved-profile quick switch propagation (token/filter/date) and rerun behavior, raising `app/components/views/ebay_ops.py` to ~`33.26%` and global coverage to ~`38.82%` (`549` tests)
+  - Added Sync render guard coverage in `tests/test_views_small.py` for execute-now disabled-job rejection and disabled-queued-run finalize confirmation guard, raising `app/components/views/sync.py` to ~`67.77%` while keeping suite stable at `549` passing tests
+  - Added Operations Home governance queue render coverage in `tests/test_views_small.py` (single-queue empty-state and cadence follow-up resolve action path), raising `app/components/views/operations_home.py` to ~`51.94%` and global coverage to ~`38.82%` (`549` tests)
+  - Added dedicated Admin helper coverage suite (`tests/test_admin_helpers.py`) for audit parsing, migration history/revision helpers, env/runtime defaults coverage builders, and runtime seed paths
+  - Added Operations Home blocker-queue open-workflow render-path test (`tests/test_views_small.py`) and expanded queue action branch coverage
+  - Added targeted sync/shipping guardrail tests (`tests/test_sync_shipping_helpers.py`) for retry eligibility edge-cases and shipping queue submit/exception-resolution branches
+  - Added additional sync lineage and shipping update error-path tests (`tests/test_sync_shipping_helpers.py`) covering orphan/cycle retry ancestry and mixed-success bulk shipping updates
+  - Added dedicated Reports render-path coverage (`tests/test_reports_view.py`) including full empty-state run plus Reports Copilot permission-denied and success flows, raising `reports.py` to `~71.13%`; latest suite is `585` tests with global coverage at `~41.43%`
+  - Expanded Documents render-flow coverage (`tests/test_documents_view.py`) for prefill/session controls (`Clear Prefill`, handoff `Clear History`, and `Reopen Selected Handoff`), raising `documents.py` to `~67.56%`
+  - Expanded `page_common` quick-action unified-nav error-path coverage (`tests/test_page_common.py`) for role-default and workflow-link failures, raising `page_common.py` to `~95.63%`
+  - Expanded repository edge-path coverage (`tests/test_repository_inventory_movements.py`) for purchase-lot update/not-found/no-op, create-product eBay/coin-ref validation paths, missing-product sale no-movement path, and lot-allocation fallback branches; raised `repository.py` to `~87.65%` and fixed audit serialization for nested `Decimal` values via `_record_audit(..., default=...)`
+  - Expanded repository upsert/update coverage for eBay listing template profiles and saved filter profiles (`tests/test_repository_inventory_movements.py`), lifting `repository.py` to `~89.40%` and scoped-core to `~92.90%`
+  - Added additional repository API-contract coverage for purchase-document/source no-op/unknown-field paths and reconciled tests to current purchase-document creation signature (`document_kind` + storage metadata), lifting `repository.py` to `~90.19%` and scoped-core to `~93.56%`
+  - Expanded `llm_runtime` branch/error-path coverage for runtime setting exception/unknown-value fallbacks, fallback all-fail path, model endpoint candidate variants, dedupe/no-rows chain behavior, multimodal empty-image branches, and direct responses `output_text` handling, raising `app/services/llm_runtime.py` to `~96.52%`
+  - Expanded repository branch coverage for shipping preset/listing template/AI provider/runtime setting/shared-filter ownership/order-update/app-user password-update paths, raising `app/repository.py` to `~93.47%` and scoped-core coverage to `~94.85%`
+  - Completed scoped-core QA gate milestone by expanding repository branches (purchase-lot updates, app-user no-change/update unknown-field, media update unknown-field), raising `app/repository.py` to `~93.97%` and scoped-core coverage to `~95.01%`
+  - Hardened Playwright operator flows with deeper mutation assertions:
+    - Listings review action now asserts approved review-state evidence.
+    - Sync execute-now test now validates result/disabled states (instead of surface-only checks).
+    - Shipping flow now validates bulk-update form guardrail messaging.
+    - Added deterministic e2e role-permission seeding (`E2E_ENSURE_ROLE_PERMISSIONS=true`) and coin-intake navigation hardening; current local e2e status: `9/9` passing.
+  - Added QA CI evidence packaging in `qa_tests.yaml`: dedicated `qa-evidence` artifact (`qa_evidence.md` + `qa_evidence.json`) plus GitHub job summary output for direct go-live checklist linkage.
+  - Added QA suite segmentation + deterministic integration test helpers:
+    - New `scripts/run_test_suites.py` supports `fast` and `integration` unittest selectors for CI fan-out.
+    - Added reusable test support helpers (`tests/test_support.py`) with deterministic SKU suffix generation and shared in-memory repository fixture/factory wiring.
+    - Added local convenience targets: `make qa-unit-fast`, `make qa-unit-integration` (and `task` equivalents).
+  - Ratcheted CI QA coverage gates in `.github/workflows/qa_tests.yaml` to global `>=30%` and scoped-core `>=85%` (from baseline `25/25`) and aligned README/QA docs/checklists
+  - Revalidated Playwright critical-path suite locally after QA changes: `9/9` chromium specs passing
+  - Added GS-V10-006 phased quality-gate plan:
+    - Phase 1: enforce baseline reporting + minimum gates (`>=30%` global, `>=85%` scoped-core) and fail build below threshold
+    - Phase 2: raise to `>=40%` global while adding core flow Playwright coverage
+    - Phase 3: raise to `>=55%` global and enforce scoped-core `>=95%` target
+    - Phase 4: continue ratchet toward near-100% on core modules and higher global target post-go-live
+  - High-priority remaining (as of 2026-04-02):
+    - GS-V10-006 (P0): raise coverage gate beyond baseline and continue core-module + operator-critical e2e expansion.
+    - GS-V10-004 ops: execute calibration/alert-routing evidence in target env and attach owner/date/evidence links.
+    - GS-V10-003 ops: execute hardening evidence in target env and attach owner/date/evidence links.
+    - GS-V10-002 ops: execute live provider validation in Dev/Prod (`purchase_label` API mode) and attach evidence links/sign-off records.
+    - Go-live ops: execute first Dev/Prod restore drills and attach owner/date/evidence links for final DR sign-off.
+
+## Cross-Phase Technical Standards
+- Migrations required for all schema changes
+- Feature flags for risky integrations
+- Idempotent sync jobs and retry-safe write logic
+- Test coverage for repository/business logic on new domains
+- Documentation updated per milestone (README + runbooks)
+
+## Suggested Delivery Sequence
+1. Build `inventory_movements` before expanding order logic.
+2. Ship `orders/order_items` and migrate sales workflows to consume them.
+3. Add returns/refunds once orders are canonical.
+4. Implement eBay pull sync before push actions.
+5. Add cost basis + accounting exports after sync data is stable.

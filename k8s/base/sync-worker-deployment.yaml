@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gs-inv-sync-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gs-inv-sync-worker
+  template:
+    metadata:
+      labels:
+        app: gs-inv-sync-worker
+    spec:
+      containers:
+        - name: sync-worker
+          image: ghcr.io/goldenstackers/gs-inv-mgmt:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.services.sync_runner"]
+          envFrom:
+            - configMapRef:
+                name: gs-inv-config
+            - secretRef:
+                name: gs-inv-secret
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 512Mi
