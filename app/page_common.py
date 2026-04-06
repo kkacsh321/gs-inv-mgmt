@@ -6,7 +6,12 @@ import time
 import streamlit as st
 
 try:
-    from app.auth import current_user, init_user_context_sidebar, require_authenticated_session
+    from app.auth import (
+        current_user,
+        has_oauth_callback_query_params,
+        init_user_context_sidebar,
+        require_authenticated_session,
+    )
     from app.config import settings
     from app.db.init_db import init_db
     from app.db.session import SessionLocal
@@ -14,7 +19,7 @@ try:
     from app.services.media_storage import MediaStorageService
 except ModuleNotFoundError:
     # Fallback for script-execution contexts where package root resolution differs.
-    from auth import current_user, init_user_context_sidebar, require_authenticated_session
+    from auth import current_user, has_oauth_callback_query_params, init_user_context_sidebar, require_authenticated_session
     from config import settings
     from db.init_db import init_db
     from db.session import SessionLocal
@@ -50,6 +55,7 @@ QUICK_ACTION_PAGE_MAP: dict[str, str] = {
     "sync": "pages/18_Sync.py",
     "ebay-ops": "pages/22_eBay_Workspace.py",
     "ebay-workspace": "pages/22_eBay_Workspace.py",
+    "ebay-user-details": "pages/24_eBay_User_Details.py",
     "coin-intake": "pages/20_Coin_Intake_Wizard.py",
     "inventory-intake": "pages/23_Inventory_Intake_Wizard.py",
     "ask-gs": "pages/21_Ask_GoldenStackers.py",
@@ -77,6 +83,7 @@ QUICK_ACTION_ALIASES: dict[str, str] = {
     "sy": "sync",
     "ops-ebay": "ebay-ops",
     "ew": "ebay-workspace",
+    "eud": "ebay-user-details",
     "ci": "coin-intake",
     "ii": "inventory-intake",
     "ask": "ask-gs",
@@ -88,6 +95,7 @@ ROLE_PINNED_PAGES: dict[str, list[tuple[str, str]]] = {
     "admin": [
         ("Operations Home", "pages/00_Operations_Home.py"),
         ("eBay Workspace", "pages/22_eBay_Workspace.py"),
+        ("eBay User Details", "pages/24_eBay_User_Details.py"),
         ("Sync", "pages/18_Sync.py"),
         ("Admin", "pages/17_Admin.py"),
     ],
@@ -96,6 +104,7 @@ ROLE_PINNED_PAGES: dict[str, list[tuple[str, str]]] = {
         ("Listings", "pages/03_Listings.py"),
         ("Shipping", "pages/11_Shipping.py"),
         ("eBay Workspace", "pages/22_eBay_Workspace.py"),
+        ("eBay User Details", "pages/24_eBay_User_Details.py"),
     ],
     "viewer": [
         ("Dashboard", "pages/01_Dashboard.py"),
@@ -113,14 +122,14 @@ ROLE_DEFAULT_PAGE: dict[str, str] = {
 ROLE_WORKFLOW_GROUPS: dict[str, list[tuple[str, list[tuple[str, str, str]]]]] = {
     "admin": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory"), ("Sources", "pages/13_Sources.py", "workspace_inventory")]),
-        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
+        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
         ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
         ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Documents", "pages/16_Documents.py", "workspace_revenue"), ("Reports", "pages/09_Reports.py", "workspace_revenue")]),
         ("Admin", [("Operations Home", "pages/00_Operations_Home.py", ""), ("Admin", "pages/17_Admin.py", ""), ("Search & Edit", "pages/10_Search_Edit.py", ""), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
     ],
     "ops": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory")]),
-        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
+        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
         ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
         ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Reports", "pages/09_Reports.py", "workspace_revenue")]),
     ],
@@ -355,7 +364,7 @@ def _render_quick_actions_sidebar(user_role: str, *, nav_mode: str) -> None:
             submitted = st.form_submit_button("Go")
         st.caption(
             "Shortcuts: `/p` Products, `/l` Listings, `/sa` Sales, `/sh` Shipping, "
-            "`/sy` Sync, `/a` Admin, `/op` Operations, `/doc` Documents, `/ci` Coin Intake, `/ii` Inventory Intake, `/ask` Chat, `/he` Health (Admin tab)."
+            "`/sy` Sync, `/a` Admin, `/op` Operations, `/doc` Documents, `/ci` Coin Intake, `/ii` Inventory Intake, `/ask` Chat, `/he` Health (Admin tab), `/eud` eBay User Details."
         )
         if submitted:
             normalized = _normalize_quick_action(command)
@@ -369,12 +378,21 @@ def _render_quick_actions_sidebar(user_role: str, *, nav_mode: str) -> None:
                 st.error(f"Navigation failed for `{normalized}`: {exc}")
 
 
-def setup_page(page_title: str, *, allow_bootstrap_if_no_users: bool = False) -> None:
+def setup_page(
+    page_title: str,
+    *,
+    allow_bootstrap_if_no_users: bool = False,
+    allow_oauth_callback_query: bool = False,
+) -> None:
     st.set_page_config(page_title=f"{settings.app_name} | {page_title}", layout="wide")
     user = init_user_context_sidebar()
     if SIDEBAR_LOGO_PATH.exists():
         _inject_sidebar_top_logo(SIDEBAR_LOGO_PATH)
-    if not require_authenticated_session(allow_bootstrap_if_no_users=allow_bootstrap_if_no_users):
+    allow_oauth = bool(allow_oauth_callback_query and has_oauth_callback_query_params())
+    if not require_authenticated_session(
+        allow_bootstrap_if_no_users=allow_bootstrap_if_no_users,
+        allow_oauth_callback_query=allow_oauth,
+    ):
         st.stop()
     ui_flags = _runtime_ui_flags()
     nav_mode = str(ui_flags.get("navigation_mode") or "unified")

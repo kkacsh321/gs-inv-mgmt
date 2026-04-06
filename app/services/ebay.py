@@ -1,4 +1,5 @@
 import base64
+import json
 from urllib.parse import urlencode
 
 import requests
@@ -20,6 +21,7 @@ class EbayClient:
         "https://api.ebay.com/oauth/api_scope/sell.inventory",
         "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
         "https://api.ebay.com/oauth/api_scope/sell.account",
+        "https://api.ebay.com/oauth/api_scope/commerce.identity.readonly",
     ]
 
     def __init__(self) -> None:
@@ -28,10 +30,12 @@ class EbayClient:
             self.auth_host = "https://auth.ebay.com"
             self.api_host = "https://api.ebay.com"
             self.media_host = "https://apim.ebay.com"
+            self.identity_host = "https://apiz.ebay.com"
         else:
             self.auth_host = "https://auth.sandbox.ebay.com"
             self.api_host = "https://api.sandbox.ebay.com"
             self.media_host = "https://apim.sandbox.ebay.com"
+            self.identity_host = "https://apiz.sandbox.ebay.com"
 
     def is_configured(self) -> bool:
         return bool(settings.ebay_client_id and settings.ebay_client_secret and settings.ebay_ru_name)
@@ -89,7 +93,7 @@ class EbayClient:
         }
 
         response = requests.post(token_endpoint, headers=headers, data=payload, timeout=30)
-        response.raise_for_status()
+        self._raise_for_status_with_body(response)
         return response.json()
 
     def fetch_application_token(self, scopes: list[str] | None = None) -> dict:
@@ -108,9 +112,52 @@ class EbayClient:
         response.raise_for_status()
         return response.json()
 
+    def refresh_user_token(self, refresh_token: str, scopes: list[str] | None = None) -> dict:
+        token_endpoint = self._token_endpoint()
+        basic_auth = self._basic_auth_header()
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {basic_auth}",
+        }
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": str(refresh_token or "").strip(),
+        }
+        scope_values = scopes or self.SCOPES
+        if scope_values:
+            payload["scope"] = " ".join(scope_values)
+        response = requests.post(token_endpoint, headers=headers, data=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def decode_access_token_claims(self, access_token: str) -> dict:
+        token = str(access_token or "").strip()
+        if not token or "." not in token:
+            return {}
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1].strip()
+        if not payload:
+            return {}
+        padding = "=" * (-len(payload) % 4)
+        try:
+            raw = base64.urlsafe_b64decode((payload + padding).encode("utf-8"))
+            data = json.loads(raw.decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def get_account_privileges(self, access_token: str) -> dict:
         endpoint = f"{self.api_host}/sell/account/v1/privilege"
         headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get(endpoint, headers=headers, timeout=30)
+        self._raise_for_status_with_body(response)
+        return response.json()
+
+    def get_identity_user(self, access_token: str) -> dict:
+        endpoint = f"{self.identity_host}/commerce/identity/v1/user/"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
         response = requests.get(endpoint, headers=headers, timeout=30)
         self._raise_for_status_with_body(response)
         return response.json()

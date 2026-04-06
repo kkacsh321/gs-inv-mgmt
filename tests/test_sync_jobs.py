@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
+import requests
 
 from app.services import sync_jobs
 
@@ -420,7 +421,10 @@ class SyncJobsTests(unittest.TestCase):
         ) as pull, patch(
             "app.services.sync_jobs.execute_ebay_shipping_tracking_push",
             return_value={"run_id": 2, "status": "success"},
-        ) as push:
+        ) as push, patch(
+            "app.services.sync_jobs.execute_ebay_connection_health_check",
+            return_value={"run_id": 3, "status": "success"},
+        ) as health:
             out1 = sync_jobs.execute_sync_job(
                 object(),
                 job_name="ebay_orders_pull_import",
@@ -436,10 +440,18 @@ class SyncJobsTests(unittest.TestCase):
                 access_token="tok",
                 sale_ids=(1, 2, 0),
             )
+            out3 = sync_jobs.execute_sync_job(
+                object(),
+                job_name="ebay_connection_health_check",
+                actor="qa",
+                access_token="tok",
+            )
         self.assertEqual(out1["status"], "success")
         self.assertEqual(out2["status"], "success")
+        self.assertEqual(out3["status"], "success")
         pull.assert_called_once()
         push.assert_called_once()
+        health.assert_called_once()
 
     def test_sync_job_catalog_contains_retry_and_dispatch_metadata(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
@@ -454,18 +466,21 @@ class SyncJobsTests(unittest.TestCase):
         fake_settings = SimpleNamespace(
             sync_job_ebay_orders_pull_import_enabled=True,
             sync_job_ebay_shipping_tracking_push_enabled=False,
+            sync_job_ebay_connection_health_check_enabled=True,
             sync_job_quickbooks_export_enabled=False,
             sync_job_shopify_orders_pull_enabled=True,
         )
         with patch("app.services.sync_jobs.settings", fake_settings):
             self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_orders_pull_import", repo=None))
             self.assertFalse(sync_jobs.is_sync_job_enabled("ebay_shipping_tracking_push", repo=None))
+            self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_connection_health_check", repo=None))
 
     def test_is_sync_job_enabled_uses_runtime_when_repo_present(self) -> None:
         def _runtime_bool(_repo, key, default):
             mapping = {
                 "sync_job_ebay_orders_pull_import_enabled": True,
                 "sync_job_ebay_shipping_tracking_push_enabled": False,
+                "sync_job_ebay_connection_health_check_enabled": True,
                 "sync_job_quickbooks_export_enabled": True,
                 "sync_job_shopify_orders_pull_enabled": False,
             }
@@ -474,6 +489,7 @@ class SyncJobsTests(unittest.TestCase):
         with patch("app.services.sync_jobs.get_runtime_bool", side_effect=_runtime_bool):
             self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_orders_pull_import", repo=object()))
             self.assertFalse(sync_jobs.is_sync_job_enabled("ebay_shipping_tracking_push", repo=object()))
+            self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_connection_health_check", repo=object()))
 
     def test_execute_sync_job_unknown_raises(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):
@@ -592,6 +608,42 @@ class SyncJobsTests(unittest.TestCase):
                 sync_jobs.execute_ebay_orders_pull_import(repo, access_token="tok", actor="qa", client=client)
         self.assertTrue(any(e.get("code") == "EBAY_PULL_FAILED" for e in repo.errors))
         self.assertTrue(any(u[1].get("status") == "failed" for u in repo.updated_runs))
+
+    def test_execute_ebay_orders_pull_import_refreshes_token_on_auth_failure(self) -> None:
+        repo = _FakeRepoWithDB(db=_FakeDB(products=[], listings=[]))
+
+        auth_error = requests.HTTPError("expired")
+        auth_error.response = SimpleNamespace(status_code=401)
+
+        class _Client:
+            def __init__(self):
+                self.calls = 0
+
+            def pull_recent_orders(self, token, limit=25, offset=0):
+                self.calls += 1
+                if self.calls == 1:
+                    raise auth_error
+                return {"orders": []}
+
+            def refresh_user_token(self, refresh_token, scopes=None):
+                _ = scopes
+                if refresh_token != "ref-1":
+                    raise RuntimeError("bad refresh")
+                return {"access_token": "tok-2", "refresh_token": "ref-2", "expires_in": 7200}
+
+        client = _Client()
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=lambda _repo, key, default: "ref-1" if key == "ebay_user_refresh_token" else default,
+        ):
+            out = sync_jobs.execute_ebay_orders_pull_import(
+                repo,
+                access_token="tok-1",
+                actor="qa",
+                client=client,
+            )
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(client.calls, 2)
 
     def test_upsert_ebay_order_updates_existing_order_and_sales(self) -> None:
         existing_order = SimpleNamespace(id=41)
@@ -785,6 +837,88 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(out["failed"], 1)
         self.assertEqual(out["status"], "partial")
         self.assertTrue(any(e.get("code") == "EBAY_TRACKING_PUSH_FAILED" for e in repo.errors))
+
+    def test_execute_ebay_shipping_tracking_push_refreshes_on_auth_failure(self) -> None:
+        sale = SimpleNamespace(
+            id=20,
+            marketplace="ebay",
+            external_order_id="ORD20",
+            tracking_number="TRK20",
+            shipping_provider="usps",
+            shipped_at=None,
+        )
+        repo = _FakeRepoWithDB(db=_FakeDB(sales_by_id={20: sale}))
+        auth_error = requests.HTTPError("expired")
+        auth_error.response = SimpleNamespace(status_code=401)
+
+        class _Client:
+            def __init__(self):
+                self.order_calls = 0
+                self.push_calls = 0
+
+            def get_order(self, **_kwargs):
+                self.order_calls += 1
+                if self.order_calls == 1:
+                    raise auth_error
+                return {"lineItems": [{"lineItemId": "LI20", "lineItemQuantity": 1}]}
+
+            def create_shipping_fulfillment(self, **_kwargs):
+                self.push_calls += 1
+                return {"ok": True}
+
+            def refresh_user_token(self, refresh_token, scopes=None):
+                _ = scopes
+                if refresh_token != "ref-ship":
+                    raise RuntimeError("bad refresh")
+                return {"access_token": "tok-ship-2", "refresh_token": "ref-ship-2", "expires_in": 7200}
+
+        client = _Client()
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=lambda _repo, key, default: "ref-ship" if key == "ebay_user_refresh_token" else default,
+        ):
+            out = sync_jobs.execute_ebay_shipping_tracking_push(
+                repo,
+                access_token="tok-ship-1",
+                actor="qa",
+                sale_ids=[20],
+                client=client,
+            )
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["updated"], 1)
+        self.assertEqual(client.order_calls, 2)
+
+    def test_execute_ebay_connection_health_check_success(self) -> None:
+        repo = _FakeRepo()
+
+        class _Client:
+            SCOPES = []
+
+            def is_configured(self):
+                return True
+
+            def decode_access_token_claims(self, _token):
+                return {"scope": "https://api.ebay.com/oauth/api_scope/sell.account"}
+
+            def get_account_privileges(self, _token):
+                return {"sellerRegistrationCompleted": True}
+
+            def get_identity_user(self, _token):
+                return {"username": "goldenstackers"}
+
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=lambda _repo, key, default="": "tok" if key == "ebay_user_access_token" else "",
+        ):
+            out = sync_jobs.execute_ebay_connection_health_check(
+                repo,
+                actor="qa",
+                client=_Client(),
+            )
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(len(repo.created_runs), 1)
+        self.assertGreaterEqual(len(repo.updated_runs), 2)
+        self.assertTrue(repo.events)
 
 
 if __name__ == "__main__":

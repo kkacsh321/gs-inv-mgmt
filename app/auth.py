@@ -327,6 +327,66 @@ def _set_query_auth_token(token: str) -> bool:
             return False
 
 
+def _has_oauth_callback_query_params() -> bool:
+    params = getattr(st, "query_params", None)
+    if params is None:
+        return False
+    for key in ("code", "state", "error", "error_description", "expires_in"):
+        try:
+            val = params.get(key, "")
+        except Exception:
+            continue
+        if isinstance(val, list):
+            if any(str(v or "").strip() for v in val):
+                return True
+            continue
+        if str(val or "").strip():
+            return True
+    return False
+
+
+def _is_query_token_fallback_enabled() -> bool:
+    default_enabled = bool(getattr(settings, "app_auth_query_token_fallback_enabled", True))
+    cache_key = "auth_query_fallback_enabled_cache"
+    now_ts = int(time.time())
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict) and int(cached.get("exp") or 0) > now_ts:
+        return bool(cached.get("enabled"))
+    enabled = default_enabled
+    try:
+        from app.db.session import SessionLocal
+        from app.repository import InventoryRepository
+    except Exception:
+        st.session_state[cache_key] = {"enabled": enabled, "exp": now_ts + 30}
+        return enabled
+    try:
+        db = SessionLocal()
+        try:
+            repo = InventoryRepository(db)
+            row = repo.get_runtime_setting(
+                environment=settings.app_env,
+                key="auth_query_token_fallback_enabled",
+                active_only=True,
+            )
+            if row is not None:
+                raw = str(row.value or "").strip().lower()
+                if raw in {"1", "true", "yes", "on"}:
+                    enabled = True
+                elif raw in {"0", "false", "no", "off"}:
+                    enabled = False
+        finally:
+            db.close()
+    except Exception:
+        enabled = default_enabled
+    st.session_state[cache_key] = {"enabled": enabled, "exp": now_ts + 30}
+    return enabled
+
+
+def has_oauth_callback_query_params() -> bool:
+    """Public helper for pages that need to allow OAuth callback handling pre-login."""
+    return _has_oauth_callback_query_params()
+
+
 def _clear_query_auth_token() -> None:
     try:
         if "auth" in st.query_params:
@@ -345,6 +405,8 @@ def _clear_query_auth_token() -> None:
 
 
 def _restore_auth_from_query_token(user_map: dict) -> bool:
+    if not _is_query_token_fallback_enabled():
+        return False
     token = _get_query_auth_token()
     if not token:
         return False
@@ -407,9 +469,15 @@ def _ensure_remember_tokens_for_authenticated_user(user_map: dict) -> None:
         existing_exp = max(existing_exp, int(cookie_claims.get("exp") or 0))
     expires_at = max(existing_exp, min_exp)
     token = _build_auth_remember_token(username=row.username, role=row.role, expires_at=expires_at)
-    if _get_query_auth_token() != token:
-        _set_query_auth_token(token)
-    _set_cookie_auth_token(token)
+    cookie_persisted = _set_cookie_auth_token(token)
+    _ = cookie_persisted
+    # Keep query-token fallback in sync for robustness across browser/session edge cases.
+    # Skip writes only during OAuth callback handling so provider code/state params are preserved.
+    if _is_query_token_fallback_enabled():
+        if _get_query_auth_token() != token and not _has_oauth_callback_query_params():
+            _set_query_auth_token(token)
+    else:
+        _clear_query_auth_token()
 
 
 def _load_rbac_from_db() -> tuple[list, dict[str, set[str]]]:
@@ -518,10 +586,13 @@ def init_user_context_sidebar() -> UserContext:
                                 role=row.role,
                                 expires_at=expires_at,
                             )
-                            _set_cookie_auth_token(remember_token)
-                            _set_query_auth_token(
-                                remember_token
-                            )
+                            cookie_persisted = _set_cookie_auth_token(remember_token)
+                            _ = cookie_persisted
+                            if _is_query_token_fallback_enabled():
+                                if not _has_oauth_callback_query_params():
+                                    _set_query_auth_token(remember_token)
+                            else:
+                                _clear_query_auth_token()
                         else:
                             _clear_cookie_auth_token()
                             _clear_query_auth_token()
@@ -619,8 +690,15 @@ def ensure_permission(user: UserContext, permission: str, action_label: str) -> 
     return False
 
 
-def require_authenticated_session(*, allow_bootstrap_if_no_users: bool = False) -> bool:
+def require_authenticated_session(
+    *,
+    allow_bootstrap_if_no_users: bool = False,
+    allow_oauth_callback_query: bool = False,
+) -> bool:
     if not settings.app_require_password_auth:
+        return True
+
+    if allow_oauth_callback_query and _has_oauth_callback_query_params():
         return True
 
     users_count = int(st.session_state.get("auth_users_count") or 0)
@@ -661,6 +739,7 @@ def auth_debug_snapshot() -> dict[str, object]:
         "cookie_token_expires_at": int(cookie_claims.get("exp") or 0) if cookie_claims else 0,
         "cookie_claim_username": str(cookie_claims.get("username") or "") if cookie_claims else "",
         "query_token_present": bool(query_token),
+        "query_fallback_enabled": bool(_is_query_token_fallback_enabled()),
         "query_token_valid": bool(query_claims and int(query_claims.get("exp") or 0) > now_ts),
         "query_token_expires_at": int(query_claims.get("exp") or 0) if query_claims else 0,
         "query_claim_username": str(query_claims.get("username") or "") if query_claims else "",

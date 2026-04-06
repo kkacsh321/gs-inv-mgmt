@@ -30,6 +30,31 @@ Status key:
   - Tax-treatment posting audit context and immutable document-artifact retention are implemented in-app.
   - Remaining: legal/tax policy sign-off, retention policy sign-off, and production role-control sign-off.
 
+## Readiness Audit Pass (2026-04-05, Local Environment)
+
+This is a code/config-derived prefill to accelerate owner/evidence completion.
+
+| Area | Current Status | Evidence (Current) | Gap to Close |
+|---|---|---|---|
+| QA unit/integration baseline | In Progress | `python -m unittest tests.test_sync_jobs tests.test_sync_runner tests.test_ebay_view` passed; `python -m unittest tests.test_config` passed | Attach CI run URL/artifact for release candidate |
+| Coverage gates | Implemented | V1 checklist shows global/scoped gates enforced (`>=30%` global, `>=85%` scoped-core) | Ratchet toward release target and attach latest coverage artifact |
+| Playwright critical suite | In Progress | Prior local evidence indicates critical chromium suite passing; CI evidence step present | Run full Playwright suite in CI for current release tag/branch and attach link |
+| eBay OAuth in-app flow | Implemented | In-app callback code exchange + token persistence is implemented | Validate in Dev/Prod account contexts and attach screenshots/log evidence |
+| eBay connection health telemetry | Implemented, not active locally | `ebay_connection_health_check` job + status cards added | Enable scheduler in target env (`SYNC_RUNNER_ENABLED=true`) and collect first health run evidence |
+| Sync worker scheduler | Blocked locally by config | `.env` currently `SYNC_RUNNER_ENABLED=false` | Enable in Dev/Prod and verify cadence jobs execute |
+| Session persistence across restart | Blocked locally by config | `.env` currently `APP_AUTH_COOKIE_ENABLED=false` | Enable cookie-backed remember mode in target env and capture restart persistence evidence |
+| eBay environment fidelity | Local test mode only | `.env` currently `EBAY_ENVIRONMENT=sandbox` | Validate full prod account flow in Dev/Prod with production eBay credentials and policies |
+| Shipping live-provider validation | Not Started | Label queue + adapter/test controls implemented | Execute Admin live validation runs in Dev and Prod; attach exported evidence |
+| Backup/restore drill evidence | Not Started | Backup/DR tooling implemented per V1 checklist | Execute Dev/Prod drill runs and attach artifacts + RTO notes |
+| Legal/tax sign-offs | Not Started | Commerce legal sign-off tracker implemented | Complete policy owner/date/evidence entries in Admin and export evidence pack |
+
+### Immediate Next Actions (P0)
+- [ ] Enable sync runner in target environment and capture first successful `ebay_connection_health_check` + `ebay_orders_pull_import` runs.
+- [ ] Enable cookie auth in target environment and validate login persistence across app/container restart.
+- [ ] Execute live shipping provider validation run (Dev first), export evidence, then repeat for Prod.
+- [ ] Run release-candidate QA workflow (unit + Playwright), attach `qa-evidence` artifact link.
+- [ ] Export and attach `Go-Live Evidence Pack (ZIP)` after above validations.
+
 ## Priority Remaining Focus (Next Execution Window)
 - [x] Implement CI coverage gates (current: global `>=30%`, scoped-core `>=85%`) and publish coverage artifacts on QA runs.
 - [x] Expand test coverage on core business modules (`repository/services/auth/validation/security`) toward scoped-core `>=95%`.

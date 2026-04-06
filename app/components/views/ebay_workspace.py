@@ -22,6 +22,42 @@ from app.services.runtime_settings import get_runtime_str
 from app.utils.time import utc_today
 
 
+def _read_query_param(name: str) -> str:
+    params = getattr(st, "query_params", None)
+    if params is None:
+        return ""
+    try:
+        value = params.get(name, "")
+    except Exception:
+        return ""
+    if isinstance(value, list):
+        return str(value[0]).strip() if value else ""
+    return str(value).strip()
+
+
+def _render_oauth_callback_banner() -> None:
+    oauth_code = _read_query_param("code")
+    oauth_state = _read_query_param("state")
+    oauth_error = _read_query_param("error")
+    oauth_error_desc = _read_query_param("error_description")
+    oauth_expires = _read_query_param("expires_in")
+
+    if oauth_error:
+        details = f"{oauth_error}: {oauth_error_desc}".strip(": ").strip()
+        st.error(f"OAuth callback received from eBay with an error. {details}")
+        return
+    if not oauth_code and not oauth_state:
+        return
+
+    state_preview = f"{oauth_state[:8]}..." if oauth_state else "(missing)"
+    expiry_note = f" Code expires in ~{oauth_expires}s." if oauth_expires else ""
+    st.success(
+        "OAuth callback received from eBay. "
+        f"State: `{state_preview}`.{expiry_note} "
+        "Continue in the Integration tab to complete token exchange."
+    )
+
+
 def _listing_format_hint(row, *, default_format_type: str, default_auction_duration: str) -> str:
     if (row.marketplace or "").strip().lower() != "ebay":
         return ""
@@ -191,6 +227,8 @@ def render_ebay_workspace(repo: InventoryRepository) -> None:
     user = current_user()
     st.subheader("eBay Workspace")
     st.caption("Unified eBay workspace for integration setup, listing operations, and daily execution.")
+    st.page_link("pages/24_eBay_User_Details.py", label="Open eBay User Details", icon=":material/badge:")
+    _render_oauth_callback_banner()
     render_help_panel(
         section_title="eBay Workspace",
         goal="Run eBay integration checks and daily listing operations from one consolidated workspace.",

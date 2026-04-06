@@ -19,6 +19,7 @@ from alembic.script import ScriptDirectory
 
 from app.auth import DEFAULT_PERMISSIONS, auth_debug_snapshot, current_user, ensure_permission
 from app.components.views.shared import handoff_to_documents_draft, render_help_panel
+from app.components.views.ebay import render_ebay_connection_status_card
 from app.components.views.system_health import render_system_health
 from app.config import settings
 from app.db.migrate import downgrade as migrate_downgrade
@@ -250,6 +251,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Application build git SHA (for deployment traceability).",
         },
         {
+            "key": "auth_query_token_fallback_enabled",
+            "value": "true" if getattr(settings, "app_auth_query_token_fallback_enabled", True) else "false",
+            "value_type": "bool",
+            "description": "Enable URL `?auth=` remember-token fallback when cookie session persistence is unavailable.",
+        },
+        {
             "key": "comp_web_fallback_enabled",
             "value": "true" if settings.comp_web_fallback_enabled else "false",
             "value_type": "bool",
@@ -364,10 +371,28 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Default eBay workspace store profile alias loaded on workspace start.",
         },
         {
+            "key": "ebay_auth_accepted_url",
+            "value": settings.ebay_auth_accepted_url_effective,
+            "value_type": "str",
+            "description": "eBay developer portal accepted callback URL.",
+        },
+        {
+            "key": "ebay_auth_declined_url",
+            "value": settings.ebay_auth_declined_url_effective,
+            "value_type": "str",
+            "description": "eBay developer portal declined callback URL.",
+        },
+        {
             "key": "ebay_user_access_token",
             "value": settings.ebay_user_access_token,
             "value_type": "str",
             "description": "Default eBay user access token used in forms.",
+        },
+        {
+            "key": "ebay_user_refresh_token",
+            "value": settings.ebay_user_refresh_token,
+            "value_type": "str",
+            "description": "Default eBay user refresh token used for access token renewal.",
         },
         {
             "key": "spot_price_provider",
@@ -434,6 +459,20 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "true" if settings.sync_job_ebay_shipping_tracking_push_enabled else "false",
             "value_type": "bool",
             "description": "Enable/disable eBay tracking push job.",
+        },
+        {
+            "key": "sync_job_ebay_connection_health_check_enabled",
+            "value": "true"
+            if getattr(settings, "sync_job_ebay_connection_health_check_enabled", True)
+            else "false",
+            "value_type": "bool",
+            "description": "Enable/disable scheduled eBay connection health-check job.",
+        },
+        {
+            "key": "sync_job_ebay_connection_health_check_interval_minutes",
+            "value": str(int(getattr(settings, "sync_job_ebay_connection_health_check_interval_minutes", 30))),
+            "value_type": "int",
+            "description": "Minimum minutes between scheduled eBay connection health checks.",
         },
         {
             "key": "sync_job_quickbooks_export_enabled",
@@ -5898,7 +5937,19 @@ def render_admin(repo: InventoryRepository) -> None:
     with tab_ebay_verify:
         st.markdown("### eBay API Verification")
         st.caption("Validate eBay credentials and confirm token/API calls succeed from this runtime.")
+        st.markdown("### Connection Status")
+        render_ebay_connection_status_card(repo)
         client = EbayClient()
+        ebay_auth_accepted_url = get_runtime_str(
+            repo,
+            "ebay_auth_accepted_url",
+            settings.ebay_auth_accepted_url_effective,
+        ).strip()
+        ebay_auth_declined_url = get_runtime_str(
+            repo,
+            "ebay_auth_declined_url",
+            settings.ebay_auth_declined_url_effective,
+        ).strip()
 
         st.dataframe(
             pd.DataFrame(
@@ -5920,17 +5971,168 @@ def render_admin(repo: InventoryRepository) -> None:
                         "value": settings.ebay_ru_name or "(not set)",
                     },
                     {
+                        "field": "Auth Accepted URL",
+                        "value": ebay_auth_accepted_url or "(not set)",
+                    },
+                    {
+                        "field": "Auth Declined URL",
+                        "value": ebay_auth_declined_url or "(not set)",
+                    },
+                    {
                         "field": "User Access Token",
                         "value": "set" if settings.ebay_user_access_token.strip() else "(not set)",
+                    },
+                    {
+                        "field": "User Refresh Token",
+                        "value": "set"
+                        if get_runtime_str(
+                            repo,
+                            "ebay_user_refresh_token",
+                            settings.ebay_user_refresh_token,
+                        ).strip()
+                        else "(not set)",
                     },
                     {
                         "field": "Configured",
                         "value": "yes" if client.is_configured() else "no",
                     },
+                    {
+                        "field": "Auth Query Fallback",
+                        "value": "enabled"
+                        if get_runtime_bool(
+                            repo,
+                            "auth_query_token_fallback_enabled",
+                            getattr(settings, "app_auth_query_token_fallback_enabled", True),
+                        )
+                        else "disabled",
+                    },
                 ]
             ),
             use_container_width=True,
         )
+        expected_callback_host = {
+            "prod": "inventory.goldenstackers.com",
+            "production": "inventory.goldenstackers.com",
+            "dev": "dev-inventory.goldenstackers.com",
+            "development": "dev-inventory.goldenstackers.com",
+            "staging": "dev-inventory.goldenstackers.com",
+            "local": "localhost:8501",
+        }.get((settings.app_env or "").strip().lower(), "")
+        accepted_parsed = urlparse(ebay_auth_accepted_url or "")
+        declined_parsed = urlparse(ebay_auth_declined_url or "")
+        accepted_path = (accepted_parsed.path or "").strip()
+        declined_path = (declined_parsed.path or "").strip()
+        accepted_host = (accepted_parsed.netloc or "").strip()
+        declined_host = (declined_parsed.netloc or "").strip()
+        readiness_checks = [
+            {
+                "check": "Client ID present",
+                "status": "pass" if bool(settings.ebay_client_id.strip()) else "fail",
+                "details": "Configured" if settings.ebay_client_id.strip() else "Missing EBAY_CLIENT_ID",
+            },
+            {
+                "check": "Client Secret present",
+                "status": "pass" if bool(settings.ebay_client_secret.strip()) else "fail",
+                "details": "Configured" if settings.ebay_client_secret.strip() else "Missing EBAY_CLIENT_SECRET",
+            },
+            {
+                "check": "RU Name present",
+                "status": "pass" if bool(settings.ebay_ru_name.strip()) else "fail",
+                "details": settings.ebay_ru_name.strip() if settings.ebay_ru_name.strip() else "Missing EBAY_RU_NAME",
+            },
+            {
+                "check": "Accepted callback URL set",
+                "status": "pass" if bool(ebay_auth_accepted_url) else "fail",
+                "details": ebay_auth_accepted_url or "(not set)",
+            },
+            {
+                "check": "Declined callback URL set",
+                "status": "pass" if bool(ebay_auth_declined_url) else "fail",
+                "details": ebay_auth_declined_url or "(not set)",
+            },
+            {
+                "check": "Accepted callback path",
+                "status": "pass" if accepted_path == "/eBay_Workspace" else "warn",
+                "details": accepted_path or "(missing path)",
+            },
+            {
+                "check": "Declined callback path",
+                "status": "pass" if declined_path == "/eBay_Workspace" else "warn",
+                "details": declined_path or "(missing path)",
+            },
+            {
+                "check": "Accepted/Declined URL consistency",
+                "status": "pass" if ebay_auth_accepted_url == ebay_auth_declined_url else "warn",
+                "details": "Same URL" if ebay_auth_accepted_url == ebay_auth_declined_url else "URLs differ",
+            },
+            {
+                "check": "Callback host matches environment",
+                "status": (
+                    "pass"
+                    if (
+                        expected_callback_host
+                        and accepted_host == expected_callback_host
+                        and declined_host == expected_callback_host
+                    )
+                    else "warn"
+                ),
+                "details": (
+                    f"accepted={accepted_host or '(missing)'} | declined={declined_host or '(missing)'} | "
+                    f"expected={expected_callback_host or '(unknown)'}"
+                ),
+            },
+            {
+                "check": "Client config complete",
+                "status": "pass" if client.is_configured() else "fail",
+                "details": "Ready for OAuth/app-token calls." if client.is_configured() else "Missing required keyset values.",
+            },
+        ]
+        readiness_df = pd.DataFrame(readiness_checks)
+        pass_count = int((readiness_df["status"] == "pass").sum())
+        warn_count = int((readiness_df["status"] == "warn").sum())
+        fail_count = int((readiness_df["status"] == "fail").sum())
+        st.markdown("#### OAuth Readiness Check")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Pass", pass_count)
+        r2.metric("Warn", warn_count)
+        r3.metric("Fail", fail_count)
+        st.dataframe(readiness_df, use_container_width=True, hide_index=True)
+        if fail_count > 0:
+            st.error("Resolve failed checks before starting OAuth authorization.")
+        elif warn_count > 0:
+            st.warning("OAuth can proceed, but warning checks may cause callback or session issues.")
+        else:
+            st.success("OAuth readiness checks passed.")
+
+        recent_verify_feedback: list[dict[str, Any]] = []
+        try:
+            audit_rows = repo.list_audit_logs(limit=500)
+            for row in audit_rows:
+                if str(getattr(row, "entity_type", "") or "").strip().lower() != "ebay_verify":
+                    continue
+                payload = _audit_changes(row)
+                recent_verify_feedback.append(
+                    {
+                        "at": row.created_at,
+                        "actor": str(getattr(row, "actor", "") or "").strip(),
+                        "action": str(getattr(row, "action", "") or "").strip(),
+                        "status": str(payload.get("status") or "").strip(),
+                        "resolved_user": str(payload.get("resolved_user") or "").strip(),
+                        "seller_registered": bool(payload.get("seller_registered"))
+                        if payload.get("seller_registered") is not None
+                        else "",
+                        "message": str(payload.get("message") or "").strip(),
+                    }
+                )
+                if len(recent_verify_feedback) >= 50:
+                    break
+        except Exception:
+            recent_verify_feedback = []
+        if recent_verify_feedback:
+            st.caption("Recent Verification Feedback")
+            st.dataframe(pd.DataFrame(recent_verify_feedback), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Recent Verification Feedback: no verification events recorded yet.")
 
         if not client.is_configured():
             st.warning("Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET, and EBAY_RU_NAME before running verification.")
@@ -5949,6 +6151,21 @@ def render_admin(repo: InventoryRepository) -> None:
                 try:
                     token_payload = client.fetch_application_token(scopes=[scope])
                     st.success("App token request succeeded. eBay keys are valid for this environment.")
+                    try:
+                        repo.record_audit_event(
+                            entity_type="ebay_verify",
+                            entity_id=None,
+                            action="app_token_verify",
+                            actor=user.username,
+                            changes={
+                                "status": "success",
+                                "scope": str(scope or "").strip(),
+                                "expires_in": token_payload.get("expires_in"),
+                                "message": "App token request succeeded.",
+                            },
+                        )
+                    except Exception:
+                        pass
                     st.json(
                         {
                             "token_type": token_payload.get("token_type"),
@@ -5958,25 +6175,265 @@ def render_admin(repo: InventoryRepository) -> None:
                     )
                 except Exception as exc:
                     st.error(f"App token verification failed: {exc}")
+                    try:
+                        repo.record_audit_event(
+                            entity_type="ebay_verify",
+                            entity_id=None,
+                            action="app_token_verify",
+                            actor=user.username,
+                            changes={
+                                "status": "error",
+                                "scope": str(scope or "").strip(),
+                                "message": str(exc),
+                            },
+                        )
+                    except Exception:
+                        pass
 
             st.caption("Step 2: Optional user-token API check (Sell Account privileges endpoint).")
             verify_user_token = st.text_area(
                 "Access Token",
                 height=120,
                 key="admin_ebay_verify_user_token",
-                value=settings.ebay_user_access_token,
+                value=get_runtime_str(
+                    repo,
+                    "ebay_user_access_token",
+                    settings.ebay_user_access_token,
+                ),
                 help="Paste a user OAuth access token from eBay OAuth code exchange.",
+            )
+            verify_refresh_token = st.text_area(
+                "Refresh Token (optional but recommended)",
+                height=120,
+                key="admin_ebay_verify_refresh_token",
+                value=get_runtime_str(
+                    repo,
+                    "ebay_user_refresh_token",
+                    settings.ebay_user_refresh_token,
+                ),
+                help="Used to auto-renew short-lived access tokens when they expire.",
             )
             if st.button("Verify User Token API Access", key="admin_ebay_verify_user_token_button"):
                 if not verify_user_token.strip():
                     st.error("Paste an access token first.")
                 else:
                     try:
-                        privileges = client.get_account_privileges(verify_user_token.strip())
+                        token_text = verify_user_token.strip()
+                        claims = client.decode_access_token_claims(token_text)
+                        privileges = client.get_account_privileges(token_text)
+                        identity_payload: dict[str, Any] = {}
+                        identity_error = ""
+                        try:
+                            identity_payload = client.get_identity_user(token_text)
+                        except Exception as exc:
+                            identity_error = str(exc)
+                        username_hint = (
+                            str(
+                                claims.get("preferred_username")
+                                or claims.get("username")
+                                or claims.get("user_name")
+                                or claims.get("sub")
+                                or ""
+                            ).strip()
+                        )
+                        if not username_hint:
+                            username_hint = str(
+                                identity_payload.get("username")
+                                or identity_payload.get("userId")
+                                or identity_payload.get("userID")
+                                or identity_payload.get("individualAccount", {}).get("email")
+                                or ""
+                            ).strip()
+                        seller_registration_completed = bool(privileges.get("sellerRegistrationCompleted"))
+                        token_scope = str(claims.get("scope") or "").strip()
+                        token_exp = claims.get("exp")
+                        token_iat = claims.get("iat")
+
                         st.success("User token API call succeeded.")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Resolved User", username_hint or "(unknown)")
+                        c2.metric(
+                            "Seller Registered",
+                            "yes" if seller_registration_completed else "no",
+                        )
+                        c3.metric("Token Scope Present", "yes" if token_scope else "no")
+                        c4.metric("JWT Claims Parsed", "yes" if claims else "no")
+
+                        feedback_rows = [
+                            {
+                                "check": "Token parse",
+                                "status": "pass" if claims else "warn",
+                                "details": "JWT claims parsed successfully."
+                                if claims
+                                else "Could not parse JWT claims; token may be opaque or non-JWT.",
+                            },
+                            {
+                                "check": "User identity",
+                                "status": "pass" if username_hint else "warn",
+                                "details": username_hint
+                                if username_hint
+                                else "No username/sub claim found in token payload.",
+                            },
+                            {
+                                "check": "Privileges endpoint",
+                                "status": "pass",
+                                "details": "Sell Account privileges endpoint returned successfully.",
+                            },
+                            {
+                                "check": "Identity endpoint",
+                                "status": "pass" if identity_payload else ("warn" if identity_error else "info"),
+                                "details": (
+                                    f"Resolved via Identity API: {username_hint or '(no username field)'}"
+                                    if identity_payload
+                                    else (
+                                        f"Identity API check did not return user details: {identity_error}"
+                                        if identity_error
+                                        else "Identity API check not run."
+                                    )
+                                ),
+                            },
+                            {
+                                "check": "Seller registration",
+                                "status": "pass" if seller_registration_completed else "warn",
+                                "details": "sellerRegistrationCompleted=true"
+                                if seller_registration_completed
+                                else "sellerRegistrationCompleted=false (seller operations may be blocked).",
+                            },
+                            {
+                                "check": "Token timing",
+                                "status": "info",
+                                "details": f"iat={token_iat or '(missing)'}, exp={token_exp or '(missing)'}",
+                            },
+                        ]
+                        st.caption("Verification Feedback")
+                        st.dataframe(pd.DataFrame(feedback_rows), use_container_width=True, hide_index=True)
+                        if not seller_registration_completed:
+                            st.warning(
+                                "Seller registration is not completed for this token/account. "
+                                "Publishing/policy operations may fail until onboarding is complete."
+                            )
+                        try:
+                            repo.upsert_runtime_setting(
+                                environment=settings.app_env,
+                                key="ebay_user_access_token",
+                                value=token_text,
+                                value_type="str",
+                                description="Default eBay user access token used by verification and sync jobs.",
+                                actor=user.username,
+                            )
+                            if verify_refresh_token.strip():
+                                repo.upsert_runtime_setting(
+                                    environment=settings.app_env,
+                                    key="ebay_user_refresh_token",
+                                    value=verify_refresh_token.strip(),
+                                    value_type="str",
+                                    description="Default eBay user refresh token used to renew access tokens.",
+                                    actor=user.username,
+                                )
+                            st.caption("Verified tokens were persisted to runtime settings for this environment.")
+                        except Exception:
+                            pass
+                        try:
+                            repo.record_audit_event(
+                                entity_type="ebay_verify",
+                                entity_id=None,
+                                action="user_token_verify",
+                                actor=user.username,
+                                changes={
+                                    "status": "success",
+                                    "resolved_user": username_hint,
+                                    "seller_registered": seller_registration_completed,
+                                    "token_scope_present": bool(token_scope),
+                                    "claims_parsed": bool(claims),
+                                    "identity_resolved": bool(identity_payload),
+                                    "identity_error": identity_error,
+                                    "message": "User token privileges check succeeded.",
+                                },
+                            )
+                        except Exception:
+                            pass
                         st.json(privileges)
+                        with st.expander("Decoded Token Claims", expanded=False):
+                            st.json(claims or {"note": "No decodable JWT claims found."})
+                        with st.expander("Identity API Response", expanded=False):
+                            if identity_payload:
+                                st.json(identity_payload)
+                            else:
+                                st.json(
+                                    {
+                                        "note": "Identity endpoint did not return payload.",
+                                        "error": identity_error or "",
+                                    }
+                                )
                     except Exception as exc:
-                        st.error(f"User token verification failed: {exc}")
+                        refreshed_retry_ok = False
+                        refresh_error = ""
+                        refreshed_access = ""
+                        if verify_refresh_token.strip():
+                            try:
+                                refreshed = client.refresh_user_token(verify_refresh_token.strip())
+                                refreshed_access = str(refreshed.get("access_token") or "").strip()
+                                rotated_refresh = str(refreshed.get("refresh_token") or "").strip()
+                                expires_in = int(refreshed.get("expires_in") or 0)
+                                if refreshed_access:
+                                    repo.upsert_runtime_setting(
+                                        environment=settings.app_env,
+                                        key="ebay_user_access_token",
+                                        value=refreshed_access,
+                                        value_type="str",
+                                        description="Default eBay user access token used in forms.",
+                                        actor=user.username,
+                                    )
+                                    if rotated_refresh:
+                                        repo.upsert_runtime_setting(
+                                            environment=settings.app_env,
+                                            key="ebay_user_refresh_token",
+                                            value=rotated_refresh,
+                                            value_type="str",
+                                            description="Default eBay user refresh token used for access token renewal.",
+                                            actor=user.username,
+                                        )
+                                    if expires_in > 0:
+                                        repo.upsert_runtime_setting(
+                                            environment=settings.app_env,
+                                            key="ebay_user_access_token_expires_at",
+                                            value=(
+                                                utcnow_naive() + timedelta(seconds=max(0, expires_in - 120))
+                                            ).isoformat(timespec="seconds"),
+                                            value_type="str",
+                                            description="Best-effort expiry timestamp for current eBay user access token.",
+                                            actor=user.username,
+                                        )
+                                    st.session_state["admin_ebay_verify_user_token"] = refreshed_access
+                                    retry_privileges = client.get_account_privileges(refreshed_access)
+                                    refreshed_retry_ok = True
+                                    st.success("Token was expired; refreshed successfully and verification now passed.")
+                                    st.json(retry_privileges)
+                            except Exception as refresh_exc:
+                                refresh_error = str(refresh_exc)
+                        if not refreshed_retry_ok:
+                            st.error(f"User token verification failed: {exc}")
+                            if verify_refresh_token.strip():
+                                st.warning(f"Refresh attempt failed: {refresh_error or 'unknown error'}")
+                        try:
+                            repo.record_audit_event(
+                                entity_type="ebay_verify",
+                                entity_id=None,
+                                action="user_token_verify",
+                                actor=user.username,
+                                changes={
+                                    "status": "success" if refreshed_retry_ok else "error",
+                                    "message": (
+                                        "Recovered by refresh token retry."
+                                        if refreshed_retry_ok
+                                        else str(exc)
+                                    ),
+                                    "refresh_attempted": bool(verify_refresh_token.strip()),
+                                    "refresh_error": refresh_error,
+                                },
+                            )
+                        except Exception:
+                            pass
 
     with tab_ai_runtime:
         st.markdown("### AI Provider Runtime")
@@ -11106,6 +11563,7 @@ def render_admin(repo: InventoryRepository) -> None:
         env_map = {
             "ebay_orders_pull_import": "SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_ENABLED",
             "ebay_shipping_tracking_push": "SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED",
+            "ebay_connection_health_check": "SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_ENABLED",
             "quickbooks_export": "SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED",
             "shopify_orders_pull": "SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED",
         }
@@ -11134,6 +11592,27 @@ def render_admin(repo: InventoryRepository) -> None:
             desired_tracking_push = st.checkbox(
                 "Enable eBay shipping tracking push",
                 value=bool(is_sync_job_enabled("ebay_shipping_tracking_push", repo=repo)),
+            )
+            desired_connection_health_check = st.checkbox(
+                "Enable eBay connection health check",
+                value=bool(is_sync_job_enabled("ebay_connection_health_check", repo=repo)),
+            )
+            desired_connection_health_check_interval_minutes = st.number_input(
+                "eBay connection health check interval (minutes)",
+                min_value=5,
+                max_value=24 * 60,
+                value=max(
+                    5,
+                    min(
+                        24 * 60,
+                        get_runtime_int(
+                            repo,
+                            "sync_job_ebay_connection_health_check_interval_minutes",
+                            int(getattr(settings, "sync_job_ebay_connection_health_check_interval_minutes", 30)),
+                        ),
+                    ),
+                ),
+                step=5,
             )
             desired_quickbooks_export = st.checkbox(
                 "Enable QuickBooks export (future job)",
@@ -11190,6 +11669,24 @@ def render_admin(repo: InventoryRepository) -> None:
                     value="true" if desired_tracking_push else "false",
                     value_type="bool",
                     description="Enable/disable eBay shipping tracking push job.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="sync_job_ebay_connection_health_check_enabled",
+                    value="true" if desired_connection_health_check else "false",
+                    value_type="bool",
+                    description="Enable/disable eBay connection health-check job.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="sync_job_ebay_connection_health_check_interval_minutes",
+                    value=str(int(desired_connection_health_check_interval_minutes)),
+                    value_type="int",
+                    description="Minimum minutes between scheduled eBay connection health checks.",
                     is_active=True,
                     actor=user.username,
                 )
@@ -11256,6 +11753,8 @@ def render_admin(repo: InventoryRepository) -> None:
             snippet = (
                 f"SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_ENABLED={'true' if desired_orders_pull else 'false'}\n"
                 f"SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED={'true' if desired_tracking_push else 'false'}\n"
+                f"SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_ENABLED={'true' if desired_connection_health_check else 'false'}\n"
+                f"SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_INTERVAL_MINUTES={int(desired_connection_health_check_interval_minutes)}\n"
                 f"SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED={'true' if desired_quickbooks_export else 'false'}\n"
                 f"SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED={'true' if desired_shopify_pull else 'false'}\n"
                 "# Governance snapshot scheduler is runtime-only (DB-backed):\n"

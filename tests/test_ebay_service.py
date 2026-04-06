@@ -82,12 +82,49 @@ class EbayClientTests(unittest.TestCase):
         self.assertEqual(app_tok["token_type"], "Bearer")
         self.assertIn("client_credentials", str(post.call_args.kwargs["data"]))
 
+    def test_refresh_user_token(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        with patch(
+            "app.services.ebay.requests.post",
+            return_value=_FakeResponse(payload={"access_token": "newtok", "refresh_token": "newref", "expires_in": 7200}),
+        ) as post:
+            out = client.refresh_user_token("oldref")
+        self.assertEqual(out.get("access_token"), "newtok")
+        payload = post.call_args.kwargs["data"]
+        self.assertEqual(payload.get("grant_type"), "refresh_token")
+        self.assertEqual(payload.get("refresh_token"), "oldref")
+
     def test_get_account_privileges(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
         with patch("app.services.ebay.requests.get", return_value=_FakeResponse(payload={"privileges": []})):
             out = client.get_account_privileges("tok")
         self.assertIn("privileges", out)
+
+    def test_get_identity_user(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(payload={"username": "sandbox-user-1"}),
+        ):
+            out = client.get_identity_user("tok")
+        self.assertEqual(out.get("username"), "sandbox-user-1")
+
+    def test_decode_access_token_claims(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        token = "a.eyJzdWIiOiJ1c2VyLTEyMyIsInByZWZlcnJlZF91c2VybmFtZSI6ImVheS11c2VyIiwiZXhwIjoxNzAwMDAwMDAwfQ.b"
+        claims = client.decode_access_token_claims(token)
+        self.assertEqual(claims.get("sub"), "user-123")
+        self.assertEqual(claims.get("preferred_username"), "eay-user")
+        self.assertEqual(claims.get("exp"), 1700000000)
+
+    def test_decode_access_token_claims_invalid_returns_empty(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        self.assertEqual(client.decode_access_token_claims("not-a-jwt"), {})
 
     def test_policy_list_calls(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):

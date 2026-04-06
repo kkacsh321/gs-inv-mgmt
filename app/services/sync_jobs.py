@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+import json
 
 from sqlalchemy import select
 
@@ -12,6 +13,97 @@ from app.services.ebay import EbayClient
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
 from app.services.slack_notify import build_slack_alert_text, dispatch_slack_alert, resolve_slack_notify_config
 from app.utils.time import utcnow_naive
+
+
+def _is_ebay_auth_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in {401, 403}:
+        return True
+    message = str(exc or "").lower()
+    if "token" in message and ("expired" in message or "invalid" in message):
+        return True
+    return False
+
+
+def _resolve_ebay_tokens(
+    repo: InventoryRepository,
+    *,
+    access_token: str = "",
+) -> tuple[str, str]:
+    resolved_access = str(access_token or "").strip() or get_runtime_str(
+        repo,
+        "ebay_user_access_token",
+        settings.ebay_user_access_token,
+    ).strip()
+    resolved_refresh = get_runtime_str(
+        repo,
+        "ebay_user_refresh_token",
+        settings.ebay_user_refresh_token,
+    ).strip()
+    return resolved_access, resolved_refresh
+
+
+def _persist_ebay_tokens(
+    repo: InventoryRepository,
+    *,
+    actor: str,
+    access_token: str,
+    refresh_token: str = "",
+    expires_in: int = 0,
+) -> None:
+    try:
+        if access_token:
+            repo.upsert_runtime_setting(
+                environment=settings.app_env,
+                key="ebay_user_access_token",
+                value=access_token,
+                value_type="str",
+                description="Default eBay user access token used by verification and sync jobs.",
+                actor=actor,
+            )
+        if refresh_token:
+            repo.upsert_runtime_setting(
+                environment=settings.app_env,
+                key="ebay_user_refresh_token",
+                value=refresh_token,
+                value_type="str",
+                description="Default eBay user refresh token used to renew access tokens.",
+                actor=actor,
+            )
+        if expires_in and int(expires_in) > 0:
+            repo.upsert_runtime_setting(
+                environment=settings.app_env,
+                key="ebay_user_access_token_expires_at",
+                value=(utcnow_naive()).isoformat(timespec="seconds"),
+                value_type="str",
+                description="Best-effort timestamp when eBay access token was last refreshed.",
+                actor=actor,
+            )
+    except Exception:
+        pass
+
+
+def _refresh_ebay_access_token(
+    repo: InventoryRepository,
+    *,
+    ebay_client: EbayClient,
+    actor: str,
+    refresh_token: str,
+) -> tuple[str, str]:
+    payload = ebay_client.refresh_user_token(refresh_token)
+    new_access = str(payload.get("access_token") or "").strip()
+    if not new_access:
+        raise ValueError("eBay refresh token call returned no access_token.")
+    new_refresh = str(payload.get("refresh_token") or "").strip() or refresh_token
+    _persist_ebay_tokens(
+        repo,
+        actor=actor,
+        access_token=new_access,
+        refresh_token=new_refresh,
+        expires_in=int(payload.get("expires_in") or 0),
+    )
+    return new_access, new_refresh
 
 
 def _csv_set(value: str, default: set[str]) -> set[str]:
@@ -128,6 +220,14 @@ def sync_job_catalog(repo: InventoryRepository | None = None) -> list[dict[str, 
             "enabled": bool(is_sync_job_enabled("ebay_shipping_tracking_push", repo=repo)),
         },
         {
+            "job_name": "ebay_connection_health_check",
+            "provider": "ebay",
+            "direction": "pull",
+            "implemented": True,
+            "description": "Validate eBay token/identity/privileges and keep integration health current.",
+            "enabled": bool(is_sync_job_enabled("ebay_connection_health_check", repo=repo)),
+        },
+        {
             "job_name": "quickbooks_export",
             "provider": "quickbooks",
             "direction": "push",
@@ -166,6 +266,13 @@ def sync_job_dispatch_meta(job_name: str) -> dict[str, object]:
             "required_args": ["access_token"],
             "optional_args": ["sale_ids", "run_id", "retry_of_run_id"],
         }
+    if resolved == "ebay_connection_health_check":
+        return {
+            "supports_execute_now": True,
+            "supports_retry_execute_now": True,
+            "required_args": [],
+            "optional_args": ["access_token", "run_id", "retry_of_run_id", "client"],
+        }
     if resolved == "shopify_orders_pull":
         return {
             "supports_execute_now": True,
@@ -194,6 +301,9 @@ def is_sync_job_enabled(job_name: str, repo: InventoryRepository | None = None) 
         mapping = {
             "ebay_orders_pull_import": bool(settings.sync_job_ebay_orders_pull_import_enabled),
             "ebay_shipping_tracking_push": bool(settings.sync_job_ebay_shipping_tracking_push_enabled),
+            "ebay_connection_health_check": bool(
+                getattr(settings, "sync_job_ebay_connection_health_check_enabled", True)
+            ),
             "quickbooks_export": bool(settings.sync_job_quickbooks_export_enabled),
             "shopify_orders_pull": bool(settings.sync_job_shopify_orders_pull_enabled),
         }
@@ -208,6 +318,11 @@ def is_sync_job_enabled(job_name: str, repo: InventoryRepository | None = None) 
                 repo,
                 "sync_job_ebay_shipping_tracking_push_enabled",
                 bool(settings.sync_job_ebay_shipping_tracking_push_enabled),
+            ),
+            "ebay_connection_health_check": get_runtime_bool(
+                repo,
+                "sync_job_ebay_connection_health_check_enabled",
+                bool(getattr(settings, "sync_job_ebay_connection_health_check_enabled", True)),
             ),
             "quickbooks_export": get_runtime_bool(
                 repo,
@@ -267,8 +382,210 @@ def execute_sync_job(
             run_id=kwargs.get("run_id"),
             retry_of_run_id=kwargs.get("retry_of_run_id"),
         )
+    if resolved == "ebay_connection_health_check":
+        return execute_ebay_connection_health_check(
+            repo,
+            actor=actor,
+            access_token=str(kwargs.get("access_token") or "").strip(),
+            run_id=kwargs.get("run_id"),
+            retry_of_run_id=kwargs.get("retry_of_run_id"),
+            client=kwargs.get("client"),
+        )
 
     raise NotImplementedError(f"Sync job `{resolved}` is not implemented yet.")
+
+
+def execute_ebay_connection_health_check(
+    repo: InventoryRepository,
+    *,
+    actor: str,
+    access_token: str = "",
+    run_id: int | None = None,
+    retry_of_run_id: int | None = None,
+    client: EbayClient | None = None,
+) -> dict:
+    if not is_sync_job_enabled("ebay_connection_health_check", repo=repo):
+        raise ValueError("Sync job `ebay_connection_health_check` is disabled by configuration.")
+
+    ebay_client = client or EbayClient()
+    resolved_access, refresh_token = _resolve_ebay_tokens(repo, access_token=access_token)
+
+    if run_id is None:
+        run = repo.create_sync_run(
+            provider="ebay",
+            job_name="ebay_connection_health_check",
+            direction="pull",
+            status="queued",
+            retry_of_run_id=retry_of_run_id,
+            retry_count=1 if retry_of_run_id else 0,
+            notes="eBay connection health check queued.",
+            actor=actor,
+        )
+        run_id = int(run.id)
+
+    repo.update_sync_run(
+        int(run_id),
+        {
+            "status": "running",
+            "started_at": utcnow_naive(),
+            "notes": "eBay connection health check running.",
+        },
+        actor=actor,
+    )
+
+    checks: list[dict[str, object]] = []
+    failures: list[str] = []
+    warnings: list[str] = []
+    resolved_user = ""
+    seller_registered = False
+    token_scope_present = False
+    claims_parsed = False
+    token_refreshed = False
+
+    if not ebay_client.is_configured():
+        failures.append("eBay client keys/RU name are not configured.")
+        checks.append({"name": "client_configured", "status": "failed", "details": failures[-1]})
+    else:
+        checks.append({"name": "client_configured", "status": "pass", "details": "Client credentials configured."})
+
+    if not resolved_access:
+        failures.append("No eBay user access token found.")
+        checks.append({"name": "access_token", "status": "failed", "details": failures[-1]})
+    else:
+        claims = ebay_client.decode_access_token_claims(resolved_access)
+        claims_parsed = bool(claims)
+        scope_value = str(claims.get("scope") or "").strip()
+        token_scope_present = bool(scope_value)
+        if claims_parsed:
+            checks.append({"name": "token_claims", "status": "pass", "details": "JWT claims parsed."})
+        else:
+            warnings.append("Token claims were not parseable (opaque token is possible).")
+            checks.append({"name": "token_claims", "status": "warn", "details": warnings[-1]})
+
+        try:
+            privileges = ebay_client.get_account_privileges(resolved_access)
+        except Exception as exc:
+            if _is_ebay_auth_error(exc) and refresh_token:
+                try:
+                    refreshed_access, _new_refresh = _refresh_ebay_access_token(
+                        repo,
+                        ebay_client=ebay_client,
+                        actor=actor,
+                        refresh_token=refresh_token,
+                    )
+                    token_refreshed = True
+                    resolved_access = refreshed_access
+                    privileges = ebay_client.get_account_privileges(resolved_access)
+                    checks.append(
+                        {
+                            "name": "token_refresh",
+                            "status": "pass",
+                            "details": "Access token refreshed automatically.",
+                        }
+                    )
+                except Exception as refresh_exc:
+                    failures.append(f"Token refresh failed: {refresh_exc}")
+                    checks.append({"name": "token_refresh", "status": "failed", "details": failures[-1]})
+                    privileges = {}
+            else:
+                failures.append(f"Privileges check failed: {exc}")
+                checks.append({"name": "privileges_api", "status": "failed", "details": failures[-1]})
+                privileges = {}
+
+        if privileges:
+            seller_registered = bool(privileges.get("sellerRegistrationCompleted"))
+            checks.append({"name": "privileges_api", "status": "pass", "details": "Privileges endpoint returned."})
+            if not seller_registered:
+                warnings.append("sellerRegistrationCompleted=false (listing operations may be limited).")
+                checks.append({"name": "seller_registration", "status": "warn", "details": warnings[-1]})
+            else:
+                checks.append({"name": "seller_registration", "status": "pass", "details": "Seller registered."})
+
+            try:
+                identity_payload = ebay_client.get_identity_user(resolved_access)
+                resolved_user = str(
+                    identity_payload.get("username")
+                    or identity_payload.get("userId")
+                    or identity_payload.get("userID")
+                    or ""
+                ).strip()
+                checks.append(
+                    {
+                        "name": "identity_api",
+                        "status": "pass",
+                        "details": f"Identity resolved: {resolved_user or '(unknown)'}",
+                    }
+                )
+            except Exception as exc:
+                warnings.append(f"Identity API check failed: {exc}")
+                checks.append({"name": "identity_api", "status": "warn", "details": warnings[-1]})
+
+    status = "success"
+    if failures:
+        status = "failed"
+    elif warnings:
+        status = "partial"
+
+    payload = {
+        "checks": checks,
+        "failures": failures,
+        "warnings": warnings,
+        "resolved_user": resolved_user,
+        "seller_registered": bool(seller_registered),
+        "token_scope_present": bool(token_scope_present),
+        "claims_parsed": bool(claims_parsed),
+        "token_refreshed": bool(token_refreshed),
+    }
+    repo.add_sync_event(
+        sync_run_id=int(run_id),
+        entity_type="ebay_connection",
+        entity_id="health",
+        action="health_check",
+        status="ok" if status == "success" else ("warn" if status == "partial" else "error"),
+        message=f"eBay connection health check finished with status={status}.",
+        payload_json=json.dumps(payload),
+    )
+    for idx, msg in enumerate(failures[:10], start=1):
+        repo.add_sync_error(
+            sync_run_id=int(run_id),
+            code=f"health_failure_{idx}",
+            message=msg,
+            severity="error",
+            context_json=json.dumps(payload),
+        )
+
+    repo.update_sync_run(
+        int(run_id),
+        {
+            "status": status,
+            "records_processed": int(len(checks)),
+            "records_created": 0,
+            "records_updated": 0,
+            "records_failed": int(len(failures)),
+            "completed_at": utcnow_naive(),
+            "notes": (
+                f"health={status} user={resolved_user or '(unknown)'} "
+                f"seller_registered={'yes' if seller_registered else 'no'} "
+                f"token_scope_present={'yes' if token_scope_present else 'no'} "
+                f"claims_parsed={'yes' if claims_parsed else 'no'} "
+                f"token_refreshed={'yes' if token_refreshed else 'no'}"
+            ),
+        },
+        actor=actor,
+    )
+
+    return {
+        "run_id": int(run_id),
+        "status": status,
+        "processed": int(len(checks)),
+        "failed": int(len(failures)),
+        "warnings": int(len(warnings)),
+        "resolved_user": resolved_user,
+        "seller_registered": bool(seller_registered),
+        "token_scope_present": bool(token_scope_present),
+        "claims_parsed": bool(claims_parsed),
+        "token_refreshed": bool(token_refreshed),
+    }
 
 
 def execute_shopify_orders_pull_scaffold(
@@ -798,8 +1115,17 @@ def execute_ebay_orders_pull_import(
     if not is_sync_job_enabled("ebay_orders_pull_import", repo=repo):
         raise ValueError("Sync job `ebay_orders_pull_import` is disabled by configuration.")
     ebay_client = client or EbayClient()
-    if not access_token.strip():
+    resolved_access_token, refresh_token = _resolve_ebay_tokens(repo, access_token=access_token)
+    if not resolved_access_token and refresh_token:
+        resolved_access_token, refresh_token = _refresh_ebay_access_token(
+            repo,
+            ebay_client=ebay_client,
+            actor=actor,
+            refresh_token=refresh_token,
+        )
+    if not resolved_access_token.strip():
         raise ValueError("Access token is required.")
+    current_access_token = resolved_access_token.strip()
 
     if run_id is None:
         run = repo.create_sync_run(
@@ -825,7 +1151,19 @@ def execute_ebay_orders_pull_import(
     )
 
     try:
-        payload = ebay_client.pull_recent_orders(access_token.strip(), limit=int(limit), offset=int(offset))
+        try:
+            payload = ebay_client.pull_recent_orders(current_access_token, limit=int(limit), offset=int(offset))
+        except Exception as pull_exc:
+            if _is_ebay_auth_error(pull_exc) and refresh_token:
+                current_access_token, refresh_token = _refresh_ebay_access_token(
+                    repo,
+                    ebay_client=ebay_client,
+                    actor=actor,
+                    refresh_token=refresh_token,
+                )
+                payload = ebay_client.pull_recent_orders(current_access_token, limit=int(limit), offset=int(offset))
+            else:
+                raise
         orders = _extract_orders(payload)
         product_map = {p.sku: p.id for p in repo.db.scalars(select(Product)).all() if p.sku}
         product_id_to_sku = {pid: sku for sku, pid in product_map.items()}
@@ -860,17 +1198,39 @@ def execute_ebay_orders_pull_import(
         for order in orders:
             external_order_id = str(order.get("orderId") or "").strip()
             try:
-                result = _upsert_ebay_order_into_local(
-                    repo,
-                    order,
-                    actor=actor,
-                    product_map=product_map,
-                    listing_map=listing_map,
-                    sku_listing_candidates=sku_listing_candidates,
-                    ebay_client=ebay_client,
-                    access_token=access_token.strip(),
-                    sync_run_id=run_id,
-                )
+                try:
+                    result = _upsert_ebay_order_into_local(
+                        repo,
+                        order,
+                        actor=actor,
+                        product_map=product_map,
+                        listing_map=listing_map,
+                        sku_listing_candidates=sku_listing_candidates,
+                        ebay_client=ebay_client,
+                        access_token=current_access_token,
+                        sync_run_id=run_id,
+                    )
+                except Exception as upsert_exc:
+                    if _is_ebay_auth_error(upsert_exc) and refresh_token:
+                        current_access_token, refresh_token = _refresh_ebay_access_token(
+                            repo,
+                            ebay_client=ebay_client,
+                            actor=actor,
+                            refresh_token=refresh_token,
+                        )
+                        result = _upsert_ebay_order_into_local(
+                            repo,
+                            order,
+                            actor=actor,
+                            product_map=product_map,
+                            listing_map=listing_map,
+                            sku_listing_candidates=sku_listing_candidates,
+                            ebay_client=ebay_client,
+                            access_token=current_access_token,
+                            sync_run_id=run_id,
+                        )
+                    else:
+                        raise
                 processed_count += 1
                 created_count += int(
                     result["orders_created"] + result["sales_created"] + result["listings_created"]
@@ -1024,8 +1384,17 @@ def execute_ebay_shipping_tracking_push(
     if not is_sync_job_enabled("ebay_shipping_tracking_push", repo=repo):
         raise ValueError("Sync job `ebay_shipping_tracking_push` is disabled by configuration.")
     ebay_client = client or EbayClient()
-    if not access_token.strip():
+    resolved_access_token, refresh_token = _resolve_ebay_tokens(repo, access_token=access_token)
+    if not resolved_access_token and refresh_token:
+        resolved_access_token, refresh_token = _refresh_ebay_access_token(
+            repo,
+            ebay_client=ebay_client,
+            actor=actor,
+            refresh_token=refresh_token,
+        )
+    if not resolved_access_token.strip():
         raise ValueError("Access token is required.")
+    current_access_token = resolved_access_token.strip()
     sale_ids = [int(sid) for sid in sale_ids if int(sid) > 0]
     if not sale_ids:
         raise ValueError("At least one sale ID is required.")
@@ -1105,34 +1474,49 @@ def execute_ebay_shipping_tracking_push(
             continue
 
         try:
-            order_payload = ebay_client.get_order(access_token=access_token, order_id=order_id)
-            line_items = order_payload.get("lineItems") if isinstance(order_payload, dict) else None
-            fulfillment_line_items: list[dict] = []
-            if isinstance(line_items, list):
-                for item in line_items:
-                    line_item_id = str(item.get("lineItemId") or "").strip()
-                    if not line_item_id:
-                        continue
-                    quantity = int(item.get("lineItemQuantity") or item.get("quantity") or 1)
-                    fulfillment_line_items.append(
-                        {
-                            "lineItemId": line_item_id,
-                            "quantity": max(1, quantity),
-                        }
-                    )
+            def _push_once(token_value: str) -> None:
+                order_payload = ebay_client.get_order(access_token=token_value, order_id=order_id)
+                line_items = order_payload.get("lineItems") if isinstance(order_payload, dict) else None
+                fulfillment_line_items: list[dict] = []
+                if isinstance(line_items, list):
+                    for item in line_items:
+                        line_item_id = str(item.get("lineItemId") or "").strip()
+                        if not line_item_id:
+                            continue
+                        quantity = int(item.get("lineItemQuantity") or item.get("quantity") or 1)
+                        fulfillment_line_items.append(
+                            {
+                                "lineItemId": line_item_id,
+                                "quantity": max(1, quantity),
+                            }
+                        )
 
-            shipped_at = sale.shipped_at or utcnow_naive()
-            payload = {
-                "lineItems": fulfillment_line_items,
-                "shippedDate": shipped_at.isoformat(timespec="seconds") + "Z",
-                "shippingCarrierCode": _ebay_carrier_code(sale.shipping_provider),
-                "trackingNumber": tracking,
-            }
-            ebay_client.create_shipping_fulfillment(
-                access_token=access_token,
-                order_id=order_id,
-                payload=payload,
-            )
+                shipped_at = sale.shipped_at or utcnow_naive()
+                payload = {
+                    "lineItems": fulfillment_line_items,
+                    "shippedDate": shipped_at.isoformat(timespec="seconds") + "Z",
+                    "shippingCarrierCode": _ebay_carrier_code(sale.shipping_provider),
+                    "trackingNumber": tracking,
+                }
+                ebay_client.create_shipping_fulfillment(
+                    access_token=token_value,
+                    order_id=order_id,
+                    payload=payload,
+                )
+
+            try:
+                _push_once(current_access_token)
+            except Exception as push_exc:
+                if _is_ebay_auth_error(push_exc) and refresh_token:
+                    current_access_token, refresh_token = _refresh_ebay_access_token(
+                        repo,
+                        ebay_client=ebay_client,
+                        actor=actor,
+                        refresh_token=refresh_token,
+                    )
+                    _push_once(current_access_token)
+                else:
+                    raise
             updated += 1
             repo.add_sync_event(
                 sync_run_id=run_id,

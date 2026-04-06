@@ -223,10 +223,14 @@
       - Added segmented suite runner (`scripts/run_test_suites.py`) with `fast` and `integration` selectors and new local task targets (`make qa-unit-fast`, `make qa-unit-integration`, task equivalents) to enable CI fan-out.
   - [x] Add unit tests for purchase-document extraction service (`app/services/purchase_doc_extraction.py`) including Textract payload mapping, line-item parsing, and merge behavior.
 
-## High-Priority Remaining (as of 2026-04-02)
+## High-Priority Remaining (as of 2026-04-05)
 - [~] GS-V10-006 QA automation + coverage hardening is now P0:
   - coverage baseline captured and improved (`~41.77%` global, `604` tests passing, scoped-core `~95.01%`);
   - interim gates are now enforced (`>=30%` global, `>=85%` scoped-core); next ratchets and broad core/e2e expansion remain.
+- [x] eBay connection health foundation implemented:
+  - Added scheduled `ebay_connection_health_check` sync job (token/identity/privileges checks with refresh-on-auth-failure path).
+  - Added shared eBay connection status card in eBay workspace + Admin eBay verify.
+  - Operational remaining: enable scheduler in target environment(s) and capture go-live evidence.
 - [x] GS-V10-002 implementation scope complete for now (live-provider execution validation remains tracked in `GO_LIVE_CHECKLIST.md`).
 - [x] GS-V10-003 implementation scope complete for now (ops execution/sign-off remains tracked in `GO_LIVE_CHECKLIST.md`).
 - [x] GS-V10-004 implementation scope complete for now (ops execution/sign-off remains tracked in `GO_LIVE_CHECKLIST.md`).

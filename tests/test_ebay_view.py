@@ -26,6 +26,8 @@ class _FakeSt:
         self.calls = []
         self._button_map = {}
         self._form_submit_map = {}
+        self.query_params = {}
+        self.last_text_input_value = None
 
     def set_button(self, label, value):
         self._button_map[label] = value
@@ -54,7 +56,11 @@ class _FakeSt:
     def link_button(self, *a, **k):
         self.calls.append(("link_button", a, k))
 
+    def code(self, *a, **k):
+        self.calls.append(("code", a, k))
+
     def text_input(self, _label, value="", **_kwargs):
+        self.last_text_input_value = value
         return value or ""
 
     def text_area(self, _label, height=None, key=None, help=None):
@@ -184,7 +190,7 @@ class EbayViewTests(unittest.TestCase):
 
         client = SimpleNamespace(
             is_configured=lambda: True,
-            authorize_url=lambda: "https://example.com/auth",
+            authorize_url=lambda state="": "https://example.com/auth",
             get_account_privileges=lambda token: {"ok": True},
             exchange_code_for_tokens=lambda code: {"access_token": "x"},
         )
@@ -217,6 +223,69 @@ class EbayViewTests(unittest.TestCase):
         self.assertTrue(run_job.called)
         self.assertTrue(any(c[0] == "success" for c in fake_st.calls))
         self.assertTrue(any(c[0] == "dataframe" for c in fake_st.calls))
+
+    def test_render_ebay_auto_exchanges_query_code(self):
+        fake_st = _FakeSt()
+        fake_st.query_params = {"code": "oauth-code-123", "state": "state-123"}
+        fake_st.session_state["ebay_oauth_state"] = "state-123"
+
+        client = SimpleNamespace(
+            is_configured=lambda: True,
+            authorize_url=lambda state="": "https://example.com/auth",
+            exchange_code_for_tokens=lambda code: {
+                "access_token": "acc-1",
+                "refresh_token": "ref-1",
+                "expires_in": 3600,
+            },
+            get_account_privileges=lambda token: {"ok": True},
+        )
+        repo = SimpleNamespace(
+            list_listings=lambda: [],
+            list_sync_runs=lambda provider=None, limit=200: [],
+            upsert_runtime_setting=lambda **kwargs: None,
+        )
+        user = SimpleNamespace(username="admin", role="admin")
+
+        with patch.object(ebay_view, "st", fake_st), \
+            patch.object(ebay_view, "current_user", return_value=user), \
+            patch.object(ebay_view, "is_sync_job_enabled", return_value=True), \
+            patch.object(ebay_view, "render_help_panel", return_value=None), \
+            patch.object(ebay_view, "render_active_ebay_context_banner", return_value=None), \
+            patch.object(ebay_view, "get_runtime_str", return_value=""):
+            ebay_view.render_ebay(client, repo)
+
+        self.assertEqual(fake_st.session_state.get("ebay_workspace_access_token"), "acc-1")
+        self.assertEqual(fake_st.session_state.get("ebay_verify_access_token"), "acc-1")
+        self.assertEqual(fake_st.session_state.get("ebay_pull_access_token"), "acc-1")
+        self.assertEqual(fake_st.query_params.get("code"), None)
+        self.assertTrue(any(c[0] == "rerun" for c in fake_st.calls))
+
+    def test_render_ebay_does_not_prefill_from_last_oauth_code_when_query_missing(self):
+        fake_st = _FakeSt()
+        fake_st.session_state["ebay_oauth_last_code"] = "cached-oauth-code"
+
+        client = SimpleNamespace(
+            is_configured=lambda: True,
+            authorize_url=lambda state="": "https://example.com/auth",
+            exchange_code_for_tokens=lambda code: {"access_token": "acc-1"},
+            get_account_privileges=lambda token: {"ok": True},
+        )
+        repo = SimpleNamespace(
+            list_listings=lambda: [],
+            list_sync_runs=lambda provider=None, limit=200: [],
+            upsert_runtime_setting=lambda **kwargs: None,
+        )
+        user = SimpleNamespace(username="admin", role="admin")
+
+        with patch.object(ebay_view, "st", fake_st), \
+            patch.object(ebay_view, "current_user", return_value=user), \
+            patch.object(ebay_view, "is_sync_job_enabled", return_value=True), \
+            patch.object(ebay_view, "render_help_panel", return_value=None), \
+            patch.object(ebay_view, "render_active_ebay_context_banner", return_value=None), \
+            patch.object(ebay_view, "get_runtime_str", return_value=""):
+            ebay_view.render_ebay(client, repo)
+
+        self.assertEqual(fake_st.last_text_input_value, "")
 
 
 if __name__ == "__main__":

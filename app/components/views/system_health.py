@@ -810,6 +810,8 @@ def render_system_health(repo) -> None:
         "sync_job_ebay_orders_pull_import_limit",
         "sync_job_ebay_orders_pull_import_offset",
         "sync_job_ebay_shipping_tracking_push_enabled",
+        "sync_job_ebay_connection_health_check_enabled",
+        "sync_job_ebay_connection_health_check_interval_minutes",
         "sync_job_quickbooks_export_enabled",
         "sync_job_shopify_orders_pull_enabled",
         "comp_llm_system_message",

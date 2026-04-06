@@ -64,6 +64,59 @@ def _run_ebay_orders_pull_import() -> None:
         db.close()
 
 
+def _run_ebay_connection_health_check() -> None:
+    db = SessionLocal()
+    try:
+        repo = InventoryRepository(db)
+        if not is_sync_job_enabled("ebay_connection_health_check", repo=repo):
+            _log("Job `ebay_connection_health_check` disabled by configuration.")
+            return
+
+        interval_minutes = max(
+            5,
+            int(
+                get_runtime_int(
+                    repo,
+                    "sync_job_ebay_connection_health_check_interval_minutes",
+                    int(getattr(settings, "sync_job_ebay_connection_health_check_interval_minutes", 30)),
+                )
+            ),
+        )
+        now = utcnow_naive()
+        existing = [
+            row
+            for row in repo.list_sync_runs(provider="ebay", limit=500)
+            if str(getattr(row, "job_name", "") or "").strip().lower() == "ebay_connection_health_check"
+        ]
+        latest = existing[0] if existing else None
+        latest_at = getattr(latest, "completed_at", None) or getattr(latest, "started_at", None)
+        if latest_at is not None:
+            due_at = latest_at + timedelta(minutes=int(interval_minutes))
+            if due_at > now:
+                _log(
+                    "Skipping `ebay_connection_health_check` (not due): "
+                    f"next_due={due_at.isoformat(timespec='seconds')}"
+                )
+                return
+
+        token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+        result = execute_sync_job(
+            repo,
+            job_name="ebay_connection_health_check",
+            access_token=token,
+            actor=settings.sync_runner_actor,
+        )
+        _log(
+            "Completed `ebay_connection_health_check`: "
+            f"run_id={result['run_id']} status={result['status']} "
+            f"processed={result['processed']} failed={result['failed']}"
+        )
+    except Exception as exc:
+        _log(f"Job `ebay_connection_health_check` failed: {exc}")
+    finally:
+        db.close()
+
+
 def _run_governance_snapshot_schedule() -> None:
     db = SessionLocal()
     try:
@@ -172,6 +225,7 @@ def _run_governance_snapshot_schedule() -> None:
 
 
 def run_once() -> None:
+    _run_ebay_connection_health_check()
     _run_ebay_orders_pull_import()
     _run_governance_snapshot_schedule()
 

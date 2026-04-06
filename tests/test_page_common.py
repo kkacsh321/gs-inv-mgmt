@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 fake_auth = types.ModuleType("app.auth")
 fake_auth.current_user = lambda: None
 fake_auth.init_user_context_sidebar = lambda: SimpleNamespace(username="admin", role="admin")
-fake_auth.require_authenticated_session = lambda allow_bootstrap_if_no_users=False: True
+fake_auth.require_authenticated_session = (
+    lambda allow_bootstrap_if_no_users=False, allow_oauth_callback_query=False: True
+)
+fake_auth.has_oauth_callback_query_params = lambda: False
 
 fake_config = types.ModuleType("app.config")
 fake_config.settings = SimpleNamespace(app_env="local", app_name="GoldenStackers")

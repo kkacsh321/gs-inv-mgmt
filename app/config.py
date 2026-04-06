@@ -5,6 +5,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _default_ebay_callback_base(app_env: str) -> str:
+    normalized = (app_env or "").strip().lower()
+    if normalized in {"prod", "production"}:
+        return "https://inventory.goldenstackers.com"
+    if normalized in {"dev", "development", "staging"}:
+        return "https://dev-inventory.goldenstackers.com"
+    return "http://localhost:8501"
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = os.getenv("APP_NAME", "GoldenStackers Inventory")
@@ -18,6 +27,9 @@ class Settings:
     app_auth_signing_key: str = os.getenv("APP_AUTH_SIGNING_KEY", os.getenv("POSTGRES_PASSWORD", "change-me-signing-key"))
     app_auth_remember_days: int = int(os.getenv("APP_AUTH_REMEMBER_DAYS", "14"))
     app_auth_cookie_enabled: bool = os.getenv("APP_AUTH_COOKIE_ENABLED", "false").lower() == "true"
+    app_auth_query_token_fallback_enabled: bool = (
+        os.getenv("APP_AUTH_QUERY_TOKEN_FALLBACK_ENABLED", "true").lower() == "true"
+    )
     ux_workspace_ebay_enabled: bool = os.getenv("UX_WORKSPACE_EBAY_ENABLED", "false").lower() == "true"
     db_host: str = os.getenv("POSTGRES_HOST", "db")
     db_port: int = int(os.getenv("POSTGRES_PORT", "5432"))
@@ -31,7 +43,10 @@ class Settings:
     ebay_client_secret: str = os.getenv("EBAY_CLIENT_SECRET", "")
     ebay_ru_name: str = os.getenv("EBAY_RU_NAME", "")
     ebay_redirect_uri: str = os.getenv("EBAY_REDIRECT_URI", "")
+    ebay_auth_accepted_url: str = os.getenv("EBAY_AUTH_ACCEPTED_URL", "")
+    ebay_auth_declined_url: str = os.getenv("EBAY_AUTH_DECLINED_URL", "")
     ebay_user_access_token: str = os.getenv("EBAY_USER_ACCESS_TOKEN", "")
+    ebay_user_refresh_token: str = os.getenv("EBAY_USER_REFRESH_TOKEN", "")
     ebay_marketplace_id: str = os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US")
     ebay_currency: str = os.getenv("EBAY_CURRENCY", "USD")
     ebay_content_language: str = os.getenv("EBAY_CONTENT_LANGUAGE", "en-US")
@@ -72,6 +87,12 @@ class Settings:
     sync_job_ebay_shipping_tracking_push_enabled: bool = (
         os.getenv("SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED", "false").lower() == "true"
     )
+    sync_job_ebay_connection_health_check_enabled: bool = (
+        os.getenv("SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_ENABLED", "true").lower() == "true"
+    )
+    sync_job_ebay_connection_health_check_interval_minutes: int = int(
+        os.getenv("SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_INTERVAL_MINUTES", "30")
+    )
     sync_job_quickbooks_export_enabled: bool = (
         os.getenv("SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED", "false").lower() == "true"
     )
@@ -99,6 +120,20 @@ class Settings:
             f"postgresql+psycopg://{self.db_user}:{self.db_password}@"
             f"{self.db_host}:{self.db_port}/{self.db_name}"
         )
+
+    @property
+    def ebay_auth_accepted_url_effective(self) -> str:
+        explicit = (self.ebay_auth_accepted_url or "").strip()
+        if explicit:
+            return explicit
+        return f"{_default_ebay_callback_base(self.app_env).rstrip('/')}/eBay_Workspace"
+
+    @property
+    def ebay_auth_declined_url_effective(self) -> str:
+        explicit = (self.ebay_auth_declined_url or "").strip()
+        if explicit:
+            return explicit
+        return f"{_default_ebay_callback_base(self.app_env).rstrip('/')}/eBay_Workspace"
 
 
 settings = Settings()

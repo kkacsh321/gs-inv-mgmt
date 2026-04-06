@@ -62,10 +62,13 @@ class _FakeRepo:
 
 class SyncRunnerTests(unittest.TestCase):
     def test_run_once_calls_both_jobs(self) -> None:
-        with patch("app.services.sync_runner._run_ebay_orders_pull_import") as ebay_job, patch(
+        with patch("app.services.sync_runner._run_ebay_connection_health_check") as ebay_health_job, patch(
+            "app.services.sync_runner._run_ebay_orders_pull_import"
+        ) as ebay_job, patch(
             "app.services.sync_runner._run_governance_snapshot_schedule"
         ) as gov_job:
             sync_runner.run_once()
+        ebay_health_job.assert_called_once()
         ebay_job.assert_called_once()
         gov_job.assert_called_once()
 

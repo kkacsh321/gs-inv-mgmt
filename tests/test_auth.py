@@ -138,6 +138,14 @@ class AuthTests(unittest.TestCase):
         ):
             self.assertTrue(auth.require_authenticated_session())
 
+    def test_require_authenticated_session_allows_oauth_callback_query(self) -> None:
+        self.fake_st.session_state = {"auth_users_count": 1, "auth_authenticated": False}
+        self.fake_st.query_params = {"code": "abc123", "state": "state123"}
+        with patch("app.auth.st", self.fake_st), patch(
+            "app.auth.settings", SimpleNamespace(app_require_password_auth=True)
+        ):
+            self.assertTrue(auth.require_authenticated_session(allow_oauth_callback_query=True))
+
     def test_auth_debug_snapshot_includes_token_claims(self) -> None:
         now_ts = 1000
         self.fake_st.session_state.update(
@@ -288,7 +296,7 @@ class AuthTests(unittest.TestCase):
             "app.auth._parse_auth_remember_token", return_value=None
         ), patch("app.auth._build_auth_remember_token", return_value="new-token"), patch(
             "app.auth._set_query_auth_token"
-        ) as set_q, patch("app.auth._set_cookie_auth_token") as set_c:
+        ) as set_q, patch("app.auth._set_cookie_auth_token", return_value=False) as set_c:
             auth._ensure_remember_tokens_for_authenticated_user(user_map)
         set_q.assert_called_once_with("new-token")
         set_c.assert_called_once_with("new-token")
@@ -604,7 +612,7 @@ class AuthTests(unittest.TestCase):
         ), patch(
             "app.auth._build_auth_remember_token", return_value="tok"
         ), patch(
-            "app.auth._set_cookie_auth_token"
+            "app.auth._set_cookie_auth_token", return_value=False
         ) as set_cookie, patch(
             "app.auth._set_query_auth_token"
         ) as set_query:
@@ -615,6 +623,64 @@ class AuthTests(unittest.TestCase):
         self.assertTrue(st_mock.session_state.get("auth_authenticated"))
         set_cookie.assert_called_once_with("tok")
         set_query.assert_called_once_with("tok")
+        st_mock.rerun.assert_called_once()
+
+    def test_init_user_context_sidebar_password_login_skips_query_token_on_oauth_callback(self) -> None:
+        def _text_input(label, *args, **kwargs):
+            if label == "Username":
+                return "alice"
+            if label == "Password":
+                return "pass"
+            return kwargs.get("value", "")
+
+        st_mock = SimpleNamespace(
+            session_state={},
+            query_params={"code": "oauth-code", "state": "oauth-state"},
+            sidebar=MagicMock(),
+            form=MagicMock(return_value=_Ctx()),
+            text_input=MagicMock(side_effect=_text_input),
+            checkbox=MagicMock(return_value=True),
+            form_submit_button=MagicMock(return_value=True),
+            button=MagicMock(return_value=False),
+            caption=MagicMock(),
+            selectbox=MagicMock(return_value="alice"),
+            info=MagicMock(),
+            error=MagicMock(),
+            rerun=MagicMock(),
+        )
+        st_mock.sidebar.expander.return_value = _Ctx()
+
+        users = [SimpleNamespace(username="alice", role="ops", is_active=True, password_hash="h", password_salt="s")]
+        settings_mock = SimpleNamespace(
+            app_require_password_auth=True,
+            app_allow_role_override=False,
+            app_env="local",
+            app_user_name="employee",
+            app_user_role="viewer",
+            app_auth_cookie_enabled=False,
+            app_auth_remember_days=14,
+        )
+
+        with patch("app.auth.st", st_mock), patch("app.auth.settings", settings_mock), patch(
+            "app.auth._load_rbac_from_db", return_value=(users, {"ops": {"read", "update"}})
+        ), patch("app.auth._cookie_manager_status", return_value=(None, "disabled", "")), patch(
+            "app.auth._restore_auth_from_cookie_token", return_value=False
+        ), patch("app.auth._restore_auth_from_query_token", return_value=False), patch(
+            "app.services.security.verify_password", return_value=True
+        ), patch(
+            "app.auth._build_auth_remember_token", return_value="tok"
+        ), patch(
+            "app.auth._set_cookie_auth_token"
+        ) as set_cookie, patch(
+            "app.auth._set_query_auth_token"
+        ) as set_query:
+            user = auth.init_user_context_sidebar()
+
+        self.assertEqual(user.username, "alice")
+        self.assertEqual(user.role, "ops")
+        self.assertTrue(st_mock.session_state.get("auth_authenticated"))
+        set_cookie.assert_called_once_with("tok")
+        set_query.assert_not_called()
         st_mock.rerun.assert_called_once()
 
     def test_init_user_context_sidebar_password_login_invalid(self) -> None:
