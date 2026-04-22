@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 
 import pandas as pd
 import streamlit as st
@@ -24,6 +25,142 @@ from app.services.ai_text import normalize_ai_text
 from app.services.validation import ValidationService, ValidationError
 from app.utils.time import utcnow_naive
 
+
+def _build_lot_assignment_rows(assignments: list, product_index: dict[int, object]) -> dict[int, list[dict]]:
+    lot_assignment_rows: dict[int, list[dict]] = {}
+    for assignment in assignments:
+        lot_id_val = int(assignment.lot_id)
+        prod = product_index.get(int(assignment.product_id))
+        lot_assignment_rows.setdefault(lot_id_val, []).append(
+            {
+                "assignment_id": int(assignment.id),
+                "product_id": int(assignment.product_id),
+                "sku": str(getattr(prod, "sku", "") or ""),
+                "product_title": str(getattr(prod, "title", "") or ""),
+                "quantity_acquired": int(assignment.quantity_acquired or 0),
+                "unit_cost": float(assignment.unit_cost) if assignment.unit_cost is not None else None,
+                "unit_tax_paid": float(assignment.unit_tax_paid) if assignment.unit_tax_paid is not None else None,
+                "unit_shipping_paid": float(assignment.unit_shipping_paid) if assignment.unit_shipping_paid is not None else None,
+                "unit_handling_paid": float(assignment.unit_handling_paid) if assignment.unit_handling_paid is not None else None,
+                "allocated_cost": float(assignment.allocated_cost) if assignment.allocated_cost is not None else None,
+                "allocated_tax_paid": float(assignment.allocated_tax_paid) if assignment.allocated_tax_paid is not None else None,
+                "allocated_shipping_paid": float(assignment.allocated_shipping_paid) if assignment.allocated_shipping_paid is not None else None,
+                "allocated_handling_paid": float(assignment.allocated_handling_paid) if assignment.allocated_handling_paid is not None else None,
+                "acquired_at": iso_or_none(assignment.acquired_at),
+            }
+        )
+    return lot_assignment_rows
+
+
+def _build_lot_table_rows(filtered_lots: list, lot_assignment_rows: dict[int, list[dict]]) -> list[dict]:
+    return [
+        {
+            "id": int(lot.id),
+            "lot_code": str(lot.lot_code or ""),
+            "source_id": lot.source_id,
+            "source_name": (lot.source.name if lot.source else ""),
+            "vendor": str(lot.vendor or ""),
+            "purchase_date": iso_or_none(lot.purchase_date),
+            "total_cost": float(lot.total_cost) if lot.total_cost is not None else None,
+            "total_tax_paid": float(getattr(lot, "total_tax_paid", None))
+            if getattr(lot, "total_tax_paid", None) is not None
+            else None,
+            "total_shipping_paid": float(getattr(lot, "total_shipping_paid", None))
+            if getattr(lot, "total_shipping_paid", None) is not None
+            else None,
+            "total_handling_paid": float(getattr(lot, "total_handling_paid", None))
+            if getattr(lot, "total_handling_paid", None) is not None
+            else None,
+            "ebay_purchase": bool(getattr(lot, "ebay_purchase", False)),
+            "ebay_purchase_item_id": str(getattr(lot, "ebay_purchase_item_id", "") or ""),
+            "ebay_purchase_url": str(getattr(lot, "ebay_purchase_url", "") or ""),
+            "archived": bool(_lot_is_archived(lot)),
+            "attached_products_count": len(lot_assignment_rows.get(int(lot.id), [])),
+            "attached_products": ", ".join(
+                sorted(
+                    {
+                        str(row.get("sku") or "").strip() or f"product#{int(row.get('product_id') or 0)}"
+                        for row in lot_assignment_rows.get(int(lot.id), [])
+                    }
+                )
+            ),
+            "notes": str(lot.notes or ""),
+        }
+        for lot in filtered_lots
+    ]
+
+
+def _validate_lot_update_inputs(lot_code: str, ebay_purchase: bool, ebay_purchase_item_id: str) -> str | None:
+    if not str(lot_code or "").strip():
+        return "Lot code is required."
+    if bool(ebay_purchase) and not str(ebay_purchase_item_id or "").strip():
+        return "eBay Purchase Item ID is required when Purchased On eBay is enabled."
+    return None
+
+
+def _listing_is_archived(listing) -> bool:
+    raw = str(getattr(listing, "marketplace_details", "") or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    lifecycle = parsed.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return False
+    return bool(lifecycle.get("archived"))
+
+
+def _lot_is_archived(lot) -> bool:
+    raw = str(getattr(lot, "notes", "") or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    lifecycle = parsed.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return False
+    return bool(lifecycle.get("archived"))
+
+
+def _build_lot_update_payload(
+    *,
+    source_id: int | None,
+    lot_code: str,
+    vendor: str,
+    purchase_date,
+    total_cost: float,
+    total_tax_paid: float,
+    total_shipping_paid: float,
+    total_handling_paid: float,
+    ebay_purchase: bool,
+    ebay_purchase_item_id: str,
+    ebay_purchase_url: str,
+    notes: str,
+) -> dict:
+    return {
+        "lot_code": str(lot_code or "").strip(),
+        "source_id": source_id,
+        "vendor": str(vendor or "").strip(),
+        "purchase_date": datetime.combine(purchase_date, datetime.min.time()),
+        "total_cost": to_decimal_or_none(total_cost),
+        "total_tax_paid": to_decimal_or_none(total_tax_paid),
+        "total_shipping_paid": to_decimal_or_none(total_shipping_paid),
+        "total_handling_paid": to_decimal_or_none(total_handling_paid),
+        "ebay_purchase": bool(ebay_purchase),
+        "ebay_purchase_item_id": str(ebay_purchase_item_id or "").strip(),
+        "ebay_purchase_url": str(ebay_purchase_url or "").strip(),
+        "notes": str(notes or "").strip(),
+    }
+
+
 def render_search_edit(repo: InventoryRepository) -> None:
     user = current_user()
     st.subheader("Search, Edit, and Audit")
@@ -42,12 +179,82 @@ def render_search_edit(repo: InventoryRepository) -> None:
     actor = user.username
     st.caption(f"Signed in as `{user.username}` ({user.role}). Update actions use this identity in audit logs.")
 
-    tab_products, tab_listings, tab_sales, tab_media, tab_audit = st.tabs(
-        ["Products", "Listings", "Sales", "Media", "Audit Log"]
+    se1, se2 = st.columns(2)
+    with se1:
+        search_edit_render_full_tables = st.checkbox(
+            "Render Full Tables",
+            value=False,
+            key="search_edit_render_full_tables",
+            help="When off, tables render as previews for faster page responsiveness.",
+        )
+    with se2:
+        search_edit_preview_row_limit = st.number_input(
+            "Preview Row Limit",
+            min_value=10,
+            max_value=500,
+            value=100,
+            step=10,
+            key="search_edit_preview_row_limit",
+            help="Rows shown per table when full-table rendering is disabled.",
+        )
+
+    _cache: dict[str, object] = {}
+
+    def _get_cached(key: str, loader):
+        if key not in _cache:
+            _cache[key] = loader()
+        return _cache[key]
+
+    def _products():
+        return _get_cached("products", repo.list_products)
+
+    def _listings():
+        return _get_cached("listings", repo.list_listings)
+
+    def _sales():
+        return _get_cached("sales", repo.list_sales)
+
+    def _orders():
+        return _get_cached("orders", repo.list_orders)
+
+    def _order_items():
+        return _get_cached("order_items", repo.list_order_items)
+
+    def _lots():
+        return _get_cached("lots", repo.list_purchase_lots)
+
+    def _sources():
+        return _get_cached("sources", lambda: repo.list_inventory_sources(active_only=False))
+
+    def _lot_assignments():
+        return _get_cached("lot_assignments", repo.list_product_lot_assignments)
+
+    def _media_assets(include_archived: bool):
+        return _get_cached(
+            f"media_assets_{int(bool(include_archived))}",
+            lambda: repo.list_media_assets(include_archived=bool(include_archived)),
+        )
+
+    tab_products, tab_listings, tab_sales, tab_lots, tab_media, tab_audit = st.tabs(
+        ["Products", "Listings", "Sales", "Lots", "Media", "Audit Log"]
     )
 
+    def _render_df_with_preview(df: pd.DataFrame, *, hide_index: bool = False) -> None:
+        if bool(search_edit_render_full_tables):
+            st.dataframe(df, use_container_width=True, hide_index=hide_index)
+            return
+        preview_limit = int(search_edit_preview_row_limit)
+        total_rows = int(len(df.index))
+        preview_df = df.head(preview_limit)
+        st.dataframe(preview_df, use_container_width=True, hide_index=hide_index)
+        if total_rows > preview_limit:
+            st.caption(
+                f"Showing preview rows: {preview_limit} / {total_rows}. "
+                "Enable `Render Full Tables` to load all rows."
+            )
+
     with tab_products:
-        products = repo.list_products()
+        products = _products()
         q = st.text_input("Search Products", key="search_products")
         q_lower = q.strip().lower()
         filtered = [
@@ -60,7 +267,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
             or q_lower in (p.metal_type or "").lower()
         ]
 
-        st.dataframe(
+        _render_df_with_preview(
             pd.DataFrame(
                 [
                     {
@@ -103,8 +310,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     }
                     for p in filtered
                 ]
-            ),
-            use_container_width=True,
+            )
         )
 
         if filtered:
@@ -180,12 +386,10 @@ def render_search_edit(repo: InventoryRepository) -> None:
                 ebay_purchase_item_id = st.text_input(
                     "eBay Purchase Item ID",
                     value=str(getattr(selected, "ebay_purchase_item_id", "") or ""),
-                    disabled=not ebay_purchase,
                 )
                 ebay_purchase_url = st.text_input(
                     "eBay Purchase Link",
                     value=str(getattr(selected, "ebay_purchase_url", "") or ""),
-                    disabled=not ebay_purchase,
                 )
                 qty = st.number_input("Quantity", min_value=0, value=int(selected.current_quantity), step=1)
                 acquired_date = st.date_input(
@@ -249,10 +453,15 @@ def render_search_edit(repo: InventoryRepository) -> None:
             st.info("No matching products.")
 
     with tab_listings:
-        listings = repo.list_listings()
-        products = repo.list_products()
+        listings = _listings()
+        products = _products()
         product_map = build_product_options(products, include_none=False, include_id=True)
         q = st.text_input("Search Listings", key="search_listings")
+        include_archived_listings = st.checkbox(
+            "Include Archived Listings",
+            value=False,
+            key="search_edit_listings_include_archived",
+        )
         q_lower = q.strip().lower()
         filtered = [
             l
@@ -265,8 +474,10 @@ def render_search_edit(repo: InventoryRepository) -> None:
             or q_lower in (l.marketplace_details or "").lower()
             or q_lower in (l.product.sku.lower() if l.product else "")
         ]
+        if not include_archived_listings:
+            filtered = [l for l in filtered if not _listing_is_archived(l)]
 
-        st.dataframe(
+        _render_df_with_preview(
             pd.DataFrame(
                 [
                     {
@@ -280,11 +491,11 @@ def render_search_edit(repo: InventoryRepository) -> None:
                         "quantity_listed": l.quantity_listed,
                         "listed_at": iso_or_none(l.listed_at),
                         "status": l.listing_status,
+                        "archived": bool(_listing_is_archived(l)),
                     }
                     for l in filtered
                 ]
-            ),
-            use_container_width=True,
+            )
         )
 
         if filtered:
@@ -293,12 +504,12 @@ def render_search_edit(repo: InventoryRepository) -> None:
             selected = listing_map[selected_key]
             listing_related_sales = [
                 sale
-                for sale in repo.list_sales()
+                for sale in _sales()
                 if sale.listing_id is not None and int(sale.listing_id) == int(selected.id)
             ]
             listing_related_order_items = [
                 item
-                for item in repo.list_order_items()
+                for item in _order_items()
                 if item.listing_id is not None and int(item.listing_id) == int(selected.id)
             ]
             listing_related_order_ids = {
@@ -310,7 +521,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
                 for item in listing_related_order_items
                 if item.order_id is not None
             }
-            listing_order_index = {int(order.id): order for order in repo.list_orders()}
+            listing_order_index = {int(order.id): order for order in _orders()}
             listing_related_orders = [
                 listing_order_index[oid]
                 for oid in sorted(listing_related_order_ids)
@@ -393,8 +604,8 @@ def render_search_edit(repo: InventoryRepository) -> None:
                 )
                 listing_status = st.selectbox(
                     "Listing Status",
-                    ["draft", "active", "ended"],
-                    index=["draft", "active", "ended"].index(selected.listing_status),
+                    ["draft", "active", "ended", "sold"],
+                    index=["draft", "active", "ended", "sold"].index(selected.listing_status),
                 )
                 external_listing_id = st.text_input("External Listing ID", value=selected.external_listing_id or "")
                 marketplace_url = st.text_input("Marketplace URL", value=selected.marketplace_url or "")
@@ -442,13 +653,51 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     st.error("Update failed due to data constraints (possibly duplicate marketplace/external ID).")
                 except (ValueError, ValidationError) as exc:
                     st.error(str(exc))
+            st.markdown("##### Listing Lifecycle")
+            listing_archived = bool(_listing_is_archived(selected))
+            if listing_archived:
+                st.info("Listing is archived.")
+                if st.button(
+                    "Restore Listing",
+                    key=f"search_edit_restore_listing_{selected.id}",
+                ):
+                    if not ensure_permission(user, "update", "Restore Listing"):
+                        st.stop()
+                    try:
+                        repo.restore_listing(int(selected.id), actor=actor)
+                        st.success("Listing restored.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                archive_reason = st.text_input(
+                    "Archive Reason (optional)",
+                    value="",
+                    key=f"search_edit_archive_listing_reason_{selected.id}",
+                )
+                if st.button(
+                    "Archive Listing",
+                    key=f"search_edit_archive_listing_{selected.id}",
+                ):
+                    if not ensure_permission(user, "update", "Archive Listing"):
+                        st.stop()
+                    try:
+                        repo.archive_listing(
+                            int(selected.id),
+                            actor=actor,
+                            reason=str(archive_reason or "").strip(),
+                        )
+                        st.success("Listing archived.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
         else:
             st.info("No matching listings.")
 
     with tab_sales:
-        sales = repo.list_sales()
-        products = repo.list_products()
-        listings = repo.list_listings()
+        sales = _sales()
+        products = _products()
+        listings = _listings()
         product_opts = build_product_options(products, include_none=True, include_id=True)
         listing_opts = build_listing_options(listings, include_none=True, include_id=True)
         q = st.text_input("Search Sales", key="search_sales")
@@ -467,7 +716,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
             or q_lower in (s.product.sku.lower() if s.product else "")
         ]
 
-        st.dataframe(
+        _render_df_with_preview(
             pd.DataFrame(
                 [
                     {
@@ -495,8 +744,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     }
                     for s in filtered
                 ]
-            ),
-            use_container_width=True,
+            )
         )
 
         if filtered:
@@ -675,10 +923,215 @@ def render_search_edit(repo: InventoryRepository) -> None:
         else:
             st.info("No matching sales.")
 
+    with tab_lots:
+        lots = _lots()
+        sources = _sources()
+        products = _products()
+        assignments = _lot_assignments()
+        product_index = {int(p.id): p for p in products}
+        lot_assignment_rows = _build_lot_assignment_rows(assignments, product_index)
+        source_options: dict[str, int | None] = {"None (one-off/manual)": None}
+        for s in sources:
+            source_options[f"#{int(s.id)} | {s.name} ({s.source_type})"] = int(s.id)
+        q = st.text_input("Search Lots", key="search_lots")
+        include_archived_lots = st.checkbox(
+            "Include Archived Lots",
+            value=False,
+            key="search_edit_lots_include_archived",
+        )
+        q_lower = q.strip().lower()
+        filtered_lots = [
+            lot
+            for lot in lots
+            if not q_lower
+            or q_lower in str(lot.lot_code or "").lower()
+            or q_lower in str(lot.vendor or "").lower()
+            or q_lower in str(lot.notes or "").lower()
+            or q_lower in str(getattr(lot, "ebay_purchase_item_id", "") or "").lower()
+            or q_lower in str(getattr(lot, "ebay_purchase_url", "") or "").lower()
+        ]
+        if not include_archived_lots:
+            filtered_lots = [lot for lot in filtered_lots if not _lot_is_archived(lot)]
+
+        _render_df_with_preview(pd.DataFrame(_build_lot_table_rows(filtered_lots, lot_assignment_rows)))
+
+        if filtered_lots:
+            lot_map = {
+                f"#{int(lot.id)} | {str(lot.lot_code or '')} | {str(lot.vendor or '')}": lot
+                for lot in filtered_lots
+            }
+            selected_key = st.selectbox("Select Lot to Edit", list(lot_map.keys()), key="edit_lot_key")
+            selected = lot_map[selected_key]
+            selected_lot_assignments = lot_assignment_rows.get(int(selected.id), [])
+            st.markdown("##### Attached Products")
+            if selected_lot_assignments:
+                _render_df_with_preview(
+                    pd.DataFrame(selected_lot_assignments),
+                    hide_index=True,
+                )
+            else:
+                st.caption("No products are currently attached to this lot.")
+
+            default_source_key = "None (one-off/manual)"
+            for label, source_id in source_options.items():
+                if source_id == selected.source_id:
+                    default_source_key = label
+                    break
+            source_labels = list(source_options.keys())
+            default_source_idx = source_labels.index(default_source_key)
+
+            with st.form("edit_lot_form"):
+                lot_code = st.text_input("Lot Code", value=str(selected.lot_code or "").strip())
+                source_key = st.selectbox("Common Source (Optional)", source_labels, index=default_source_idx)
+                vendor = st.text_input("Vendor Override / One-Off Source (Optional)", value=str(selected.vendor or ""))
+                purchase_date = st.date_input(
+                    "Purchase Date",
+                    value=(selected.purchase_date or utcnow_naive()).date(),
+                    key="edit_lot_purchase_date",
+                )
+                total_cost = st.number_input(
+                    "Total Lot Cost",
+                    min_value=0.0,
+                    value=float(selected.total_cost or 0.0),
+                    step=1.0,
+                )
+                total_tax_paid = st.number_input(
+                    "Total Lot Tax Paid",
+                    min_value=0.0,
+                    value=float(getattr(selected, "total_tax_paid", 0.0) or 0.0),
+                    step=1.0,
+                )
+                total_shipping_paid = st.number_input(
+                    "Total Lot Shipping Paid",
+                    min_value=0.0,
+                    value=float(getattr(selected, "total_shipping_paid", 0.0) or 0.0),
+                    step=1.0,
+                )
+                total_handling_paid = st.number_input(
+                    "Total Lot Handling Paid",
+                    min_value=0.0,
+                    value=float(getattr(selected, "total_handling_paid", 0.0) or 0.0),
+                    step=1.0,
+                )
+                ebay_purchase = st.checkbox(
+                    "Purchased On eBay",
+                    value=bool(getattr(selected, "ebay_purchase", False)),
+                )
+                ebay_purchase_item_id = st.text_input(
+                    "eBay Purchase Item ID",
+                    value=str(getattr(selected, "ebay_purchase_item_id", "") or ""),
+                )
+                ebay_purchase_url = st.text_input(
+                    "eBay Purchase Link",
+                    value=str(getattr(selected, "ebay_purchase_url", "") or ""),
+                )
+                notes = st.text_area("Notes", value=str(selected.notes or ""))
+                submit = st.form_submit_button("Save Lot Changes")
+
+            if submit:
+                if not ensure_permission(user, "update", "Update Purchase Lot"):
+                    st.stop()
+                try:
+                    lot_update_error = _validate_lot_update_inputs(
+                        lot_code=lot_code,
+                        ebay_purchase=bool(ebay_purchase),
+                        ebay_purchase_item_id=ebay_purchase_item_id,
+                    )
+                    if lot_update_error:
+                        st.error(lot_update_error)
+                        st.stop()
+                    repo.update_purchase_lot(
+                        selected.id,
+                        _build_lot_update_payload(
+                            source_id=source_options[source_key],
+                            lot_code=lot_code,
+                            vendor=vendor,
+                            purchase_date=purchase_date,
+                            total_cost=total_cost,
+                            total_tax_paid=total_tax_paid,
+                            total_shipping_paid=total_shipping_paid,
+                            total_handling_paid=total_handling_paid,
+                            ebay_purchase=bool(ebay_purchase),
+                            ebay_purchase_item_id=ebay_purchase_item_id,
+                            ebay_purchase_url=ebay_purchase_url,
+                            notes=notes,
+                        ),
+                        actor=actor,
+                    )
+                    st.success("Lot updated.")
+                except IntegrityError:
+                    repo.db.rollback()
+                    st.error("Update failed due to data constraints (possibly duplicate lot code).")
+                except ValueError as exc:
+                    st.error(str(exc))
+
+            st.markdown("##### Lot Lifecycle")
+            lot_archived = bool(_lot_is_archived(selected))
+            if lot_archived:
+                st.info("Lot is archived.")
+                if st.button(
+                    "Restore Lot",
+                    key=f"search_edit_restore_lot_{selected.id}",
+                ):
+                    if not ensure_permission(user, "update", "Restore Purchase Lot"):
+                        st.stop()
+                    try:
+                        repo.restore_purchase_lot(int(selected.id), actor=actor)
+                        st.success("Lot restored.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                blockers = repo.get_purchase_lot_archive_blockers(int(selected.id))
+                blockers_total = sum(int(v or 0) for v in blockers.values())
+                if blockers_total > 0:
+                    st.warning(
+                        "Archive preflight: linked records detected "
+                        f"(assignments={int(blockers.get('product_assignments', 0))}, "
+                        f"documents={int(blockers.get('purchase_documents', 0))}, "
+                        f"active_products={int(blockers.get('active_products', 0))}, "
+                        f"active_listings={int(blockers.get('active_listings', 0))})."
+                    )
+                force_archive_lot = st.checkbox(
+                    "Force archive lot despite linked records",
+                    value=False,
+                    key=f"search_edit_force_archive_lot_{selected.id}",
+                    disabled=blockers_total <= 0,
+                )
+                archive_reason = st.text_input(
+                    "Archive Reason (optional)",
+                    value="",
+                    key=f"search_edit_archive_lot_reason_{selected.id}",
+                )
+                if st.button(
+                    "Archive Lot",
+                    key=f"search_edit_archive_lot_{selected.id}",
+                ):
+                    if not ensure_permission(user, "update", "Archive Purchase Lot"):
+                        st.stop()
+                    try:
+                        repo.archive_purchase_lot(
+                            int(selected.id),
+                            actor=actor,
+                            reason=str(archive_reason or "").strip(),
+                            force=bool(force_archive_lot),
+                        )
+                        st.success("Lot archived.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+        else:
+            st.info("No matching lots.")
+
     with tab_media:
-        media_items = repo.list_media_assets()
-        products = repo.list_products()
-        listings = repo.list_listings()
+        include_archived_media = st.checkbox(
+            "Include Archived Media",
+            value=False,
+            key="search_edit_media_include_archived",
+        )
+        media_items = _media_assets(bool(include_archived_media))
+        products = _products()
+        listings = _listings()
         product_opts = build_product_options(products, include_none=True, include_id=True)
         listing_opts = build_listing_options(listings, include_none=True, include_id=True)
         q = st.text_input("Search Media", key="search_media")
@@ -692,7 +1145,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
             or q_lower in (m.s3_url or "").lower()
         ]
 
-        st.dataframe(
+        _render_df_with_preview(
             pd.DataFrame(
                 [
                     {
@@ -703,11 +1156,11 @@ def render_search_edit(repo: InventoryRepository) -> None:
                         "listing_id": m.listing_id,
                         "uploaded_by": m.uploaded_by,
                         "s3_key": m.s3_key,
+                        "archived": bool(getattr(m, "is_archived", False)),
                     }
                     for m in filtered
                 ]
-            ),
-            use_container_width=True,
+            )
         )
 
         if filtered:
@@ -750,60 +1203,105 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     actor=actor,
                 )
                 st.success("Media updated.")
+
+            st.markdown("##### Media Lifecycle")
+            media_archived = bool(getattr(selected, "is_archived", False))
+            if media_archived:
+                st.info("Media is archived.")
+                if st.button("Restore Media", key=f"search_edit_restore_media_{selected.id}"):
+                    if not ensure_permission(user, "update", "Restore Media"):
+                        st.stop()
+                    try:
+                        repo.restore_media_asset(int(selected.id), actor=actor)
+                        st.success("Media restored.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                blockers = repo.get_media_asset_archive_blockers(int(selected.id))
+                blockers_total = sum(int(v or 0) for v in blockers.values())
+                if blockers_total > 0:
+                    st.warning(
+                        "Archive preflight: active listing context detected "
+                        f"(linked_listing_active={int(blockers.get('linked_listing_active', 0))}, "
+                        f"linked_product_active_listings={int(blockers.get('linked_product_active_listings', 0))})."
+                    )
+                force_archive_media = st.checkbox(
+                    "Force archive media despite active listing links",
+                    value=False,
+                    key=f"search_edit_force_archive_media_{selected.id}",
+                    disabled=blockers_total <= 0,
+                )
+                if st.button("Archive Media", key=f"search_edit_archive_media_{selected.id}"):
+                    if not ensure_permission(user, "update", "Archive Media"):
+                        st.stop()
+                    try:
+                        repo.archive_media_asset(int(selected.id), actor=actor, force=bool(force_archive_media))
+                        st.success("Media archived.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
         else:
             st.info("No matching media.")
 
     with tab_audit:
-        logs = repo.list_audit_logs(limit=500)
-        entity_filter = st.selectbox(
-            "Entity Type Filter",
-            [
-                "all",
-                "product",
-                "listing",
-                "sale",
-                "order",
-                "order_item",
-                "return",
-                "media_asset",
-                "purchase_lot",
-                "product_lot_assignment",
-                "inventory_source",
-                "shipping_preset",
-                "document_template_profile",
-            ],
-            key="audit_entity_filter",
+        load_audit_history = st.checkbox(
+            "Load Audit History (slower)",
+            value=False,
+            key="search_edit_load_audit_logs",
         )
-        action_filter = st.selectbox("Action Filter", ["all", "create", "update"], key="audit_action_filter")
-        q = st.text_input("Search Actor / Changes", key="audit_search")
-        q_lower = q.strip().lower()
-
-        filtered_logs = [
-            log
-            for log in logs
-            if (entity_filter == "all" or log.entity_type == entity_filter)
-            and (action_filter == "all" or log.action == action_filter)
-            and (
-                not q_lower
-                or q_lower in (log.actor or "").lower()
-                or q_lower in (log.changes_json or "").lower()
-            )
-        ]
-
-        st.dataframe(
-            pd.DataFrame(
+        if not load_audit_history:
+            st.caption("Enable audit history loading to query and render recent change logs.")
+        else:
+            logs = repo.list_audit_logs(limit=500)
+            entity_filter = st.selectbox(
+                "Entity Type Filter",
                 [
-                    {
-                        "id": log.id,
-                        "created_at": iso_or_none(log.created_at),
-                        "entity_type": log.entity_type,
-                        "entity_id": log.entity_id,
-                        "action": log.action,
-                        "actor": log.actor,
-                        "changes": pretty_json(log.changes_json),
-                    }
-                    for log in filtered_logs
-                ]
-            ),
-            use_container_width=True,
-        )
+                    "all",
+                    "product",
+                    "listing",
+                    "sale",
+                    "order",
+                    "order_item",
+                    "return",
+                    "media_asset",
+                    "purchase_lot",
+                    "product_lot_assignment",
+                    "inventory_source",
+                    "shipping_preset",
+                    "document_template_profile",
+                ],
+                key="audit_entity_filter",
+            )
+            action_filter = st.selectbox("Action Filter", ["all", "create", "update"], key="audit_action_filter")
+            q = st.text_input("Search Actor / Changes", key="audit_search")
+            q_lower = q.strip().lower()
+
+            filtered_logs = [
+                log
+                for log in logs
+                if (entity_filter == "all" or log.entity_type == entity_filter)
+                and (action_filter == "all" or log.action == action_filter)
+                and (
+                    not q_lower
+                    or q_lower in (log.actor or "").lower()
+                    or q_lower in (log.changes_json or "").lower()
+                )
+            ]
+
+            _render_df_with_preview(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": log.id,
+                            "created_at": iso_or_none(log.created_at),
+                            "entity_type": log.entity_type,
+                            "entity_id": log.entity_id,
+                            "action": log.action,
+                            "actor": log.actor,
+                            "changes": pretty_json(log.changes_json),
+                        }
+                        for log in filtered_logs
+                    ]
+                )
+            )

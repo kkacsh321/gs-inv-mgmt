@@ -55,6 +55,24 @@ services:
     volumes:
       - .:/app
 
+  slack_ops_worker:
+    build: .
+    container_name: gs_inventory_slack_ops_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+    command: ["python", "-m", "app.services.slack_ops_runner"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - .:/app
+
   migrate:
     build: .
     container_name: gs_inventory_migrate

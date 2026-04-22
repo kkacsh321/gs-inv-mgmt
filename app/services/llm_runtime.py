@@ -67,7 +67,7 @@ def resolve_comp_llm_runtime_config(repo: Any) -> LLMRuntimeConfig:
             endpoint_type=(row.endpoint_type or "responses").strip().lower(),
             api_key=(row.api_key or "").strip(),
             temperature=_safe_float(row.temperature, 0.2),
-            max_output_tokens=max(1, _safe_int(row.max_output_tokens, 600)),
+            max_output_tokens=max(1, _safe_int(row.max_output_tokens, 16000)),
             timeout_seconds=max(5, _safe_int(row.timeout_seconds, 60)),
         )
 
@@ -81,7 +81,7 @@ def resolve_comp_llm_runtime_config(repo: Any) -> LLMRuntimeConfig:
         endpoint_type=(settings.comp_llm_endpoint_type or "responses").strip().lower(),
         api_key=(settings.openai_api_key or "").strip(),
         temperature=_safe_float(settings.comp_llm_temperature, 0.2),
-        max_output_tokens=max(1, _safe_int(settings.comp_llm_max_output_tokens, 600)),
+        max_output_tokens=max(1, _safe_int(settings.comp_llm_max_output_tokens, 16000)),
         timeout_seconds=max(5, _safe_int(settings.comp_llm_timeout_seconds, 60)),
     )
 
@@ -114,7 +114,48 @@ def _runtime_int_from_repo(repo: Any, key: str, fallback: int) -> int:
         return fallback
 
 
-def resolve_comp_llm_runtime_chain(repo: Any) -> list[LLMRuntimeConfig]:
+def _runtime_str_from_repo(repo: Any, key: str, fallback: str = "") -> str:
+    try:
+        row = repo.get_runtime_setting(environment=settings.app_env, key=key, active_only=True)
+    except Exception:
+        row = None
+    if row is None:
+        return str(fallback or "")
+    return str(row.value or "").strip()
+
+
+def _build_llm_runtime_config_from_row(row: Any) -> LLMRuntimeConfig:
+    return LLMRuntimeConfig(
+        source="db",
+        enabled=bool(row.is_active),
+        provider=(row.provider or "openai").strip().lower(),
+        model=(row.model or "gpt-4o-mini").strip(),
+        multimodal_model=((row.multimodal_model or "").strip() or (row.model or "gpt-4o-mini").strip()),
+        base_url=((row.base_url or DEFAULT_LLM_BASE_URL).strip().rstrip("/")),
+        endpoint_type=(row.endpoint_type or "responses").strip().lower(),
+        api_key=(row.api_key or "").strip(),
+        temperature=_safe_float(row.temperature, 0.2),
+        max_output_tokens=max(1, _safe_int(row.max_output_tokens, 16000)),
+        timeout_seconds=max(5, _safe_int(row.timeout_seconds, 60)),
+    )
+
+
+def _workflow_profile_selector(repo: Any, workflow: str) -> tuple[int | None, str]:
+    normalized = str(workflow or "").strip().lower()
+    if normalized not in {"listing", "intake", "comp", "risk"}:
+        return None, ""
+    selector_raw = _runtime_str_from_repo(repo, f"ai_workflow_profile_{normalized}", "").strip()
+    selector_id: int | None = None
+    selector_name = ""
+    if selector_raw:
+        try:
+            selector_id = int(selector_raw)
+        except Exception:
+            selector_name = selector_raw.lower()
+    return selector_id, selector_name
+
+
+def resolve_comp_llm_runtime_chain(repo: Any, workflow: str = "comp") -> list[LLMRuntimeConfig]:
     primary = resolve_comp_llm_runtime_config(repo)
     fallback_enabled = _runtime_bool_from_repo(repo, "ai_fallback_enabled", True)
     max_profiles = max(1, min(8, _runtime_int_from_repo(repo, "ai_fallback_max_profiles", 3)))
@@ -130,24 +171,38 @@ def resolve_comp_llm_runtime_chain(repo: Any) -> list[LLMRuntimeConfig]:
     if not rows:
         return [primary]
 
-    default_rows = [row for row in rows if bool(row.is_default)]
-    ordered_rows = default_rows + [row for row in rows if not bool(row.is_default)]
+    selector_id, selector_name = _workflow_profile_selector(repo, workflow)
+    prioritized_rows = list(rows)
+    selected_ids: set[Any] = set()
+    if selector_id is not None or selector_name:
+        selected_rows = []
+        for row in rows:
+            row_id = getattr(row, "id", None)
+            row_name = str(getattr(row, "name", "") or "").strip().lower()
+            if (selector_id is not None and row_id == selector_id) or (selector_name and row_name == selector_name):
+                selected_rows.append(row)
+        if selected_rows:
+            selected_ids = {getattr(r, "id", None) for r in selected_rows}
+            prioritized_rows = selected_rows + [r for r in rows if getattr(r, "id", None) not in selected_ids]
+
+    default_rows = [
+        row
+        for row in prioritized_rows
+        if bool(row.is_default) and getattr(row, "id", None) not in selected_ids
+    ]
+    ordered_rows = (
+        [row for row in prioritized_rows if getattr(row, "id", None) in selected_ids]
+        + default_rows
+        + [
+            row
+            for row in prioritized_rows
+            if not bool(row.is_default) and getattr(row, "id", None) not in selected_ids
+        ]
+    )
     chain: list[LLMRuntimeConfig] = []
     seen: set[tuple[str, str, str, str]] = set()
     for row in ordered_rows:
-        cfg = LLMRuntimeConfig(
-            source="db",
-            enabled=bool(row.is_active),
-            provider=(row.provider or "openai").strip().lower(),
-            model=(row.model or "gpt-4o-mini").strip(),
-            multimodal_model=((row.multimodal_model or "").strip() or (row.model or "gpt-4o-mini").strip()),
-            base_url=((row.base_url or DEFAULT_LLM_BASE_URL).strip().rstrip("/")),
-            endpoint_type=(row.endpoint_type or "responses").strip().lower(),
-            api_key=(row.api_key or "").strip(),
-            temperature=_safe_float(row.temperature, 0.2),
-            max_output_tokens=max(1, _safe_int(row.max_output_tokens, 600)),
-            timeout_seconds=max(5, _safe_int(row.timeout_seconds, 60)),
-        )
+        cfg = _build_llm_runtime_config_from_row(row)
         signature = (cfg.provider, cfg.base_url, cfg.endpoint_type, cfg.model)
         if signature in seen:
             continue
@@ -256,8 +311,14 @@ def generate_comp_ai_summary_with_fallback(
     system_message: str = DEFAULT_COMP_SYSTEM_MESSAGE,
     instruction: str = DEFAULT_COMP_INSTRUCTION,
 ) -> tuple[str, LLMRuntimeConfig, list[str]]:
-    attempts = [cfg for cfg in configs if bool(cfg.enabled)]
+    enabled_profiles = [cfg for cfg in configs if bool(cfg.enabled)]
+    attempts = [cfg for cfg in enabled_profiles if not (cfg.provider == "openai" and not (cfg.api_key or "").strip())]
     if not attempts:
+        if enabled_profiles:
+            raise RuntimeError(
+                "No executable AI runtime profiles available. "
+                "OpenAI profiles require an API key; set one in Admin > AI Runtime or disable those profiles."
+            )
         raise RuntimeError("No enabled AI runtime profiles available.")
     errors: list[str] = []
     for cfg in attempts:
@@ -440,6 +501,15 @@ def _looks_like_no_vision_capability_response(text: str) -> bool:
     return any(marker in t for marker in markers)
 
 
+def _is_transient_multimodal_exception(exc: Exception) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+        return status in {408, 409, 425, 429, 500, 502, 503, 504}
+    return False
+
+
 def generate_multimodal_ai_markdown(
     config: LLMRuntimeConfig,
     *,
@@ -568,23 +638,46 @@ def generate_multimodal_ai_markdown_with_fallback(
     additional_images: list[tuple[bytes, str]] | None = None,
     max_output_tokens_override: int | None = None,
 ) -> tuple[str, LLMRuntimeConfig, list[str]]:
-    attempts = [cfg for cfg in configs if bool(cfg.enabled)]
+    enabled_profiles = [cfg for cfg in configs if bool(cfg.enabled)]
+    attempts = [cfg for cfg in enabled_profiles if not (cfg.provider == "openai" and not (cfg.api_key or "").strip())]
     if not attempts:
+        if enabled_profiles:
+            raise RuntimeError(
+                "No executable multimodal runtime profiles available. "
+                "OpenAI profiles require an API key; set one in Admin > AI Runtime or disable those profiles."
+            )
         raise RuntimeError("No enabled AI runtime profiles available.")
     errors: list[str] = []
     for cfg in attempts:
-        try:
-            text = generate_multimodal_ai_markdown(
-                cfg,
-                system_message=system_message,
-                instruction=instruction,
-                image_bytes=image_bytes,
-                image_content_type=image_content_type,
-                additional_images=additional_images,
-                max_output_tokens_override=max_output_tokens_override,
-            )
-            return text, cfg, errors
-        except Exception as exc:
-            errors.append(f"{cfg.provider}:{cfg.multimodal_model or cfg.model} -> {exc}")
-            continue
+        model_label = cfg.multimodal_model or cfg.model
+        transient_retry_exception: Exception | None = None
+        for attempt_no in range(2):
+            try:
+                text = generate_multimodal_ai_markdown(
+                    cfg,
+                    system_message=system_message,
+                    instruction=instruction,
+                    image_bytes=image_bytes,
+                    image_content_type=image_content_type,
+                    additional_images=additional_images,
+                    max_output_tokens_override=max_output_tokens_override,
+                )
+                if transient_retry_exception is not None:
+                    errors.append(
+                        f"{cfg.provider}:{model_label} -> recovered after transient error retry: "
+                        f"{transient_retry_exception}"
+                    )
+                return text, cfg, errors
+            except Exception as exc:
+                if attempt_no == 0 and _is_transient_multimodal_exception(exc):
+                    transient_retry_exception = exc
+                    continue
+                if transient_retry_exception is not None:
+                    errors.append(
+                        f"{cfg.provider}:{model_label} -> transient retry failed "
+                        f"(first: {transient_retry_exception}; final: {exc})"
+                    )
+                else:
+                    errors.append(f"{cfg.provider}:{model_label} -> {exc}")
+                break
     raise RuntimeError("All multimodal fallback attempts failed. " + " | ".join(errors))

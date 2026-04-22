@@ -5,6 +5,22 @@ import unittest
 from pathlib import Path
 
 
+class _Ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSt:
+    def __init__(self):
+        self.successes = []
+
+    def success(self, msg):
+        self.successes.append(str(msg))
+
+
 def _bootstrap_views_package() -> None:
     if "boto3" not in sys.modules:
         fake_boto3 = types.ModuleType("boto3")
@@ -77,6 +93,72 @@ class LotsHelpersTests(unittest.TestCase):
         self.assertEqual(lots._extract_first_line_item({"line_items": []}), {})
         self.assertEqual(lots._extract_first_line_item({"line_items": ["bad", 1]}), {})
         self.assertEqual(lots._extract_first_line_item({}), {})
+
+    def test_lot_create_defaults_and_source_normalization(self):
+        labels = ["None (one-off/manual)", "Dealer A (vendor)"]
+        defaults = lots._lot_create_defaults(labels)
+        self.assertEqual(defaults["lots_create_source_key"], "None (one-off/manual)")
+        self.assertIn("lots_create_total_tax_paid", defaults)
+        self.assertIn("lots_create_total_shipping_paid", defaults)
+        self.assertIn("lots_create_total_handling_paid", defaults)
+        self.assertIn("lots_create_ebay_purchase", defaults)
+
+        self.assertEqual(
+            lots._normalize_lot_create_source_key(labels, "Dealer A (vendor)"),
+            "Dealer A (vendor)",
+        )
+        self.assertEqual(
+            lots._normalize_lot_create_source_key(labels, "Missing Value"),
+            "None (one-off/manual)",
+        )
+        self.assertEqual(
+            lots._normalize_lot_create_source_key([], "Anything"),
+            "None (one-off/manual)",
+        )
+
+    def test_validate_lot_create_inputs(self):
+        self.assertEqual(
+            lots._validate_lot_create_inputs("", False, ""),
+            "Lot code is required.",
+        )
+        self.assertEqual(
+            lots._validate_lot_create_inputs("LOT-001", True, ""),
+            "eBay Purchase Item ID is required when Purchased On eBay is enabled.",
+        )
+        self.assertIsNone(
+            lots._validate_lot_create_inputs("LOT-001", True, "1234567890"),
+        )
+        self.assertIsNone(
+            lots._validate_lot_create_inputs("LOT-001", False, ""),
+        )
+
+    def test_prime_lot_create_state_handles_flash_and_reset(self):
+        labels = ["None (one-off/manual)", "Dealer A (vendor)"]
+        state = {
+            "lots_create_flash_message": "Purchase lot created.",
+            "lots_create_reset_requested": True,
+            "lots_create_lot_code": "OLD",
+            "lots_create_source_key": "Missing",
+            "lots_create_vendor": "Old Vendor",
+            "lots_create_ebay_purchase": True,
+            "lots_create_ebay_purchase_item_id": "123",
+        }
+        flash = lots._prime_lot_create_state(state, labels)
+        self.assertEqual(flash, "Purchase lot created.")
+        self.assertNotIn("lots_create_flash_message", state)
+        self.assertNotIn("lots_create_reset_requested", state)
+        self.assertEqual(state["lots_create_lot_code"], "")
+        self.assertEqual(state["lots_create_vendor"], "")
+        self.assertEqual(state["lots_create_source_key"], "None (one-off/manual)")
+        self.assertFalse(state["lots_create_ebay_purchase"])
+        self.assertEqual(state["lots_create_ebay_purchase_item_id"], "")
+
+    def test_render_lot_create_state_feedback_shows_flash(self):
+        labels = ["None (one-off/manual)"]
+        state = {"lots_create_flash_message": "Purchase lot created."}
+        fake_st = _FakeSt()
+        lots._render_lot_create_state_feedback(fake_st, state, labels)
+        self.assertEqual(fake_st.successes, ["Purchase lot created."])
 
 
 if __name__ == "__main__":

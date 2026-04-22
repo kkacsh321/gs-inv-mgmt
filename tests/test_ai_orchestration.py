@@ -72,6 +72,9 @@ class AIOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.citation["context"]["query"], "1 oz silver eagle")
         self.assertEqual(result.citation["context"]["ebay_rows"], 1)
         self.assertEqual(result.citation["context"]["web_rows"], 2)
+        self.assertEqual(result.citation["context"]["workflow"], "comp")
+        _args, kwargs = mock_chain.call_args
+        self.assertEqual(kwargs.get("workflow"), "comp")
 
     @patch("app.services.ai_orchestration.generate_comp_ai_summary_with_fallback")
     @patch("app.services.ai_orchestration.resolve_comp_llm_runtime_chain")
@@ -154,12 +157,15 @@ class AIOrchestrationTests(unittest.TestCase):
             additional_images=[(b"456", "image/jpeg")],
             max_output_tokens_override=1200,
             context={"run_id": 99},
+            workflow="intake",
         )
 
         self.assertEqual(result.text, "vision-result")
         self.assertEqual(result.citation["tool_name"], "coin_identifier")
-        self.assertEqual(result.citation["context"], {"run_id": 99})
+        self.assertEqual(result.citation["context"], {"run_id": 99, "workflow": "intake"})
         self.assertEqual(result.citation["fallback_attempts"], 0)
+        _args_chain, kwargs_chain = mock_chain.call_args
+        self.assertEqual(kwargs_chain.get("workflow"), "intake")
 
         mock_generate.assert_called_once()
         _args, kwargs = mock_generate.call_args

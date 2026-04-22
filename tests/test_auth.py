@@ -339,8 +339,7 @@ class AuthTests(unittest.TestCase):
 
         self.fake_st.session_state["auth_cookie_manager"] = enc_pending
         enabled_settings = SimpleNamespace(app_auth_cookie_enabled=True, app_name="GS", app_auth_signing_key="k")
-        fake_mod = types.SimpleNamespace(CookieManager=_FakeRawCookieManager)
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_FakeRawCookieManager, "extra_streamlit_components")), patch(
             "app.auth.st", self.fake_st
         ), patch("app.auth.settings", enabled_settings):
             manager, state, _err = auth._cookie_manager_status()
@@ -349,13 +348,13 @@ class AuthTests(unittest.TestCase):
             self.assertIsNone(auth._get_cookie_manager())
 
         self.fake_st.session_state["auth_cookie_manager"] = enc_ready
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_FakeRawCookieManager, "extra_streamlit_components")), patch(
             "app.auth.st", self.fake_st
         ), patch("app.auth.settings", enabled_settings):
             self.assertIsNotNone(auth._get_cookie_manager())
 
         self.fake_st.session_state["auth_cookie_manager"] = enc_boom
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_FakeRawCookieManager, "extra_streamlit_components")), patch(
             "app.auth.st", self.fake_st
         ), patch("app.auth.settings", enabled_settings):
             manager, state, err = auth._cookie_manager_status()
@@ -378,8 +377,7 @@ class AuthTests(unittest.TestCase):
 
         self.fake_st.session_state["auth_cookie_manager"] = enc
         enabled_settings = SimpleNamespace(app_auth_cookie_enabled=True, app_name="GS", app_auth_signing_key="k")
-        fake_mod = types.SimpleNamespace(CookieManager=_FakeRawCookieManager)
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_FakeRawCookieManager, "extra_streamlit_components")), patch(
             "app.auth.st", self.fake_st
         ), patch("app.auth.settings", enabled_settings):
             self.assertTrue(auth._set_cookie_auth_token("remember"))
@@ -406,15 +404,27 @@ class AuthTests(unittest.TestCase):
 
     def test_cookie_manager_import_error_paths(self) -> None:
         settings_mock = SimpleNamespace(app_auth_cookie_enabled=True, app_name="GS", app_auth_signing_key="k")
-        empty_mod = types.ModuleType("streamlit_cookies_manager")
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": empty_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(None, "")), patch(
             "app.auth.st", self.fake_st
         ), patch("app.auth.settings", settings_mock):
             self.assertIsNone(auth._get_cookie_manager())
             manager, state, err = auth._cookie_manager_status()
         self.assertIsNone(manager)
-        self.assertEqual(state, "unavailable")
-        self.assertIn("ImportError", err)
+        self.assertEqual(state, "error")
+        self.assertEqual(err, "manager_none")
+
+    def test_cookie_manager_backend_prefers_extra_streamlit_components_only(self) -> None:
+        fake_extra_mod = types.ModuleType("extra_streamlit_components")
+        fake_extra_mod.CookieManager = _FakeRawCookieManager
+        with patch.dict(sys.modules, {"extra_streamlit_components": fake_extra_mod}):
+            cls, backend = auth._cookie_manager_backend()
+        self.assertIs(cls, _FakeRawCookieManager)
+        self.assertEqual(backend, "extra_streamlit_components")
+
+        with patch.dict(sys.modules, {"extra_streamlit_components": None}):
+            cls2, backend2 = auth._cookie_manager_backend()
+        self.assertIsNone(cls2)
+        self.assertEqual(backend2, "")
 
     def test_cookie_manager_status_builds_manager_ready_and_none_paths(self) -> None:
         settings_mock = SimpleNamespace(app_auth_cookie_enabled=True, app_name="GS", app_auth_signing_key="k")
@@ -422,9 +432,8 @@ class AuthTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 super().__init__(ready_value=True)
 
-        fake_mod = types.SimpleNamespace(CookieManager=_CookieMgrFactory)
         st_local = _FakeSt()
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_CookieMgrFactory, "extra_streamlit_components")), patch(
             "app.auth.st", st_local
         ), patch("app.auth.settings", settings_mock):
             manager, state, err = auth._cookie_manager_status()
@@ -433,7 +442,7 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(err, "")
 
         st_local.session_state["auth_cookie_manager"] = None
-        with patch.dict(sys.modules, {"streamlit_cookies_manager": fake_mod}), patch(
+        with patch("app.auth._cookie_manager_backend", return_value=(_CookieMgrFactory, "extra_streamlit_components")), patch(
             "app.auth.st", st_local
         ), patch("app.auth.settings", settings_mock):
             manager2, state2, err2 = auth._cookie_manager_status()

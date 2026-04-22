@@ -7,7 +7,7 @@ def render_active_ebay_context_banner(*, section_title: str = "Active Account Co
         str(st.session_state.get("ebay_workspace_active_store_profile") or "manual-store").strip()
         or "manual-store"
     )
-    status_filter = list(st.session_state.get("ebay_workspace_status_filter") or ["draft", "active", "ended"])
+    status_filter = list(st.session_state.get("ebay_workspace_status_filter") or ["draft", "active", "ended", "sold"])
     linked_only = bool(st.session_state.get("ebay_workspace_linked_only"))
     search_text = str(st.session_state.get("ebay_workspace_search") or "").strip()
     use_date_filter = bool(st.session_state.get("ebay_workspace_use_date_filter"))

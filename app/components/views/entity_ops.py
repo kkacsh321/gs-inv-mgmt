@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import streamlit as st
 
+from app.components.ui_helpers import safe_dataframe
 from app.config import settings
 from app.repository import InventoryRepository
 
@@ -370,15 +371,15 @@ def render_entity_timeline(
                     )
             if change_rows:
                 st.caption("Change Summary")
-                st.dataframe(pd.DataFrame(change_rows), use_container_width=True)
+                st.dataframe(safe_dataframe(change_rows), use_container_width=True)
             if st.button(
                 "Open Search & Edit",
                 key=f"timeline_open_search_edit_{resolved_entity_type}_{resolved_entity_id}",
             ):
                 if hasattr(st, "switch_page"):
-                    st.switch_page("app/pages/10_Search_Edit.py")
+                    st.switch_page("pages/10_Search_Edit.py")
                 else:
-                    st.info("Open `app/pages/10_Search_Edit.py` from the sidebar.")
+                    st.info("Open `pages/10_Search_Edit.py` from the sidebar.")
 
         selected_sync_run_id = selected_row.get("sync_run_id")
         if selected_sync_run_id:
@@ -388,9 +389,9 @@ def render_entity_timeline(
             ):
                 st.session_state["sync_focus_run_id"] = int(selected_sync_run_id)
                 if hasattr(st, "switch_page"):
-                    st.switch_page("app/pages/18_Sync.py")
+                    st.switch_page("pages/18_Sync.py")
                 else:
-                    st.info("Open `app/pages/18_Sync.py` from the sidebar.")
+                    st.info("Open `pages/18_Sync.py` from the sidebar.")
 
 
 def render_standard_row_actions(
@@ -400,7 +401,7 @@ def render_standard_row_actions(
     rows: list[dict],
     id_field: str = "id",
     title: str = "Row Actions",
-    search_edit_page: str = "app/pages/10_Search_Edit.py",
+    search_edit_page: str = "pages/10_Search_Edit.py",
     edit_action_label: str = "Open Search & Edit",
     edit_action_caption: str = "Use Search & Edit for canonical updates and audit-safe edits.",
 ) -> None:

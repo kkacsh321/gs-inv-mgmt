@@ -11,6 +11,7 @@ resources:
   - pvc-backups.yaml
   - deployment-app.yaml
   - deployment-sync-worker.yaml
+  - deployment-slack-ops-worker.yaml
   - service.yaml
   - ingress.yaml
   - migration-job.yaml

@@ -1,4 +1,5 @@
 from datetime import datetime
+import hashlib
 import json
 
 import pandas as pd
@@ -6,7 +7,7 @@ import streamlit as st
 from sqlalchemy.exc import IntegrityError
 
 from app.auth import current_user, ensure_permission
-from app.components.ui_helpers import iso_or_none, to_decimal_or_none
+from app.components.ui_helpers import iso_or_none, normalize_multiselect_values, to_decimal_or_none
 from app.components.views.shared import (
     generate_sku,
     render_help_panel,
@@ -80,6 +81,36 @@ def _try_extract_json_object(raw_text: str) -> dict:
         except Exception:
             return {}
     return {}
+
+
+def _validate_product_create_inputs(
+    sku: str,
+    title: str,
+    ebay_purchase: bool,
+    ebay_purchase_item_id: str,
+) -> str | None:
+    if not str(sku or "").strip() or not str(title or "").strip():
+        return "SKU and title are required."
+    if bool(ebay_purchase) and not str(ebay_purchase_item_id or "").strip():
+        return "eBay Purchase Item ID is required when Purchased On eBay is enabled."
+    return None
+
+
+def _validate_product_edit_ebay_inputs(
+    ebay_purchase: bool,
+    ebay_purchase_item_id: str,
+) -> str | None:
+    if bool(ebay_purchase) and not str(ebay_purchase_item_id or "").strip():
+        return "eBay Purchase Item ID is required when Purchased On eBay is enabled."
+    return None
+
+
+def _product_ebay_fields_disabled(*, ebay_purchase: bool, context: str) -> bool:
+    # Products page keeps eBay fields editable in both create and side-panel edit flows.
+    # Validation enforces required Item ID only when Purchased On eBay is enabled.
+    _ = context
+    _ = ebay_purchase
+    return False
 
 
 def render_products(repo: InventoryRepository, storage: MediaStorageService) -> None:
@@ -373,14 +404,16 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
             "eBay Purchase Item ID",
             value="",
             key="product_ebay_purchase_item_id_input",
-            disabled=not ebay_purchase,
+            disabled=_product_ebay_fields_disabled(ebay_purchase=bool(ebay_purchase), context="create"),
         )
         ebay_purchase_url = st.text_input(
             "eBay Purchase Link",
             value="",
             key="product_ebay_purchase_url_input",
-            disabled=not ebay_purchase,
+            disabled=_product_ebay_fields_disabled(ebay_purchase=bool(ebay_purchase), context="create"),
         )
+        if not ebay_purchase:
+            st.caption("Tip: enable `Purchased On eBay` to require Item ID validation on create.")
         st.markdown("#### Shipping Package Details")
         sp1, sp2, sp3, sp4 = st.columns(4)
         with sp1:
@@ -415,10 +448,14 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         if st.form_submit_button("Create Product"):
             if not ensure_permission(user, "create", "Create Product"):
                 st.stop()
-            if not sku.strip() or not title.strip():
-                st.error("SKU and title are required.")
-            elif ebay_purchase and not ebay_purchase_item_id.strip():
-                st.error("eBay Purchase Item ID is required when Purchased On eBay is enabled.")
+            create_validation_error = _validate_product_create_inputs(
+                sku=sku,
+                title=title,
+                ebay_purchase=bool(ebay_purchase),
+                ebay_purchase_item_id=ebay_purchase_item_id,
+            )
+            if create_validation_error:
+                st.error(create_validation_error)
             else:
                 try:
                     created_product = repo.create_product(
@@ -540,30 +577,50 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         for p in products
     ]
     st.markdown("### Product Filters")
+    product_category_options = sorted({str(row["category"]) for row in product_rows if row.get("category")})
+    product_status_options = sorted({str(row["status"]) for row in product_rows if row.get("status")})
+    product_inventory_class_options = sorted(
+        {str(row["inventory_class"]) for row in product_rows if row.get("inventory_class")}
+    )
     f1, f2, f3, f4 = st.columns(4)
     with f1:
         product_filter_query = st.text_input("Search SKU/Title", key="products_filter_query")
     with f2:
         product_filter_categories = st.multiselect(
             "Category",
-            options=sorted({str(row["category"]) for row in product_rows if row.get("category")}),
-            default=[],
+            options=product_category_options,
             key="products_filter_categories",
         )
     with f3:
         product_filter_status = st.multiselect(
             "Status",
-            options=sorted({str(row["status"]) for row in product_rows if row.get("status")}),
-            default=[],
+            options=product_status_options,
             key="products_filter_status",
         )
     with f4:
         product_filter_inventory_classes = st.multiselect(
             "Inventory Class",
-            options=sorted({str(row["inventory_class"]) for row in product_rows if row.get("inventory_class")}),
-            default=[],
+            options=product_inventory_class_options,
             key="products_filter_inventory_classes",
         )
+    product_filter_include_archived = st.checkbox(
+        "Include Archived",
+        value=False,
+        key="products_filter_include_archived",
+        help="Show archived products in table and side-panel selection.",
+    )
+    product_filter_categories = normalize_multiselect_values(
+        product_filter_categories,
+        product_category_options,
+    )
+    product_filter_status = normalize_multiselect_values(
+        product_filter_status,
+        product_status_options,
+    )
+    product_filter_inventory_classes = normalize_multiselect_values(
+        product_filter_inventory_classes,
+        product_inventory_class_options,
+    )
     effective_filter = render_saved_filter_bar(
         repo=repo,
         scope="products",
@@ -573,6 +630,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
             "categories": product_filter_categories,
             "statuses": product_filter_status,
             "inventory_classes": product_filter_inventory_classes,
+            "include_archived": bool(product_filter_include_archived),
         },
     )
     q = str(effective_filter.get("query") or "").strip().lower()
@@ -581,6 +639,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
     inventory_class_filter = {
         str(v).strip().lower() for v in (effective_filter.get("inventory_classes") or []) if str(v).strip()
     }
+    include_archived = bool(effective_filter.get("include_archived"))
     filtered_rows = []
     for row in product_rows:
         if q and q not in str(row.get("sku") or "").lower() and q not in str(row.get("title") or "").lower():
@@ -590,6 +649,8 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         if statuses and str(row.get("status") or "").strip().lower() not in statuses:
             continue
         if inventory_class_filter and str(row.get("inventory_class") or "").strip().lower() not in inventory_class_filter:
+            continue
+        if not include_archived and str(row.get("status") or "").strip().lower() == "archived":
             continue
         filtered_rows.append(row)
 
@@ -606,6 +667,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                 "categories": sorted(categories),
                 "statuses": sorted(statuses),
                 "inventory_classes": sorted(inventory_class_filter),
+                "include_archived": bool(include_archived),
             },
         )
         st.dataframe(filtered_df, use_container_width=True)
@@ -747,13 +809,21 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                     edit_ebay_purchase_item_id = st.text_input(
                         "eBay Purchase Item ID",
                         value=str(getattr(selected_product, "ebay_purchase_item_id", "") or ""),
-                        disabled=not edit_ebay_purchase,
+                        disabled=_product_ebay_fields_disabled(
+                            ebay_purchase=bool(edit_ebay_purchase),
+                            context="edit",
+                        ),
                     )
                     edit_ebay_purchase_url = st.text_input(
                         "eBay Purchase Link",
                         value=str(getattr(selected_product, "ebay_purchase_url", "") or ""),
-                        disabled=not edit_ebay_purchase,
+                        disabled=_product_ebay_fields_disabled(
+                            ebay_purchase=bool(edit_ebay_purchase),
+                            context="edit",
+                        ),
                     )
+                    if not edit_ebay_purchase:
+                        st.caption("Tip: enable `Purchased On eBay` to require Item ID validation on save.")
                     current_coin_ref_id = int(selected_product.coin_reference_id or 0)
                     coin_ref_edit_labels = list(coin_ref_options.keys())
                     default_coin_ref_index = 0
@@ -849,8 +919,12 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                         ai_comp_value = normalize_ai_text(
                             str(st.session_state.get("comp_last_ai_summary") or "").strip()
                         ) or ai_comp_value
-                    if edit_ebay_purchase and not edit_ebay_purchase_item_id.strip():
-                        raise ValueError("eBay Purchase Item ID is required when Purchased On eBay is enabled.")
+                    edit_validation_error = _validate_product_edit_ebay_inputs(
+                        ebay_purchase=bool(edit_ebay_purchase),
+                        ebay_purchase_item_id=edit_ebay_purchase_item_id,
+                    )
+                    if edit_validation_error:
+                        raise ValueError(edit_validation_error)
                     repo.update_product(
                         selected_product.id,
                         {
@@ -891,6 +965,125 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                 except (ValueError, ValidationError, IntegrityError) as exc:
                     repo.db.rollback()
                     st.error(str(exc))
+
+            st.markdown("#### Product Lifecycle")
+            product_is_archived = str(getattr(selected_product, "status", "") or "").strip().lower() == "archived"
+            active_product_listing_count = sum(
+                1
+                for row in repo.list_listings()
+                if int(getattr(row, "product_id", 0) or 0) == int(selected_product.id)
+                and str(getattr(row, "listing_status", "") or "").strip().lower() == "active"
+            )
+            if product_is_archived:
+                st.info("This product is archived.")
+                if st.button(
+                    "Restore Product",
+                    key=f"restore_product_btn_{selected_product.id}",
+                    use_container_width=True,
+                ):
+                    if not ensure_permission(user, "update", "Restore Product"):
+                        st.stop()
+                    try:
+                        repo.restore_product(int(selected_product.id), actor=user.username)
+                        st.success(f"Restored product #{int(selected_product.id)}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to restore product: {exc}")
+            else:
+                if active_product_listing_count > 0:
+                    st.warning(
+                        f"{active_product_listing_count} active listing(s) are linked to this product. "
+                        "Archive is blocked unless forced."
+                    )
+                force_archive = st.checkbox(
+                    "Force archive even with active listings",
+                    value=False,
+                    key=f"force_archive_product_{selected_product.id}",
+                    disabled=active_product_listing_count <= 0,
+                )
+                if st.button(
+                    "Archive Product",
+                    key=f"archive_product_btn_{selected_product.id}",
+                    use_container_width=True,
+                ):
+                    if not ensure_permission(user, "update", "Archive Product"):
+                        st.stop()
+                    try:
+                        repo.archive_product(
+                            int(selected_product.id),
+                            actor=user.username,
+                            force=bool(force_archive),
+                        )
+                        st.success(f"Archived product #{int(selected_product.id)}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to archive product: {exc}")
+
+            st.markdown("#### Link Product To Purchase Lot")
+            if not lots:
+                st.info("No purchase lots found. Create a lot first from the Lots page.")
+            else:
+                with st.form(f"product_assign_lot_form_{selected_product.id}"):
+                    assign_lot_key = st.selectbox(
+                        "Purchase Lot",
+                        options=list(side_lot_options.keys()),
+                        key=f"assign_lot_key_{selected_product.id}",
+                        help="Create an assignment record linking this product to a purchase lot.",
+                    )
+                    la1, la2, la3, la4 = st.columns(4)
+                    with la1:
+                        assign_qty = st.number_input(
+                            "Qty Acquired",
+                            min_value=1,
+                            value=1,
+                            step=1,
+                            key=f"assign_lot_qty_{selected_product.id}",
+                        )
+                    with la2:
+                        assign_unit_cost = st.number_input(
+                            "Unit Cost",
+                            min_value=0.0,
+                            value=float(selected_product.acquisition_cost or 0),
+                            step=0.01,
+                            key=f"assign_lot_unit_cost_{selected_product.id}",
+                        )
+                    with la3:
+                        assign_unit_tax = st.number_input(
+                            "Unit Tax Paid",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.01,
+                            key=f"assign_lot_unit_tax_{selected_product.id}",
+                        )
+                    with la4:
+                        assign_acquired_date = st.date_input(
+                            "Acquired Date",
+                            value=utc_today(),
+                            key=f"assign_lot_acquired_date_{selected_product.id}",
+                        )
+                    assign_submit = st.form_submit_button("Assign To Lot")
+
+                if assign_submit:
+                    if not ensure_permission(user, "update", "Assign Product To Lot"):
+                        st.stop()
+                    chosen_lot_id = side_lot_options.get(assign_lot_key)
+                    if not chosen_lot_id:
+                        st.error("Select a purchase lot to assign.")
+                    else:
+                        try:
+                            repo.assign_product_to_lot(
+                                product_id=int(selected_product.id),
+                                lot_id=int(chosen_lot_id),
+                                quantity_acquired=int(assign_qty),
+                                unit_cost=to_decimal_or_none(assign_unit_cost),
+                                unit_tax_paid=to_decimal_or_none(assign_unit_tax),
+                                acquired_at=datetime.combine(assign_acquired_date, datetime.min.time()),
+                            )
+                            st.success("Product linked to purchase lot.")
+                            st.rerun()
+                        except (ValueError, ValidationError, IntegrityError) as exc:
+                            repo.db.rollback()
+                            st.error(str(exc))
 
             st.markdown("#### Convert Inventory To New SKU")
             st.caption(
@@ -1314,7 +1507,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
 
             st.markdown("#### Repurchase / Restock Existing SKU")
             with st.form(f"product_repurchase_form_{selected_product.id}"):
-                rp1, rp2 = st.columns(2)
+                rp1, rp2, rp3 = st.columns(3)
                 with rp1:
                     repurchase_qty = st.number_input(
                         "Repurchase Quantity",
@@ -1330,7 +1523,37 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                         step=0.01,
                         key=f"repurchase_unit_cost_{selected_product.id}",
                     )
+                    repurchase_unit_product_cost = st.number_input(
+                        "Repurchase Unit Product Cost",
+                        min_value=0.0,
+                        value=float(getattr(selected_product, "product_cost", 0) or 0),
+                        step=0.01,
+                        key=f"repurchase_unit_product_cost_{selected_product.id}",
+                        help="Unit direct product cost used in margin calculations.",
+                    )
                 with rp2:
+                    repurchase_unit_tax = st.number_input(
+                        "Repurchase Unit Tax Paid",
+                        min_value=0.0,
+                        value=float(getattr(selected_product, "acquisition_tax_paid", 0) or 0),
+                        step=0.01,
+                        key=f"repurchase_unit_tax_{selected_product.id}",
+                    )
+                    repurchase_unit_shipping = st.number_input(
+                        "Repurchase Unit Shipping Paid",
+                        min_value=0.0,
+                        value=float(getattr(selected_product, "acquisition_shipping_paid", 0) or 0),
+                        step=0.01,
+                        key=f"repurchase_unit_shipping_{selected_product.id}",
+                    )
+                    repurchase_unit_handling = st.number_input(
+                        "Repurchase Unit Handling Paid",
+                        min_value=0.0,
+                        value=float(getattr(selected_product, "acquisition_handling_paid", 0) or 0),
+                        step=0.01,
+                        key=f"repurchase_unit_handling_{selected_product.id}",
+                    )
+                with rp3:
                     repurchase_date = st.date_input(
                         "Repurchase Date",
                         value=utc_today(),
@@ -1340,6 +1563,16 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                         "Purchase Lot (Optional)",
                         options=list(side_lot_options.keys()),
                         key=f"repurchase_lot_{selected_product.id}",
+                    )
+                    repurchase_doc_kind = st.selectbox(
+                        "Repurchase Document Kind",
+                        options=["incoming_invoice", "purchase_order", "receipt", "other"],
+                        key=f"repurchase_doc_kind_{selected_product.id}",
+                    )
+                    repurchase_doc_file = st.file_uploader(
+                        "Attach Repurchase Invoice/Receipt (optional)",
+                        type=["pdf", "png", "jpg", "jpeg", "webp"],
+                        key=f"repurchase_doc_file_{selected_product.id}",
                     )
                 repurchase_notes = st.text_area(
                     "Repurchase Notes",
@@ -1356,12 +1589,50 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                         product_id=selected_product.id,
                         quantity_acquired=int(repurchase_qty),
                         unit_cost=to_decimal_or_none(repurchase_unit_cost),
+                        unit_tax_paid=to_decimal_or_none(repurchase_unit_tax),
+                        unit_shipping_paid=to_decimal_or_none(repurchase_unit_shipping),
+                        unit_handling_paid=to_decimal_or_none(repurchase_unit_handling),
+                        unit_product_cost=to_decimal_or_none(repurchase_unit_product_cost),
                         acquired_at=datetime.combine(repurchase_date, datetime.min.time()),
                         lot_id=side_lot_options.get(repurchase_lot_key),
                         notes=repurchase_notes.strip(),
                         actor=user.username,
                     )
-                    st.success("Repurchase recorded with lot/movement tracking.")
+                    repurchase_doc_message = ""
+                    if repurchase_doc_file is not None:
+                        if not storage.enabled:
+                            repurchase_doc_message = " Repurchase recorded, but document upload skipped (S3 not configured)."
+                        else:
+                            file_name = str(getattr(repurchase_doc_file, "name", "") or "").strip() or "repurchase_document.bin"
+                            file_bytes = bytes(repurchase_doc_file.getvalue() or b"")
+                            if not file_bytes:
+                                repurchase_doc_message = " Repurchase recorded, but attached document was empty."
+                            else:
+                                content_type = str(getattr(repurchase_doc_file, "type", "") or "").strip() or "application/octet-stream"
+                                upload_result = storage.upload_file(
+                                    file_name=file_name,
+                                    file_bytes=file_bytes,
+                                    content_type=content_type,
+                                )
+                                created_doc = repo.create_purchase_document(
+                                    document_kind=str(repurchase_doc_kind or "incoming_invoice").strip().lower() or "incoming_invoice",
+                                    title=f"Repurchase {selected_product.sku} {repurchase_date.isoformat()}",
+                                    original_filename=file_name,
+                                    content_type=content_type,
+                                    size_bytes=len(file_bytes),
+                                    content_sha256=hashlib.sha256(file_bytes).hexdigest(),
+                                    s3_bucket=upload_result.bucket,
+                                    s3_key=upload_result.key,
+                                    s3_url=upload_result.url,
+                                    lot_id=side_lot_options.get(repurchase_lot_key),
+                                    product_id=int(selected_product.id),
+                                    ai_extracted_json="{}",
+                                    ai_summary="",
+                                    uploaded_by=user.username,
+                                    actor=user.username,
+                                )
+                                repurchase_doc_message = f" Attached purchase document #{int(created_doc.id)}."
+                    st.success("Repurchase recorded with lot/movement tracking." + repurchase_doc_message)
                     st.rerun()
                 except (ValueError, ValidationError, IntegrityError) as exc:
                     repo.db.rollback()
@@ -1420,6 +1691,10 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                             product_id=selected_product.id,
                             quantity_acquired=int(batch_receive_qty),
                             unit_cost=to_decimal_or_none(batch_receive_unit_cost),
+                            unit_tax_paid=to_decimal_or_none(float(getattr(selected_product, "acquisition_tax_paid", 0) or 0)),
+                            unit_shipping_paid=to_decimal_or_none(float(getattr(selected_product, "acquisition_shipping_paid", 0) or 0)),
+                            unit_handling_paid=to_decimal_or_none(float(getattr(selected_product, "acquisition_handling_paid", 0) or 0)),
+                            unit_product_cost=to_decimal_or_none(float(getattr(selected_product, "product_cost", 0) or 0)),
                             acquired_at=datetime.combine(batch_receive_date, datetime.min.time()),
                             lot_id=side_lot_options.get(batch_receive_lot_key),
                             notes=notes,
@@ -1716,7 +1991,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
         d1, d2 = st.columns(2)
         with d1:
-            listing_status = st.selectbox("Listing Status", ["draft", "active", "ended"], index=0)
+            listing_status = st.selectbox("Listing Status", ["draft", "active", "ended", "sold"], index=0)
         with d2:
             listed_date = st.date_input("Listed Date", value=utc_today(), key="create_ebay_listed_date")
         external_listing_id = st.text_input("External Listing ID (optional)")

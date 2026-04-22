@@ -14,6 +14,14 @@ class _FakeRepo:
             raise RuntimeError("db unavailable")
         return self.rows.get(key)
 
+    def list_runtime_settings(self, *, environment: str, active_only: bool = False):
+        if self.raise_error:
+            raise RuntimeError("db unavailable")
+        return [
+            SimpleNamespace(key=key, value=row.value, value_type=row.value_type)
+            for key, row in self.rows.items()
+        ]
+
 
 class RuntimeSettingsTests(unittest.TestCase):
     def test_to_bool_variants(self) -> None:
@@ -65,6 +73,28 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertAlmostEqual(runtime_settings.get_runtime_float(repo, "float_key", 0.0), 1.25)
         self.assertEqual(runtime_settings.get_runtime_str(repo, "str_key", "fallback"), "fallback")
 
+    def test_get_runtime_values_bulk_resolution(self) -> None:
+        repo = _FakeRepo(
+            rows={
+                "flag": SimpleNamespace(value="true", value_type="bool"),
+                "count": SimpleNamespace(value="12", value_type="int"),
+                "obj": SimpleNamespace(value='{"a":1}', value_type="json"),
+            }
+        )
+        resolved = runtime_settings.get_runtime_values(
+            repo,
+            {"flag": False, "count": 0, "obj": {}, "missing": "fallback"},
+        )
+        self.assertEqual(
+            resolved,
+            {"flag": True, "count": 12, "obj": {"a": 1}, "missing": "fallback"},
+        )
+
+    def test_get_runtime_values_returns_defaults_on_repo_error(self) -> None:
+        repo = _FakeRepo(raise_error=True)
+        resolved = runtime_settings.get_runtime_values(repo, {"a": "x", "b": 2})
+        self.assertEqual(resolved, {"a": "x", "b": 2})
+
     def test_is_ai_domain_enabled_uses_default_and_override(self) -> None:
         empty_repo = _FakeRepo()
         self.assertTrue(runtime_settings.is_ai_domain_enabled(empty_repo, "chat"))
@@ -78,4 +108,3 @@ class RuntimeSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

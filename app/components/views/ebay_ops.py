@@ -344,7 +344,7 @@ def render_ebay_ops(repo: InventoryRepository) -> None:
     if "ebay_ops_access_token" not in st.session_state:
         st.session_state["ebay_ops_access_token"] = default_token
     if "ebay_ops_status_filter" not in st.session_state:
-        st.session_state["ebay_ops_status_filter"] = ["draft", "active", "ended"]
+        st.session_state["ebay_ops_status_filter"] = ["draft", "active", "ended", "sold"]
     if "ebay_ops_linked_only" not in st.session_state:
         st.session_state["ebay_ops_linked_only"] = False
     if "ebay_ops_search_query" not in st.session_state:
@@ -406,7 +406,7 @@ def render_ebay_ops(repo: InventoryRepository) -> None:
                 st.session_state["ebay_verify_access_token"] = token_val
                 st.session_state["ebay_pull_access_token"] = token_val
             st.session_state["ebay_workspace_status_filter"] = list(
-                payload.get("status_filter") or ["draft", "active", "ended"]
+                payload.get("status_filter") or ["draft", "active", "ended", "sold"]
             )
             st.session_state["ebay_workspace_linked_only"] = bool(payload.get("linked_only"))
             st.session_state["ebay_workspace_search"] = str(payload.get("search") or "").strip()
@@ -441,7 +441,7 @@ def render_ebay_ops(repo: InventoryRepository) -> None:
     st.markdown("### Shared Listing Filter Bar")
     status_filter = st.multiselect(
         "Status Filter",
-        options=["draft", "active", "ended"],
+        options=["draft", "active", "ended", "sold"],
         key="ebay_ops_status_filter",
         help="Shared across Local Ops and eBay API Listings tabs.",
     )

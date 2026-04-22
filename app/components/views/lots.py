@@ -91,6 +91,116 @@ def _extract_first_line_item(parsed_json: dict) -> dict:
     return {}
 
 
+def _build_purchase_lot_updates_from_payload(parsed_json: dict) -> tuple[dict[str, object], dict[str, object]]:
+    if not isinstance(parsed_json, dict):
+        return {}, {}
+    ai_vendor = str(parsed_json.get("vendor_name") or "").strip()
+    ai_invoice_date = _extract_invoice_date_candidate(parsed_json.get("invoice_date"))
+    ai_total = _extract_decimal_candidate(parsed_json.get("total"))
+    ai_tax = _extract_decimal_candidate(parsed_json.get("tax"))
+    ai_shipping = _extract_decimal_candidate(parsed_json.get("shipping"))
+    ai_handling = _extract_decimal_candidate(parsed_json.get("handling"))
+    apply_updates: dict[str, object] = {}
+    if ai_vendor:
+        apply_updates["vendor"] = ai_vendor
+    if ai_invoice_date is not None:
+        apply_updates["purchase_date"] = datetime.combine(ai_invoice_date, datetime.min.time())
+    if ai_total is not None:
+        apply_updates["total_cost"] = to_decimal_or_none(ai_total)
+    if ai_tax is not None:
+        apply_updates["total_tax_paid"] = to_decimal_or_none(ai_tax)
+    if ai_shipping is not None:
+        apply_updates["total_shipping_paid"] = to_decimal_or_none(ai_shipping)
+    if ai_handling is not None:
+        apply_updates["total_handling_paid"] = to_decimal_or_none(ai_handling)
+    candidates = {
+        "vendor": ai_vendor,
+        "invoice_date": ai_invoice_date.isoformat() if ai_invoice_date else "n/a",
+        "total": ai_total if ai_total is not None else "n/a",
+        "tax": ai_tax if ai_tax is not None else "n/a",
+        "shipping": ai_shipping if ai_shipping is not None else "n/a",
+        "handling": ai_handling if ai_handling is not None else "n/a",
+    }
+    return apply_updates, candidates
+
+
+def _lot_is_archived(lot) -> bool:
+    raw = str(getattr(lot, "notes", "") or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    lifecycle = parsed.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return False
+    return bool(lifecycle.get("archived"))
+
+
+def _lot_create_defaults(source_labels: list[str]) -> dict:
+    fallback_source = source_labels[0] if source_labels else "None (one-off/manual)"
+    return {
+        "lots_create_lot_code": "",
+        "lots_create_source_key": fallback_source,
+        "lots_create_vendor": "",
+        "lots_create_purchase_date": utc_today(),
+        "lots_create_total_cost": 0.0,
+        "lots_create_total_tax_paid": 0.0,
+        "lots_create_total_shipping_paid": 0.0,
+        "lots_create_total_handling_paid": 0.0,
+        "lots_create_ebay_purchase": False,
+        "lots_create_ebay_purchase_item_id": "",
+        "lots_create_ebay_purchase_url": "",
+        "lots_create_notes": "",
+    }
+
+
+def _normalize_lot_create_source_key(
+    source_labels: list[str],
+    current_value: object,
+) -> str:
+    if current_value in source_labels:
+        return str(current_value)
+    return source_labels[0] if source_labels else "None (one-off/manual)"
+
+
+def _validate_lot_create_inputs(
+    lot_code: str,
+    ebay_purchase: bool,
+    ebay_purchase_item_id: str,
+) -> str | None:
+    if not lot_code:
+        return "Lot code is required."
+    if ebay_purchase and not ebay_purchase_item_id:
+        return "eBay Purchase Item ID is required when Purchased On eBay is enabled."
+    return None
+
+
+def _prime_lot_create_state(session_state, source_labels: list[str]) -> str:
+    lot_defaults = _lot_create_defaults(source_labels)
+    create_flash = str(session_state.pop("lots_create_flash_message", "") or "").strip()
+    for key, default_value in lot_defaults.items():
+        if key not in session_state:
+            session_state[key] = default_value
+    if bool(session_state.pop("lots_create_reset_requested", False)):
+        for key, default_value in lot_defaults.items():
+            session_state[key] = default_value
+    session_state["lots_create_source_key"] = _normalize_lot_create_source_key(
+        source_labels,
+        session_state.get("lots_create_source_key"),
+    )
+    return create_flash
+
+
+def _render_lot_create_state_feedback(st_module, session_state, source_labels: list[str]) -> None:
+    create_flash = _prime_lot_create_state(session_state, source_labels)
+    if create_flash:
+        st_module.success(create_flash)
+
+
 def render_lots(repo: InventoryRepository) -> None:
     st.subheader("Purchase Lots")
     st.caption("Track bulk purchases and assign individual products back to source lots.")
@@ -106,71 +216,102 @@ def render_lots(repo: InventoryRepository) -> None:
         roadmap_phase="v0.2 Operations Foundation",
     )
 
-    with st.form("create_lot_form", clear_on_submit=True):
-        lot_code = st.text_input("Lot Code", help="Example: LOT-20260323-A")
-        sources = repo.list_inventory_sources(active_only=True)
-        source_options = {"None (one-off/manual)": None, **{f"{s.name} ({s.source_type})": s.id for s in sources}}
-        source_key = st.selectbox(
-            "Common Source (Optional)",
-            list(source_options.keys()),
-            help="Select from managed Sources, or use manual vendor text below for one-off entries.",
-        )
-        vendor = st.text_input(
-            "Vendor Override / One-Off Source (Optional)",
-            placeholder="Optional manual value when no common source is selected.",
-        )
-        purchase_date = st.date_input("Purchase Date", value=utc_today())
-        total_cost = st.number_input("Total Lot Cost", min_value=0.0, value=0.0, step=1.0)
-        total_tax_paid = st.number_input("Total Lot Tax Paid", min_value=0.0, value=0.0, step=1.0)
-        total_shipping_paid = st.number_input("Total Lot Shipping Paid", min_value=0.0, value=0.0, step=1.0)
-        total_handling_paid = st.number_input("Total Lot Handling Paid", min_value=0.0, value=0.0, step=1.0)
-        ebay_purchase = st.checkbox(
-            "Purchased On eBay",
-            value=False,
-            help="Enable when this lot was acquired through eBay so purchase references are tracked.",
-        )
-        ebay_purchase_item_id = st.text_input(
-            "eBay Purchase Item ID",
-            value="",
-            disabled=not ebay_purchase,
-            help="Required when eBay purchase is enabled.",
-        )
-        ebay_purchase_url = st.text_input(
-            "eBay Purchase Link",
-            value="",
-            disabled=not ebay_purchase,
-            help="Optional direct URL to the eBay purchase/listing.",
-        )
-        notes = st.text_area("Notes")
-        if st.form_submit_button("Create Lot"):
-            if not lot_code.strip():
-                st.error("Lot code is required.")
-            elif ebay_purchase and not ebay_purchase_item_id.strip():
-                st.error("eBay Purchase Item ID is required when Purchased On eBay is enabled.")
-            else:
-                try:
-                    repo.create_purchase_lot(
-                        lot_code=lot_code.strip(),
-                        vendor=vendor.strip(),
-                        purchase_date=datetime.combine(purchase_date, datetime.min.time()),
-                        total_cost=to_decimal_or_none(total_cost),
-                        total_tax_paid=to_decimal_or_none(total_tax_paid),
-                        total_shipping_paid=to_decimal_or_none(total_shipping_paid),
-                        total_handling_paid=to_decimal_or_none(total_handling_paid),
-                        ebay_purchase=bool(ebay_purchase),
-                        ebay_purchase_item_id=ebay_purchase_item_id.strip(),
-                        ebay_purchase_url=ebay_purchase_url.strip(),
-                        notes=notes.strip(),
-                        source_id=source_options[source_key],
-                    )
-                    st.success("Purchase lot created.")
-                except IntegrityError:
-                    repo.db.rollback()
-                    st.error("Lot code must be unique.")
+    sources = repo.list_inventory_sources(active_only=True)
+    source_options = {"None (one-off/manual)": None, **{f"{s.name} ({s.source_type})": s.id for s in sources}}
+    source_labels = list(source_options.keys())
+
+    _render_lot_create_state_feedback(st, st.session_state, source_labels)
+
+    st.text_input("Lot Code", key="lots_create_lot_code", help="Example: LOT-20260323-A")
+    st.selectbox(
+        "Common Source (Optional)",
+        source_labels,
+        key="lots_create_source_key",
+        help="Select from managed Sources, or use manual vendor text below for one-off entries.",
+    )
+    st.text_input(
+        "Vendor Override / One-Off Source (Optional)",
+        key="lots_create_vendor",
+        placeholder="Optional manual value when no common source is selected.",
+    )
+    st.date_input("Purchase Date", key="lots_create_purchase_date")
+    st.number_input("Total Lot Cost", min_value=0.0, step=1.0, key="lots_create_total_cost")
+    st.number_input("Total Lot Tax Paid", min_value=0.0, step=1.0, key="lots_create_total_tax_paid")
+    st.number_input("Total Lot Shipping Paid", min_value=0.0, step=1.0, key="lots_create_total_shipping_paid")
+    st.number_input("Total Lot Handling Paid", min_value=0.0, step=1.0, key="lots_create_total_handling_paid")
+    st.checkbox(
+        "Purchased On eBay",
+        key="lots_create_ebay_purchase",
+        help="Enable when this lot was acquired through eBay so purchase references are tracked.",
+    )
+    ebay_purchase_enabled = bool(st.session_state.get("lots_create_ebay_purchase"))
+    st.text_input(
+        "eBay Purchase Item ID",
+        key="lots_create_ebay_purchase_item_id",
+        disabled=not ebay_purchase_enabled,
+        help="Required when eBay purchase is enabled.",
+    )
+    st.text_input(
+        "eBay Purchase Link",
+        key="lots_create_ebay_purchase_url",
+        disabled=not ebay_purchase_enabled,
+        help="Optional direct URL to the eBay purchase/listing.",
+    )
+    if not ebay_purchase_enabled:
+        st.caption("Tip: Enable `Purchased On eBay` to require Item ID validation on save.")
+    st.text_area("Notes", key="lots_create_notes")
+
+    if st.button("Create Lot", key="lots_create_submit_btn"):
+        lot_code = str(st.session_state.get("lots_create_lot_code") or "").strip()
+        source_key = str(st.session_state.get("lots_create_source_key") or "").strip()
+        vendor = str(st.session_state.get("lots_create_vendor") or "").strip()
+        purchase_date = st.session_state.get("lots_create_purchase_date") or utc_today()
+        total_cost = float(st.session_state.get("lots_create_total_cost") or 0.0)
+        total_tax_paid = float(st.session_state.get("lots_create_total_tax_paid") or 0.0)
+        total_shipping_paid = float(st.session_state.get("lots_create_total_shipping_paid") or 0.0)
+        total_handling_paid = float(st.session_state.get("lots_create_total_handling_paid") or 0.0)
+        ebay_purchase = bool(st.session_state.get("lots_create_ebay_purchase"))
+        ebay_purchase_item_id = str(st.session_state.get("lots_create_ebay_purchase_item_id") or "").strip()
+        ebay_purchase_url = str(st.session_state.get("lots_create_ebay_purchase_url") or "").strip()
+        notes = str(st.session_state.get("lots_create_notes") or "").strip()
+        validation_error = _validate_lot_create_inputs(lot_code, ebay_purchase, ebay_purchase_item_id)
+        if validation_error:
+            st.error(validation_error)
+        else:
+            try:
+                repo.create_purchase_lot(
+                    lot_code=lot_code,
+                    vendor=vendor,
+                    purchase_date=datetime.combine(purchase_date, datetime.min.time()),
+                    total_cost=to_decimal_or_none(total_cost),
+                    total_tax_paid=to_decimal_or_none(total_tax_paid),
+                    total_shipping_paid=to_decimal_or_none(total_shipping_paid),
+                    total_handling_paid=to_decimal_or_none(total_handling_paid),
+                    ebay_purchase=ebay_purchase,
+                    ebay_purchase_item_id=ebay_purchase_item_id,
+                    ebay_purchase_url=ebay_purchase_url,
+                    notes=notes,
+                    source_id=source_options.get(source_key),
+                )
+                st.session_state["lots_create_flash_message"] = "Purchase lot created."
+                st.session_state["lots_create_reset_requested"] = True
+                st.rerun()
+            except IntegrityError:
+                repo.db.rollback()
+                st.error("Lot code must be unique.")
 
     lots = repo.list_purchase_lots()
     products = repo.list_products()
-    if lots:
+    include_archived_lots = st.checkbox(
+        "Include Archived Lots",
+        value=False,
+        key="lots_include_archived",
+        help="Show archived lots in table and selection controls.",
+    )
+    visible_lots = list(lots)
+    if not include_archived_lots:
+        visible_lots = [lot for lot in visible_lots if not _lot_is_archived(lot)]
+    if visible_lots:
         st.dataframe(
             pd.DataFrame(
                 [
@@ -188,15 +329,98 @@ def render_lots(repo: InventoryRepository) -> None:
                         "ebay_purchase": bool(getattr(lot, "ebay_purchase", False)),
                         "ebay_purchase_item_id": str(getattr(lot, "ebay_purchase_item_id", "") or ""),
                         "ebay_purchase_url": str(getattr(lot, "ebay_purchase_url", "") or ""),
+                        "archived": bool(_lot_is_archived(lot)),
                         "notes": lot.notes,
                     }
-                    for lot in lots
+                    for lot in visible_lots
                 ]
             ),
             use_container_width=True,
         )
     else:
-        st.info("No lots yet.")
+        st.info("No visible lots yet.")
+
+    if lots:
+        st.markdown("### Manage Existing Lot Lifecycle")
+        lot_manage_map = {
+            f"#{int(lot.id)} | {str(lot.lot_code or '').strip()} | archived={str(_lot_is_archived(lot)).lower()}": lot
+            for lot in lots
+        }
+        selected_manage_label = st.selectbox(
+            "Select Lot",
+            options=list(lot_manage_map.keys()),
+            key="lots_manage_select",
+        )
+        selected_manage_lot = lot_manage_map[selected_manage_label]
+        lot_archived = bool(_lot_is_archived(selected_manage_lot))
+        if lot_archived:
+            st.info("Selected lot is archived.")
+            if st.button("Restore Lot", key=f"restore_lot_btn_{selected_manage_lot.id}"):
+                try:
+                    repo.restore_purchase_lot(int(selected_manage_lot.id), actor="employee")
+                    st.success(f"Restored lot #{int(selected_manage_lot.id)}.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to restore lot: {exc}")
+        else:
+            blockers = repo.get_purchase_lot_archive_blockers(int(selected_manage_lot.id))
+            blockers_total = sum(int(v or 0) for v in blockers.values())
+            if blockers_total > 0:
+                st.warning(
+                    "Archive preflight: linked records detected "
+                    f"(assignments={int(blockers.get('product_assignments', 0))}, "
+                    f"documents={int(blockers.get('purchase_documents', 0))}, "
+                    f"active_products={int(blockers.get('active_products', 0))}, "
+                    f"active_listings={int(blockers.get('active_listings', 0))})."
+                )
+            force_archive_lot = st.checkbox(
+                "Force archive lot despite linked records",
+                value=False,
+                key=f"force_archive_lot_{selected_manage_lot.id}",
+                disabled=blockers_total <= 0,
+                help="Required when linked assignments/documents/active records exist.",
+            )
+            archive_reason = st.text_input(
+                "Archive Reason (optional)",
+                value="",
+                key=f"archive_lot_reason_{selected_manage_lot.id}",
+            )
+            if st.button("Archive Lot", key=f"archive_lot_btn_{selected_manage_lot.id}"):
+                try:
+                    repo.archive_purchase_lot(
+                        int(selected_manage_lot.id),
+                        actor="employee",
+                        reason=str(archive_reason or "").strip(),
+                        force=bool(force_archive_lot),
+                    )
+                    st.success(f"Archived lot #{int(selected_manage_lot.id)}.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to archive lot: {exc}")
+
+        st.markdown("#### Lot P/L Snapshot (Estimated)")
+        st.caption(
+            "Estimated lot performance using linked product assignments and proportional sales attribution. "
+            "Use for operational signal; exact accounting depends on final COGS policy."
+        )
+        if not hasattr(repo, "lot_profitability_snapshot"):
+            st.info("Lot P/L snapshot is unavailable in this runtime context.")
+        else:
+            try:
+                snapshot = repo.lot_profitability_snapshot(int(selected_manage_lot.id))
+                summary = dict(snapshot.get("summary") or {})
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Assigned Qty", int(summary.get("assigned_qty") or 0))
+                s2.metric("Allocated Landed Cost", f"${float(summary.get('allocated_landed_cost') or 0):,.2f}")
+                s3.metric("Estimated Net (pre-COGS)", f"${float(summary.get('estimated_net_before_cogs') or 0):,.2f}")
+                s4.metric("Estimated Profit", f"${float(summary.get('estimated_lot_profit') or 0):,.2f}")
+                lot_rows = list(snapshot.get("rows") or [])
+                if lot_rows:
+                    st.dataframe(pd.DataFrame(lot_rows), use_container_width=True)
+                else:
+                    st.info("No product assignments found for this lot yet.")
+            except Exception as exc:
+                st.error(f"Unable to load lot P/L snapshot: {exc}")
 
     st.markdown("### Incoming Purchase Invoices / Documents")
     st.caption(
@@ -211,7 +435,7 @@ def render_lots(repo: InventoryRepository) -> None:
         except Exception as exc:
             st.error(f"Unable to initialize S3 bucket for purchase documents: {exc}")
             storage = None
-    lot_options = {"None": None, **{f"{lot.lot_code} | {lot.vendor}": lot.id for lot in lots}}
+    lot_options = {"None": None, **{f"{lot.lot_code} | {lot.vendor}": lot.id for lot in visible_lots}}
     product_options = {"None": None, **{f"{p.sku} | {p.title}": p.id for p in products}}
     source_options_for_docs = {"None": None, **{f"{s.name} ({s.source_type})": s.id for s in sources}}
 
@@ -330,6 +554,7 @@ def render_lots(repo: InventoryRepository) -> None:
                                 image_bytes=image_bytes,
                                 image_content_type=image_content_type,
                                 additional_images=additional_images,
+                                workflow="intake",
                                 context={
                                     "doc_kind": doc_kind,
                                     "file_name": file_name,
@@ -378,6 +603,34 @@ def render_lots(repo: InventoryRepository) -> None:
                         uploaded_by="employee",
                         actor="employee",
                     )
+                    auto_apply_enabled = bool(
+                        get_runtime_bool(repo, "purchase_doc_auto_apply_linked_lot_fields", False)
+                    )
+                    linked_lot_id = lot_options.get(link_lot_key)
+                    if auto_apply_enabled and linked_lot_id is not None and isinstance(ai_payload, dict):
+                        apply_updates, _ = _build_purchase_lot_updates_from_payload(ai_payload)
+                        if apply_updates:
+                            repo.update_purchase_lot(
+                                int(linked_lot_id),
+                                apply_updates,
+                                actor="employee",
+                            )
+                            repo.record_audit_event(
+                                entity_type="purchase_document",
+                                entity_id=int(created.id),
+                                action="auto_apply_extracted_fields_to_lot",
+                                actor="employee",
+                                changes={
+                                    "workflow": "lots_purchase_document_upload",
+                                    "mode": "auto",
+                                    "lot_id": int(linked_lot_id),
+                                    "applied_fields": sorted(apply_updates.keys()),
+                                },
+                            )
+                            st.success(
+                                "Auto-applied extracted purchase-document fields to "
+                                f"linked lot #{int(linked_lot_id)} ({int(len(apply_updates))} field(s))."
+                            )
                     st.success(f"Stored purchase document #{int(created.id)}.")
                 except Exception as exc:
                     st.error(f"Unable to store purchase document: {exc}")
@@ -788,36 +1041,18 @@ def render_lots(repo: InventoryRepository) -> None:
                 if linked_lot_id is None:
                     st.caption("Link this document to a lot to enable lot auto-fill.")
                 else:
-                    ai_vendor = str(parsed_json.get("vendor_name") or "").strip()
-                    ai_invoice_date = _extract_invoice_date_candidate(parsed_json.get("invoice_date"))
-                    ai_total = _extract_decimal_candidate(parsed_json.get("total"))
-                    ai_tax = _extract_decimal_candidate(parsed_json.get("tax"))
-                    ai_shipping = _extract_decimal_candidate(parsed_json.get("shipping"))
-                    ai_handling = _extract_decimal_candidate(parsed_json.get("handling"))
-                    apply_updates = {}
-                    if ai_vendor:
-                        apply_updates["vendor"] = ai_vendor
-                    if ai_invoice_date is not None:
-                        apply_updates["purchase_date"] = datetime.combine(ai_invoice_date, datetime.min.time())
-                    if ai_total is not None:
-                        apply_updates["total_cost"] = to_decimal_or_none(ai_total)
-                    if ai_tax is not None:
-                        apply_updates["total_tax_paid"] = to_decimal_or_none(ai_tax)
-                    if ai_shipping is not None:
-                        apply_updates["total_shipping_paid"] = to_decimal_or_none(ai_shipping)
-                    if ai_handling is not None:
-                        apply_updates["total_handling_paid"] = to_decimal_or_none(ai_handling)
+                    apply_updates, candidates = _build_purchase_lot_updates_from_payload(parsed_json)
 
                     st.caption(
                         "Detected candidates: "
                         + ", ".join(
                             [
-                                f"vendor={ai_vendor or 'n/a'}",
-                                f"invoice_date={ai_invoice_date.isoformat() if ai_invoice_date else 'n/a'}",
-                                f"total={ai_total if ai_total is not None else 'n/a'}",
-                                f"tax={ai_tax if ai_tax is not None else 'n/a'}",
-                                f"shipping={ai_shipping if ai_shipping is not None else 'n/a'}",
-                                f"handling={ai_handling if ai_handling is not None else 'n/a'}",
+                                f"vendor={str(candidates.get('vendor') or 'n/a')}",
+                                f"invoice_date={str(candidates.get('invoice_date') or 'n/a')}",
+                                f"total={str(candidates.get('total') or 'n/a')}",
+                                f"tax={str(candidates.get('tax') or 'n/a')}",
+                                f"shipping={str(candidates.get('shipping') or 'n/a')}",
+                                f"handling={str(candidates.get('handling') or 'n/a')}",
                             ]
                         )
                     )
@@ -832,6 +1067,18 @@ def render_lots(repo: InventoryRepository) -> None:
                                 apply_updates,
                                 actor="employee",
                             )
+                            repo.record_audit_event(
+                                entity_type="purchase_document",
+                                entity_id=int(selected_doc.id),
+                                action="manual_apply_extracted_fields_to_lot",
+                                actor="employee",
+                                changes={
+                                    "workflow": "lots_purchase_document_detail",
+                                    "mode": "manual",
+                                    "lot_id": int(linked_lot_id),
+                                    "applied_fields": sorted(apply_updates.keys()),
+                                },
+                            )
                             st.success(f"Applied AI extracted fields to lot #{int(linked_lot_id)}.")
                             st.rerun()
                         except Exception as exc:
@@ -843,12 +1090,13 @@ def render_lots(repo: InventoryRepository) -> None:
     else:
         st.caption("No purchase documents uploaded yet.")
 
-    if not lots or not products:
+    active_lots = [lot for lot in lots if not _lot_is_archived(lot)]
+    if not active_lots or not products:
         return
 
     st.markdown("### Assign Existing Product To Lot")
     with st.form("assign_product_lot_form", clear_on_submit=True):
-        lot_map = {f"{lot.lot_code} | {lot.vendor}": lot.id for lot in lots}
+        lot_map = {f"{lot.lot_code} | {lot.vendor}": lot.id for lot in active_lots}
         product_map = {f"{p.sku} | {p.title}": p.id for p in products}
         lot_key = st.selectbox("Lot", list(lot_map.keys()))
         product_key = st.selectbox("Product", list(product_map.keys()))

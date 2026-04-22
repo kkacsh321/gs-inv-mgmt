@@ -180,6 +180,15 @@ def _try_extract_json_object(raw_text: str) -> dict[str, Any]:
     return {}
 
 
+def _render_grader_summary_text(summary_text: str) -> None:
+    text = str(summary_text or "").strip()
+    if not text:
+        return
+    # Render as plain text so markdown parsing cannot corrupt model output.
+    st.markdown("##### Grader Summary")
+    st.code(text, language="text")
+
+
 def _coin_ref_match_key_from_parts(
     *,
     coin_name: str,
@@ -332,6 +341,28 @@ def _parse_photo_comp_retry_preset(raw_payload: str | None) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _build_inventory_mode_query(
+    *,
+    selected_product,
+    use_title: bool,
+    use_sku: bool,
+    use_metal: bool,
+    prefill_query: str,
+    prefill_apply_once: bool,
+) -> str:
+    query_parts: list[str] = []
+    if use_title:
+        query_parts.append(str(getattr(selected_product, "title", "") or "").strip())
+    if use_sku:
+        query_parts.append(str(getattr(selected_product, "sku", "") or "").strip())
+    if use_metal:
+        query_parts.append(str(getattr(selected_product, "metal_type", "") or "").strip())
+    query = " ".join([p for p in query_parts if p]).strip()
+    if prefill_apply_once and str(prefill_query or "").strip():
+        query = str(prefill_query or "").strip()
+    return query
 
 
 def _generate_comp_query_from_hint_image(
@@ -1612,16 +1643,14 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                 use_title = st.checkbox("Use title in query", value=True)
                 use_sku = st.checkbox("Use SKU in query", value=False)
                 use_metal = st.checkbox("Use metal type in query", value=True)
-                query_parts = []
-                if use_title:
-                    query_parts.append((selected_product.title or "").strip())
-                if use_sku:
-                    query_parts.append((selected_product.sku or "").strip())
-                if use_metal:
-                    query_parts.append((selected_product.metal_type or "").strip())
-                query = " ".join([p for p in query_parts if p]).strip()
-                if prefill_query:
-                    query = prefill_query
+                query = _build_inventory_mode_query(
+                    selected_product=selected_product,
+                    use_title=bool(use_title),
+                    use_sku=bool(use_sku),
+                    use_metal=bool(use_metal),
+                    prefill_query=prefill_query,
+                    prefill_apply_once=bool(prefill_apply_once),
+                )
         elif source_mode == "Manual Title/Description":
             if prefill_apply_once and prefill_manual_title:
                 st.session_state["comp_manual_title"] = prefill_manual_title
@@ -1731,6 +1760,9 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
         if prefill_apply_once:
             st.session_state["comp_prefill_applied"] = True
 
+        if query:
+            st.caption(f"Effective Comp Query: `{query}`")
+
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             comp_limit = st.number_input("Comps to fetch", min_value=5, max_value=100, value=25, step=5)
@@ -1808,6 +1840,9 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
             "Use AI/LLM summary over comp results",
             value=False,
             help="Uses Admin AI runtime config when present; falls back to COMP_LLM_* env settings.",
+        )
+        st.caption(
+            "eBay sold-results HTML is the primary comp source. Web fallback is used when eBay rows are empty."
         )
         auto_seed_query_from_photo = False
         photo_always_include_web_fallback = False
@@ -1899,8 +1934,6 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                 st.error("Comp Tool is disabled by Admin.")
             elif not ensure_permission(user, "ai_comp_use", "Run Comp Tool"):
                 pass
-            elif not client.is_configured():
-                st.error("eBay client is not configured. Set EBAY_CLIENT_ID/SECRET/RU_NAME first.")
             else:
                 try:
                     effective_query = str(query or "").strip()
@@ -2105,57 +2138,51 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                     attempts: list[dict] = []
                     rows: list[dict] = []
                     web_rows: list[dict] = []
+                    ebay_configured = bool(client.is_configured())
+                    if not ebay_configured:
+                        attempts.append(
+                            {
+                                "query": effective_query,
+                                "sold_only": "n/a",
+                                "results": 0,
+                                "note": "ebay_not_configured_web_only",
+                            }
+                        )
+                        st.info("eBay client is not configured; running web fallback search only.")
                     variants = _query_variants(effective_query)
                     if not variants:
                         variants = [effective_query]
 
-                    for idx, query_try in enumerate(variants):
-                        sold_flag = bool(effective_sold_only)
-                        attempt_rows = client.find_completed_items(
-                            keywords=query_try,
-                            sold_only=sold_flag,
-                            category_id=category_id.strip(),
-                            entries_per_page=int(comp_limit),
-                        )
-                        attempts.append(
-                            {
-                                "query": query_try,
-                                "sold_only": "true" if sold_flag else "false",
-                                "results": len(attempt_rows),
-                            }
-                        )
-                        if attempt_rows:
-                            rows = attempt_rows
-                            break
-                        if not effective_auto_broaden:
-                            break
-                        # On first miss with sold-only enabled, retry completed (not sold-only) with same query.
-                        if idx == 0 and sold_flag:
-                            fallback_rows = client.find_completed_items(
-                                keywords=query_try,
-                                sold_only=False,
-                                category_id=category_id.strip(),
-                                entries_per_page=int(comp_limit),
-                            )
+                    if ebay_configured:
+                        for query_try in variants:
+                            try:
+                                attempt_rows = client.search_sold_items_html(
+                                    keywords=query_try,
+                                    limit=int(comp_limit),
+                                )
+                            except Exception:
+                                attempt_rows = []
                             attempts.append(
                                 {
                                     "query": query_try,
-                                    "sold_only": "false",
-                                    "results": len(fallback_rows),
+                                    "sold_only": "true" if bool(effective_sold_only) else "false",
+                                    "results": len(attempt_rows),
+                                    "note": "ebay_sold_html_primary",
                                 }
                             )
-                            if fallback_rows:
-                                rows = fallback_rows
+                            if attempt_rows:
+                                rows = attempt_rows
                                 break
 
                     if not rows:
                         if effective_use_web_fallback:
-                            web_rows = _web_comp_search(
+                            raw_web_rows = _web_comp_search(
                                 effective_query,
                                 limit=int(web_fallback_limit),
                                 page_fetch_limit=int(web_detail_fetch_limit),
                                 dealer_domains=dealer_domains,
                             )
+                            web_rows = list(raw_web_rows)
                             if effective_min_web_confidence != "any":
                                 allowed = ["very_low", "low", "medium", "high"]
                                 min_idx = allowed.index(effective_min_web_confidence)
@@ -2202,6 +2229,12 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                     for row in web_rows
                                     if not any(token in str(row.get("domain") or "").lower() for token in exclude_tokens)
                                 ]
+                            if raw_web_rows and not web_rows:
+                                st.warning(
+                                    "Web fallback returned rows, but active web filters removed all results. "
+                                    "Showing unfiltered web rows for this run."
+                                )
+                                web_rows = raw_web_rows
                             attempts.append(
                                 {
                                     "query": effective_query,
@@ -2272,10 +2305,17 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                 )
                             except Exception:
                                 pass
-                        st.caption(
-                            "This is common in sandbox data. Try broader keywords (brand + item type), "
-                            "disable sold-only, or run against production credentials."
-                        )
+                        env_label = str(getattr(settings, "ebay_environment", "sandbox") or "sandbox").strip().lower()
+                        if env_label == "sandbox":
+                            st.caption(
+                                "This is common in sandbox data. Try broader keywords (brand + item type), "
+                                "disable sold-only, or run against production credentials."
+                            )
+                        else:
+                            st.caption(
+                                "Try broader keywords (brand + item type) and optionally disable sold-only. "
+                                "Legacy Finding diagnostics are informational only."
+                            )
                         st.dataframe(pd.DataFrame(attempts), use_container_width=True)
                     else:
                         effective_rows = rows if rows else web_rows
@@ -3300,9 +3340,7 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                     if structured_grade:
                         st.json(structured_grade)
                         formatted_grade_text = coin_grader_structured_to_text(structured_grade)
-                        if formatted_grade_text:
-                            st.markdown("##### Grader Summary")
-                            st.markdown(formatted_grade_text.replace("\n", "  \n"))
+                        _render_grader_summary_text(formatted_grade_text)
                     else:
                         st.markdown(grade_result)
                         st.warning(

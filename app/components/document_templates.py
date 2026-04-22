@@ -75,7 +75,11 @@ def build_document_html(
     items: list[dict],
     subtotal: float,
     fees: float,
+    show_fees: bool = True,
+    fees_label: str = "Fees",
     shipping_cost: float,
+    discount_amount: float = 0.0,
+    discount_label: str = "Discount",
     tax_amount: float = 0.0,
     tax_label: str = "Sales Tax",
     total: float,
@@ -90,6 +94,11 @@ def build_document_html(
     logo_block = (
         f"<div style='margin-bottom:12px;'><img src='{escape(logo_src)}' alt='Brand Logo' style='max-height:72px;max-width:280px;object-fit:contain;'></div>"
         if logo_src.strip()
+        else ""
+    )
+    fees_row = (
+        f"<tr><td>{escape(fees_label)}</td><td class='right'>{money(fees)}</td></tr>"
+        if bool(show_fees)
         else ""
     )
     return f"""
@@ -218,8 +227,9 @@ def build_document_html(
 
         <table class="totals">
           <tr><td>Subtotal</td><td class="right">{money(subtotal)}</td></tr>
-          <tr><td>Fees</td><td class="right">{money(fees)}</td></tr>
+          {fees_row}
           <tr><td>Shipping</td><td class="right">{money(shipping_cost)}</td></tr>
+          <tr><td>{escape(discount_label)}</td><td class="right">-{money(discount_amount)}</td></tr>
           <tr><td>{escape(tax_label)}</td><td class="right">{money(tax_amount)}</td></tr>
           <tr class="total"><td>Total</td><td class="right">{money(total)}</td></tr>
         </table>

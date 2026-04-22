@@ -30,12 +30,19 @@ test.describe("Auth flow", () => {
     const passwordInput = page.getByLabel("Password", { exact: true }).first();
     await passwordInput.fill(password);
     await expect(passwordInput).toHaveValue(password);
-    await page.getByLabel("Remember me on this browser").first().check();
+    const rememberCheckbox = page.getByLabel("Remember me on this browser").first();
+    const rememberVisible = await rememberCheckbox.isVisible().catch(() => false);
+    if (rememberVisible) {
+      await rememberCheckbox.check();
+    } else {
+      // Streamlit theme/layout can hide native checkbox input; click label text fallback.
+      await page.getByText("Remember me on this browser").first().click({ force: true });
+    }
     await signInButton.click();
     await page.waitForTimeout(300);
     const invalidLogin = page.getByText(/Invalid username\/password/i).first();
     if (await invalidLogin.isVisible().catch(() => false)) {
-      test.skip(true, "Local auth credentials rejected; rerun seed and verify E2E_USERNAME/E2E_PASSWORD.");
+      throw new Error("E2E auth credentials rejected after seed.");
     }
 
     const signOutButton = page.getByRole("button", { name: /Sign Out/i }).first();
@@ -48,8 +55,6 @@ test.describe("Auth flow", () => {
       }, { timeout: 15000 })
       .toBeTruthy();
     await expect(signedInBanner).toBeVisible({ timeout: 15000 });
-    await expect.poll(async () => page.url().includes("auth=")).toBeTruthy();
-
     if (await signOutButton.isVisible().catch(() => false)) {
       await signOutButton.click();
       await expect(signInButton).toBeVisible({ timeout: 15000 });

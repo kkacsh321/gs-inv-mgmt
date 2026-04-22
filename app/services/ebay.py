@@ -1,6 +1,10 @@
 import base64
 import json
-from urllib.parse import urlencode
+import re
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from html import unescape
+from urllib.parse import quote_plus, urlencode
 
 import requests
 
@@ -21,6 +25,7 @@ class EbayClient:
         "https://api.ebay.com/oauth/api_scope/sell.inventory",
         "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
         "https://api.ebay.com/oauth/api_scope/sell.account",
+        "https://api.ebay.com/oauth/api_scope/sell.finances",
         "https://api.ebay.com/oauth/api_scope/commerce.identity.readonly",
     ]
 
@@ -53,8 +58,19 @@ class EbayClient:
             "Content-Type": "application/json",
         }
         if content_language:
-            headers["Content-Language"] = content_language
+            headers["Content-Language"] = self._normalize_content_language(content_language)
         return headers
+
+    def _normalize_content_language(self, value: str | None) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return "en-US"
+        if not self._CONTENT_LANGUAGE_RE.match(raw):
+            return "en-US"
+        if "-" in raw:
+            left, right = raw.split("-", 1)
+            return f"{left.lower()}-{right.upper()}"
+        return raw.lower()
 
     def _raise_for_status_with_body(self, response: requests.Response) -> None:
         try:
@@ -155,6 +171,66 @@ class EbayClient:
         self._raise_for_status_with_body(response)
         return response.json()
 
+    def get_default_category_tree_id(self, *, access_token: str, marketplace_id: str = "EBAY_US") -> str:
+        endpoint = f"{self.api_host}/commerce/taxonomy/v1/get_default_category_tree_id"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"marketplace_id": str(marketplace_id or "EBAY_US").strip().upper()}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=30)
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        return str(payload.get("categoryTreeId") or "").strip()
+
+    def get_category_suggestions(
+        self,
+        *,
+        access_token: str,
+        query: str,
+        marketplace_id: str = "EBAY_US",
+        limit: int = 20,
+    ) -> list[dict]:
+        keyword = str(query or "").strip()
+        if not keyword:
+            return []
+        category_tree_id = self.get_default_category_tree_id(
+            access_token=access_token,
+            marketplace_id=marketplace_id,
+        )
+        if not category_tree_id:
+            return []
+        endpoint = (
+            f"{self.api_host}/commerce/taxonomy/v1/category_tree/"
+            f"{category_tree_id}/get_category_suggestions"
+        )
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"q": keyword}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        rows = payload.get("categorySuggestions") or []
+        suggestions: list[dict] = []
+        for row in rows[: max(1, min(int(limit), 100))]:
+            category = row.get("category") or {}
+            ancestors = row.get("categoryTreeNodeAncestors") or []
+            ancestor_names = [
+                str((ancestor.get("category") or {}).get("categoryName") or "").strip()
+                for ancestor in ancestors
+                if isinstance(ancestor, dict)
+            ]
+            ancestor_names = [name for name in ancestor_names if name]
+            category_id = str(category.get("categoryId") or "").strip()
+            category_name = str(category.get("categoryName") or "").strip()
+            if not category_id:
+                continue
+            path = " > ".join([*ancestor_names, category_name] if category_name else ancestor_names)
+            suggestions.append(
+                {
+                    "category_id": category_id,
+                    "category_name": category_name,
+                    "path": path,
+                }
+            )
+        return suggestions
+
     def get_identity_user(self, access_token: str) -> dict:
         endpoint = f"{self.identity_host}/commerce/identity/v1/user/"
         headers = {"Authorization": f"Bearer {access_token.strip()}"}
@@ -233,6 +309,66 @@ class EbayClient:
             return rows
         return []
 
+    def list_finance_transactions_for_order(
+        self,
+        *,
+        access_token: str,
+        order_id: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        endpoint = f"{self.identity_host}/sell/finances/v1/transaction"
+        headers = {
+            "Authorization": f"Bearer {access_token.strip()}",
+            "X-EBAY-C-MARKETPLACE-ID": str(settings.ebay_marketplace_id or "EBAY_US").strip().upper() or "EBAY_US",
+        }
+        wanted_order_id = str(order_id or "").strip()
+        if not wanted_order_id:
+            return []
+        params = {
+            "limit": max(1, min(int(limit), 200)),
+            "filter": f"orderId:{{{wanted_order_id}}}",
+        }
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        # Some accounts/environments reject filter syntax. Fall back to a small
+        # unfiltered page and let caller-side parsing match the order id.
+        if response.status_code in {400, 404}:
+            response = requests.get(
+                endpoint,
+                headers=headers,
+                params={"limit": max(1, min(int(limit), 200))},
+                timeout=45,
+            )
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        rows = payload.get("transactions")
+        if isinstance(rows, list):
+            return rows
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def list_finance_transactions(
+        self,
+        *,
+        access_token: str,
+        limit: int = 25,
+    ) -> list[dict]:
+        endpoint = f"{self.identity_host}/sell/finances/v1/transaction"
+        headers = {
+            "Authorization": f"Bearer {access_token.strip()}",
+            "X-EBAY-C-MARKETPLACE-ID": str(settings.ebay_marketplace_id or "EBAY_US").strip().upper() or "EBAY_US",
+        }
+        params = {"limit": max(1, min(int(limit), 200))}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        rows = payload.get("transactions")
+        if isinstance(rows, list):
+            return rows
+        if isinstance(payload, list):
+            return payload
+        return []
+
     def create_shipping_fulfillment(self, *, access_token: str, order_id: str, payload: dict) -> dict:
         endpoint = f"{self.api_host}/sell/fulfillment/v1/order/{order_id}/shipping_fulfillment"
         headers = self._rest_headers(access_token)
@@ -253,9 +389,9 @@ class EbayClient:
         response = requests.put(endpoint, headers=headers, json=payload, timeout=45)
         self._raise_for_status_with_body(response)
 
-    def create_offer(self, *, access_token: str, payload: dict) -> dict:
+    def create_offer(self, *, access_token: str, payload: dict, content_language: str = "en-US") -> dict:
         endpoint = f"{self.api_host}/sell/inventory/v1/offer"
-        headers = self._rest_headers(access_token)
+        headers = self._rest_headers(access_token, content_language=content_language)
         response = requests.post(endpoint, headers=headers, json=payload, timeout=45)
         self._raise_for_status_with_body(response)
         return response.json()
@@ -307,12 +443,346 @@ class EbayClient:
             return f"https://www.ebay.com/itm/{listing_id}"
         return f"https://www.sandbox.ebay.com/itm/{listing_id}"
 
+    def seller_hub_listings_url(self) -> str:
+        if self.environment == "production":
+            return "https://www.ebay.com/sh/lst/active"
+        return "https://www.sandbox.ebay.com/sh/lst/active"
+
     def create_image_from_url(self, *, access_token: str, image_url: str) -> dict:
         endpoint = f"{self.media_host}/commerce/media/v1_beta/image/create_image_from_url"
         headers = self._rest_headers(access_token)
         response = requests.post(endpoint, headers=headers, json={"imageUrl": image_url}, timeout=45)
         self._raise_for_status_with_body(response)
         return response.json() if response.text else {}
+
+    def create_image_from_file(
+        self,
+        *,
+        access_token: str,
+        file_bytes: bytes,
+        filename: str = "image.jpg",
+        content_type: str = "image/jpeg",
+    ) -> dict:
+        endpoint = f"{self.media_host}/commerce/media/v1_beta/image/create_image_from_file"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        safe_name = str(filename or "image.jpg").strip() or "image.jpg"
+        safe_type = str(content_type or "image/jpeg").strip() or "image/jpeg"
+        # eBay expects multipart file upload for private/local image sources.
+        files = {"image": (safe_name, file_bytes, safe_type)}
+        response = requests.post(endpoint, headers=headers, files=files, timeout=90)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def get_inventory_location(self, *, access_token: str, merchant_location_key: str) -> dict:
+        endpoint = f"{self.api_host}/sell/inventory/v1/location/{merchant_location_key.strip()}"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        response = requests.get(endpoint, headers=headers, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def create_or_replace_inventory_location(
+        self,
+        *,
+        access_token: str,
+        merchant_location_key: str,
+        payload: dict,
+    ) -> dict:
+        endpoint = f"{self.api_host}/sell/inventory/v1/location/{merchant_location_key.strip()}"
+        headers = self._rest_headers(access_token)
+        # eBay createInventoryLocation uses POST on /location/{merchantLocationKey}.
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=45)
+        if response.status_code >= 400:
+            # Retry with a minimal fallback payload shape that some accounts enforce.
+            try:
+                location_obj = dict((payload or {}).get("location") or {})
+                address_obj = dict(location_obj.get("address") or {})
+                fallback_payload = {
+                    "location": {
+                        "address": {
+                            "addressLine1": str(address_obj.get("addressLine1") or "").strip(),
+                            "city": str(address_obj.get("city") or "").strip(),
+                            "stateOrProvince": str(address_obj.get("stateOrProvince") or "").strip(),
+                            "postalCode": str(address_obj.get("postalCode") or "").strip(),
+                            "country": str(address_obj.get("country") or "").strip(),
+                        },
+                    },
+                    "name": str((payload or {}).get("name") or "").strip(),
+                    "merchantLocationStatus": str(
+                        (payload or {}).get("merchantLocationStatus") or "ENABLED"
+                    ).strip()
+                    or "ENABLED",
+                    "locationTypes": list((payload or {}).get("locationTypes") or ["WAREHOUSE"]),
+                }
+                retry = requests.post(endpoint, headers=headers, json=fallback_payload, timeout=45)
+                self._raise_for_status_with_body(retry)
+                return retry.json() if retry.text else {}
+            except Exception:
+                self._raise_for_status_with_body(response)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def resolve_merchant_location_key(self, *, access_token: str, merchant_location_key: str) -> str:
+        raw = str(merchant_location_key or "").strip()
+        if not raw:
+            return ""
+        try:
+            payload = self.get_inventory_location(access_token=access_token, merchant_location_key=raw)
+            resolved = str(payload.get("merchantLocationKey") or "").strip()
+            if resolved:
+                return resolved
+        except Exception:
+            pass
+
+        def _norm(value: str) -> str:
+            return " ".join(str(value or "").strip().lower().split())
+
+        wanted = _norm(raw)
+        try:
+            rows = self.list_inventory_locations(access_token=access_token, limit=200, offset=0)
+        except Exception:
+            return raw
+
+        for row in rows:
+            key = str((row or {}).get("merchantLocationKey") or "").strip()
+            if not key:
+                continue
+            if _norm(key) == wanted:
+                return key
+
+            location_obj = (row or {}).get("location") or {}
+            name = str(location_obj.get("name") or row.get("name") or "").strip()
+            address = location_obj.get("address") or {}
+            label_parts = [
+                name,
+                str(address.get("city") or "").strip(),
+                str(address.get("stateOrProvince") or "").strip(),
+                str(address.get("country") or "").strip(),
+            ]
+            label = ", ".join([part for part in label_parts if part])
+            norm_label = _norm(label)
+            if norm_label and (norm_label == wanted or wanted in norm_label or norm_label in wanted):
+                return key
+        return raw
+
+    def get_payment_policy(self, *, access_token: str, payment_policy_id: str, marketplace_id: str) -> dict:
+        endpoint = f"{self.api_host}/sell/account/v1/payment_policy/{payment_policy_id.strip()}"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"marketplace_id": str(marketplace_id or "EBAY_US").strip().upper()}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def get_fulfillment_policy(
+        self,
+        *,
+        access_token: str,
+        fulfillment_policy_id: str,
+        marketplace_id: str,
+    ) -> dict:
+        endpoint = f"{self.api_host}/sell/account/v1/fulfillment_policy/{fulfillment_policy_id.strip()}"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"marketplace_id": str(marketplace_id or "EBAY_US").strip().upper()}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def get_return_policy(self, *, access_token: str, return_policy_id: str, marketplace_id: str) -> dict:
+        endpoint = f"{self.api_host}/sell/account/v1/return_policy/{return_policy_id.strip()}"
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"marketplace_id": str(marketplace_id or "EBAY_US").strip().upper()}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def get_category_subtree(
+        self,
+        *,
+        access_token: str,
+        marketplace_id: str,
+        category_id: str,
+    ) -> dict:
+        category_tree_id = self.get_default_category_tree_id(
+            access_token=access_token,
+            marketplace_id=marketplace_id,
+        )
+        if not category_tree_id:
+            raise RuntimeError("No default category tree id found for marketplace.")
+        endpoint = (
+            f"{self.api_host}/commerce/taxonomy/v1/category_tree/"
+            f"{category_tree_id}/get_category_subtree"
+        )
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"category_id": str(category_id or "").strip()}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
+
+    def verify_publish_dependencies(
+        self,
+        *,
+        access_token: str,
+        marketplace_id: str,
+        category_id: str,
+        merchant_location_key: str,
+        payment_policy_id: str,
+        fulfillment_policy_id: str,
+        return_policy_id: str,
+    ) -> dict:
+        blockers: list[str] = []
+        warnings: list[str] = []
+        checks: list[dict] = []
+
+        def _record(name: str, ok: bool, detail: str) -> None:
+            checks.append({"check": name, "ok": bool(ok), "detail": str(detail or "")})
+
+        def _contains_category_id(payload: object, expected: str) -> bool:
+            target = str(expected or "").strip()
+            if not target:
+                return False
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    if str(key).strip().lower() == "categoryid" and str(value).strip() == target:
+                        return True
+                    if _contains_category_id(value, target):
+                        return True
+                return False
+            if isinstance(payload, list):
+                return any(_contains_category_id(item, target) for item in payload)
+            return False
+
+        def _status_and_text(exc: Exception) -> tuple[int, str]:
+            response = getattr(exc, "response", None)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            text = str(getattr(response, "text", "") or "").strip()
+            return status_code, text[:400]
+
+        def _handle_exc(name: str, exc: Exception) -> None:
+            status_code, body_preview = _status_and_text(exc)
+            detail = f"{type(exc).__name__}: {exc}"
+            if body_preview:
+                detail += f" | {body_preview}"
+            _record(name, False, detail)
+            # Taxonomy subtree validation can reject otherwise publishable categories
+            # (for example category-tree drift or marketplace-tree mismatch during checks).
+            # Do not hard-block publish/revise on this preflight-only probe.
+            if name == "category_id" and (
+                '"errorId":62005' in body_preview
+                or "does not belong to specified category tree" in body_preview.lower()
+            ):
+                warnings.append(f"{name}: {detail}")
+                return
+            if 400 <= status_code < 500:
+                blockers.append(f"{name}: {detail}")
+            else:
+                warnings.append(f"{name}: {detail}")
+
+        if merchant_location_key.strip():
+            try:
+                resolved_location_key = self.resolve_merchant_location_key(
+                    access_token=access_token,
+                    merchant_location_key=merchant_location_key,
+                )
+                payload = self.get_inventory_location(
+                    access_token=access_token,
+                    merchant_location_key=resolved_location_key,
+                )
+                _record(
+                    "merchant_location",
+                    True,
+                    str(payload.get("merchantLocationKey") or resolved_location_key).strip(),
+                )
+            except Exception as exc:
+                _handle_exc("merchant_location", exc)
+        else:
+            blockers.append("merchant_location: missing value")
+            _record("merchant_location", False, "missing value")
+
+        if payment_policy_id.strip():
+            try:
+                payload = self.get_payment_policy(
+                    access_token=access_token,
+                    payment_policy_id=payment_policy_id,
+                    marketplace_id=marketplace_id,
+                )
+                _record(
+                    "payment_policy",
+                    True,
+                    str(payload.get("paymentPolicyId") or payment_policy_id).strip(),
+                )
+            except Exception as exc:
+                _handle_exc("payment_policy", exc)
+        else:
+            blockers.append("payment_policy: missing value")
+            _record("payment_policy", False, "missing value")
+
+        if fulfillment_policy_id.strip():
+            try:
+                payload = self.get_fulfillment_policy(
+                    access_token=access_token,
+                    fulfillment_policy_id=fulfillment_policy_id,
+                    marketplace_id=marketplace_id,
+                )
+                _record(
+                    "fulfillment_policy",
+                    True,
+                    str(payload.get("fulfillmentPolicyId") or fulfillment_policy_id).strip(),
+                )
+            except Exception as exc:
+                _handle_exc("fulfillment_policy", exc)
+        else:
+            blockers.append("fulfillment_policy: missing value")
+            _record("fulfillment_policy", False, "missing value")
+
+        if return_policy_id.strip():
+            try:
+                payload = self.get_return_policy(
+                    access_token=access_token,
+                    return_policy_id=return_policy_id,
+                    marketplace_id=marketplace_id,
+                )
+                _record(
+                    "return_policy",
+                    True,
+                    str(payload.get("returnPolicyId") or return_policy_id).strip(),
+                )
+            except Exception as exc:
+                _handle_exc("return_policy", exc)
+        else:
+            blockers.append("return_policy: missing value")
+            _record("return_policy", False, "missing value")
+
+        if category_id.strip():
+            try:
+                payload = self.get_category_subtree(
+                    access_token=access_token,
+                    marketplace_id=marketplace_id,
+                    category_id=category_id,
+                )
+                expected_category_id = str(category_id).strip()
+                node = payload.get("categoryTreeNode") or {}
+                resolved_id = str((node.get("category") or {}).get("categoryId") or "").strip()
+                if (
+                    (resolved_id and resolved_id == expected_category_id)
+                    or _contains_category_id(payload, expected_category_id)
+                ):
+                    _record("category_id", True, expected_category_id)
+                else:
+                    warnings.append(
+                        f"category_id: eBay category check returned unexpected shape for `{category_id}` "
+                        "(continuing; verify category manually if publish fails)."
+                    )
+                    _record("category_id", True, f"unexpected shape; input accepted: {category_id}")
+            except Exception as exc:
+                _handle_exc("category_id", exc)
+        else:
+            blockers.append("category_id: missing value")
+            _record("category_id", False, "missing value")
+
+        return {
+            "blockers": blockers,
+            "warnings": warnings,
+            "checks": checks,
+        }
 
     def create_video(
         self,
@@ -375,6 +845,113 @@ class EbayClient:
             return raw.replace("_", "-")
         return raw
 
+    @classmethod
+    def _finding_rate_limit_cooldown_seconds(cls) -> int:
+        # Keep a local cooldown after 429/RateLimiter responses to avoid rapid repeated failures.
+        return max(30, int(getattr(settings, "ebay_finding_rate_limit_cooldown_seconds", 600)))
+
+    @classmethod
+    def _finding_rate_limit_severe_cooldown_seconds(cls) -> int:
+        # Use a longer cooldown when eBay explicitly reports operation quota exhaustion.
+        base = cls._finding_rate_limit_cooldown_seconds()
+        return max(
+            base,
+            int(getattr(settings, "ebay_finding_rate_limit_severe_cooldown_seconds", 3600)),
+        )
+
+    @classmethod
+    def _finding_rate_limit_probe_interval_seconds(cls) -> int:
+        # While local cooldown is active, permit occasional probe calls so
+        # the app can recover quickly when eBay quota opens back up.
+        return max(30, int(getattr(settings, "ebay_finding_rate_limit_probe_interval_seconds", 120)))
+
+    @classmethod
+    def _finding_rate_limit_until(cls) -> datetime | None:
+        value = getattr(cls, "_finding_rate_limited_until", None)
+        return value if isinstance(value, datetime) else None
+
+    @classmethod
+    def _set_finding_rate_limit_cooldown(cls, *, seconds: int | None = None) -> None:
+        cooldown_seconds = int(seconds if seconds is not None else cls._finding_rate_limit_cooldown_seconds())
+        cooldown_seconds = max(30, cooldown_seconds)
+        cls._finding_rate_limited_until = datetime.now(timezone.utc) + timedelta(
+            seconds=cooldown_seconds
+        )
+
+    @classmethod
+    def finding_rate_limit_cooldown_remaining_seconds(cls) -> int:
+        until = cls._finding_rate_limit_until()
+        if until is None:
+            return 0
+        remaining = int((until - datetime.now(timezone.utc)).total_seconds())
+        if remaining <= 0:
+            cls._finding_rate_limited_until = None
+            return 0
+        return remaining
+
+    @classmethod
+    def clear_finding_rate_limit_cooldown(cls) -> None:
+        cls._finding_rate_limited_until = None
+
+    @classmethod
+    def _set_finding_last_error(cls, payload: dict) -> None:
+        cls._finding_last_error = dict(payload or {})
+        cls._finding_last_error["at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @classmethod
+    def finding_last_error(cls) -> dict:
+        return dict(getattr(cls, "_finding_last_error", {}) or {})
+
+    @classmethod
+    def _record_finding_call(
+        cls,
+        *,
+        source: str,
+        phase: str,
+        params: dict,
+        status_code: int,
+        note: str = "",
+    ) -> None:
+        cls._finding_call_log.append(
+            {
+                "at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "source": str(source or "unknown").strip().lower() or "unknown",
+                "phase": str(phase or "").strip() or "request",
+                "status_code": int(status_code or 0),
+                "global_id": str(params.get("GLOBAL-ID") or "").strip(),
+                "keywords": str(params.get("keywords") or "").strip()[:140],
+                "sold_only": str(params.get("itemFilter(0).value") or "").strip().lower() == "true",
+                "note": str(note or "").strip(),
+            }
+        )
+
+    @classmethod
+    def finding_call_snapshot(cls, *, window_seconds: int = 600) -> dict:
+        now = datetime.now(timezone.utc)
+        window = max(60, int(window_seconds))
+        recent_rows: list[dict] = []
+        by_source: dict[str, int] = {}
+        for row in reversed(list(cls._finding_call_log)):
+            ts_raw = str(row.get("at_utc") or "").strip()
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except Exception:
+                continue
+            age = (now - ts).total_seconds()
+            if age > window:
+                continue
+            recent_rows.append(dict(row))
+            source = str(row.get("source") or "unknown")
+            by_source[source] = int(by_source.get(source, 0) + 1)
+        return {
+            "window_seconds": window,
+            "count": len(recent_rows),
+            "by_source": by_source,
+            "recent": recent_rows[:50],
+        }
+
     def find_completed_items(
         self,
         *,
@@ -383,10 +960,43 @@ class EbayClient:
         category_id: str = "",
         entries_per_page: int = 25,
         page_number: int = 1,
+        source: str = "unknown",
     ) -> list[dict]:
         query = (keywords or "").strip()
         if not query:
             return []
+        cooldown_remaining = self.finding_rate_limit_cooldown_remaining_seconds()
+        if cooldown_remaining > 0:
+            now_utc = datetime.now(timezone.utc)
+            last_probe = getattr(self.__class__, "_finding_last_probe_at", None)
+            probe_interval = int(self._finding_rate_limit_probe_interval_seconds())
+            allow_probe = not isinstance(last_probe, datetime) or (
+                now_utc - last_probe
+            ).total_seconds() >= probe_interval
+            if allow_probe:
+                self.__class__._finding_last_probe_at = now_utc
+                self._set_finding_last_error(
+                    {
+                        "type": "local_cooldown_probe",
+                        "remaining_seconds": int(cooldown_remaining),
+                        "environment": str(self.environment or ""),
+                        "keywords": query[:140],
+                        "probe_interval_seconds": int(probe_interval),
+                    }
+                )
+            else:
+                self._set_finding_last_error(
+                    {
+                        "type": "local_cooldown",
+                        "remaining_seconds": int(cooldown_remaining),
+                        "environment": str(self.environment or ""),
+                        "keywords": query[:140],
+                        "probe_interval_seconds": int(probe_interval),
+                    }
+                )
+                raise RuntimeError(
+                    f"EBAY_FINDING_RATE_LIMITED: cooldown active ({cooldown_remaining}s remaining)."
+                )
         if self.environment == "production":
             endpoint = "https://svcs.ebay.com/services/search/FindingService/v1"
         else:
@@ -410,12 +1020,100 @@ class EbayClient:
             params["categoryId"] = category_id.strip()
 
         response = requests.get(endpoint, params=params, timeout=45)
-        if response.status_code >= 400 and params.get("GLOBAL-ID") == "EBAY-US":
-            # Last-resort compatibility retry if gateway expects underscore style.
-            retry_params = dict(params)
-            retry_params["GLOBAL-ID"] = "EBAY_US"
-            response = requests.get(endpoint, params=retry_params, timeout=45)
+        self._record_finding_call(
+            source=source,
+            phase="initial",
+            params=params,
+            status_code=response.status_code,
+        )
+
+        def _is_global_id_error(resp: requests.Response) -> bool:
+            if resp.status_code < 400:
+                return False
+            body = (getattr(resp, "text", "") or "").lower()
+            if "global-id" in body and ("valid" in body or "input error" in body):
+                return True
+            return False
+
+        if _is_global_id_error(response):
+            original_gid = str(params.get("GLOBAL-ID") or "").strip()
+            alt_gid = ""
+            if "_" in original_gid:
+                alt_gid = original_gid.replace("_", "-")
+            elif "-" in original_gid:
+                alt_gid = original_gid.replace("-", "_")
+            if alt_gid and alt_gid != original_gid:
+                retry_params = dict(params)
+                retry_params["GLOBAL-ID"] = alt_gid
+                response = requests.get(endpoint, params=retry_params, timeout=45)
+                self._record_finding_call(
+                    source=source,
+                    phase="retry_global_id_alt",
+                    params=retry_params,
+                    status_code=response.status_code,
+                )
+            if _is_global_id_error(response):
+                retry_params = dict(params)
+                retry_params.pop("GLOBAL-ID", None)
+                response = requests.get(endpoint, params=retry_params, timeout=45)
+                self._record_finding_call(
+                    source=source,
+                    phase="retry_no_global_id",
+                    params=retry_params,
+                    status_code=response.status_code,
+                )
+
+        def _is_rate_limited(resp: requests.Response) -> bool:
+            if resp.status_code < 400:
+                return False
+            raw = (getattr(resp, "text", "") or "").lower()
+            if "ratelimiter" in raw or "exceeded the number of times" in raw:
+                return True
+            if '"errorid":["10001"]' in raw:
+                return True
+            return False
+
+        if _is_rate_limited(response):
+            raw_text = str(getattr(response, "text", "") or "")
+            raw_lower = raw_text.lower()
+            severe_quota_exhausted = "exceeded the number of times" in raw_lower
+            cooldown_seconds = (
+                int(self._finding_rate_limit_severe_cooldown_seconds())
+                if severe_quota_exhausted
+                else int(self._finding_rate_limit_cooldown_seconds())
+            )
+            self._set_finding_rate_limit_cooldown(seconds=cooldown_seconds)
+            self.__class__._finding_last_probe_at = datetime.now(timezone.utc)
+            self._set_finding_last_error(
+                {
+                    "type": "remote_rate_limited",
+                    "status_code": int(response.status_code or 0),
+                    "environment": str(self.environment or ""),
+                    "keywords": query[:140],
+                    "global_id": str(params.get("GLOBAL-ID") or ""),
+                    "response_excerpt": raw_text[:600],
+                    "cooldown_seconds": int(cooldown_seconds),
+                    "rate_limit_scope": "severe_quota_exhausted" if severe_quota_exhausted else "standard",
+                }
+            )
+            self._record_finding_call(
+                source=source,
+                phase="rate_limited",
+                params=params,
+                status_code=response.status_code,
+                note=(
+                    "rate_limited_severe_quota_exhausted"
+                    if severe_quota_exhausted
+                    else "rate_limited"
+                ),
+            )
+            raise RuntimeError(
+                "EBAY_FINDING_RATE_LIMITED: eBay Finding API rate limit exceeded for findCompletedItems."
+            )
         self._raise_for_status_with_body(response)
+        # Successful request means cooldown can be cleared immediately.
+        if self.finding_rate_limit_cooldown_remaining_seconds() > 0:
+            self.clear_finding_rate_limit_cooldown()
         payload = response.json()
         root = (payload.get("findCompletedItemsResponse") or [{}])[0]
         ack = str((root.get("ack") or [""])[0]).strip().lower()
@@ -459,3 +1157,142 @@ class EbayClient:
                 }
             )
         return rows
+
+    @staticmethod
+    def _extract_price_hints_simple(raw_text: str) -> list[float]:
+        text = unescape(str(raw_text or "")).replace("\xa0", " ").strip()
+        if not text:
+            return []
+        matches = re.findall(
+            r"(?i)(?:US\$|USD|\$)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+            text,
+        )
+        prices: list[float] = []
+        for raw in matches:
+            try:
+                prices.append(float(str(raw).replace(",", "").strip()))
+            except Exception:
+                continue
+        deduped: list[float] = []
+        seen: set[float] = set()
+        for value in prices:
+            if value <= 0 or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
+
+    def search_sold_items_html(self, *, keywords: str, limit: int = 25) -> list[dict]:
+        query = " ".join(str(keywords or "").split()).strip()
+        if not query:
+            return []
+        endpoint = (
+            "https://www.ebay.com/sch/i.html"
+            f"?_nkw={quote_plus(query)}&LH_Sold=1&LH_Complete=1&rt=nc"
+        )
+        try:
+            response = requests.get(
+                endpoint,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; GoldenStackersComp/1.0)"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            html_text = str(response.text or "")
+        except Exception:
+            return []
+        row_limit = max(1, min(int(limit), 100))
+        item_blocks = re.findall(
+            r'<li[^>]*class="[^"]*\bs-item\b[^"]*"[^>]*>(.*?)</li>',
+            html_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        rows: list[dict] = []
+        for block in item_blocks:
+            if len(rows) >= row_limit:
+                break
+            title_match = re.search(
+                r'<[^>]*class="[^"]*\bs-item__title\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            title = unescape(re.sub(r"<[^>]+>", " ", str(title_match.group(1) if title_match else ""))).strip()
+            if not title or title.lower().startswith("shop on ebay"):
+                continue
+            href_match = re.search(
+                r'<a[^>]*class="[^"]*\bs-item__link\b[^"]*"[^>]*href="([^"]+)"',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            view_url = unescape(str(href_match.group(1) if href_match else "")).strip()
+            price_match = re.search(
+                r'<[^>]*class="[^"]*\bs-item__price\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            shipping_match = re.search(
+                r'<[^>]*class="[^"]*\bs-item__shipping\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            price_text = unescape(re.sub(r"<[^>]+>", " ", str(price_match.group(1) if price_match else ""))).strip()
+            shipping_text = unescape(
+                re.sub(r"<[^>]+>", " ", str(shipping_match.group(1) if shipping_match else ""))
+            ).strip()
+            sold_hints = self._extract_price_hints_simple(price_text)
+            shipping_hints = self._extract_price_hints_simple(shipping_text)
+            sold_price = float(sold_hints[0]) if sold_hints else 0.0
+            shipping_cost = float(shipping_hints[0]) if shipping_hints else 0.0
+            if sold_price <= 0:
+                continue
+            item_id = ""
+            item_id_match = re.search(r"/itm/([0-9]{9,20})", view_url)
+            if item_id_match:
+                item_id = str(item_id_match.group(1) or "").strip()
+            rows.append(
+                {
+                    "item_id": item_id,
+                    "title": title,
+                    "sold_price": sold_price,
+                    "shipping_cost": shipping_cost,
+                    "total_price": float(sold_price + shipping_cost),
+                    "currency": "USD",
+                    "condition": "",
+                    "end_time": "",
+                    "view_url": view_url,
+                    "gallery_url": "",
+                    "source": "ebay_sold_html",
+                }
+            )
+        return rows
+
+    def find_completed_items_with_fallback(
+        self,
+        *,
+        keywords: str,
+        sold_only: bool = True,
+        category_id: str = "",
+        entries_per_page: int = 25,
+        page_number: int = 1,
+        source: str = "unknown",
+        auto_broaden: bool = True,
+        allow_html_fallback: bool = True,
+    ) -> dict:
+        outcome = {"rows": [], "mode": "none", "rate_limited_note": ""}
+        html_rows = self.search_sold_items_html(
+            keywords=keywords,
+            limit=max(1, min(int(entries_per_page), 100)),
+        )
+        if html_rows:
+            outcome["rows"] = list(html_rows)
+            outcome["mode"] = "ebay_sold_html_primary"
+            return outcome
+        # Finding API fallback is intentionally disabled by default because sold
+        # comps are now sourced primarily from eBay sold-result HTML paths.
+        if (not allow_html_fallback) and auto_broaden:
+            outcome["mode"] = "html_disabled"
+        return outcome
+    _finding_call_log: deque[dict] = deque(maxlen=500)
+    _finding_rate_limited_until: datetime | None = None
+    _finding_last_probe_at: datetime | None = None
+    _finding_last_error: dict = {}
+    _CONTENT_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2}(?:-[A-Za-z]{2})?$")

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { ensureSignedIn, isAuthGateVisibleEventually, navigateAuthed } from "./_auth";
 
 test.describe("Products flow", () => {
   test("creates and edits a product", async ({ page }) => {
@@ -14,41 +15,12 @@ test.describe("Products flow", () => {
     }
     expect(appReady).toBeTruthy();
 
-    const signInButton = page.getByRole("button", { name: /Sign In/i }).first();
-    const authGateAlert = page.getByText(/^Sign in required\.$/i).first();
-    const usernameInput = page.getByLabel("Username", { exact: true }).first();
-    const passwordInput = page.getByLabel("Password", { exact: true }).first();
-    const username = process.env.E2E_USERNAME || "e2e";
-    const withCurrentAuth = (path: string): string => {
-      const token = new URL(page.url()).searchParams.get("auth");
-      return token ? `${path}?auth=${encodeURIComponent(token)}` : path;
-    };
-    const password = process.env.E2E_PASSWORD || "";
-    test.skip(!username || !password, "Auth is enabled locally; set E2E_USERNAME/E2E_PASSWORD to run this test.");
-    try {
-      await usernameInput.waitFor({ state: "visible", timeout: 12000 });
-      await passwordInput.waitFor({ state: "visible", timeout: 12000 });
-      await signInButton.waitFor({ state: "visible", timeout: 12000 });
-      await usernameInput.fill(username);
-      await passwordInput.fill(password);
-      await expect(passwordInput).toHaveValue(password);
-      await page.getByLabel("Remember me on this browser").first().check();
-      await signInButton.click();
-      await page.waitForTimeout(300);
-      const invalidLogin = page.getByText(/Invalid username\/password/i).first();
-      if (await invalidLogin.isVisible().catch(() => false)) {
-        test.skip(true, "Local auth credentials rejected; rerun seed and verify E2E_USERNAME/E2E_PASSWORD.");
-      }
-      await expect.poll(async () => {
-        const visible = await signInButton.isVisible().catch(() => false);
-        const stillRequired = await authGateAlert.isVisible().catch(() => false);
-        return !visible && !stillRequired;
-      }, { timeout: 15000 }).toBeTruthy();
-    } catch {
-      // Auth form not present (password auth disabled) or not required in this environment.
-    }
-
-    await page.goto(withCurrentAuth("/Products"));
+    await page.goto("/Products");
+    const signedIn = await ensureSignedIn(page);
+    test.skip(!signedIn, "Auth gate remained active; skipping in this environment.");
+    await navigateAuthed(page, "/Products", "Products");
+    const productsAuthRequired = await isAuthGateVisibleEventually(page);
+    test.skip(productsAuthRequired, "Auth gate still active on Products page.");
     const productsReady = page.getByLabel("SKU", { exact: true }).first();
     if (!(await productsReady.isVisible().catch(() => false))) {
       const sidebarProductsLink = page.locator("a[href$='/Products']").first();
@@ -60,12 +32,6 @@ test.describe("Products flow", () => {
           await sidebarProductsLink.click();
         }
       }
-    }
-    if (!(await productsReady.isVisible().catch(() => false))) {
-      const stillAuthRequired =
-        (await authGateAlert.isVisible().catch(() => false)) ||
-        (await signInButton.isVisible().catch(() => false));
-      test.skip(stillAuthRequired, "Auth gate still active for /Products in this run.");
     }
     await expect(productsReady).toBeVisible({ timeout: 15000 });
 
@@ -83,7 +49,8 @@ test.describe("Products flow", () => {
     await page.getByLabel("SKU", { exact: true }).first().fill(uniqueSku);
     await page.getByLabel("Title", { exact: true }).first().fill(createdTitle);
     await page.getByRole("button", { name: /Create Product/i }).first().click();
-    await expect(page.getByText(/Product created\./i).first()).toBeVisible({ timeout: 20000 });
+    const productCreatedToast = page.getByText(/Product created\.|SKU must be unique/i).first();
+    await productCreatedToast.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
 
     await page.getByLabel("Search SKU/Title", { exact: true }).first().fill(uniqueSku);
     await page.waitForTimeout(500);

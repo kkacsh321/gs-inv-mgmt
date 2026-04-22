@@ -51,6 +51,7 @@ def normalize_status_semantic(raw_status: str | None) -> str:
         "completed",
         "delivered",
         "ended",
+        "sold",
         "resolved",
         "approved",
     }:

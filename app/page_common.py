@@ -56,6 +56,8 @@ QUICK_ACTION_PAGE_MAP: dict[str, str] = {
     "ebay-ops": "pages/22_eBay_Workspace.py",
     "ebay-workspace": "pages/22_eBay_Workspace.py",
     "ebay-user-details": "pages/24_eBay_User_Details.py",
+    "ebay-templates": "pages/25_eBay_Templates.py",
+    "listing-wizard": "pages/26_Listing_Wizard.py",
     "coin-intake": "pages/20_Coin_Intake_Wizard.py",
     "inventory-intake": "pages/23_Inventory_Intake_Wizard.py",
     "ask-gs": "pages/21_Ask_GoldenStackers.py",
@@ -84,6 +86,8 @@ QUICK_ACTION_ALIASES: dict[str, str] = {
     "ops-ebay": "ebay-ops",
     "ew": "ebay-workspace",
     "eud": "ebay-user-details",
+    "et": "ebay-templates",
+    "lw": "listing-wizard",
     "ci": "coin-intake",
     "ii": "inventory-intake",
     "ask": "ask-gs",
@@ -95,6 +99,8 @@ ROLE_PINNED_PAGES: dict[str, list[tuple[str, str]]] = {
     "admin": [
         ("Operations Home", "pages/00_Operations_Home.py"),
         ("eBay Workspace", "pages/22_eBay_Workspace.py"),
+        ("Listing Wizard", "pages/26_Listing_Wizard.py"),
+        ("eBay Templates", "pages/25_eBay_Templates.py"),
         ("eBay User Details", "pages/24_eBay_User_Details.py"),
         ("Sync", "pages/18_Sync.py"),
         ("Admin", "pages/17_Admin.py"),
@@ -102,6 +108,8 @@ ROLE_PINNED_PAGES: dict[str, list[tuple[str, str]]] = {
     "ops": [
         ("Operations Home", "pages/00_Operations_Home.py"),
         ("Listings", "pages/03_Listings.py"),
+        ("Listing Wizard", "pages/26_Listing_Wizard.py"),
+        ("eBay Templates", "pages/25_eBay_Templates.py"),
         ("Shipping", "pages/11_Shipping.py"),
         ("eBay Workspace", "pages/22_eBay_Workspace.py"),
         ("eBay User Details", "pages/24_eBay_User_Details.py"),
@@ -122,14 +130,14 @@ ROLE_DEFAULT_PAGE: dict[str, str] = {
 ROLE_WORKFLOW_GROUPS: dict[str, list[tuple[str, list[tuple[str, str, str]]]]] = {
     "admin": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory"), ("Sources", "pages/13_Sources.py", "workspace_inventory")]),
-        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
+        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("eBay Templates", "pages/25_eBay_Templates.py", "workspace_ebay"), ("Listing Wizard", "pages/26_Listing_Wizard.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
         ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
         ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Documents", "pages/16_Documents.py", "workspace_revenue"), ("Reports", "pages/09_Reports.py", "workspace_revenue")]),
         ("Admin", [("Operations Home", "pages/00_Operations_Home.py", ""), ("Admin", "pages/17_Admin.py", ""), ("Search & Edit", "pages/10_Search_Edit.py", ""), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
     ],
     "ops": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory")]),
-        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
+        ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("eBay Templates", "pages/25_eBay_Templates.py", "workspace_ebay"), ("Listing Wizard", "pages/26_Listing_Wizard.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
         ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
         ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Reports", "pages/09_Reports.py", "workspace_revenue")]),
     ],

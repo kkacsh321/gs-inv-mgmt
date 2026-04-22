@@ -159,6 +159,19 @@ class IntakeWizardHelperTests(unittest.TestCase):
             )
         self.assertEqual(dummy_st.session_state["inv_intake_ai_buffered_media"], [])
 
+    def test_inventory_grader_normalization_uses_structured_summary_when_available(self) -> None:
+        raw = '{"estimated_grade_range":"MS63","submit_for_professional_grading":"yes"}'
+        structured = {"estimated_grade_range": "MS63", "submit_for_professional_grading": "YES"}
+        got = iiw._normalize_inventory_grader_output(raw_result_text=raw, structured_grade=structured)
+        self.assertIn("Estimated Grade Range: MS63", got)
+        self.assertIn("Submit For Professional Grading: YES", got)
+
+    def test_inventory_grader_normalization_falls_back_when_structured_render_is_blank(self) -> None:
+        raw = '{"estimated_grade_range":"AU55","recommendation_rationale":"decent upside if straight-graded"}'
+        structured = {"estimated_grade_range": "", "submit_for_professional_grading": ""}
+        got = iiw._normalize_inventory_grader_output(raw_result_text=raw, structured_grade=structured)
+        self.assertIn("AU55", got)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from app.components.ui_helpers import (
     build_listing_options,
     build_product_options,
     iso_or_none,
+    normalize_multiselect_values,
     to_decimal,
 )
 from app.components.views.shared import (
@@ -146,20 +147,34 @@ def render_sales(repo: InventoryRepository) -> None:
         for s in sales
     ]
     st.markdown("### Sales Filters")
+    sales_marketplace_options = sorted(
+        {str(row["marketplace"]) for row in sale_rows if row.get("marketplace")}
+    )
+    sales_tracking_status_options = sorted(
+        {str(row["tracking_status"]) for row in sale_rows if row.get("tracking_status")}
+    )
+    st.session_state["sales_filter_marketplaces"] = normalize_multiselect_values(
+        st.session_state.get("sales_filter_marketplaces"),
+        sales_marketplace_options,
+    )
+    st.session_state["sales_filter_tracking_status"] = normalize_multiselect_values(
+        st.session_state.get("sales_filter_tracking_status"),
+        sales_tracking_status_options,
+    )
     f1, f2, f3 = st.columns(3)
     with f1:
         sale_filter_query = st.text_input("Search External Order / Tracking", key="sales_filter_query")
     with f2:
         sale_filter_marketplaces = st.multiselect(
             "Marketplace",
-            options=sorted({str(row["marketplace"]) for row in sale_rows if row.get("marketplace")}),
+            options=sales_marketplace_options,
             default=[],
             key="sales_filter_marketplaces",
         )
     with f3:
         sale_filter_tracking_status = st.multiselect(
             "Tracking Status",
-            options=sorted({str(row["tracking_status"]) for row in sale_rows if row.get("tracking_status")}),
+            options=sales_tracking_status_options,
             default=[],
             key="sales_filter_tracking_status",
         )

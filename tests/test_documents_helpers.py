@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,6 +173,27 @@ class DocumentHelpersTests(unittest.TestCase):
             use_line_item_taxability=False,
         )
         self.assertEqual(auto_min_basis, "shipping_exempt")
+
+    def test_extract_ebay_marketplace_financials(self):
+        payload = {
+            "pricingSummary": {
+                "priceSubtotal": {"value": "130.0", "currency": "USD"},
+                "deliveryCost": {"value": "25.88", "currency": "USD"},
+                "deliveryDiscount": {"value": "-13.87", "currency": "USD"},
+                "total": {"value": "142.01", "currency": "USD"},
+            },
+            "lineItems": [
+                {
+                    "taxes": [
+                        {"amount": {"value": "5.21", "currency": "USD"}},
+                    ]
+                }
+            ],
+        }
+        order = SimpleNamespace(marketplace_payload_json=json.dumps(payload))
+        extracted = docs._extract_ebay_marketplace_financials(order)
+        self.assertAlmostEqual(float(extracted["tax_amount"]), 5.21, places=2)
+        self.assertAlmostEqual(float(extracted["discount_amount"]), 13.87, places=2)
 
     def test_resolve_logo_src_classic_default(self):
         with patch.object(docs, "DEFAULT_LOGO_PATH", Path(__file__).resolve()):

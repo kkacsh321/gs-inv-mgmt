@@ -208,6 +208,42 @@ class SmallViewsTests(unittest.TestCase):
         ):
             dashboard.render_dashboard(repo)
 
+    def test_render_dashboard_uses_rollup_when_available(self) -> None:
+        fake_st = _FakeSt()
+        repo = SimpleNamespace(
+            dashboard_metrics=lambda: {
+                "product_count": 10,
+                "listing_count": 3,
+                "sale_count": 5,
+                "inventory_cost": 100.0,
+                "gross_sales": 250.0,
+                "net_sales": 220.0,
+            },
+            dashboard_live_metrics=lambda now=None: {
+                "orders_7d_count": 2,
+                "orders_30d_count": 4,
+                "orders_30d_shipped": 3,
+                "orders_30d_not_shipped": 1,
+                "sales_7d_count": 1,
+                "sales_30d_count": 3,
+                "sales_7d_gross": 100.0,
+                "sales_7d_net": 85.0,
+                "sales_30d_gross": 300.0,
+                "sales_30d_net": 250.0,
+                "sales_30d_shipping_charged": 20.0,
+                "sales_30d_shipping_label_spend": 15.0,
+                "sales_30d_shipping_delta": 5.0,
+                "sales_30d_est_cogs": 80.0,
+                "sales_30d_est_profit": 170.0,
+            },
+            list_sales=lambda: (_ for _ in ()).throw(AssertionError("list_sales should not be called")),
+            list_orders=lambda: (_ for _ in ()).throw(AssertionError("list_orders should not be called")),
+        )
+        with patch.object(dashboard, "st", fake_st), patch.object(dashboard, "render_help_panel"), patch.object(
+            dashboard, "as_money", side_effect=lambda v: f"${v:,.2f}"
+        ):
+            dashboard.render_dashboard(repo)
+
     def test_render_inventory_movements(self) -> None:
         fake_st = _FakeSt()
         product = SimpleNamespace(sku="SKU-1", title="Silver Bar")
@@ -267,7 +303,7 @@ class SmallViewsTests(unittest.TestCase):
         repo = SimpleNamespace(
             list_products=lambda: [SimpleNamespace(id=10, sku="SKU-1", title="Item")],
             list_listings=lambda: [SimpleNamespace(id=20, marketplace="ebay", listing_title="L1")],
-            list_media_assets=lambda: [asset],
+            list_media_assets=lambda include_archived=False: [asset],
         )
         storage = SimpleNamespace(enabled=True)
         with patch.object(media, "st", st_enabled), patch.object(media, "current_user", return_value=SimpleNamespace(username="u")), patch.object(

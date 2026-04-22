@@ -4,9 +4,13 @@
   "private": true,
   "scripts": {
     "test:unit": "python -m unittest discover -s tests -p 'test_*.py'",
-    "test:e2e": "playwright test",
-    "test:e2e:headed": "playwright test --headed",
-    "test:e2e:debug": "playwright test --debug",
+    "test:e2e": "env -u NO_COLOR playwright test",
+    "test:e2e:listings:strict": "E2E_STRICT_LISTINGS=1 PLAYWRIGHT_REQUIRE_SEED=1 env -u NO_COLOR playwright test tests/e2e/listings_flow_strict.spec.ts",
+    "test:e2e:lifecycle:strict": "E2E_STRICT_LIFECYCLE=1 PLAYWRIGHT_REQUIRE_SEED=1 env -u NO_COLOR playwright test tests/e2e/lifecycle_archive_flow_strict.spec.ts",
+    "test:e2e:lifecycle:entities:strict": "E2E_STRICT_LIFECYCLE=1 PLAYWRIGHT_REQUIRE_SEED=1 env -u NO_COLOR playwright test tests/e2e/lifecycle_entities_strict.spec.ts",
+    "test:e2e:admin:lifecycle-retention": "PLAYWRIGHT_REQUIRE_SEED=1 env -u NO_COLOR playwright test tests/e2e/admin_lifecycle_retention_flow.spec.ts",
+    "test:e2e:headed": "env -u NO_COLOR playwright test --headed",
+    "test:e2e:debug": "env -u NO_COLOR playwright test --debug",
     "test:qa": "npm run test:unit && npm run test:e2e"
   },
   "devDependencies": {

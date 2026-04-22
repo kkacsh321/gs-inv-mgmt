@@ -1,6 +1,10 @@
 from datetime import datetime
 from decimal import Decimal
+import json
+import re
 from typing import Any
+
+import pandas as pd
 
 from app.utils.time import utc_today
 
@@ -62,3 +66,58 @@ def dataframe_date_bounds(values: list[datetime]) -> tuple[datetime.date, dateti
     min_date = min(values).date()
     max_date = max(values).date()
     return min_date, max_date
+
+
+def normalize_multiselect_values(values: Any, options: list[Any]) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    option_set = {str(v) for v in (options or [])}
+    normalized: list[str] = []
+    for value in values:
+        token = str(value)
+        if token in option_set:
+            normalized.append(token)
+    return normalized
+
+
+def safe_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows or [])
+    if frame.empty:
+        return frame
+    for col in frame.columns:
+        if frame[col].dtype == "object":
+            frame[col] = frame[col].map(
+                lambda v: (
+                    json.dumps(v, ensure_ascii=True, default=str)
+                    if isinstance(v, (dict, list, tuple, set))
+                    else ("" if v is None else str(v))
+                )
+            )
+    return frame
+
+
+def format_ebay_sync_note_for_customer(raw_notes: str | None) -> str:
+    raw = str(raw_notes or "").strip()
+    if not raw:
+        return ""
+
+    parts: dict[str, str] = {}
+    for key in ("buyer", "shipping_service", "ship_to"):
+        pattern = re.compile(rf"{re.escape(key)}=([^;]+)", flags=re.IGNORECASE)
+        match = pattern.search(raw)
+        if match:
+            parts[key] = str(match.group(1) or "").strip()
+
+    if not parts:
+        return raw
+
+    lines: list[str] = []
+    if "ebay sync pull" in raw.lower():
+        lines.append("Imported from eBay sync pull.")
+    if parts.get("buyer"):
+        lines.append(f"Buyer: {parts['buyer']}")
+    if parts.get("shipping_service"):
+        lines.append(f"Shipping Service: {parts['shipping_service']}")
+    if parts.get("ship_to"):
+        lines.append(f"Ship To: {parts['ship_to']}")
+    return "\n".join(lines).strip()

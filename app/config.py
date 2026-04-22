@@ -30,6 +30,7 @@ class Settings:
     app_auth_query_token_fallback_enabled: bool = (
         os.getenv("APP_AUTH_QUERY_TOKEN_FALLBACK_ENABLED", "true").lower() == "true"
     )
+    app_default_timezone: str = os.getenv("APP_DEFAULT_TIMEZONE", "America/Denver")
     ux_workspace_ebay_enabled: bool = os.getenv("UX_WORKSPACE_EBAY_ENABLED", "false").lower() == "true"
     db_host: str = os.getenv("POSTGRES_HOST", "db")
     db_port: int = int(os.getenv("POSTGRES_PORT", "5432"))
@@ -50,10 +51,19 @@ class Settings:
     ebay_marketplace_id: str = os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US")
     ebay_currency: str = os.getenv("EBAY_CURRENCY", "USD")
     ebay_content_language: str = os.getenv("EBAY_CONTENT_LANGUAGE", "en-US")
-    ebay_merchant_location_key: str = os.getenv("EBAY_MERCHANT_LOCATION_KEY", "")
+    ebay_merchant_location_key: str = os.getenv("EBAY_MERCHANT_LOCATION_KEY", "goldenstackers-main")
     ebay_payment_policy_id: str = os.getenv("EBAY_PAYMENT_POLICY_ID", "")
     ebay_fulfillment_policy_id: str = os.getenv("EBAY_FULFILLMENT_POLICY_ID", "")
     ebay_return_policy_id: str = os.getenv("EBAY_RETURN_POLICY_ID", "")
+    ebay_finding_rate_limit_cooldown_seconds: int = int(
+        os.getenv("EBAY_FINDING_RATE_LIMIT_COOLDOWN_SECONDS", "600")
+    )
+    ebay_finding_rate_limit_severe_cooldown_seconds: int = int(
+        os.getenv("EBAY_FINDING_RATE_LIMIT_SEVERE_COOLDOWN_SECONDS", "3600")
+    )
+    ebay_finding_rate_limit_probe_interval_seconds: int = int(
+        os.getenv("EBAY_FINDING_RATE_LIMIT_PROBE_INTERVAL_SECONDS", "120")
+    )
 
     storage_provider: str = os.getenv("STORAGE_PROVIDER", "s3")
     aws_region: str = os.getenv("AWS_REGION", "us-east-1")
@@ -111,7 +121,7 @@ class Settings:
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     comp_llm_model: str = os.getenv("COMP_LLM_MODEL", "gpt-4o-mini")
     comp_llm_temperature: float = float(os.getenv("COMP_LLM_TEMPERATURE", "0.2"))
-    comp_llm_max_output_tokens: int = int(os.getenv("COMP_LLM_MAX_OUTPUT_TOKENS", "600"))
+    comp_llm_max_output_tokens: int = int(os.getenv("COMP_LLM_MAX_OUTPUT_TOKENS", "16000"))
     comp_llm_timeout_seconds: int = int(os.getenv("COMP_LLM_TIMEOUT_SECONDS", "60"))
 
     @property

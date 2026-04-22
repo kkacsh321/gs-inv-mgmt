@@ -1,7 +1,9 @@
 import base64
 import json
+import sys
 import unittest
 from datetime import timedelta
+from typing import Any
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,6 +26,10 @@ class _FakeRepo:
         self.updated_jobs: list[tuple[int, dict, str]] = []
         self.logged_events: list[dict] = []
         self.queue_rows: list[object] = []
+        self.created_media: list[dict] = []
+        self.created_documents: list[dict] = []
+        self.created_listings: list[dict] = []
+        self.created_products: list[dict] = []
 
     def update_sale(self, sale_id: int, updates: dict, *, actor: str):
         self.updated_sales.append((sale_id, updates, actor))
@@ -40,6 +46,42 @@ class _FakeRepo:
 
     def list_integration_queue_jobs(self, **_kwargs):
         return list(self.queue_rows)
+
+    def create_media_asset(self, **kwargs):
+        media_row = dict(kwargs)
+        media_row["id"] = len(self.created_media) + 1
+        self.created_media.append(media_row)
+        return SimpleNamespace(**media_row)
+
+    def create_purchase_document(self, **kwargs):
+        self.created_documents.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.created_documents), **kwargs)
+
+    def dashboard_metrics(self):
+        return {
+            "product_count": 12,
+            "listing_count": 5,
+            "sale_count": 3,
+            "inventory_cost": 1234.56,
+        }
+
+    def create_listing(self, **kwargs):
+        self.created_listings.append(dict(kwargs))
+        listing_id = len(self.created_listings)
+        return SimpleNamespace(id=listing_id, **kwargs)
+
+    def create_product(self, **kwargs):
+        self.created_products.append(dict(kwargs))
+        product_id = 100 + len(self.created_products)
+        return SimpleNamespace(id=product_id, **kwargs)
+
+    def bulk_update_media_assets(self, media_ids, updates, actor="system"):
+        updated_ids = [int(v) for v in (media_ids or [])]
+        for media in self.created_media:
+            media_id = int(media.get("id") or 0)
+            if media_id in updated_ids:
+                media.update(dict(updates or {}))
+        return {"updated_ids": updated_ids, "missing_ids": []}
 
 
 class IntegrationQueueTests(unittest.TestCase):
@@ -135,6 +177,2033 @@ class IntegrationQueueTests(unittest.TestCase):
         ok, message = integration_queue.execute_integration_queue_job(_FakeRepo(), job, actor="qa")
         self.assertFalse(ok)
         self.assertIn("Unsupported slack action", message)
+
+    def test_execute_integration_queue_job_slack_ops_command_ingest_media(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "raw_payload": {"product_id": 46, "listing_id": 35},
+                        "files": [
+                            {
+                                "name": "coin.jpg",
+                                "mimetype": "image/jpeg",
+                                "content_b64": base64.b64encode(b"img-bytes").decode("utf-8"),
+                            }
+                        ],
+                    },
+                    "request_context": {"app_username": "ops-user"},
+                }
+            ),
+        )
+        storage = SimpleNamespace(
+            enabled=True,
+            ensure_bucket=lambda: None,
+            upload_file=lambda **_kwargs: SimpleNamespace(
+                bucket="bucket",
+                key="media/x-coin.jpg",
+                url="https://storage/bucket/media/x-coin.jpg",
+                content_type="image/jpeg",
+                size_bytes=9,
+            ),
+        )
+        fake_media_module = SimpleNamespace(MediaStorageService=lambda: storage)
+        with patch.dict(sys.modules, {"app.services.media_storage": fake_media_module}):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("media=1", message)
+        self.assertEqual(len(repo.created_media), 1)
+        self.assertEqual(repo.created_media[0]["product_id"], 46)
+        self.assertEqual(repo.created_media[0]["listing_id"], 35)
+        self.assertEqual(repo.created_media[0]["uploaded_by"], "ops-user")
+
+    def test_execute_integration_queue_job_slack_ops_command_ingest_document(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "raw_payload": {"product_id": 99, "document_kind": "incoming_invoice"},
+                        "files": [
+                            {
+                                "name": "invoice.pdf",
+                                "mimetype": "application/pdf",
+                                "content_b64": base64.b64encode(b"pdf-bytes").decode("utf-8"),
+                            }
+                        ],
+                    },
+                    "request_context": {"slack_username": "keith"},
+                }
+            ),
+        )
+        storage = SimpleNamespace(
+            enabled=True,
+            ensure_bucket=lambda: None,
+            upload_file=lambda **_kwargs: SimpleNamespace(
+                bucket="bucket",
+                key="media/x-invoice.pdf",
+                url="https://storage/bucket/media/x-invoice.pdf",
+                content_type="application/pdf",
+                size_bytes=9,
+            ),
+        )
+        fake_media_module = SimpleNamespace(MediaStorageService=lambda: storage)
+        with patch.dict(sys.modules, {"app.services.media_storage": fake_media_module}):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("documents=1", message)
+        self.assertEqual(len(repo.created_documents), 1)
+        self.assertEqual(repo.created_documents[0]["product_id"], 99)
+        self.assertEqual(repo.created_documents[0]["document_kind"], "incoming_invoice")
+        self.assertEqual(repo.created_documents[0]["uploaded_by"], "keith")
+
+    def test_execute_integration_queue_job_slack_ops_command_ingest_no_files(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(integration="slack_ops", action="command_ingest", payload_json=json.dumps({"command": {}}))
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("no file attachments", message)
+
+    def test_execute_integration_queue_job_slack_ops_comp_ai_summary_persisted(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=77,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1909 vdb penny",
+                        "raw_payload": {"product_id": 46},
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[77] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Suggested range: $120-$150"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+        fake_ebay_module = SimpleNamespace(
+            EbayClient=lambda: SimpleNamespace(
+                is_configured=lambda: False,
+                search_sold_items_html=lambda **_kwargs: [],
+            )
+        )
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        payload = json.loads(str(job.payload_json))
+        self.assertEqual(payload["ai_response"]["intent"], "comp")
+        self.assertIn("**Suggested Range:** Unavailable", payload["ai_response"]["summary"])
+        self.assertIn("Product #46", payload["ai_response"]["links"])
+        self.assertIn("eBay rows: 0", payload["ai_response"]["links"])
+
+    def test_execute_integration_queue_job_slack_ops_comp_fetches_ebay_rows_when_configured(self) -> None:
+        repo = _FakeRepo()
+        captured = {"ebay_rows": [], "query": ""}
+        job = SimpleNamespace(
+            id=92,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar ampex",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[92] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["ebay_rows"] = list(kwargs.get("ebay_rows") or [])
+            captured["query"] = str(kwargs.get("query") or "")
+            return SimpleNamespace(text="Comp summary from fetched rows")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return True
+
+            def search_sold_items_html(self, **kwargs):
+                keywords = str(kwargs.get("keywords") or "").strip().lower()
+                if "apmex" in keywords:
+                    return [{"title": "APMEX 1 oz Silver Bar", "sold_price": 39.99, "shipping_cost": 4.99}]
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        self.assertEqual(len(captured["ebay_rows"]), 1)
+        self.assertEqual(captured["query"], "1oz silver bar ampex")
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("eBay rows: 1", payload["ai_response"]["links"])
+        self.assertIn("Query: 1oz silver bar ampex", payload["ai_response"]["links"])
+        self.assertIn("Comps:", payload["ai_response"]["summary"])
+        self.assertIn("Top comps:", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_comp_honors_overrides(self) -> None:
+        repo = _FakeRepo()
+        seen_calls: list[dict[str, Any]] = []
+        job = SimpleNamespace(
+            id=93,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar ampex sold_only=false limit=10 category_id=1111",
+                        "args": ["1oz", "silver", "bar", "ampex", "sold_only=false", "limit=10", "category_id=1111"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[93] = job
+
+        def _exec_comp(*_args, **_kwargs):
+            return SimpleNamespace(text="Comp summary from override rows")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return True
+
+            def search_sold_items_html(self, **kwargs):
+                seen_calls.append(dict(kwargs))
+                return [{"title": "Row", "sold_price": 20.0}]
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(seen_calls), 1)
+        first = seen_calls[0]
+        self.assertEqual(int(first.get("limit") or 0), 10)
+
+    def test_execute_integration_queue_job_slack_ops_comp_uses_runtime_band_percentages(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=931,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[931] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Comp summary"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return True
+
+            def search_sold_items_html(self, **_kwargs):
+                return [{"title": "1 oz Silver Bar", "sold_price": 40.0, "shipping_cost": 4.0}]
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=lambda _repo, key, default=False: (
+                False
+                if str(key)
+                in {"slack_ops_comp_min_qualified_rows_gate_enabled", "slack_ops_comp_min_confidence_gate_enabled"}
+                else default
+            ),
+        ), patch(
+            "app.services.integration_queue.get_runtime_float",
+            side_effect=lambda _repo, key, default: (
+                85.0
+                if str(key).endswith("_low_pct")
+                else (120.0 if str(key).endswith("_high_pct") else default)
+            ),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("Suggested list band $37.40-$52.80", payload["ai_response"]["summary"])
+        self.assertIn("Qualified comps: 1", payload["ai_response"]["summary"])
+        self.assertIn("Distinct sources: 1", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_rows(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=94,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver round",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[94] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with web fallback")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://example.com/item1">1 oz Silver Round Deal</a>
+        <div class="result__snippet">Great round for only $29.99 shipped</div>
+        """
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.requests.get", return_value=_Resp(ddg_html)):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(captured["web_rows"]), 1)
+        self.assertGreater(float(captured["web_rows"][0].get("listed_price") or 0), 0.0)
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_prefers_structured_page_price(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=941,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[941] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with structured web fallback")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.apmex.com%2Fproduct%2F12345%2Fsample">Buy 1 oz Silver Bars | Free Shipping on Orders $199+</a>
+        <div class="result__snippet">Free Shipping on Orders $199+ at APMEX</div>
+        """
+        product_html = """
+        <html><head><meta property="product:price:amount" content="90.70"></head><body>Sample</body></html>
+        """
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            side_effect=[_Resp(ddg_html), _Resp(product_html)],
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 90.70, places=2)
+        self.assertEqual(str(first.get("price_hint_source") or ""), "structured_page")
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_extracts_jsonld_offer_price(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=946,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[946] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with jsonld extraction")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/sample">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current inventory listing</div>
+        """
+        product_html = """
+        <html>
+          <head>
+            <script type="application/ld+json">
+              {
+                "@context":"https://schema.org",
+                "@type":"Product",
+                "name":"1 oz Silver Bar Random Design",
+                "offers":{
+                  "@type":"Offer",
+                  "priceCurrency":"USD",
+                  "price":"90.70"
+                }
+              }
+            </script>
+          </head>
+          <body>Sample</body>
+        </html>
+        """
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            side_effect=[_Resp(ddg_html), _Resp(product_html)],
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 90.70, places=2)
+        self.assertEqual(str(first.get("price_hint_source") or ""), "structured_page")
+
+    def test_execute_integration_queue_job_slack_ops_comp_top_snippet_prefers_confidence_over_price(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=947,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[947] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Comp summary ordering test"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/11111/high-price-snippet">High Price Snippet Product</a>
+        <div class="result__snippet">Current listed price $150.00</div>
+        <a class="result__a" href="https://www.apmex.com/product/22222/structured-price-product">Structured Price Product</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        """
+        first_product_html = "<html><body>No structured price fields here</body></html>"
+        second_product_html = """
+        <html><head><meta property="product:price:amount" content="90.70"></head><body>Sample</body></html>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_fallback_limit":
+                return 2
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 2
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            side_effect=[_Resp(ddg_html), _Resp(first_product_html), _Resp(second_product_html)],
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("Top comps:", summary)
+        high_idx = summary.find("High Price Snippet Product")
+        structured_idx = summary.find("Structured Price Product")
+        self.assertGreaterEqual(high_idx, 0)
+        self.assertGreaterEqual(structured_idx, 0)
+        self.assertLess(structured_idx, high_idx)
+        self.assertIn("[", summary)
+        self.assertIn("Evidence confidence", summary)
+
+    def test_execute_integration_queue_job_slack_ops_comp_low_confidence_gate_message(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=948,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[948] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Comp summary gate test"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://example.com/listing">Loose web listing</a>
+        <div class="result__snippet">Possible market listing around $50.00</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        def _runtime_float(_repo, key, default=0.0):
+            if str(key) == "slack_ops_comp_min_confidence_score":
+                return 9.0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_float",
+            side_effect=_runtime_float,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("Comp evidence gate triggered", summary)
+        self.assertIn(
+            "Suggested list band unavailable (insufficient evidence confidence and comp count)",
+            summary,
+        )
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(
+            any("Fetch mode:" in str(link) and "evidence_gate_confidence_rows" in str(link) for link in links)
+        )
+
+    def test_execute_integration_queue_job_slack_ops_comp_min_rows_gate_message(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=949,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[949] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(
+                text="**Confidence:** Medium\nComp summary min rows test"
+            ),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/sample">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            if str(key) == "slack_ops_comp_min_qualified_rows":
+                return 3
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_min_qualified_rows_gate_enabled":
+                return True
+            if str(key) == "slack_ops_comp_min_confidence_gate_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("Comp evidence gate triggered", summary)
+        self.assertIn("qualified comp row count is below minimum threshold (1 < 3)", summary)
+        self.assertIn("Suggested list band unavailable (insufficient qualified comps)", summary)
+        self.assertIn("Evidence confidence medium (single-comp; row-gated)", summary)
+        self.assertIn("**Confidence:** Medium (rule-based)", summary)
+        self.assertNotIn("**Confidence:** Medium Comp summary", summary)
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Min qualified comps: 3" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_gate_rewrites_ai_suggested_range(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=950,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[950] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(
+                text=(
+                    "**Confidence:** Medium\n"
+                    "**Suggested Range:** $89.45 - $94.22\n"
+                    "**Recommendation:** Price at $94 now.\n"
+                    "Comp summary"
+                )
+            ),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/sample">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            if str(key) == "slack_ops_comp_min_qualified_rows":
+                return 3
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_min_qualified_rows_gate_enabled":
+                return True
+            if str(key) == "slack_ops_comp_min_confidence_gate_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("**Suggested Range:** Unavailable (insufficient qualified comps)", summary)
+        self.assertNotIn("**Suggested Range:** $89.45 - $94.22", summary)
+        self.assertIn(
+            "**Recommendation:** Directional-only comp. Hold final pricing until stronger sold/product evidence is available.",
+            summary,
+        )
+        self.assertNotIn("**Recommendation:** Price at $94 now.", summary)
+
+    def test_execute_integration_queue_job_slack_ops_comp_gate_rewrites_inline_suggested_range_field_chain(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=951,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[951] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(
+                text=(
+                    "### 1 oz Silver Bar APMEX .999 - Resale Comp Analysis "
+                    "**Confidence:** High "
+                    "**Suggested Range:** $89.40 - $94.17 "
+                    "**Current Listing:** $90.89 (Free shipping) "
+                    "**Recommendation:** Proceed with standard pricing, but verify current spot pricing before finalizing."
+                )
+            ),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/27086/1-oz-silver-bar-apmex">1 oz Silver Bar APMEX</a>
+        <div class="result__snippet">Current listed price $90.89</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            if str(key) == "slack_ops_comp_min_qualified_rows":
+                return 2
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_min_qualified_rows_gate_enabled":
+                return True
+            if str(key) == "slack_ops_comp_min_confidence_gate_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("**Suggested Range:** Unavailable (insufficient qualified comps)", summary)
+        self.assertIn("**Current Listing:** $90.89 (Free shipping)", summary)
+        self.assertIn(
+            "**Recommendation:** Directional-only comp. Hold final pricing until stronger sold/product evidence is available.",
+            summary,
+        )
+        self.assertNotIn("**Suggested Range:** $89.40 - $94.17", summary)
+        self.assertNotIn("**Recommendation:** Proceed with standard pricing", summary)
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_honors_detail_fetch_limit(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=942,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[942] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with snippet-only fallback")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/sample">Buy 1 oz Silver Bars</a>
+        <div class="result__snippet">Sample listing shown at $90.70</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ) as mock_get:
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertGreaterEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertEqual(str(first.get("price_hint_source") or ""), "snippet_or_url")
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_filters_shipping_threshold_price(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=943,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[943] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with threshold filter")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/sample">Buy 1 oz Silver Bars | APMEX</a>
+        <div class="result__snippet">Deal price $90.70 today. Free shipping on orders $199.</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 90.70, places=2)
+        self.assertAlmostEqual(float(first.get("listed_price_high") or 0), 90.70, places=2)
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_prefers_product_pages(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=944,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[944] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary preferring product URLs")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/category/25625/1-oz-silver-bars">Buy 1 oz Silver Bars | Free Shipping on Orders $199+</a>
+        <div class="result__snippet">Category listing around $199.</div>
+        <a class="result__a" href="https://www.apmex.com/product/12345/1-oz-silver-bar-random">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current listed price $90.70.</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("/product/", str(first.get("item_url") or ""))
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 90.70, places=2)
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_ignores_non_product_snippet_price(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=9441,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[9441] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with non-product snippet suppression")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/category/25625/1-oz-silver-bars">Buy 1 oz Silver Bars | Free Shipping on Orders $199+</a>
+        <div class="result__snippet">Category listing around $199.</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("/category/", str(first.get("item_url") or ""))
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 0.0, places=2)
+        self.assertEqual(str(first.get("price_hint_source") or ""), "none")
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_ignores_non_product_structured_price_noise(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=9442,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar apmex .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[9442] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary with non-product structured suppression")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/category/25625/1-oz-silver-bars">Buy 1 oz Silver Bars | Free Shipping on Orders $199+</a>
+        <div class="result__snippet">Category listing results.</div>
+        """
+        category_html = """
+        <html>
+          <head>
+            <script type="application/json">
+              {"promo":{"price":"199"}}
+            </script>
+          </head>
+          <body>Category page marketing content only.</body>
+        </html>
+        """
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            side_effect=[_Resp(ddg_html), _Resp(category_html)],
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("/category/", str(first.get("item_url") or ""))
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 0.0, places=2)
+        self.assertEqual(str(first.get("price_hint_source") or ""), "none")
+
+    def test_execute_integration_queue_job_slack_ops_comp_web_fallback_prefers_jm_product_slug(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=945,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar jm bullion .999",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[945] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary preferring JM product slug")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.jmbullion.com/silver/silver-bars/">JM Bullion Silver Bars</a>
+        <div class="result__snippet">Browse category prices around $199.</div>
+        <a class="result__a" href="https://www.jmbullion.com/1-oz-silver-bar-random-design/">1 oz Silver Bar (Random Design)</a>
+        <div class="result__snippet">Current listed price $39.99.</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("jmbullion.com/1-oz-silver-bar-random-design", str(first.get("item_url") or ""))
+        self.assertAlmostEqual(float(first.get("listed_price") or 0), 39.99, places=2)
+
+    def test_execute_integration_queue_job_slack_ops_comp_trusted_sources_only_filters_web_rows(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=950,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[950] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary trusted-source test")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://example.com/random-silver-bar">Random Silver Bar Listing</a>
+        <div class="result__snippet">Some listing around $115.00</div>
+        <a class="result__a" href="https://www.apmex.com/product/12345/1-oz-silver-bar-random">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_trusted_sources_only_enabled":
+                return True
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("apmex.com", str(first.get("item_url") or ""))
+        payload = json.loads(str(job.payload_json))
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Trusted-source web filter: on" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_trusted_only_override_true(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=951,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                        "args": ["trusted_only=true"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[951] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary trusted-only override")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://example.com/random-silver-bar">Random Silver Bar Listing</a>
+        <div class="result__snippet">Some listing around $115.00</div>
+        <a class="result__a" href="https://www.apmex.com/product/12345/1-oz-silver-bar-random">1 oz Silver Bar Random Design</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_trusted_sources_only_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("apmex.com", str(first.get("item_url") or ""))
+        payload = json.loads(str(job.payload_json))
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Trusted-source override: true" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_gate_overrides_disable_gates(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=952,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar",
+                        "args": [
+                            "confidence_gate=false",
+                            "rows_gate=false",
+                            "min_confidence=9.0",
+                            "min_rows=5",
+                        ],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[952] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Comp summary"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return True
+
+            def search_sold_items_html(self, **_kwargs):
+                return [{"title": "1 oz Silver Bar", "sold_price": 40.0, "shipping_cost": 4.0}]
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("Suggested list band $39.60-$48.40", summary)
+        self.assertNotIn("Comp evidence gate triggered", summary)
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Confidence-gate override: false" in str(link) for link in links))
+        self.assertTrue(any("Rows-gate override: false" in str(link) for link in links))
+        self.assertTrue(any("Min-confidence override: 9.00" in str(link) for link in links))
+        self.assertTrue(any("Min-rows override: 5" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_single_row_confidence_dampened(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=955,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar",
+                        "args": ["confidence_gate=false", "rows_gate=false"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[955] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="Comp summary"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return True
+
+            def search_sold_items_html(self, **_kwargs):
+                return [
+                    {
+                        "title": "1 oz Silver Bar",
+                        "sold_price": 90.0,
+                        "shipping_cost": 0.0,
+                        "item_url": "https://www.ebay.com/itm/1234567890",
+                    }
+                ]
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        payload = json.loads(str(job.payload_json))
+        summary = str(payload.get("ai_response", {}).get("summary") or "")
+        self.assertIn("Qualified comps: 1", summary)
+        self.assertIn("Distinct sources: 1", summary)
+        self.assertIn("Evidence confidence medium", summary)
+        self.assertNotIn("Evidence confidence high", summary)
+
+    def test_execute_integration_queue_job_slack_ops_comp_trusted_domains_override(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=953,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                        "args": ["trusted_only=true", "trusted_domains=jmbullion.com"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[953] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary trusted-domain override")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/1-oz-silver-bar-random">APMEX 1 oz Silver Bar</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        <a class="result__a" href="https://www.jmbullion.com/1-oz-silver-bar-random-design/">JM Bullion 1 oz Silver Bar</a>
+        <div class="result__snippet">Current listed price $39.99</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_trusted_sources_only_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("jmbullion.com", str(first.get("item_url") or ""))
+        payload = json.loads(str(job.payload_json))
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Trusted-source override: true" in str(link) for link in links))
+        self.assertTrue(any("Trusted-domains override: jmbullion.com" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_trusted_domains_override_enables_filter(self) -> None:
+        repo = _FakeRepo()
+        captured = {"web_rows": []}
+        job = SimpleNamespace(
+            id=954,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1 oz silver bar random design",
+                        "args": ["trusted_domains=jmbullion.com"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[954] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Comp summary trusted-domain implicit filter")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return []
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ddg_html = """
+        <a class="result__a" href="https://www.apmex.com/product/12345/1-oz-silver-bar-random">APMEX 1 oz Silver Bar</a>
+        <div class="result__snippet">Current listed price $90.70</div>
+        <a class="result__a" href="https://www.jmbullion.com/1-oz-silver-bar-random-design/">JM Bullion 1 oz Silver Bar</a>
+        <div class="result__snippet">Current listed price $39.99</div>
+        """
+
+        def _runtime_int(_repo, key, default=0):
+            if str(key) == "slack_ops_comp_web_detail_fetch_limit":
+                return 0
+            return default
+
+        def _runtime_bool(_repo, key, default=False):
+            if str(key) == "slack_ops_comp_trusted_sources_only_enabled":
+                return False
+            return default
+
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch("app.services.integration_queue.get_runtime_int", side_effect=_runtime_int), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=_runtime_bool,
+        ), patch(
+            "app.services.integration_queue.requests.get",
+            return_value=_Resp(ddg_html),
+        ):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertEqual(len(captured["web_rows"]), 1)
+        first = captured["web_rows"][0]
+        self.assertIn("jmbullion.com", str(first.get("item_url") or ""))
+        payload = json.loads(str(job.payload_json))
+        links = payload.get("ai_response", {}).get("links") or []
+        self.assertTrue(any("Trusted-source web filter: on" in str(link) for link in links))
+        self.assertTrue(any("Trusted-domains override: jmbullion.com" in str(link) for link in links))
+
+    def test_execute_integration_queue_job_slack_ops_comp_ebay_html_fallback_rows(self) -> None:
+        repo = _FakeRepo()
+        captured = {"ebay_rows": []}
+        job = SimpleNamespace(
+            id=95,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "comp",
+                        "command_text": "comp 1oz silver bar apmex",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[95] = job
+
+        def _exec_comp(*_args, **kwargs):
+            captured["ebay_rows"] = list(kwargs.get("ebay_rows") or [])
+            return SimpleNamespace(text="Comp summary with ebay html fallback")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=_exec_comp,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+
+        class _FakeEbayClient:
+            def is_configured(self):
+                return False
+
+            def search_sold_items_html(self, **_kwargs):
+                return [
+                    {
+                        "title": "APMEX 1 oz Silver Bar .999 Fine",
+                        "sold_price": 39.95,
+                        "shipping_cost": 4.99,
+                        "total_price": 44.94,
+                        "item_url": "https://www.ebay.com/itm/137217809542",
+                    }
+                ]
+
+        fake_ebay_module = SimpleNamespace(EbayClient=_FakeEbayClient)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        ebay_html = """
+        <li class="s-item">
+          <a class="s-item__link" href="https://www.ebay.com/itm/137217809542">
+            <h3 class="s-item__title">APMEX 1 oz Silver Bar .999 Fine</h3>
+          </a>
+          <span class="s-item__price">$39.95</span>
+          <span class="s-item__shipping">$4.99 shipping</span>
+        </li>
+        """
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.ebay": fake_ebay_module},
+        ), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=lambda _repo, key, default=False: (
+                False if str(key) == "slack_ops_comp_min_qualified_rows_gate_enabled" else default
+            ),
+        ), patch("app.services.integration_queue.requests.get", return_value=_Resp(ebay_html)):
+            ok, _message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(captured["ebay_rows"]), 1)
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("eBay rows: 1", payload["ai_response"]["links"])
+        self.assertIn("Fetch mode: ebay_sold_html_fallback", payload["ai_response"]["links"])
+
+    def test_execute_integration_queue_job_slack_ops_status_intent(self) -> None:
+        repo = _FakeRepo()
+        repo.queue_rows = [
+            SimpleNamespace(status="queued", next_attempt_at=None),
+            SimpleNamespace(status="failed", next_attempt_at=utcnow_naive()),
+        ]
+        job = SimpleNamespace(
+            id=88,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "status",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[88] = job
+        with patch("app.services.integration_queue.get_runtime_bool", return_value=False):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("status summary", message.lower())
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("GoldenStackers Status", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_operations_run_due_alias(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=89,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "operations",
+                        "args": ["run_sync", "slack_ops", "7"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[89] = job
+        with patch(
+            "app.services.integration_queue.process_due_integration_queue_jobs",
+            return_value={"processed": 2, "success": 2, "queued": 0, "failed": 0, "blocked": 0},
+        ) as run_due:
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("Run due executed", message)
+        run_due.assert_called_once()
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("Run Due Result", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_operations_create_ebay_draft(self) -> None:
+        repo = _FakeRepo()
+        repo.db.rows[46] = SimpleNamespace(id=46, title="Copper Round", acquisition_cost=10, current_quantity=3)
+        job = SimpleNamespace(
+            id=90,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "operations",
+                        "args": ["create_ebay_draft", "46", "19.99", "2"],
+                    },
+                    "request_context": {"channel_id": "COPS", "app_username": "ops-user"},
+                }
+            ),
+        )
+        repo.db.rows[90] = job
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("Created draft listing", message)
+        self.assertEqual(len(repo.created_listings), 1)
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("Created eBay Draft Listing", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_intake_creates_product_draft(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=91,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "intake",
+                        "command_text": "intake vintage copper round",
+                        "args": ["qty=2", "cost=15.50", "category=bullion"],
+                        "files": [
+                            {
+                                "name": "coin.jpg",
+                                "mimetype": "image/jpeg",
+                                "content_b64": base64.b64encode(b"img-bytes").decode("utf-8"),
+                            }
+                        ],
+                    },
+                    "request_context": {"channel_id": "COPS", "app_username": "ops-user"},
+                }
+            ),
+        )
+        repo.db.rows[91] = job
+        storage = SimpleNamespace(
+            enabled=True,
+            ensure_bucket=lambda: None,
+            upload_file=lambda **_kwargs: SimpleNamespace(
+                bucket="bucket",
+                key="media/x-coin.jpg",
+                url="https://storage/bucket/media/x-coin.jpg",
+                content_type="image/jpeg",
+                size_bytes=9,
+            ),
+        )
+
+        def _mm(*_args, **kwargs):
+            if str(kwargs.get("tool_name") or "") == "slack_intake_product_builder":
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "suggested_title": "Vintage Copper Round",
+                            "suggested_category": "bullion",
+                            "suggested_description": "Detailed collectible copper round.",
+                            "suggested_metal_type": "Copper",
+                            "suggested_weight_oz": "1",
+                        }
+                    )
+                )
+            return SimpleNamespace(text="AI intake summary")
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+            execute_multimodal_task=_mm,
+        )
+        fake_media_module = SimpleNamespace(MediaStorageService=lambda: storage)
+        with patch.dict(
+            sys.modules,
+            {"app.services.ai_orchestration": fake_ai_module, "app.services.media_storage": fake_media_module},
+        ):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("Created product draft", message)
+        self.assertEqual(len(repo.created_products), 1)
+        created = repo.created_products[0]
+        self.assertEqual(created["title"], "Vintage Copper Round")
+        self.assertEqual(created["category"], "bullion")
+        self.assertEqual(int(created["current_quantity"]), 2)
+        self.assertEqual(str(created["acquisition_cost"]), "15.50")
+        self.assertEqual(repo.created_media[0]["product_id"], 101)
 
     def test_execute_integration_queue_job_shipping_dry_run(self) -> None:
         repo = _FakeRepo()

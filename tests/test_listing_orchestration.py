@@ -26,6 +26,10 @@ class ListingOrchestrationTests(unittest.TestCase):
             "error",
         )
         self.assertEqual(
+            adapter.orchestration_status(listing_status="sold", readiness_status="ready", external_listing_id="123"),
+            "completed",
+        )
+        self.assertEqual(
             adapter.orchestration_status(listing_status="active", readiness_status="blocked", external_listing_id="123"),
             "published",
         )

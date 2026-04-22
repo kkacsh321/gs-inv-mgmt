@@ -34,6 +34,7 @@ def send_slack_message(
     *,
     text: str,
     channel: str = "",
+    thread_ts: str = "",
 ) -> dict[str, Any]:
     cfg = resolve_slack_notify_config(repo)
     if not cfg.enabled:
@@ -44,17 +45,22 @@ def send_slack_message(
     if not target_channel:
         raise ValueError("Slack channel is required (or set `slack_default_channel`).")
 
+    body = {
+        "channel": target_channel,
+        "text": (text or "").strip()[:4000],
+        "mrkdwn": True,
+    }
+    thread_ts_value = str(thread_ts or "").strip()
+    if thread_ts_value:
+        body["thread_ts"] = thread_ts_value
+
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={
             "Authorization": f"Bearer {cfg.bot_token}",
             "Content-Type": "application/json; charset=utf-8",
         },
-        json={
-            "channel": target_channel,
-            "text": (text or "").strip()[:4000],
-            "mrkdwn": True,
-        },
+        json=body,
         timeout=cfg.timeout_seconds,
     )
     if resp.status_code >= 400:

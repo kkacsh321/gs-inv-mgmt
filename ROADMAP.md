@@ -2,7 +2,13 @@
 
 This roadmap is focused on operational reliability first, then channel integrations, then scale and automation.
 
-## Progress Snapshot (as of April 2, 2026)
+## AI-First Execution Standard
+- Every net-new workflow must define an in-flow AI assist path (not Tools-only) where it improves speed/quality.
+- AI must remain operator-controlled: suggestion first, explicit approval before write actions, and full audit trace.
+- AI behavior must be runtime-configurable (provider/model/profile/fallback) without redeploy.
+- AI outputs used for decisions should expose confidence/citations and preserve evidence in history tables/logs.
+
+## Progress Snapshot (as of April 15, 2026)
 - v0.2 completed:
   - Inventory ledger (`inventory_movements`)
   - Source master data (`inventory_sources`)
@@ -139,6 +145,10 @@ This roadmap is focused on operational reliability first, then channel integrati
   - Listings create flow now supports auto-title from linked product/coin reference plus optional coin context + AI description/grading injection into listing details
   - Product side-panel now includes one-click Smart eBay Draft creation (coin-reference + AI-aware details, markup-based draft pricing, optional auto-attach of unassigned product media)
   - Added dedicated Coin Intake Wizard page (`pages/20_Coin_Intake_Wizard.py`) to run Reference -> AI assist -> Product -> optional draft eBay listing in one guided workflow
+  - Hardened intake wizard AI prefill reliability:
+    - identifier/grader/comp now force-apply into form keys safely before widget initialization in both Coin Intake and Inventory Intake wizards
+    - identifier mapping now tolerates alternate JSON key shapes (`title`/`item_title`/`name`, `metal_type`/`composition`, `description`/`details`/`summary`) and falls back to normalized text for description when structured keys are sparse
+    - added targeted regression tests (`tests/test_intake_wizard_prefill_helpers.py`) and browser verification spec (`tests/e2e/intake_prefill.spec.ts`)
   - Added Products/Listings -> Comp Tool integration: side-panel actions now open Tools with prefilled comp context (inventory/manual modes, query seeds, AI/listing notes)
   - Added channel capability matrix UI (eBay/Shopify/Whatnot/Facebook/Craigslist) to make current vs planned automation scope explicit
   - Comp Tool now accepts evidence screenshots and runs multimodal AI screenshot review against parsed comp rows for better human-auditable pricing context
@@ -151,9 +161,13 @@ This roadmap is focused on operational reliability first, then channel integrati
   - Added timeline jump action from sync-event rows directly to focused Sync run detail
   - Added timeline jump action from audit rows directly to Search & Edit for faster correction workflows
   - Added product-side repurchase/restock workflow for existing SKUs: each repurchase now records inventory movement + optional lot assignment + audited weighted cost/quantity update
+  - Expanded product-side repurchase workflow to capture per-unit landed-cost components (tax/shipping/handling/product-cost), optional invoice/receipt attachment, and persisted purchase-document linkage directly from Products page
+  - Added Purchase Lots `Lot P/L Snapshot (Estimated)` view that rolls linked assignments and proportional sales attribution into per-lot estimated gross/net/COGS/profit diagnostics
   - Added product lifecycle snapshot panel (acquired/sold/on-hand metrics + lot assignment + movement history) to track repeated buy/sell cycles over time
   - Started GS-V04-009 cycle reporting with new Reports export/view: `Inventory Cycles (Rebuy/Resell)` segments per-SKU zero-to-zero cycles and rolls up qty-in/out, sales, known acquisition cost, and estimated cycle margin
   - Added GS-V04-009 weighted rebuy cost trend analysis in Reports (SKU-selectable line chart + event export) combining lot assignments with deduped acquisition stock-in events
+  - GS-V04-009 inventory cycle analytics now prefer repository DB rollup `report_inventory_cycle_rows` in Reports extended mode, reducing in-memory hydration cost with legacy helper fallback retained
+  - Added GS-V04-009 `Inventory Cycle Summary by SKU` rollup export/view to surface cycle counts, open/closed mix, qty/sales totals, known-cost margin totals, and average closed-cycle duration
   - Completed GS-V04-009 with Product-side batch operator workflow for repeated SKU cycles (`Batch Receive` + `Batch Sale`) using shared batch reference linkage and optional listing association
   - Started GS-V04-008 with DB-backed eBay listing template profiles and Listings create-form template apply controls (including placeholder-aware title/details templates for repetitive branded listing workflows)
   - Completed GS-V04-008 HTML publish guardrails: Listings now previews sanitized HTML and blocks eBay publish/revise when disallowed markup remains
@@ -174,6 +188,107 @@ This roadmap is focused on operational reliability first, then channel integrati
     - new `document_artifacts` store (checksum + storage reference + retained payload)
     - listing-invoice posting now saves printable HTML artifact at post-time and links artifact lineage in sale audit events
     - Documents page now shows retained artifacts with download access for legal/accounting retrieval
+  - Added Lots regression test hardening for create-state defaults/normalization/validation (`tests/test_lots_helpers.py`) to reduce Streamlit state regressions around eBay purchase lot capture
+  - Added Products regression test hardening for eBay purchase validation in create/edit paths (`tests/test_products_helpers.py`) and factored validation helpers to keep UI behavior consistent
+  - Added Lots create-state priming helper coverage for flash/reset state transitions to prevent post-create widget-state exceptions
+  - Added Search/Edit Lots helper coverage for attached-products aggregation/table rows (`tests/test_search_edit_helpers.py`) to reduce regressions in lot-product traceability views
+  - Added Comp Tool diagnostics helper coverage for legacy eBay Finding triage (`local_cooldown` vs `remote_rate_limited`) and clear-cooldown action wiring (`tests/test_tools_helpers.py`); panel later removed from active Comp Tool UI after HTML/web-first migration.
+  - Added explicit view-render regression coverage for:
+    - Lots create flash/reset state feedback rendering (`tests/test_lots_helpers.py`)
+    - Comp Tool eBay diagnostics panel rendering + cooldown clear action (`tests/test_tools_helpers.py`)
+  - Added explicit Products eBay field editability policy coverage (`tests/test_products_helpers.py`) and Search/Edit lot update mutation helper coverage (`tests/test_search_edit_helpers.py`) to lock regression-prone edit flows
+  - Hardened eBay Finding remote-rate-limit handling: severe quota responses now trigger a longer local cooldown window with clearer operator messaging (quota exhaustion vs standard cooldown) to reduce noisy retries during throttle windows
+  - Hardened wizard comp paths for eBay cooldown/rate-limit:
+    - Inventory Intake and Coin Intake comp actions now degrade gracefully on `EBAY_FINDING_RATE_LIMITED` and continue with AI-only/web fallback context
+    - Listing Wizard quick-comp context now records cooldown state and continues AI generation without hard-fail behavior
+  - Added intake wizard e2e regression coverage for `Purchased On eBay` behavior in both Inventory and Coin flows (field enablement state + required purchase-item-id submit guardrail), reducing recurrence of eBay purchase field regressions.
+  - Extended Listings e2e publish-path coverage to assert explicit `eBay Post Mode` switching between `Publish Live Listing` and `Save Unpublished Offer (API Draft)` before preflight, reducing mode-state regressions.
+  - Extended Listings publish e2e flow with category-assist fetch/apply assertions (`Load eBay Category Assist` -> taxonomy suggestions -> apply selected category -> verify category ID state), with environment-aware skip fallback when eBay taxonomy fetch is unavailable.
+  - Hardened Listing Wizard AI generation path: multimodal failures now degrade to text fallback without page crashes, and UI now surfaces `AI Runtime Diagnostics` (attempted mode, provider/model, source/endpoint, fallback/error chain) for fast operator debugging
+  - Listing Wizard now persists AI draft metadata into listing details (`ai_draft.suggestions/diagnostics/acceptance`) so accepted AI edits are auditable per draft record
+  - Listing Wizard AI prompts/personality are now runtime-configurable in Admin (`listing_wizard_ai_system_message`, `listing_wizard_ai_seed_default`, `listing_wizard_ai_instruction_template`) with dedicated save/reset controls
+  - Listing Wizard now defaults `AI Seed Prompt` from runtime setting and supports no-dup media reuse by linking existing product media rows onto listing drafts (plus optional new uploads)
+  - Listing Wizard AI draft now supports optional quick pricing context enrichment (eBay sold comps + spot quotes) using runtime keys `listing_wizard_ai_include_quick_comp_context` and `listing_wizard_ai_quick_comp_limit`
+  - Listing Wizard AI review now includes explicit suggested price band handling (`suggested_price_low`/`suggested_price_high`) with robust fallback derivation for single-price outputs
+  - Listing Wizard AI price-band parser now safely handles non-numeric model outputs (currency symbols/range text) without `Decimal` conversion crashes
+  - Listing Wizard Step 7 now includes a consolidated `AI + Readiness Risk Summary` (risk level + readiness score + key highlights), and accepted risk snapshot is persisted to draft metadata (`ai_draft.risk_summary`) for auditable review
+  - Listing Wizard existing-media preview was simplified to Streamlit-safe checkbox-driven inline preview (no nested expander constraint violations)
+  - Listing Wizard added one-click product key-spec details helper (SKU/category/metal/weight) to accelerate listing copy completion while keeping the flow minimal
+  - Listing Wizard now supports explicit quantity input for fixed/store modes, while auction modes remain quantity-locked to 1 for policy-safe draft defaults
+  - Listing Wizard preview now supports rendered HTML view (plus raw source mode) so template/styled listing details can be reviewed before draft creation
+  - Listing Wizard now supports optional direct single-listing eBay post from Step 9 (create local draft + immediate eBay publish in one operator path), reducing dependency on Listings batch workflow for one-off postings
+  - Listing Wizard now supports per-user eBay post profiles (save/load/default/delete) for policy/location/category/currency/condition defaults, keeping direct post flows fast and repeatable
+  - Listings and Listing Wizard now include simple percent-based volume-pricing builders (`Buy 2/3/4+ save %`) with one-click JSON tier generation plus advanced JSON override path
+  - Added first-pass eBay fee economics assist in Listings + Listing Wizard:
+    - upfront estimated-fee controls (buyer-paid shipping + promoted-rate assumptions),
+    - gross/fees/net/fee% preview cards for pricing decisions,
+    - persisted `fee_estimate` snapshot in `ebay_publish` metadata for downstream reconciliation/reporting.
+  - Added first fee-reconciliation reporting slice:
+    - `Reports -> eBay Fee Reconciliation` KPI card,
+    - `eBay Fee Estimate vs Actual` detail export,
+    - `eBay Fee Reconciliation Summary` export (estimate coverage + variance).
+  - Added Reports `Fee Calibration Assist`:
+    - computes implied final-value-rate from recent eBay sales using stored estimate components + actual fees,
+    - shows current vs suggested final-value-rate and delta,
+    - supports one-click runtime update for `ebay_fee_estimate_final_value_rate_percent` (permission-gated).
+  - Improved fee reconciliation actual-fee fidelity:
+    - reconciliation now prefers imported order `fee_breakdown_json.total_marketplace_fee` when available,
+    - added `Actual Fee Source Breakdown` report/export for operational auditability of fee data provenance.
+  - Added shipping-economics profitability visibility:
+    - Reports now include `Shipping Economics Detail` and `Shipping Economics Summary` exports (shipping charged vs shipping label spend, with per-sale/per-marketplace deltas).
+  - Documents/eBay invoice hardening:
+    - customer-facing eBay invoices/receipts now suppress internal eBay fee rows while preserving optional marketplace-tax rendering.
+    - eBay sync-note text shown in Documents is now normalized to buyer/shipping/ship-to summary (pricing blobs stripped from display copy).
+  - Added local listing-state sell-through reconciliation from eBay order import:
+    - linked listings are auto-marked `sold` only when cumulative imported sold quantity reaches local listed quantity.
+    - multi-quantity listings remain active until final quantity sell-through; no premature closeout on partial fills.
+  - Expanded Dashboard live business metrics:
+    - order volume 7d/30d, sales gross/net 30d, estimated profit 30d, shipping charged vs label spend delta 30d, and shipped/not-shipped counts.
+  - Hardened direct wizard eBay publish writeback to local listing state: active + approved sync is now updated atomically with eBay IDs/URL when publish succeeds
+  - Added collision-safe direct-publish behavior when eBay listingId is already linked to another local row (new local row remains draft instead of linking wrong ID)
+  - Added post-publish `eBay Sync Integrity Check` panel in Listing Wizard showing expected vs stored eBay ID/URL/status/review for immediate operator verification
+  - eBay Templates workspace now supports editing existing templates (including active/inactive state) and custom reusable HTML block save/delete workflows
+  - Admin Runtime Coverage now treats Listing Wizard AI prompt keys as required high-signal runtime keys for go-live readiness visibility and one-click remediation
+  - Added proactive eBay OAuth user-token auto-refresh in sync runner (runtime keys: `ebay_user_token_auto_refresh_enabled`, `ebay_user_token_auto_refresh_interval_hours`, `ebay_user_token_auto_refresh_min_ttl_minutes`) to reduce expired-token outages during production operations.
+  - Fixed eBay token expiry metadata persistence: access-token expiry now records actual `now + expires_in` and persists last-refreshed timestamp (`ebay_user_access_token_refreshed_at`) for accurate health/due checks.
+  - Added `ebay_oauth / auto_refresh` integration-event telemetry for sync-runner token refresh success/failure visibility.
+  - Added eBay OAuth refresh-failure cooldown guardrails (`ebay_user_token_auto_refresh_failure_cooldown_minutes`) with persisted failure/error state to prevent repeated bad-refresh loops during token/scope misconfiguration.
+  - Added optional Slack alert routing for sync-runner eBay OAuth auto-refresh failures (`slack_notify_ebay_oauth_refresh_failures`) to improve operational awareness when refresh begins failing.
+  - Added Admin eBay token diagnostics panel (next due, expiry window, last refresh failure, cooldown status) and one-click `Clear Refresh Failure State` action for fast recovery after credential/scope fixes.
+  - Added System Health compact `eBay OAuth Auto-Refresh` card + integration row (status/next-due/expiry/cooldown/last-error) for at-a-glance runtime health in operations.
+  - Extended System Health runtime seed-key coverage to include all eBay OAuth auto-refresh/failure state keys and OAuth-failure Slack alert key, reducing false runtime-drift noise.
+  - Added System Health `Run Rollup EXPLAIN Snapshot` workflow (planning/execution timing + plan-text capture + CSV export) for dashboard/report rollup query evidence and tuning.
+  - Added rollup EXPLAIN snapshot integration-event persistence (`system_health / rollup_explain_baseline_snapshot`) and a `Recent Rollup EXPLAIN Snapshots (14d)` panel with slowest-rollup summary metrics and history export.
+  - Added repository DB rollup `report_ebay_marketplace_fee_rows` and switched Reports fee-detail pipeline to prefer DB-backed normalized finance entries before legacy order-payload parsing fallback.
+  - Added repository DB rollup `report_marketplace_reconciliation_rows` and switched Reports reconciliation-by-marketplace pipeline to prefer SQL rollups (sales/orders/returns aggregates) before legacy in-memory fallback.
+  - Added repository DB rollup `report_sales_actual_econ_rows` and switched Reports order-actual economics allocation pipeline to prefer SQL/window allocation before legacy Python fallback.
+  - Added repository DB rollups `report_listing_review_activity_rows` and `report_listing_format_outcome_rows` with Reports fast-path adoption for extended analytics review/format outcome sections.
+  - Added repository DB rollup `report_rebuy_cost_trend_rows` with Reports fast-path adoption for Rebuy Cost Trend analytics (reduced full-object hydration in extended analytics mode).
+  - Added repository DB rollup `report_inventory_movement_rows` with Reports fast-path adoption for date-bounded Inventory Movements reporting (full movement-object hydration now fallback-only).
+  - Added repository DB rollups `report_orders_rows` and `report_order_items_rows` with Reports fast-path adoption for date-bounded Orders/Order Items reporting (full OrderItem hydration now fallback-only).
+  - Added repository DB rollup `report_returns_rows` with Reports fast-path adoption for date-bounded Returns + refund-adjustment reporting (full return-object hydration now fallback-only).
+  - Added repository DB rollup `report_lot_assignment_rows` with Reports fast-path adoption for date-bounded Lot Assignment reporting (full assignment hydration now fallback-only for that surface).
+  - Added repository DB rollup `report_sale_unit_cost_maps` with Reports fast-path adoption for FIFO-per-sale and lot-weighted-per-product cost mapping before helper fallback.
+  - Added repository DB rollup `report_sales_rows` with Reports fast-path adoption for date-bounded Sales reporting; full Sale hydration is now fallback-only when rollup or compatibility prerequisites are unavailable.
+  - Reports now reuses `report_orders_rows` as the primary report-window order context source (fee/shipping/reconciliation joins), making full `Order` hydration fallback-only in normal rollup paths.
+  - Added repository DB rollups `report_products_rows` and `report_listings_rows` with Reports fast-path adoption for date-bounded Products/Listings reporting windows; full model hydration is now fallback-only for compatibility/extended fallback paths.
+  - Tightened Reports fallback hydration strategy: full `InventoryMovement` / `ProductLotAssignment` lists are now lazy-loaded only when specific fallback branches require them (movement table fallback, cycle/rebuy helper fallback, cost-map helper fallback).
+  - Extended lazy fallback hydration to full `Sale` objects as well, so normal rollup paths no longer eagerly preload full sales history.
+  - Extended lazy fallback hydration to full `Product` / `MarketplaceListing` objects as well, so rollup-first runs only hydrate these models when helper fallback branches need them.
+  - Extended lazy fallback hydration to full `Order` / `OrderItem` / `ReturnRecord` objects as well, so rollup-first runs avoid remaining upfront list preloads for these entities.
+  - Optimized Reports shipping-summary coverage calculation to use grouped coverage rollups + merge (eliminating repeated full-dataframe scans in per-row apply).
+  - Optimized Reports margin percentage derivations (SKU/channel/period) to vectorized calculations, removing repeated row-wise `apply` calls on grouped margin frames.
+  - Consolidated Reports eBay fee-reconciliation KPI/source-priority derivations into cached summary helpers for reuse across cards/sections.
+  - Optimized Reports Copilot context assembly for top-N anomaly slices by switching to `nlargest`/`nsmallest` helper selection paths instead of repeated full-frame sort pipelines.
+  - Added Reports per-run scalar summary cache for repeated KPI/context totals (shipping/Cogs/reconciliation/row counts) to reduce duplicated sum/len scans in UI and Copilot paths.
+  - Refactored Reports rollup-loading control flow behind a shared helper for consistent `report_*_rows` try/fallback semantics and lower view maintenance overhead.
+  - Added Streamlit cache-data memoization to deterministic Reports fee-source transform helpers to improve repeated rerun latency under unchanged filters.
+  - Added Streamlit cache-data memoization to deterministic Reports tax-drilldown filter/option transforms for faster repeated drilldown toggles.
+  - Added Streamlit cache-data memoization to deterministic Reports document-handoff source option builders (sale/order) for faster repeated handoff control toggles.
+  - Added Streamlit cache-data memoization for Tax Drilldown KPI scalar rollups to avoid repeated per-toggle aggregate scans.
+  - Added repository DB rollup `report_returns_rows` with Reports fast-path adoption for date-bounded Returns and QBO refund-adjustment reporting (full Return object hydration now fallback-only).
+  - Added repository DB rollup `report_lot_assignment_rows` with Reports fast-path adoption for date-bounded Lot Assignment reporting (full assignment-object hydration now fallback-only for that table).
+  - Hardened Listings publish-form state mutation path: category-assist apply and item-specific default/aspect actions now preserve key publish fields (category/pricing/offer values) to prevent rerun clobber between category ID and aspects.
 - v0.5 scoped:
   - Added AI-copilot workstream scope for domain-specific assistants across inventory, listings/eBay, sales/orders, shipping, sync, reports, and admin operations
   - Added in-app data chat workstream scope for secure conversational access to DB-backed business data with RBAC, audit logging, and guardrails
@@ -192,6 +307,85 @@ This roadmap is focused on operational reliability first, then channel integrati
   - Started GS-V05-008 first pass: Ask GoldenStackers now supports optional mic transcription + optional spoken response playback with Admin-configurable voice runtime settings and safe capability fallbacks
   - Expanded GS-V05-008 voice runtime for LocalAI/OpenAI-compatible audio endpoint variants (`/audio/*` and `/v1/audio/*`) to improve provider compatibility without redeploys
   - Completed GS-V05-008 audit extension: AI chat audit payload now records voice-origin prompt metadata and TTS playback generation events
+  - Added next v1.0 scope `GS-V10-018 App Performance Optimization` focused on slow-page load reduction (query efficiency, render decomposition, caching/lazy hydration, and baseline observability).
+  - Started GS-V10-018 step 1: added System Health page/read baseline capture (manual runner + CSV export), repository probe collector, and integration-event snapshot logging for performance traceability.
+  - Advanced GS-V10-018 step 2: System Health baseline now includes probe-budget checks, over-budget counters, and a slowest-probe summary for faster hotspot triage.
+  - Advanced GS-V10-018 step 3: added cross-session baseline trend visibility via `Recent Page/Read Baseline Snapshots (14d)` in System Health with snapshot CSV export.
+  - Started GS-V10-018 first read-path optimization: Listings side-panel document draft flow now uses listing-scoped repository reads instead of full sales/order/order-item table hydration.
+  - Continued GS-V10-018 Listings optimization: removed duplicate product/listing fetch passes in bulk draft-create controls by reusing the page’s preloaded datasets.
+  - Continued GS-V10-018 Reports optimization: consolidated base-data hydration to single-load/reuse across report slices (products/listings/sales/orders/order-items/returns/assignments/movements) instead of repeated repository fetches.
+  - Continued GS-V10-018 Reports render optimization: added explicit `Load Extended Analytics` gate so heavy fee-reconciliation/cycle-trend computations are deferred until operator-requested.
+  - Continued GS-V10-018 baseline accuracy hardening: System Health page/read baseline now treats eBay fee reconciliation as extended-only probe (`report_ebay_fee_reconciliation_rows_extended`) when heavy mode is enabled, matching Reports first-load behavior.
+  - Continued GS-V10-018 Reports UI rendering optimization: report tables now default to bounded previews with explicit full-render opt-in, reducing heavy DataFrame rendering overhead on initial page load.
+  - Continued GS-V10-018 Reports analytics optimization: shipping economics and tax drilldown dataset computation is now explicit opt-in (`Load Shipping + Tax Analytics (slower)`), reducing default report-load query/aggregation cost.
+  - Continued GS-V10-018 System Health optimization: critical-alert evidence + calibration/alert-routing sign-off history queries are now deferred behind explicit `Load Critical Alert / Sign-Off History` toggle to reduce default tab load time.
+  - Continued GS-V10-018 Admin optimization: Go-Live evidence ZIP generation is now explicit on-demand (`Prepare Go-Live Evidence Pack`) and cached for download, avoiding repeated bundle rebuild cost on normal reruns.
+  - Continued GS-V10-018 Admin workflow-state optimization: event-history retrieval is now opt-in (`Load Workflow Events`) to avoid multi-query event hydration on default governance load.
+  - Continued GS-V10-018 Admin governance export optimization: handoff/feedback/parity/photo-comp export reads are now opt-in (`Load Governance Event Exports`) to avoid default audit-log hydration cost.
+  - Continued GS-V10-018 Search/Edit optimization: added per-run lazy dataset loader reuse across tabs (`products`, `listings`, `sales`, `orders`, `order_items`, `lots`, `sources`, `lot assignments`) to avoid duplicate repository reads in a single rerun.
+  - Continued GS-V10-018 Search/Edit render optimization: `Audit Log` query/render is now deferred behind explicit `Load Audit History (slower)` toggle to reduce default first-load cost.
+  - Continued GS-V10-018 Orders render optimization: full order-items table hydration/render is now deferred behind explicit `Load Order Items Table (slower)` toggle.
+  - Continued GS-V10-018 Orders stability/perf hardening: removed direct session-state mutation for keyed multiselect filters and switched to normalized widget defaults to prevent rerun warnings and filter churn.
+  - Continued GS-V10-018 Intake Wizard optimization: existing-media attach selectors now support deferred option loading (opt-in) to avoid default hydration of large media lists on first load.
+  - Continued GS-V10-018 Coin Intake optimization: coin-reference catalog hydration (up to 5k rows) is now explicit opt-in (`Load Coin Reference Catalog (slower)`) for faster default render.
+  - Continued GS-V10-018 Intake submit-path optimization: consolidated existing-media attach lookups to a single media-map hydration per submit flow to remove duplicate `list_media_assets()` scans.
+  - Continued GS-V10-018 Intake render optimization: AI diagnostics panels are now explicit opt-in in both intake wizards, reducing default rerun/render overhead from raw payload and structured-debug blocks.
+  - Continued GS-V10-018 Purchase-document preview optimization: detailed extract rendering (AI summary, normalized key table, full JSON) is now opt-in behind `Load Detailed Purchase Extract View (slower)`.
+  - Continued GS-V10-018 Reports render optimization: bounded preview/full-render controls now also apply to earlier analytics panels (fee source breakdowns/trends, shipping economics summary, tax drilldown table), not just the final export-table block.
+  - Continued GS-V10-018 Admin System-Health optimization: navigation telemetry and workspace-feedback analytics are now explicit opt-in loads (`Load Navigation Telemetry (slower)`, `Load Workspace Feedback Insights (slower)`) to avoid default heavy audit-log hydration.
+  - Continued GS-V10-018 Admin Integrations optimization: large integration-event history sections are now explicit opt-in loads (`Load Shipping Validation Events`, `Load Shipping Adapter Events`, `Load Automation Engine Events`, `Load Slack Delivery Events`) so default Integrations tab render avoids heavy audit-log hydration.
+  - Continued GS-V10-018 Admin Integrations optimization: Slack/Google retry-queue table hydration is now explicit opt-in (`Load Slack Queue Jobs`, `Load Google Queue Jobs`) so default Integrations tab render skips large queue-table reads unless requested.
+  - Continued GS-V10-018 Admin Integrations query-efficiency optimization: added per-rerun integration-event query cache reuse across validation/shipping-adapter/automation/Slack sections to eliminate duplicate `integration_event` reads when multiple event panels are loaded in one rerun.
+  - Continued GS-V10-018 Admin Integrations optimization: validation and automation hardening sign-off history tables are now explicit opt-in (`Load Integrations Sign-Off History`) to avoid default audit-log reads on tab load.
+  - Continued GS-V10-018 Admin eBay verification optimization: recent `ebay_verify` feedback history is now explicit opt-in (`Load Recent Verification Feedback (slower)`) so default eBay verification tab load skips audit-history scans.
+  - Continued GS-V10-018 Admin governance optimization: Documents-Handoff preset/clear audit summaries are now explicit opt-in (`Load Preset Audit Summary (slower)`, `Load Clear Audit Summary (slower)`) so default governance view avoids additional audit-log scans.
+  - Continued GS-V10-018 Admin governance-export optimization: recent governance snapshot history is now explicit opt-in (`Load Governance Snapshot History (slower)`) so default governance export load skips snapshot-history queries.
+  - Continued GS-V10-018 observability coverage: System Health page/read baseline now includes optional Admin Integrations probes (`Include integration probes`) for Slack/Google queue reads and integration-event history timing, with runtime-tunable probe budgets (`perf_budget_<probe_name>_ms`).
+  - Continued GS-V10-018 baseline efficiency hardening: consolidated duplicate 14-day integration-event baseline reads into one shared probe (`integration_event_rows_shared_14d`) so baseline runs reflect real query cost without duplicate sampling overhead.
+  - Continued GS-V10-018 Search/Edit render optimization: added page-level preview-first table controls (`Render Full Tables`, `Preview Row Limit`) and applied bounded table rendering across Products/Listings/Sales/Lots/Media/Audit tables to reduce first-load UI payload cost.
+  - Continued GS-V10-018 Listings render optimization: added page-level preview-first controls (`Render Full Listings Tables`, `Listings Preview Row Limit`) and applied bounded rendering to the largest listings operational tables (main listing table, eBay readiness queue, orchestration queue, publish plan/result, bulk publish history).
+  - Continued GS-V10-018 Listings hydration optimization: bulk publish execution history metadata scan is now explicit opt-in (`Load Bulk Publish History (slower)`), preventing default full metadata-history traversal on initial load.
+  - Continued GS-V10-018 Listings read-path optimization: eBay readiness queue generation now avoids per-row product DB fetches by reusing preloaded product maps, precomputes runtime/preset defaults once per rerun, and uses keyed readiness maps for pending-age/batch-plan lookups (removes repeated O(n) scans from large readiness sets).
+  - Continued GS-V10-018 Listings readiness-panel optimization: recent blocker follow-up task history scan (`workspace_followup` audit events) is now explicit opt-in (`Load Recent Blocker Follow-up Tasks (slower)`) to avoid default heavy audit-log hydration.
+  - Continued GS-V10-018 Listings metadata optimization: added per-rerun `marketplace_details` JSON parse cache and shared bulk-publish default resolver so tag/retry/history flows avoid duplicate JSON decode and repeated runtime-setting fetches.
+  - Continued GS-V10-018 Listings audit-read optimization: added per-rerun shared audit-log cache (`_get_audit_logs` / `_audit_logs_for_entity`) so photo-comp lineage tagging and blocker-followup history reuse one audit fetch instead of issuing duplicate `list_audit_logs` reads.
+  - Continued GS-V10-018 Listings product-read optimization: batch publish/retry and side-panel/publish-selected flows now reuse the page’s preloaded `product_by_id` map instead of issuing direct per-listing `repo.db.get(Product, ...)` lookups.
+  - Continued GS-V10-018 Listings side-panel optimization: document-draft related-source queries are now explicit opt-in (`Load Related Sales/Orders (slower)`), deferring `list_sales_for_listing`/`list_order_items_for_listing`/`list_orders_by_ids` from default panel load.
+  - Continued GS-V10-018 Listings template-analytics optimization: template usage scan/aggregation is now explicit opt-in (`Load Template Usage (slower)`) so default Listings load skips listing-wide template-tracking passes.
+  - Continued GS-V10-018 Listings capability-matrix optimization: channel capability matrix build/render is now explicit opt-in (`Load Channel Capability Matrix (slower)`) to reduce default render payload.
+  - Continued GS-V10-018 Listings origin-tag optimization: photo-comp draft origin labeling is now explicit opt-in (`Load Photo-Comp Origin Tags (slower)`), deferring default 5k audit-log scan from base Listings load.
+  - Continued GS-V10-018 Listings coin-context optimization: linked coin-reference catalog hydration is now explicit opt-in (`Load Coin Reference Catalog (slower)`), avoiding default 5k coin-reference row load on Listings render.
+  - Continued GS-V10-018 Listings media-hydration optimization: main listing table media counts are now explicit opt-in (`Load Listing Media Counts (slower)`), deferring default per-listing media relationship hydration.
+  - Continued GS-V10-018 Listings preset-read optimization: repeated eBay publish preset lookups now reuse a per-rerun cache (`_list_ebay_publish_presets_cached`) across create/readiness/manage sections, removing duplicate preset queries in one render cycle.
+  - Continued GS-V10-018 Listings external-ID collision optimization: external listing owner checks now reuse preloaded in-memory listings and compute collision once per publish/update path, removing repeated `list_listings()` scans during eBay update/relist flows.
+  - Continued GS-V10-018 Listings external-ID lookup optimization: added precomputed `(marketplace, external_listing_id) -> listing_id` owner map reuse in publish/relist flows for O(1) collision checks, avoiding repeated linear scans during update-path decisioning.
+  - Continued GS-V10-018 Listings allocation optimization: external-ID owner helper now reuses provided listings sequence directly (no defensive list copy) when preloaded rows are available, reducing avoidable memory churn on publish paths.
+  - Continued GS-V10-018 Listings bulk-create optimization: bulk draft-create path now reuses the existing page-level `product_by_id` index instead of rebuilding a second `{id -> product}` map from `products`.
+  - Continued GS-V10-018 Listings bulk-filter optimization: candidate product filtering now precomputes selected category set once per rerun instead of rebuilding set conversion on every product iteration.
+  - Continued GS-V10-018 Listings filter-state hardening: pending saved-filter apply now sanitizes marketplace/status values against live options before writing widget session-state, preventing `default value not part of options` crashes on status multiselects.
+  - Continued GS-V10-018 Orders filter-state hardening: removed keyed multiselect `default=` usage in favor of pre-sanitized session-state assignment to eliminate Streamlit default-vs-session-state warnings.
+  - Continued GS-V10-018 Reports bounded-render optimization: introduced shared `_bounded_dataframe(...)` helper and routed report table rendering (including Rebuy Cost Trend SKU details and report export table loop) through preview-bounded logic for lighter default payloads.
+  - Continued GS-V10-018 performance guardrail coverage: added helper-level tests for Reports bounded rendering behavior (`tests/test_reports_helpers.py`) to lock preview/full-table semantics.
+  - Continued GS-V10-018 Media payload optimization: Media Library now uses preview-first table rendering (`Render full media table` toggle + configurable preview row limit) so large media catalogs no longer force full default table payloads.
+  - Continued GS-V10-018 Listings guardrail coverage: added helper tests for photo-comp draft lineage ID extraction and map-based external listing owner lookup behavior (`tests/test_listings_helpers.py`) to protect optimized audit/owner lookup paths.
+  - Continued GS-V10-018 System Health guardrail coverage: extracted page/read baseline row normalization + summary helpers and added unit coverage (`tests/test_system_health_helpers.py`) to lock budget/over-budget metric semantics.
+  - Continued GS-V10-018 operational evidence runbook hardening: documented explicit performance baseline capture/export workflow in go-live and QA plans (rollup baseline, page/read baseline default + heavy probes, focused helper guardrail suite).
+  - GS-V10-018 closeout recorded (April 18, 2026): first-wave performance remediation completed with baseline capture instrumentation, bounded/deferred rendering controls across heavy workflows, and targeted helper guardrail coverage for optimized paths.
+  - Continued GS-V10-018 Admin parity-checker optimization: parity audit/task evidence scan is now explicit opt-in (`Load Parity Audit Evidence (slower)`), deferring the 5k-row audit-log pull and follow-up snapshot scan from default Admin parity tab load.
+  - Continued GS-V10-018 Admin parity export optimization: Parity Governance ZIP generation is now on-demand (`Prepare Parity Governance Bundle`) and session-cached for download, avoiding repeated bundle rebuild cost on reruns.
+  - Continued GS-V10-018 Admin parity-history optimization: parity snapshots, release-decision history, and follow-up task table queries are now explicit opt-in (`Load Parity History + Follow-up Tables (slower)`) so default parity view skips additional audit-history hydration.
+  - Continued GS-V10-018 Admin Go-Live evidence optimization: heavy diagnostics scans (integration-event alert/validation windows, queue snapshot, recent evidence-capture history) are now explicit opt-in (`Load Go-Live Diagnostics Tables (slower)`), reducing default Admin go-live rerun query load.
+  - Continued GS-V10-018 Admin Go-Live history-depth optimization: sign-off/history tables now support default recent-window mode with explicit full-depth opt-in (`Load Full Go-Live Sign-Off History (slowest)`), reducing large audit-history pulls on default load while retaining deep-history access.
+  - Continued GS-V10-018 Admin Go-Live query-efficiency optimization: consolidated duplicate integration-event SQL reads (7d, 24h, 30d windows) into one shared 30-day query with in-memory window filtering for alert evidence and signal summaries.
+  - Continued GS-V10-018 Admin Go-Live checklist optimization: DR checklist table hydration now decodes audit payload once per row (instead of repeated `_audit_changes(...)` calls), reducing CPU overhead on large checklist history sets.
+  - Continued GS-V10-018 Admin parity history optimization: release-decision table hydration now decodes audit payload once per row, removing repeated `_audit_changes(...)` calls in parity decision rendering.
+  - Continued GS-V10-018 Admin parity decision optimization: parity status cards and latest-approved scan now reuse a predecoded decision payload map (`decision_payload_by_id`) instead of re-decoding payloads across latest/summary/table paths.
+  - Continued GS-V10-018 Admin parity follow-up optimization: follow-up task rows now reuse cached create-event payloads (`created_payload_by_key`) instead of re-decoding each create row during follow-up table hydration.
+  - Continued GS-V10-018 Admin parity precheck optimization: follow-up open/overdue counters now also reuse cached create-event payloads in the readiness pre-score path, removing a second decode pass during parity metric calculation.
+  - Continued GS-V10-018 Admin governance telemetry optimization: workspace-handoff event table mapping now decodes audit payload once per row (instead of repeated `_audit_changes(...)` calls) for lower CPU overhead in handoff telemetry views.
+  - Continued GS-V10-018 Admin navigation telemetry optimization: handoff-event table now reuses payloads cached during primary telemetry iteration (`nav_payload_by_id`) instead of running a second decode pass over the same audit rows.
+  - Stability hardening: fixed a Listings model-type annotation regression that caused shared views import-chain failures (`NameError`/`ImportError`) and validated runtime container importability across all `app.components.views.*` modules.
+  - Added next v1.0 scope `GS-V10-019 Slack AI Ops Bot` to let approved operators submit images/commands in Slack for inventory intake/comps and trigger constrained in-app operations with approvals + audit trail.
   - Enhanced AI Runtime Admin UX with endpoint-backed `/models` querying plus manual override fields for text and multimodal model selection
   - Started GS-V05-005 AI Admin controls: added per-domain AI feature toggles in Admin (`chat`, `comp_tool`, `coin_grader`, `coin_identifier`) with runtime enforcement in Ask GoldenStackers and Tools actions
   - Expanded GS-V05-005 role policy layer: added dedicated AI permissions (`ai_chat_use`, `ai_comp_use`, `ai_coin_grade`, `ai_coin_identify`) and enforced them in Ask/Comp/Grader/Identifier execution paths
@@ -227,6 +421,7 @@ This roadmap is focused on operational reliability first, then channel integrati
   - Added Admin config-coverage dashboards for `.env` + runtime settings to track missing/empty/default/overridden keys and feature-flag-like toggles
   - Expanded config-health governance: one-click required + bulk default repairs, drift detection for untracked env/runtime keys, top-level Admin health summary + JSON snapshot export, and shared config-health policy service reused by Admin/System Health
   - Moved System Health access under Admin tab set (instead of dedicated sidebar page) to reduce sidebar length and centralize operational controls
+  - Added auth session persistence hardening scope: replace deprecated `streamlit_cookies_manager` (`@st.cache`) dependency with a non-deprecated cookie/session adapter while preserving remember-token behavior and OAuth callback compatibility
 
 ## Production Go-Live Re-Evaluation (April 2026)
 Target: get legally and operationally ready for production selling with this system as the system of record.
@@ -493,7 +688,9 @@ Acceptance Criteria:
   - Added Operations Home `Photo-Comp Pending Review` queue card/tab with direct jump into Listings prefiltered review state
   - Extended Listings handoff banner to recognize Operations Home queue handoffs and clear/reset origin-aware filter context in one click
   - Added first-pass Documents tax engine controls (jurisdiction, auto/manual/no-tax modes, category exemption rules, shipping-taxable toggle, tax row rendering, and tax-adjusted total option)
-  - Seeded tax runtime defaults (`invoicing_tax_jurisdiction`, `invoicing_tax_rate_percent_default`, `invoicing_tax_shipping_taxable_default`, `invoicing_tax_exempt_categories_csv`) for environment-level configuration
+  - Seeded tax runtime defaults (`invoicing_tax_jurisdiction`, `invoicing_tax_rate_percent_default`, `invoicing_tax_shipping_taxable_default`, `invoicing_tax_exempt_categories_csv`, `marketplace_facilitator_channels_csv`) for environment-level configuration
+  - Updated Golden local tax default profile to `7.50%` (CO `2.90` + Jefferson County `0.50` + Golden `3.00` + CD `0.10` + RTD `1.00`) across Documents/Reports runtime fallbacks and baseline tooling inputs
+  - Added helper-level guardrails for facilitator-channel tax-scope defaults in Reports (`_default_tax_marketplace_scope` tests), ensuring local liability scope excludes configured facilitator channels by default while preserving fallback behavior when all channels are facilitators.
   - Added first-pass Documents tax presets (`Golden Local Retail`, `Marketplace Shipped`, `Bullion/Coin Exempt`) plus one-click save of current tax controls to runtime defaults
   - Added line-item taxability overrides in Documents auto-tax mode (per-line taxable toggles) to support mixed taxable/exempt invoice scenarios
   - Added first-pass Reports tax analytics (`Tax Summary`, `Tax by Marketplace`, `Tax Detail`) with jurisdiction/rate/marketplace scope controls and exempt-category-aware estimates
@@ -573,6 +770,17 @@ Acceptance Criteria:
   - Added ArgoCD bootstrap templates (`k8s/templates/argocd/*`) for Dev/Prod Applications, optional root app-of-apps, and AppProject scaffold
   - Added deployment runbook (`DEPLOYMENT_RUNBOOK.md`) documenting release artifact contract, Dev/Prod promotion gates, ArgoCD sync flow, smoke checks, and rollback procedure
   - Added operator sign-off artifact `GO_LIVE_CHECKLIST.md` for pre-Dev/Prod promotion readiness tracking (owner/evidence/date fields)
+  - Added Search/Edit Lots workflow with lot lookup and edit controls (lot/source/vendor/cost/tax/shipping/handling/eBay refs/notes)
+  - Added lot-to-product visibility in Search/Edit Lots (`attached_products_count`, SKU summary, and per-lot assignment detail table)
+  - Fixed Streamlit state reset behavior in Lots create flow (post-create flash + safe rerun reset) to avoid widget mutation exceptions
+  - Fixed Products `Purchased On eBay` field UX so eBay item/link inputs remain editable and submit-time validation enforces required item ID
+  - Hardened Comp Tool eBay reliability with:
+    - per-run call caps
+    - rolling 10-minute call caps
+    - local cooldown after eBay Finding rate-limit responses
+    - web-only graceful fallback when eBay is unavailable/capped
+    - explicit diagnostics for `local_cooldown` vs `remote_rate_limited` errors
+    - one-click local cooldown clear action and last-error payload visibility in the UI
   - Hardened Kubernetes Dev/Prod template NetworkPolicies to scoped egress ports only (DNS/HTTP/HTTPS/Postgres/NTP) and constrained policy targeting to GoldenStackers app pods
   - Completed GS-V06-011 by adding build metadata traceability support (`APP_BUILD_VERSION`, `APP_BUILD_SHA`, runtime keys `app_build_version`/`app_build_sha`) surfaced in Admin System Health
   - Extended GS-V06-011 automation by adding optional Argo configmap metadata update in release workflow (`ARGO_CONFIGMAP_PATH`) so deployed manifests automatically carry `APP_BUILD_VERSION` and `APP_BUILD_SHA`
@@ -639,6 +847,7 @@ Execution tracking: `V1_0_IMPLEMENTATION_CHECKLIST.md`
 Scope:
 - Additional channels (deferred until account readiness; current focus remains eBay-first, then Whatnot/Craigslist/Facebook when enabled)
 - QA hardening and coverage expansion (P0) to protect inventory/listing/shipping/admin workflows before broader rollout
+- DB-backed workflow draft/state persistence (P0) to reduce Streamlit session-state fragility in multi-step operator flows
 - Label buying integration (eBay shipping and/or Pirate Ship API)
 - Event-driven automation (auto-create shipment, auto-close listing, auto-status transitions)
 - Observability and SRE baseline (error tracking, metrics, alerts)
@@ -649,6 +858,9 @@ Deliverables:
 - Coverage baselines + quality gates in CI with staged threshold ratchets
 - Expanded unit/integration suite for core business logic (`repository`, `services`, `auth`, `validation`)
 - Expanded Playwright suite for critical operator flows (auth, intake, listing review/publish, shipping, sync, admin sign-off)
+- Workflow draft persistence layer (`workflow_drafts` / `workflow_events`) with repository/service API (`load/save/clear/resume`)
+- Session-state reduction map per page (Listings, Listing Wizard, eBay Workspace, intake wizards) separating `db-persisted` vs `ui-transient`
+- Autosave + resume-draft UX for long-running listing/intake/eBay setup workflows
 - Unified fulfillment API in app for label + tracking lifecycle
 - Monitoring dashboards + alert thresholds
 - Disaster recovery documentation + tested restore process
@@ -662,6 +874,10 @@ Acceptance Criteria:
   - target `>=95%` on scoped core modules (`repository`, `services`, `auth`, `validation`, `security`)
   - target `>=70%` global Python line coverage as interim operational standard, then continue ratcheting
 - Labels and tracking can be created/updated from app workflows
+- Critical multi-step workflows survive reruns/restarts without data loss:
+  - no business-critical dependence on volatile `st.session_state` alone
+  - listing/intake/eBay setup drafts are recoverable by user/environment
+  - widget-key mutation errors are eliminated from core operator paths
 - SLA/health metrics and alerts are in place
 - Backup restore drill passes on schedule
 - Progress:
@@ -723,12 +939,99 @@ Acceptance Criteria:
     - immutable original storage in S3 with checksum
     - link documents to lot/product/source for acquisition traceability
   - Added one-click “Apply AI Data To Linked Lot” from purchase-document details to populate lot vendor/date/total/tax/shipping/handling from extracted invoice fields
+  - Added runtime-controlled auto-apply for extracted purchase-document fields into linked lots (`purchase_doc_auto_apply_linked_lot_fields`) across both Intake Wizard and Lots upload flows
+  - Added explicit audit actions for purchase-document lot normalization (`auto_apply_extracted_fields_to_lot`, `manual_apply_extracted_fields_to_lot`) for governance traceability
+  - Added purchase-document lot-apply audit visibility in both Reports and Admin (date-window metrics, detailed table, CSV export)
   - Added “Create Lot + Link Document” flow from purchase-document details for unlinked invoice uploads, prefilled by AI-extracted fields
   - Added “Create Product + Link Document” flow from purchase-document details, prefilled by extracted line-item fields and supporting optional immediate lot assignment
   - Added extracted line-item selector in purchase-document product creation so operators can explicitly choose invoice rows for conversion
   - Added bulk line-item product creation grid in purchase-document details (select/edit multiple extracted rows and create products in one action)
   - Added intake-wizard existing-media attach selectors (product/listing) with quick filter, media-type filter, and select-all/clear controls for bulk reuse
   - Standardized camera UX by collapsing direct camera capture panels by default across intake wizards, tools, and lots
+  - Started GS-V10-009 eBay workflow simplification:
+    - Created dedicated `eBay Templates` page so template CRUD is separated from daily listing operations
+    - Slimmed Listings template section to quick-load + link-out model
+    - Added first `Listing Wizard` scaffold page (`pages/26_Listing_Wizard.py`) with in-flow AI draft suggestion apply and guided step structure
+    - Scoped next steps: guided Listing Wizard (`Product -> Template -> Policy/Format -> Review -> Publish`), eBay Workspace role split (Auth/Health vs Daily Ops), and clearer publish-state UX
+    - Scoped AI-first additions for Listing Wizard: AI title/details draft, AI policy/readiness preflight, AI risk summary, and explicit operator acceptance before publish
+    - Added explicit wizard safety controls: unmet-requirements create-button disable reasons, duplicate-draft override gate, and one-click input/state reset to keep daily listing flow clean and predictable
+    - Added context-change stale-state protections so switching product/template does not leak prior AI/media selections into a different listing draft
+    - Added direct eBay Workspace quick links into `Listing Wizard` and `eBay Templates` so setup/template and drafting flows are reachable without sidebar scanning
+    - Tightened Listing Wizard linear UX with explicit `Step X of 9` framing, recommended-flow hint, preflight progress bar, and default-collapsed advanced controls to reduce operator overload
+    - Added opt-in AI troubleshooting panels in Listing Wizard (shown only post-run) to reduce mid-flow noise while preserving diagnostics access
+    - Compressed AI suggestions review by default (compact previews first, full payload behind explicit toggle) to keep listing flow readable
+  - Added stage-aware `Next recommended action` guidance throughout Listing Wizard to improve operator throughput and reduce decision friction
+  - Added top-level `Wizard Status` strip in Listing Wizard (product/template/mode/preflight signal) for faster context recovery during edits
+  - Added readiness-aware preview expansion in Listing Wizard (auto-open preview only when preflight is fully clean)
+  - Closed GS-V10-009 eBay workflow UX simplification:
+    - Listing Wizard AI-first assist lane is now complete (title/details generation, readiness risk summary, comps+spot price-band suggestions, and operator price apply mode)
+    - Listing Wizard/eBay Workspace split is now the primary operator path for daily eBay work (template setup, draft flow, readiness checks, and publish handoff)
+    - Added helper-level regression coverage for Listing Wizard parsing/sanitization (`tests/test_listing_wizard_helpers.py`) and eBay template HTML block persistence/merge flows (`tests/test_listings_helpers.py`)
+  - Added Playwright e2e coverage for Listing Wizard category/quantity/preview flow and eBay Templates create/edit/custom-block actions (`tests/e2e/listing_wizard_flow.spec.ts`, `tests/e2e/ebay_templates_flow.spec.ts`)
+  - Extended Listing Wizard Playwright flow with direct-post mode/preflight assertions (`Post to eBay Immediately`, post-mode selector, and `Run eBay Dependency Preflight` card visibility) to reduce regressions in direct-post readiness UX
+  - Extended Listing Wizard Playwright flow with create-draft direct-post result handling assertions (direct-post skip/failure feedback + post-create `Open Listings` link visibility) to harden post-submit UX coverage.
+  - Added Listings Playwright e2e coverage for `eBay Post Mode` selection + dependency preflight card flow, with environment-aware skip when seller-ops controls are intentionally disabled
+  - Extended post-close GS-V10-009 eBay publish hardening:
+    - Listings now includes in-form `Run eBay Dependency Preflight` and a persistent readiness summary card (pass/warn/fail + checks table) before publish/revise
+    - Listings publish now supports explicit post mode (`Publish Live Listing` vs `Create Offer Draft Only`) with draft-link surfacing for Seller Hub review
+    - Listings and Listing Wizard now include cache-first category suggestions backed by DB (`ebay_category_suggestions`) with explicit `Refresh from eBay` bypass action
+    - Listings category-suggestion apply action now uses queued pending-field updates + rerun for reliable category ID population across fixed-price and auction workflows
+    - Listings + Listing Wizard auction payload guardrail now omits `availableQuantity` for `AUCTION` offers (eBay API compatibility)
+    - Added shared payload-construction helper in Listing Wizard direct-post path (`_wizard_build_ebay_offer_payload`) to reduce inline state drift and keep auction/fixed payload behavior aligned with Listings.
+    - Added explicit regression tests for wizard offer payload construction (`tests/test_listing_wizard_helpers.py`) covering:
+      - `FIXED_PRICE` payloads include `availableQuantity` + best-offer terms
+      - `AUCTION` payloads omit `availableQuantity` and use auction pricing fields
+    - Hardened Listing Wizard category suggestion apply/fetch/refresh/profile-apply flows to use queued pending-field updates + rerun (no post-widget direct state mutation), eliminating recurring Streamlit `cannot be modified after widget is instantiated` failures for category ID.
+    - Hardened Listing Wizard direct-post failure UX:
+      - wizard now stays in-place on direct-post failure (no immediate redirect after local draft create)
+      - failure context is persisted in listing metadata (`direct_post_last_error`, `direct_post_last_error_at`)
+      - added staged diagnostics capture (`direct_post_last_error_stage`, `direct_post_last_context`) and in-flow `Last Direct Post Diagnostics` panel for immediate troubleshooting
+    - Hardened Listings publish failure UX with staged diagnostics persistence:
+      - failed publish attempts now persist `last_publish_error`, `last_publish_error_at`, `last_publish_error_stage`, and `last_publish_error_context` under `ebay_publish` metadata
+      - Listings now surfaces `Last eBay Publish Diagnostics` directly in publish flow for fast operator triage
+      - added helper regression coverage for publish-error persistence/metadata extraction (`tests/test_listings_helpers.py`)
+    - Shared eBay bullion/coin default aspects now include required `Circulated/Uncirculated` starter value (`Uncirculated`) while remaining operator-editable
+    - Added eBay publish resiliency fallbacks for common production failures:
+      - EPS image upload failure now falls back to direct HTTPS image URL in offer payload
+      - Inventory upsert system error (`API_INVENTORY` `25001`) now retries once with a safer payload shape
+    - Added shared eBay publish dependency verification methods in service layer (`verify_publish_dependencies`) and wired them into wizard + listings flows
+    - Added migration `0043_ebay_category_cache` for persisted category suggestion caching and lookup reuse
+    - Hardened AI detail-generation quality in Listing Wizard + Listings Copilot:
+      - prefer explicit detail keys over marketplace placeholder fields
+      - reject weak/too-short/bullet-only AI details
+      - auto-generate enriched eBay-ready fallback details when AI detail output quality is insufficient
+    - Hardened Listings eBay publish duplicate-offer handling:
+      - on eBay `errorId 25002` (`Offer entity already exists`), resolve/reuse existing `offer_id` and revise/update instead of hard-failing create
+    - Improved Listing Wizard item-specifics discoverability:
+      - `Advanced eBay Fields + Item Specifics` section now opens by default for faster operator edits
+  - Started GS-V10-010 auth adapter modernization: replaced legacy cookie manager dependency path with `extra-streamlit-components` adapter and added `cookie_manager_backend` telemetry in Auth Session Debug
+  - Closed GS-V10-010 auth adapter modernization: standardized cookie backend selection to `extra-streamlit-components` (no deprecated fallback path), added adapter-selection regression tests in `tests/test_auth.py`, and revalidated Playwright auth smoke (`tests/e2e/auth_flow.spec.ts`)
+    - Completed runtime-coupling guardrail for eBay UX: Listing Wizard now surfaces active AI runtime chain/fallback metadata and explicitly avoids hardcoded provider/model assumptions at execution time
+    - Split eBay Workspace into explicit workflow lanes (`Auth / OAuth`, `Connection Health`, `Daily Ops`) with lane-specific metrics and quick remediation links
+    - Added consolidated `Publish Readiness Summary` card in `Connection Health` with blocker/warning/format-fix metrics and direct remediation actions into Listings/Format Fix/Wizard/Admin Verify
+    - Removed duplicate top-of-workspace readiness tables so `Connection Health` remains the single high-signal readiness lane
+    - Removed format-fix/ops remediation controls from `Auth / OAuth` lane to enforce clearer setup-vs-operations separation
+    - Moved runbook checklist and document handoff actions under `Daily Ops` lane to complete primary lane-boundary cleanup
+    - Simplified `Daily Ops` by removing duplicate format-fix controls (centralized in `Connection Health`) and collapsing document handoff by default
+  - Added scheduled DB backup automation in sync-runner with runtime-configurable local schedule/timezone and optional S3 upload path (`backup_policy_runner_enabled`, `backup_policy_schedule_timezone`, `backup_policy_schedule_local_time`)
+  - Added daily Slack ops report automation in sync-runner with runtime-configurable local schedule/timezone/channel (`slack_daily_report_enabled`, `slack_daily_report_timezone`, `slack_daily_report_local_time`, `slack_daily_report_channel`)
+  - Added Admin controls for backup/slack scheduler runtime keys so operators can set local schedule/timezone/channel directly from UI
+  - Added global app timezone runtime key (`app_default_timezone`, default `America/Denver`) and aligned scheduler defaults/UI controls to that local timezone baseline
+  - Added optional Slack alerts for scheduled backup success/failure with runtime toggles, channel override, and editable templates
+  - Scoped next-phase notification routing: optional email delivery (Google integration) for backup/report/system alerts in addition to Slack
+  - Scoped future `Goldy in Slack` agent mode: Slack-connected AI assistant that can execute constrained app workflows (reports, comps, listings, ops triage) with approval guardrails
+  - Added Admin notification-routing matrix + manual business-status report dispatch (daily/weekly/inventory-risk) to tighten operator visibility and comms cadence
+  - Added business-report dry-run preview controls in Admin (resolved route/event/channel + rendered payload text, send-preview-now, payload export)
+  - Added daily Slack-report normalized fee-source coverage guardrail:
+    - sync-runner computes weekly normalized coverage from reconciliation rows and raises alert context when threshold/consecutive-week criteria are breached
+    - coverage diagnostics are persisted into daily-report integration-event details for operational traceability
+  - Added Admin runtime controls for daily-report fee-coverage alerting:
+    - `slack_daily_report_normalized_fee_coverage_lookback_weeks`
+    - `slack_daily_report_normalized_fee_coverage_threshold_pct`
+    - `slack_daily_report_normalized_fee_coverage_consecutive_weeks`
+  - Added fee-coverage operator visibility surfaces:
+    - `Admin -> Integrations -> Slack Notifications` live fee-coverage preview panel
+    - `Admin -> System Health` `eBay Fee Coverage Health` card + weekly table
   - Started GS-V10-006 QA automation baseline: added mandatory unit-test step in Docker build workflow and dedicated `qa_tests.yaml` workflow (unit + Playwright smoke on compose app stack with artifact upload)
   - Added GS-V10-006 Playwright scaffolding (`playwright.config.ts`, `tests/e2e/smoke.spec.ts`) and npm QA scripts for local/CI execution
   - Established GS-V10-006 local coverage baseline (`coverage.py`, unit-test run): global Python line coverage is currently `~5%` (2026-03-30 baseline), with expansion plan now prioritized
@@ -818,25 +1121,715 @@ Acceptance Criteria:
     - Listings review action now asserts approved review-state evidence.
     - Sync execute-now test now validates result/disabled states (instead of surface-only checks).
     - Shipping flow now validates bulk-update form guardrail messaging.
+    - Shipping flow now includes deterministic carrier-preset create/save mutation assertion for non-empty and empty queue environments.
+    - Sync flow now includes deterministic run-detail counter/status update assertion (`Update Sync Run`) independent of exception queue population.
+    - Admin go-live flow now includes deterministic `Go-Live Section Sign-Off` form mutation assertion (`Record Checklist Item Sign-Off`) with success + row visibility validation.
     - Added deterministic e2e role-permission seeding (`E2E_ENSURE_ROLE_PERMISSIONS=true`) and coin-intake navigation hardening; current local e2e status: `9/9` passing.
   - Added QA CI evidence packaging in `qa_tests.yaml`: dedicated `qa-evidence` artifact (`qa_evidence.md` + `qa_evidence.json`) plus GitHub job summary output for direct go-live checklist linkage.
+  - Extended QA evidence packaging with explicit coverage-gate trend artifact (`qa-evidence/coverage_gates.json`) and gate snapshot in summary output (global/scoped thresholds + pass/fail) to harden ratchet tracking evidence.
+  - Added segmented suite manifest evidence export in CI (`qa-evidence/suite_fast_manifest.json`, `qa-evidence/suite_integration_manifest.json`) using enhanced `scripts/run_test_suites.py` list-only/json modes for deterministic suite split tracking and parallelization planning.
   - Added QA suite segmentation + deterministic integration test helpers:
     - New `scripts/run_test_suites.py` supports `fast` and `integration` unittest selectors for CI fan-out.
     - Added reusable test support helpers (`tests/test_support.py`) with deterministic SKU suffix generation and shared in-memory repository fixture/factory wiring.
     - Added local convenience targets: `make qa-unit-fast`, `make qa-unit-integration` (and `task` equivalents).
   - Ratcheted CI QA coverage gates in `.github/workflows/qa_tests.yaml` to global `>=30%` and scoped-core `>=85%` (from baseline `25/25`) and aligned README/QA docs/checklists
-  - Revalidated Playwright critical-path suite locally after QA changes: `9/9` chromium specs passing
+  - Revalidated Playwright critical-path suite locally after QA/auth-session hardening (`2026-04-09`): `9 passed / 0 skipped`, including deterministic admin-go-live governance flow execution.
+  - Standardized local Playwright command guidance on `npm run test:e2e` wrapper (instead of direct `npx playwright test`) for consistent env handling in local/operator shells.
   - Added GS-V10-006 phased quality-gate plan:
     - Phase 1: enforce baseline reporting + minimum gates (`>=30%` global, `>=85%` scoped-core) and fail build below threshold
     - Phase 2: raise to `>=40%` global while adding core flow Playwright coverage
     - Phase 3: raise to `>=55%` global and enforce scoped-core `>=95%` target
     - Phase 4: continue ratchet toward near-100% on core modules and higher global target post-go-live
-  - High-priority remaining (as of 2026-04-02):
+  - Started GS-V10-011 workflow-state persistence scope definition:
+    - documented migration path from session-heavy business state to DB-backed drafts/events
+    - scoped first rollout target on Listing Wizard and Listings publish/edit flows
+    - scoped follow-on rollout to eBay Workspace and intake wizards with autosave/resume behavior
+  - Implemented GS-V10-011 first delivery slice:
+    - added DB-backed workflow persistence tables (`workflow_drafts`, `workflow_events`) and migration `0044_workflow_state`
+    - added repository workflow draft/event APIs for load/save/resume/clear/event logging
+    - Listing Wizard now supports explicit `Save Workflow Draft`, `Resume Saved Draft`, `Clear Workflow Draft`, and draft autosave on tracked state change
+    - Listing Wizard resume restores saved product/template context from draft payload (reducing stale session-only flow drift)
+  - Extended GS-V10-011 into Listings eBay publish/edit flow:
+    - added per-listing draft scope persistence with `Save/Resume/Clear Publish Draft` controls
+    - added autosave for publish/edit form state (category/pricing/aspects/policies/shipping/post-mode/manage offer fields)
+    - switched category/item-specific apply actions to pending-update + rerun flow to reduce session-state drift after aspect-default actions
+  - Extended GS-V10-011 into eBay Workspace auth/setup controls:
+    - added scoped setup draft persistence with explicit `Save/Resume/Clear Setup Draft` controls
+    - added autosave for workspace auth/setup state (token/filter/store-policy/location/create-location/package defaults)
+    - added safe date-range restore coercion to reduce rerun-time widget state/type failures
+  - Extended GS-V10-011 into intake wizards:
+    - added initial `Save/Resume/Clear Draft` + autosave for key-backed Coin Intake and Inventory Intake wizard state
+    - persisted AI/prefill/buffered-media context to reduce rerun/restart loss in intake-assisted flows
+    - expanded intake draft payload coverage to core long-form keyed form state (item/inventory/cost/tax/shipping/lot/AI/draft-handoff), improving restart-safe resume parity
+    - added helper-state persistence for media selector/search and capture-mode controls while explicitly excluding binary upload buffers from persisted draft payloads
+    - added explicit resume warnings for non-resumable local media buffers when reopening saved drafts after restart/device change
+  - Extended GS-V10-011 with workflow-state governance operations:
+    - added repo-level workflow retention cleanup (`cleanup_workflow_state`) and draft listing API (`list_workflow_drafts`)
+    - added Admin Governance Exports panel for workflow drafts/events preview + CSV export + one-click retention cleanup
+    - added workflow-state retention coverage for cleanup behavior (expired-active drafts, stale events, active-draft preservation) in `tests/test_workflow_state.py`
+    - hardened Listing Wizard workflow-state Playwright spec to skip gracefully when target environment has not applied `workflow_drafts` migration (prevents false-negative CI/local failures from schema drift)
+  - Completed GS-V10-011 documentation/runbook closeout:
+    - README now includes explicit workflow-state operator runbook (`Save/Resume/Clear`, restart-safe expectations), Admin governance cleanup runbook, and retention policy guidance for DB drafts/events vs session-only UI state.
+  - Expanded GS-V10-011 draft-contract regression coverage:
+    - strengthened `tests/test_listing_workflow_draft_parity.py` to assert parity for category/aspects/pricing plus quantity, best-offer thresholds, volume pricing JSON, package weight, shipping cost, and post-mode fields across Listing Wizard and Listings publish/edit draft payloads.
+  - Hardened GS-V10-011 e2e stabilization path for environment variance:
+    - updated `tests/e2e/listings_flow.spec.ts` to use visibility guards and skip semantics when review/publish controls are unavailable due to environment preconditions (auth/role/data), reducing false-negative failures while keeping successful-path assertions intact.
+    - added deterministic Listings e2e fixture creation/selection (per-test unique listing titles) to reduce reliance on preexisting listing rows before review/publish assertions.
+    - fixed auth helper sign-in completion heuristic (`tests/e2e/_auth.ts`) to avoid false negatives when signed-in state is present but a `Sign In` control remains visible in the UI tree.
+    - non-prod seed now enforces runtime `ebay_allow_sandbox_seller_ops=true` for stable sandbox eBay preflight control availability in e2e flows.
+    - Playwright global setup now allows local restricted-shell fallback (continue without seed unless `PLAYWRIGHT_REQUIRE_SEED=1`) while preserving strict CI behavior.
+    - seed data now includes deterministic eBay draft fixture (`EBAY-LIST-E2E-DRAFT`) and Listings e2e spec falls back to that fixture for review/publish selection paths.
+    - added strict seeded Listings e2e gate (`tests/e2e/listings_flow_strict.spec.ts`) with hard assertions and explicit env gating (`E2E_STRICT_LISTINGS=1`) for closeout evidence runs.
+    - added strict Listings execution wiring in tooling/CI (`npm run test:e2e:listings:strict`, optional workflow toggle `QA_ENABLE_STRICT_LISTINGS=1`).
+  - GS-V10-011 (P0) closed (April 13, 2026): workflow-state modernization closeout complete (DB-backed drafts/events across targeted flows, retention/governance coverage, parity tests, and strict seeded Listings Playwright gate wiring).
+  - GS-V10-006 ratchet update (April 13, 2026):
+    - coverage gates increased to global `>=35%` and scoped-core `>=86%` across CI + local QA commands (`qa_tests.yaml`, `Makefile`, `Taskfile.yml`)
+    - latest measured baseline: `743` tests passing, global `~38.46%`, scoped-core `~86.87%`
+    - added focused workflow-contract fallback/error-path tests (`tests/test_workflow_contracts.py`) to harden draft-contract extraction behavior and increase scoped-core headroom
+    - added focused eBay health + fee-reconciliation edge-path tests (`tests/test_ebay_health.py`, `tests/test_reports_fee_reconciliation.py`) to further increase scoped-core margin
+  - GS-V10-006 follow-on ratchet update (April 13, 2026):
+    - coverage gates increased to global `>=36%` and scoped-core `>=87%` across CI + local QA commands
+    - latest measured baseline: `749` tests passing, global `~38.53%`, scoped-core `~87.17%`
+    - expanded `ebay_aspects` service coverage to `100%` (`tests/test_ebay_aspects.py`) for additional scoped-core margin
+  - GS-V10-006 scheduler-coverage update (April 13, 2026):
+    - expanded `sync_runner` helper/scheduler/health-check branch coverage (`tests/test_sync_runner.py`) from ~64.78% to ~80.11%
+    - latest measured baseline: `754` tests passing, global `~38.66%`, scoped-core `~87.69%`
+    - coverage gates ratcheted to global `>=37%` while maintaining scoped-core `>=87%`
+  - GS-V10-006 sync-jobs-coverage update (April 13, 2026):
+    - expanded `sync_jobs` helper/fallback branch coverage (`tests/test_sync_jobs.py`) including token persistence/refresh guards, slack-notify exception path, shipping-service/address fallbacks, and line-level fee/shipping helper branches
+    - latest measured baseline: `761` tests passing, global `~38.81%`, scoped-core `~88.29%`
+    - coverage gates ratcheted to global `>=38%` and scoped-core `>=88%`
+  - GS-V10-013 listing workflow contract/state coverage update (April 13, 2026):
+    - expanded DB-first workflow-state and listings helper contract parity tests (`tests/test_workflow_state.py`, `tests/test_listings_helpers.py`)
+    - latest measured baseline: `770` tests passing, global `~38.92%`, scoped-core `~88.45%`
+  - High-priority remaining (as of 2026-04-13):
+    - GS-V10-009 follow-on (P0): production direct eBay draft-posting validation is complete from small-scale rollout; targeted e2e direct-post preflight coverage is now CI-fixtured (seller-ops enabled in sandbox), with ongoing telemetry trend monitoring remaining.
     - GS-V10-006 (P0): raise coverage gate beyond baseline and continue core-module + operator-critical e2e expansion.
-    - GS-V10-004 ops: execute calibration/alert-routing evidence in target env and attach owner/date/evidence links.
-    - GS-V10-003 ops: execute hardening evidence in target env and attach owner/date/evidence links.
-    - GS-V10-002 ops: execute live provider validation in Dev/Prod (`purchase_label` API mode) and attach evidence links/sign-off records.
-    - Go-live ops: execute first Dev/Prod restore drills and attach owner/date/evidence links for final DR sign-off.
+    - GS-V10-010 (P0): monitor auth-session adapter behavior in target environments and keep deterministic admin-go-live e2e coverage green as part of release gating.
+    - Go-live comp evidence (P0) closed (April 15, 2026): production proof captured for both normal sold-comp and cooldown/fallback comp behaviors, with accepted fallback policy documented in `GO_LIVE_CHECKLIST.md`.
+    - GS-V10-012 (P0) closed (April 13, 2026): eBay fee-economics lifecycle implemented and operationally validated in small-scale production live testing (estimate/reconciliation/reporting/sign-off).
+      - Progress: eBay pull/import now hydrates full order detail per order before local upsert, improving captured pricing/buyer/shipping fidelity feeding fee reconciliation and Slack/report outputs.
+      - Progress: order-level shipping economics now include internal actual label spend (`orders.shipping_label_cost/currency`) captured during eBay sync (with sale-level fallback), and order exports now include charged-vs-actual shipping deltas for P/L traceability.
+      - Progress: Reports now include `Order Actual Economics Allocation` and actual-economics margin columns (`actual fee alloc`, `actual shipping alloc`, `actual net before COGS`, `fifo/lot actual margin`) so product/channel/period profitability can use order-level actuals instead of charged-shipping proxies.
+      - Progress: eBay order payload persistence now includes finance transaction context (`_finance_transactions`) and Reports now exposes normalized fee-type attribution from `orderLineItems[].marketplaceFees[]` (`Fee Detail`, `Fee Summary`, `Fee by SKU`, `Fee by Category`).
+      - Progress (April 15, 2026): added normalized `order_finance_entries` persistence and sync ingestion for eBay finance transactions (marketplace-fee rows + shipping-label debit rows), and Reports now prefers this DB-first source for fee detail output.
+      - Progress (April 15, 2026): eBay fee reconciliation actual-fee source now prefers normalized `order_finance_entries` marketplace-fee sums per order, then falls back to notes-derived and sale-field sources.
+      - Progress (April 15, 2026): Reports now surface an `Actual Fee Source Priority` summary (normalized/notes/sale fallback) for reconciliation quality visibility.
+      - Progress (April 15, 2026): Dashboard live metric `sales_30d_shipping_label_spend` now prefers normalized shipping-label finance rows, reducing dependence on partial order/sale fallback fields.
+      - Progress (April 15, 2026): Dashboard now surfaces normalized eBay fee attribution (`ebay_fees_30d_total` + fee-type breakdown) from `order_finance_entries`.
+      - Progress: Admin now includes `eBay Fee Calibration Sign-Off Tracker` (Dev/Prod) and Go-Live evidence-pack export integration (`ebay_fee_calibration_signoffs.csv`) for finance acceptance traceability.
+    - Go-live ops closeout update (April 13, 2026): GS-V10-002 / GS-V10-003 / GS-V10-004 / GS-V10-005 operational validation completed via small-scale production live testing; continue normal evidence-capture cadence.
+    - Go-live evidence/sign-off closeout update (April 15, 2026): checklist evidence rows and final engineering/operations/business-owner sign-offs were recorded in `GO_LIVE_CHECKLIST.md`.
+  - Added next-scope execution plan for workflow speed + reliability:
+    - GS-V10-013 (P0): DB-first listing workflow unification
+      - unify Listing Wizard + Listings publish/edit state under one DB-backed draft contract (single source of truth)
+      - persist preflight blockers/warnings as structured draft records (resume-safe, operator-auditable)
+      - reduce session-state-only mutation paths to minimize rerun race/ordering failures
+    - GS-V10-014 (P0): database reliability/performance hardening
+      - add hot-path composite indexes (sync runs, listings lifecycle, workflow drafts/events, audit timelines)
+      - add notification outbox table + retry/idempotent dispatch worker path for Slack/email events
+      - add dashboard/report rollup strategy for fast reads under production load
+    - GS-V10-015 (P1): AI/LLM operations management layer
+      - split per-workflow AI runtime profiles (listing copy, intake extraction, comp analysis, risk checks)
+      - add AI quality gates before apply (minimum detail shape, required sections, policy/risk checks)
+      - add prompt/version registry with acceptance telemetry (`accepted as-is` vs `human-edited`) for continuous tuning
+    - GS-V10-016 (P1): economics intelligence loop
+      - unify listing-time estimate + order actuals for fees/shipping into one P&L fact model
+      - add expected-net score in listing flows before publish/draft decision
+      - add KPI drilldowns by SKU/channel with configurable threshold alerts
+      - Progress (April 20, 2026): added repository rollup `report_economics_intelligence_fact_rows` and Reports export `Economics Intelligence Facts (Estimate vs Actual)` for first-pass per-sale estimate-vs-actual fee/shipping/net variance analysis.
+      - Progress (April 20, 2026): added `Expected Net Score (Pre-Publish)` cards in Listing Wizard + Listings publish workspace (fee estimate + landed cost + local fulfillment estimate) to improve before-publish pricing decisions.
+      - Progress (April 20, 2026): added Reports `Economics Intelligence Drilldowns + Alerts` with threshold-driven grouped alerting (`by SKU`, `by Marketplace`) and row-level alert export for operator triage.
+      - Progress (April 20, 2026): added Admin `Economics Threshold Sign-Off Tracker` (Dev/Prod coverage, seed/quick-approve/form, CSV) and wired its status into go-live readiness scoring + Go-Live Evidence Pack (`economics_threshold_signoffs.csv`) to close the economics intelligence loop.
+    - GS-V10-017 (P1): lifecycle close/archive controls
+      - add explicit `archive/restore/close` lifecycle actions for listings, products, lots, and media without hard-delete defaults
+      - add UI filters/views for active vs archived records across operations pages
+      - enforce cross-entity guardrails (for example: block archiving products tied to active listings unless explicitly confirmed)
+      - add lifecycle audit trail + optional scheduled retention/cleanup policy for archived records
+  - Started GS-V10-014 first delivery slice:
+    - added `notification_outbox` schema/model foundation for retry-safe, idempotent notification dispatch (`0046_notification_outbox`)
+    - added follow-up outbox composite index migration (`0052_outbox_claim_dedupe_idx`) for due-dispatch and dedupe lookup hot paths
+    - added repository APIs for outbox enqueue/list/update operations with audit trail capture
+    - added first-pass outbox processor service + sync-runner hook (`notification_outbox_runner_enabled`, `notification_outbox_runner_limit`)
+    - hardened outbox processor/repository path with DB-side due filtering (`due_before`) and direct row retrieval (`get_notification_outbox`) to reduce broad list scans on process runs
+    - added outbox enqueue dedupe-key idempotency reuse for open/sent rows (`queued`/`retrying`/`processing`/`sent`) to avoid duplicate dispatch rows
+    - added outbox retention cleanup service + daily scheduler hook (`notification_outbox_cleanup_enabled`, `notification_outbox_cleanup_timezone`, `notification_outbox_cleanup_local_time`)
+    - added System Health `Notification Outbox` visibility panel (due/retrying/failed/sent metrics + row preview)
+    - added System Health `Outbox Runner Activity` visibility (latest process/cleanup run timestamps/status/details)
+    - added config-health required runtime coverage for outbox runner/backoff/retention/cleanup keys
+    - added Admin `Notification Outbox Controls` (runner/backoff/retention/cleanup settings + manual run-now/cleanup-now actions + quick queue preview)
+    - fixed Products filter session-state warning path by removing pre-widget state mutation for category/status/inventory-class multiselects
+    - hardened eBay shipping-status enrichment to avoid false delivered mapping from weak `deliveryDate` signals when order status is still shipped/in-transit
+  - Started GS-V10-014 dashboard rollup optimization slice:
+    - added report-window hot-path index migration (`0053_report_hotpath_idx`) for `sales.sold_at/id`, `orders.sold_at/id`, and `order_finance_entries` kind/date scans used by rollup baseline queries
+    - added returns/listings date-window index migration (`0054_returns_listing_date_idx`) for `returns.returned_at/id` and `marketplace_listings` listed/created window probes used by extended rollup EXPLAIN baselines
+    - added product/inventory/lot-assignment time-window index migration (`0055_report_time_window_idx`) for `products.acquired_at/id`, `product_lot_assignments.acquired_at/id`, and `inventory_movements.occurred_at/id` report-window scans
+    - expanded rollup EXPLAIN baseline capture set with additional report-window probes (`report_orders_rows`, `report_order_items_rows`, `report_sales_rows`, `report_returns_rows`, `report_listings_rows`) for deeper plan evidence collection
+    - expanded rollup EXPLAIN capture set further with `report_products_rows` and `report_lot_assignment_rows` probes for product/acquisition and lot-assignment windows
+    - expanded rollup EXPLAIN capture set with `report_inventory_movement_rows` and `report_marketplace_reconciliation_rows` probes for movement-window and marketplace aggregate reconciliation plans
+    - fixed rollup EXPLAIN listings probe enum/column compatibility (`listing_status::text`, `external_listing_id`) and added System Health rollback guard on EXPLAIN failures to prevent aborted-transaction cascades in recent-snapshot queries
+    - hardened rollup EXPLAIN baseline execution to continue after individual probe failures (transaction rollback + per-probe error row capture) so operators still receive partial snapshots for triage
+    - reworked rollup EXPLAIN `dashboard_live_metrics` probe into CTE-based rollups (`sales_rollup`/`orders_rollup`/`label_spend_rollup`) so baseline plans no longer rely on repeated scalar subqueries for the same windows
+    - reduced duplicate scan/fan-out overhead in remaining EXPLAIN probes by removing unused joins, directly joining fee rows on `sales.order_id`, and switching marketplace reconciliation probe to per-table CTE aggregates + marketplace union
+    - added focused rollup EXPLAIN probes for normalized fee-type grouping (`dashboard_ebay_fee_type_breakdown_30d`) and notification outbox runner activity (`notification_outbox_runner_activity_14d`) to extend plan evidence coverage for finance attribution and outbox timeline reads
+    - added Slack Ops governance-path rollup EXPLAIN probes (`slack_ops_queue_health_rows`, `slack_ops_events_24h`) to capture plan evidence for queue snapshot hydration and 24h integration-event trend reads used by System Health/Admin
+    - hardened Slack/outbox EXPLAIN probe compatibility by casting `audit_logs.changes_json` to `JSONB` in probe SQL and adding table-existence guards for `audit_logs`/`integration_queue_jobs` so partially migrated environments emit explicit `skipped` rows instead of opaque SQL probe failures
+    - hardened per-probe EXPLAIN error classification so missing-table relation errors are recorded as explicit `skipped` rows (`skip_reason=table <table> not present`) instead of inflating failure-rate metrics in mixed-schema environments
+    - refined EXPLAIN snapshot semantics so guarded non-applicable probes are tracked as explicit skips (`skipped` + `skip_reason`) and shown separately in System Health, keeping failure-rate metrics focused on true query failures
+    - tightened nullable date-window report predicates (`products/listings/lot_assignments`) to use bounded `created_at` fallback when date is null, avoiding unbounded `IS NULL` branch scans in report windows
+    - added repository DB-aggregated live metrics rollup (`dashboard_live_metrics`) for 7d/30d orders/sales/shipping/profit calculations
+    - optimized `dashboard_live_metrics` aggregation path to reduce repeated sales-window scans and switched normalized finance date filters to index-friendlier split predicates (`transaction_date` or fallback `created_at` when null)
+    - Dashboard now prefers rollup query path to reduce read latency/memory churn from full sales+orders hydration
+    - added validation coverage for rollup correctness + dashboard rollup usage path
+    - added DB-backed Reports shipping economics rollups (`report_shipping_economics_rows`, `report_shipping_economics_summary`) and wired Reports to use them with compatibility fallback
+    - added DB-backed Reports tax-detail rollup (`report_tax_estimate_detail_rows`) and wired Tax Drilldown/summary inputs to use query-side calculations with compatibility fallback
+    - added DB-backed Reports fee-reconciliation rollup (`report_ebay_fee_reconciliation_rows`) and wired `eBay Fee Reconciliation` detail export to use query-side assembly with compatibility fallback
+    - added repository validation coverage for fee-reconciliation rollup query path (`test_report_ebay_fee_reconciliation_rows`)
+    - added System Health on-demand DB rollup latency baseline capture + CSV export (`collect_rollup_latency_baseline`) for production read-performance evidence
+  - GS-V10-014 (P0) closed (April 20, 2026):
+    - notification outbox foundation + runner/cleanup controls, hot-path indexing, DB rollup-first dashboard/reports, and System Health rollup EXPLAIN capture/telemetry are complete.
+    - EXPLAIN baseline now covers 18 probes including finance/outbox/Slack governance query paths, with explicit failure-vs-skip visibility for operator triage.
+    - Final operator sign-off refresh captured on April 21, 2026: rollup EXPLAIN snapshot completed with 18 rows captured (no probe-failure banner) and `dashboard_live_metrics` execution at ~0.252ms, confirming healthy performance at current production scale.
+  - Started GS-V10-015 first runtime-capacity tuning slice:
+    - raised Admin AI Runtime `Max Output Tokens` cap from `4096` to `16000`
+    - raised env fallback default `COMP_LLM_MAX_OUTPUT_TOKENS` to `16000` for higher-detail LLM outputs
+    - added Admin one-click bulk profile upgrade helper (`Bulk Max Output Tokens Upgrade`) with dry-run preview to raise existing profiles below target
+  - Started GS-V10-015 workflow-profile split slice:
+    - added workflow-aware AI runtime-chain selection (`resolve_comp_llm_runtime_chain(..., workflow=...)`)
+    - added runtime workflow selector keys (`ai_workflow_profile_listing`, `ai_workflow_profile_intake`, `ai_workflow_profile_comp`, `ai_workflow_profile_risk`) supporting profile id or name targeting
+    - wired Listing Wizard + Listings Copilot to `workflow=listing` profile preference
+    - wired Coin/Inventory Intake + purchase-invoice extraction multimodal paths to `workflow=intake` profile preference
+    - added Admin AI Runtime workflow-routing controls (`Workflow AI Profile Routing`) for listing/intake/comp/risk profile mapping and one-click reset
+    - added test coverage for workflow selector priority + orchestration workflow propagation
+  - Started GS-V10-015 apply-time AI quality-gate slice:
+    - added shared AI quality gate service (`app/services/ai_quality.py`) for placeholder/generic text detection and minimum title/details quality checks
+    - Listings Copilot now rejects weak/generic AI titles from overwriting listing title
+    - Listing Wizard AI apply flow now rejects weak/generic titles with explicit operator feedback
+    - Inventory/Coin intake AI prefill now rejects weak title/description suggestions before default-field assignment
+    - added policy blocked-term checks so suggestion apply is prevented when prohibited promise/advice phrases are present
+    - added runtime-configurable AI quality thresholds + forbidden-term controls in Admin (`AI Runtime -> AI Apply-Time Quality Gates`)
+    - seeded `ai_quality_*` runtime defaults and added config-health runtime coverage for these keys
+    - added helper validation coverage for AI quality gates (`tests/test_ai_quality.py`)
+  - Started GS-V10-015 acceptance telemetry slice:
+    - Listing Wizard AI apply now records accepted snapshot telemetry (title/details/price/offer fields) for downstream quality analysis
+    - Listing Wizard draft creation now computes `accepted_as_is` vs `edited_fields` outcome and persists under `ai_draft.outcome`
+    - Added audit telemetry events (`ai_prompt_acceptance`: `listing_wizard_apply`, `listing_wizard_outcome`) to support prompt tuning and future registry dashboards
+    - Added centralized prompt registry service (`app/services/ai_prompt_registry.py`) and Admin rollback UI (`AI Prompt Version Registry + Rollback`) for `listing` + `comp` workflows
+    - Added active prompt version runtime controls (`ai_prompt_active_version_listing`, `ai_prompt_active_version_comp`) and registry stores (`ai_prompt_registry_listing_json`, `ai_prompt_registry_comp_json`)
+    - Added prompt registry unit-test coverage (`tests/test_ai_prompt_registry.py`)
+  - Started GS-V10-015 operator quality metrics slice:
+    - Added Admin `AI Quality Metrics` panel from `ai_prompt_acceptance` telemetry (lookback/workflow filters, outcome KPIs, workflow breakdown, prompt-version breakdown, recent outcomes, CSV export)
+    - Added rollback-safe DB-session recovery on metrics query failures in Admin panel
+    - extended AI quality metrics with richer trend/drilldown views:
+      - daily acceptance trend (`accept_rate_pct`) with timeline table,
+      - workflow-specific daily trend drilldown selector,
+      - workflow-level top edited-field attribution table for prompt-tuning prioritization.
+    - added helper-level regression coverage for AI metrics summarization/filtering (`tests/test_admin_helpers.py`).
+  - GS-V10-015 (P1) closed (April 20, 2026):
+    - runtime-capacity tuning, workflow profile routing, apply-time quality gates, prompt/version registry + rollback controls, and operator-facing AI quality metrics/drilldowns are complete.
+  - Completed additional System Health hardening:
+    - all raw DB reads in System Health now use rollback-safe query wrappers to recover session state after query exceptions
+    - `Outbox Runner Activity` now sources from `audit_logs` integration events (`integration=notification_outbox`) for schema compatibility
+    - added composite performance indexes for hot reads:
+      - `sync_runs(job_name,status,started_at)`
+      - `marketplace_listings(marketplace,listing_status,updated_at)`
+      - `workflow_drafts(environment,workflow_key,status,updated_at)`
+      - `audit_logs(entity_type,entity_id,created_at)`
+  - Started GS-V10-013 Step 1:
+    - added shared listing draft contract service (`app/services/workflow_contracts.py`) for unified draft shape (`contract`, `signature`, `context`, `state`)
+    - refactored Listing Wizard + Listings publish/edit draft save/resume paths to use shared contract helpers
+    - preserved backward compatibility for legacy draft payload shapes via shared extractor fallback paths
+    - added targeted coverage for contract + legacy extraction (`tests/test_workflow_contracts.py`)
+  - Started GS-V10-013 Step 2:
+    - Listing Wizard draft payload now persists dependency preflight payload + readiness blocker/warning counters
+    - Listings publish/edit draft payload now persists dependency preflight payload for resume-safe readiness context
+    - added test coverage for structured preflight payload persistence through shared contract helpers
+  - Started GS-V10-013 Step 3 (partial):
+    - moved Listing Wizard AI business state (`suggestions/diagnostics/acceptance/evidence/has_run`) and `risk_summary` into persisted draft state (no longer session-only for resume-critical AI decisions)
+    - persisted Listing Wizard category-query seed/suggestion state + AI seed/seed-context fields in draft payload for deterministic resume
+    - persisted Listings publish category-query seed product id (`ebay_pub_category_query_seed_product_id`) for stable suggestion resume behavior
+    - Listings publish/edit now uses centralized persisted draft key contract (`LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS`) to keep business-critical fields DB-backed and reduce drift back to session-only state
+  - Started GS-V10-013 Step 4:
+    - added draft save/resume parity test suite (`tests/test_listing_workflow_draft_parity.py`) validating category/aspects/pricing/post-mode coverage across Listing Wizard + Listings
+    - added shared contract roundtrip assertions for parity paths to prevent regression in draft payload shape compatibility
+    - expanded repository workflow-state tests (`tests/test_workflow_state.py`) for DB-level validation/missing-path handling, scope-aware latest-resume behavior, and workflow-event filter/limit guardrails
+    - expanded Listings helper tests (`tests/test_listings_helpers.py`) for contract payload build/apply and pending-update key-filtering to stabilize DB-first draft mutation paths
+    - added end-to-end Listings publish draft roundtrip coverage over repository save/load/resume/clear flow with preflight payload persistence assertions (`test_listings_publish_contract_roundtrip_save_resume_clear`)
+    - expanded strict seeded Listings Playwright gate (`tests/e2e/listings_flow_strict.spec.ts`) with publish-draft `Save -> Resume -> Clear` control assertions and eBay preflight strict checks
+    - latest local strict-spec evidence run (April 16, 2026): `2 passed` under strict seeded mode (`E2E_STRICT_LISTINGS=1`, `PLAYWRIGHT_REQUIRE_SEED=1`)
+  - Started GS-V10-013 Step 5:
+    - aligned Listing Wizard + Listings publish/edit grading behavior by defaulting condition-description from product AI grading context
+    - added guarded grading-note enrichment into listing details (`AI Grading Notes`) with no duplicate reinjection on rerun
+    - added helper-level regression coverage for grading-prefill status signaling and grading-note merge behavior
+  - Added follow-on eBay comp flow stabilization (April 15, 2026):
+    - addressed wizard-path hard-fail regressions where eBay Finding local cooldown (`EBAY_FINDING_RATE_LIMITED`) bubbled as blocking errors
+    - normalized behavior across Comp Tool, Listing Wizard, and Intake wizards to preserve operator flow under cooldown windows
+  - Extended Listings + Intake UX/state hardening (April 18, 2026):
+    - Listings publish pending-update preserve path now captures full publish-form state and marks one-run signature-reset skip to prevent rerun clobber after category/aspect actions
+    - Inventory Intake and Coin Intake now always render eBay purchase item ID/link fields and enable them only when `Purchased On eBay` is checked
+  - Extended eBay Finding cooldown reliability hardening (April 18, 2026):
+    - local cooldown path now supports periodic probe calls (`ebay_finding_rate_limit_probe_interval_seconds`) instead of full lockout until expiry
+    - successful probe responses now auto-clear local Finding cooldown for faster comp/intake recovery
+    - added eBay service regression coverage for probe behavior and cooldown-clear-on-success paths (`tests/test_ebay_service.py`)
+    - added dedicated Admin `eBay Finding Throttle Controls` surface (Sync Jobs tab) for run/10m caps and cooldown/probe tuning via runtime settings, plus one-click recommended-default reset
+  - Extended GS-V10-018 Listings performance hardening (April 18, 2026):
+    - replaced relationship-driven per-row listing media counting with repository aggregate query map (`listing_media_count_map`) to remove per-listing lazy relationship churn.
+    - removed `listing.product` and `listing.media_assets` lazy relationship dependence from readiness/history/batch-plan flows by reusing `product_by_id` and explicit listing-media repository reads.
+    - added repository regression coverage for listing media count aggregation with archived-media filtering semantics (`test_listing_media_count_map_filters_archived_by_default`).
+  - Extended GS-V10-018 System Health query efficiency hardening (April 18, 2026):
+    - added per-render integration-event audit query cache in System Health and routed repeated 24h/7d/14d/cooldown slices through shared helper reads.
+    - removed duplicate audit-log roundtrips across rollup snapshot history, page-baseline snapshot history, outbox runner activity, error signals, and critical-alert evidence/cooldown checks.
+  - Extended GS-V10-018 Intake Wizard media-attach performance hardening (April 18, 2026):
+    - added repository targeted media lookup helper (`list_media_assets_by_ids`) to support sparse media resolution by selected IDs.
+    - Inventory Intake Wizard and Coin Intake Wizard now resolve existing-media attachments using selected IDs only, removing full media-table scans during submit-time attach flows.
+    - Intake draft-listing media attach now uses repository ID-only unlinked lookup (`list_unlinked_product_media_ids`) instead of full product-media object hydration (`list_media_assets_for_product`) during submit loops.
+    - Existing-media selector now uses repository DB-level row cap (`list_media_assets(limit=...)`) to avoid full media-table reads when selector UI only needs bounded rows.
+    - Intake media selector panels now support shared preloaded-row reuse in the same rerun (`preloaded_rows` pass-through), preventing duplicate selector queries when both product/listing selectors are enabled together.
+    - Added repository bulk media update helper (`bulk_update_media_assets`) and migrated intake attach paths (product attach, listing attach, unlinked-to-listing attach) to single-transaction batch updates instead of per-row commit loops.
+  - Extended GS-V10-018 Intake Wizard diagnostics render hardening (April 19, 2026):
+    - Inventory Intake and Coin Intake diagnostics now default to compact summaries and only render full AI payload JSON/code when `Render Full AI Payloads (slowest)` is explicitly enabled.
+    - keeps troubleshooting visibility while reducing default rerun/render overhead from large payload blocks.
+  - Extended GS-V10-018 Reports lazy-load hardening (April 19, 2026):
+    - split inventory-cycle/rebuy analytics behind dedicated opt-in toggle (`Load Inventory Cycle + Rebuy Analytics (slower)`) so these heavy rollups do not run unless requested.
+    - keeps fee/margin extended analytics available independently while reducing default heavy-query contention on Reports renders.
+  - Extended GS-V10-018 Listings lazy media-count hardening (April 19, 2026):
+    - `listing_media_count_map` is now computed only when `Load Listing Media Counts (slower)` is enabled, removing unconditional aggregate media-count query cost from default Listings load.
+    - side-panel selected-listing media count now uses targeted on-demand lookup when global media-count loading remains deferred.
+    - added repository scalar helper `count_media_assets_for_listing(...)` and switched Listings side-panel deferred-count path to this count query (avoids row hydration just to compute media count).
+  - Extended GS-V10-018 Listings template-query deferral (April 19, 2026):
+    - `eBay Listing Templates` query/UI hydration is now explicit opt-in (`Load eBay Listing Templates (slower)`) to reduce default Listings rerun query and widget overhead.
+  - Extended GS-V10-018 Dashboard fee-breakdown deferral (April 19, 2026):
+    - Dashboard now defers grouped eBay fee-type analytics behind explicit toggle (`Load eBay Fee Attribution Breakdown (slower)`).
+    - repository live-metrics path now supports optional fee-breakdown suppression (`include_fee_type_breakdown=False`) so default dashboard load avoids unnecessary fee-type group aggregation.
+  - Extended GS-V10-018 Listings readiness-queue deferral (April 19, 2026):
+    - readiness scoring/blocker analytics now run only when explicit toggle is enabled (`Load eBay Readiness Queue (slower)`), removing default per-listing readiness evaluation on initial load.
+    - orchestration queue now clearly indicates dependency on readiness load state when readiness computation is deferred.
+  - Extended GS-V10-018 Listings deep-history master gate (April 19, 2026):
+    - added `Load Deep Queue Analytics (slower)` master toggle to gate heavy readiness-adjacent history scans.
+    - follow-up audit history (`Load Recent Blocker Follow-up Tasks`) and bulk publish metadata history (`Load Bulk Publish History`) now require the master deep-analytics gate to be enabled.
+  - Extended GS-V10-018 Listings side-panel/media-manager deferral (April 19, 2026):
+    - side-panel related-context hydration now uses master gate (`Load Side Panel Context (slower)`) so related sales/orders and review-history rendering are disabled by default.
+    - listing media manager now uses explicit load gate (`Load Listing Media Manager Data (slower)`), deferring listing media table/gallery hydration and media-linked publish option preparation unless requested.
+  - Extended GS-V10-018 Listings publish-workspace deferral (April 19, 2026):
+    - lower eBay publish/revise/preflight/manage workspace is now explicit opt-in (`Load eBay Publish Workspace (slower)`), preventing heavy publish-workflow state hydration from running on default Listings renders.
+  - Extended GS-V10-018 Listings readiness-defaults lazy resolution (April 19, 2026):
+    - eBay publish preset/default-runtime hydration used by readiness and bulk-publish defaults is now lazily resolved only when those workflows are loaded/executed, removing an unconditional preset query from default Listings load.
+  - Extended GS-V10-018 Listings channel-adapter lazy resolution (April 19, 2026):
+    - channel adapter construction is now lazy and only initializes when orchestration/capability workflows need it, removing unconditional adapter build work from default Listings load.
+  - Extended GS-V10-018 Listings create-flow readiness deferral (April 19, 2026):
+    - create-flow eBay readiness preview is now explicit opt-in (`Load Create-Flow eBay Readiness Preview (slower)`), and create-flow default preset lookup is lazily resolved only when that preview is enabled.
+  - Extended GS-V10-018 Listings workflow-telemetry deferral (April 19, 2026):
+    - workspace feedback and workflow-completion telemetry are now explicit opt-in (`Load Listings Workflow Telemetry (slower)`), reducing default audit-query load on Listings first render.
+  - Extended GS-V10-018 Listings bulk-draft creator deferral (April 19, 2026):
+    - bulk draft creator candidate hydration is now explicit opt-in (`Load Bulk Draft Creator Data (slower)`), deferring product/listing pair scans and selector build work on default reruns.
+  - Extended GS-V10-018 Listings store-profile context deferral (April 19, 2026):
+    - eBay store profile context/load-apply UI is now explicit opt-in (`Load eBay Store Profile Context (slower)`), with lazy profile payload hydration to reduce default rerun overhead.
+  - Extended GS-V10-018 Listings external-ID map lazy build (April 19, 2026):
+    - external listing owner map for eBay collision checks now builds lazily only when publish/relist paths require it, removing unconditional map construction from default Listings reruns.
+  - Extended GS-V10-018 Listings create-media capture deferral (April 19, 2026):
+    - create-flow camera/file capture controls are now explicit opt-in (`Load Create Listing Media Capture (slower)`), reducing default widget/render overhead on Listings load.
+  - Extended GS-V10-018 Listings publish-meta parse caching (April 19, 2026):
+    - parsed `ebay_publish` metadata is now cached per listing per rerun and reused across table/readiness/publish sections to reduce repeated JSON decode overhead.
+  - Extended GS-V10-018 Listings format-diagnostics filter safety (April 19, 2026):
+    - selecting `Format Issue Only` now auto-enables format diagnostics for that run (with operator notice), preventing empty/incorrect filtered results when diagnostics were deferred.
+  - Extended GS-V10-018 Listings filtered-row diagnostics optimization (April 19, 2026):
+    - listing table rows now hydrate format diagnostics after base filters are applied, so eBay publish metadata parsing runs only for rows in the current filtered set instead of the full listing dataset.
+  - Extended GS-V10-018 Listings readiness map reuse (April 19, 2026):
+    - readiness/history paths now reuse the existing per-rerun listing-id map instead of rebuilding a second listing-id index in the same render cycle.
+  - Extended GS-V10-018 Listings diagnostics guardrail tests (April 19, 2026):
+    - added helper-level regression coverage for base listings filter behavior, deferred/required diagnostics hydration semantics, and `Format Issue Only` row filtering (`tests/test_listings_helpers.py`).
+  - Extended GS-V10-018 Listings preview-aware diagnostics hydration (April 19, 2026):
+    - when full-table rendering is off, non-queue format diagnostics now hydrate preview rows only; `Format Issue Only` still hydrates all filtered rows to preserve correctness.
+  - Extended GS-V10-018 Listings index-map reuse (April 19, 2026):
+    - side-panel and media-manager listing selectors now reuse the page-level listing-id map instead of rebuilding duplicate listing index dictionaries in the same rerun.
+  - Extended GS-V10-018 Listings audit-row fallback correctness (April 19, 2026):
+    - `_photo_comp_created_listing_ids` now honors explicitly supplied empty audit-row lists (no unintended fallback audit query), with helper test coverage for the empty-list path.
+  - Extended GS-V10-018 Listings deferred-origin tagging optimization (April 19, 2026):
+    - origin-tag row mutation now runs only when `Load Photo-Comp Origin Tags (slower)` is enabled; base filtering now treats missing origin as `other` for consistent deferred behavior.
+  - Extended GS-V10-018 Listings object-first base filtering (April 19, 2026):
+    - Listings now applies base filters directly on listing objects (query/marketplace/status/origin/archive) and materializes row dictionaries only for the filtered subset, reducing per-rerun row allocation on large datasets.
+  - Extended GS-V10-018 Listings row-actions deferral (April 19, 2026):
+    - table-level listing row actions now load only when explicitly enabled (`Load Listing Row Actions (slower)`), reducing default control hydration cost for large filtered result sets.
+  - Extended GS-V10-018 Listings export-bytes deferral (April 19, 2026):
+    - heavy Listings table toolbars now defer CSV/XLSX byte generation behind explicit opt-in (`Load Table Exports (slower)`), reducing default rerun overhead from eager export payload creation.
+  - Extended GS-V10-018 shared toolbar export deferral guardrails (April 19, 2026):
+    - added shared-view tests covering deferred export behavior (`skip by default`, `load when enabled`) and aligned media-selector test doubles with repository `limit` argument contract.
+  - Extended GS-V10-018 Listings detail-panel deferral (April 19, 2026):
+    - listing detail selector/editor panel is now explicit opt-in (`Load Listing Detail Panel (slower)`), deferring heavy selector-map/widget hydration on default table load.
+  - Extended GS-V10-018 Listings media-manager strict deferral (April 19, 2026):
+    - when media manager loading is deferred, Listings now skips media upload widgets, listing-media queries, and gallery/file-action hydration entirely (not just table rendering).
+  - Extended GS-V10-018 Listings preview-first DataFrame materialization (April 19, 2026):
+    - main Listings table now materializes preview-only DataFrame rows in default preview mode and lazily builds full filtered DataFrame only when export generation is explicitly requested.
+  - Extended GS-V10-018 Listings readiness/history selector deferral (April 19, 2026):
+    - readiness bulk-review selector map and failed-history retry selector map are now explicit opt-in (`Load Bulk Review Actions (slower)`, `Load Retry Failed Actions (slower)`) to avoid large option-map hydration on default queue/history views.
+  - Extended GS-V10-018 Listings media-count id-list lazy build (April 19, 2026):
+    - listing-id vector for media-count aggregate query is now built only when `Load Listing Media Counts (slower)` is enabled, removing eager ID list materialization on default reruns.
+  - Extended GS-V10-018 Listings orchestration-queue deferral (April 19, 2026):
+    - orchestration-status derivation and queue table hydration are now explicit opt-in (`Load Listing Orchestration Queue (slower)`), preventing default adapter/status computation when not needed.
+  - Extended GS-V10-018 Listings bulk-publish planner deferral (April 19, 2026):
+    - readiness bulk publish planner controls are now explicit opt-in (`Load Bulk Publish Batch Planner (slower)`), deferring candidate-map hydration and dry-run/publish planner state work on default queue load.
+  - Extended GS-V10-018 Listings reviewer-dashboard deferral (April 19, 2026):
+    - reviewer KPI/grouping panel is now explicit opt-in (`Load Reviewer Dashboard (slower)`), deferring pending-age/approval-window metrics and reviewer-summary groupby work on default readiness load.
+  - Extended GS-V10-018 Listings blocker-followup workbench deferral (April 19, 2026):
+    - blocker follow-up task workbench is now explicit opt-in (`Load Blocker Follow-up Workbench (slower)`), deferring follow-up creation controls and follow-up history/preset hydration by default.
+  - Extended GS-V10-018 Listings readiness-breakdown table deferral (April 19, 2026):
+    - readiness blocker/warning breakdown tables are now explicit opt-in (`Load Readiness Breakdown Tables (slower)`), deferring DataFrame render cost while retaining counts for quick filters and reason filters.
+  - Extended GS-V10-018 Listings top-blocker actions deferral (April 19, 2026):
+    - top-blocker quick-filter actions are now explicit opt-in (`Load Top Blocker Actions (slower)`), deferring quick-action button rendering and follow-up-action branch hydration by default.
+  - Extended GS-V10-018 Listings readiness filter-controls deferral (April 19, 2026):
+    - readiness triage shortcuts and filter widget cluster are now explicit opt-in (`Load Readiness Filters + Shortcuts (slower)`), so default readiness queue rendering skips shortcut/action and multi-filter widget hydration.
+  - Extended GS-V10-018 Listings readiness queue-table deferral (April 19, 2026):
+    - readiness queue table and export-toolbar rendering are now explicit opt-in (`Load Readiness Queue Table (slower)`), deferring table hydration and toolbar work on default readiness loads.
+  - Extended GS-V10-018 Listings readiness evaluation-loop deferral (April 19, 2026):
+    - per-listing readiness scoring/row-build loop is now explicit opt-in (`Load Readiness Evaluation (slower)`), deferring heavy evaluation work and avoiding false `no listings found` messaging when evaluation is intentionally deferred.
+  - Extended GS-V10-018 Listings orchestration dependency short-circuit (April 19, 2026):
+    - orchestration queue now explicitly depends on evaluated readiness rows and short-circuits with a dependency caption when readiness evaluation remains deferred.
+  - Extended GS-V10-018 Listings orchestration dependency helper guardrails (April 19, 2026):
+    - centralized orchestration dependency caption logic in a pure helper and added helper-level regression tests for queue/readiness/evaluation deferred-state combinations.
+  - Extended GS-V10-018 Listings readiness-default lazy resolution (April 19, 2026):
+    - readiness preset/runtime default resolution now executes only when readiness evaluation is enabled, avoiding unnecessary settings/preset reads when readiness queue is loaded but scoring remains deferred.
+  - Extended GS-V10-018 Listings bulk-history retry-analysis deferral (April 19, 2026):
+    - Bulk Publish Execution History now defers failed-row extraction and retry-control hydration behind explicit opt-in (`Load Bulk Publish Retry Analysis (slower)`), reducing default history-load DataFrame/filter overhead.
+  - Extended GS-V10-018 Listings bulk-history preview-first rendering (April 19, 2026):
+    - Bulk Publish Execution History now uses preview-first row rendering and lazy full filtered export DataFrame generation (`row_count` + `export_df_factory`), while retry analysis evaluates failed rows from the full filtered history set.
+  - Extended GS-V10-018 Listings channel-capability preview-first rendering (April 19, 2026):
+    - Channel Capability Matrix now uses preview-first rendering with row-count-aware toolbar and lazy full export DataFrame generation to reduce default in-page render cost while retaining full export behavior.
+  - Extended GS-V10-018 Listings side-panel selector-map deferral (April 19, 2026):
+    - Listings side panel now defaults to lightweight ID-based selection and defers heavy title/marketplace selector-label map construction behind explicit opt-in (`Load Detailed Listing Selector Labels (slower)`).
+  - Extended GS-V10-018 Listings document-source label deferral (April 19, 2026):
+    - Listings Document Draft source selection now defers rich sale/order label formatting behind explicit opt-in (`Load Detailed Document Source Labels (slower)`), defaulting to lightweight ID labels for large related sets.
+  - Extended GS-V10-018 Listings document-source option-list previewing (April 19, 2026):
+    - Listings Document Draft source picker now uses preview-limited option lists with explicit opt-in full-list loading (`Load Full Document Source List (slower)`), including session-state guardrails for truncated option transitions.
+  - Extended GS-V10-018 Listings side-panel review-history preview-first rendering (April 19, 2026):
+    - side-panel review history now uses preview-first rendering with row-count-aware toolbar and lazy full export DataFrame generation, reducing side-panel table/render overhead while retaining full history exports.
+  - Extended GS-V10-018 Listings side-panel review-controls deferral (April 19, 2026):
+    - side-panel review actions and review-history controls now sit behind explicit opt-in (`Load Review Controls (slower)`), reducing default side-panel widget/render overhead when review operations are not needed.
+  - Extended GS-V10-018 Listings media-manager table preview-first rendering (April 19, 2026):
+    - listing media table now uses preview-first rendering with row-count-aware toolbar and lazy full export DataFrame generation (`listings_media_manager_*`), reducing default media-table payload while preserving full exports.
+  - Extended GS-V10-018 Listings publish-workspace draft/preset deferral (April 19, 2026):
+    - eBay publish workspace now defers workflow-draft lookup and publish-preset hydration behind explicit opt-in (`Load Publish Draft + Presets (slower)`), reducing default publish-workspace DB reads for manual publish flows.
+  - Extended GS-V10-018 Listings category-assist deferral (April 19, 2026):
+    - eBay publish workspace now defers category-assist suggestion-map/control hydration and taxonomy lookup/cache query paths behind explicit opt-in (`Load eBay Category Assist (slower)`), reducing default publish-workspace overhead.
+  - Extended GS-V10-018 Listings default-aspects preview deferral (April 19, 2026):
+    - item-specifics default-aspect merge/preview/apply path now sits behind explicit opt-in (`Load Suggested Default Aspects (slower)`), while manual item-specifics editing remains available by default.
+  - Extended GS-V10-018 Listings sanitized-preview lazy compute (April 19, 2026):
+    - publish workspace sanitized-HTML preview now performs sanitization only when preview is explicitly enabled, removing duplicate always-on sanitization work during normal reruns while preserving publish-path sanitization.
+  - Extended GS-V10-018 Listings preflight reuse optimization (April 19, 2026):
+    - eBay publish/revise flows now reuse cached dependency preflight results when the preflight input signature is unchanged (token fingerprint + marketplace/category/location/policies), avoiding duplicate dependency-check API calls within repeated publish/revise runs.
+  - Extended GS-V10-018 Listings aspects-merge lazy resolution (April 19, 2026):
+    - merged eBay item-specific defaults are now resolved lazily only when revise/publish payload construction needs aspects, removing always-on merge overhead from non-submit reruns.
+  - Extended GS-V10-018 Listings HTML-validation lazy resolution (April 19, 2026):
+    - listing HTML validation now resolves lazily only when revise/publish paths require validation, removing always-on `_validate_listing_html` work from default publish-workspace reruns.
+  - Extended GS-V10-018 Listings publish-description sanitization lazy resolution (April 19, 2026):
+    - publish description sanitization now resolves lazily only in revise/publish action paths, removing always-on `_sanitize_listing_html` work from default publish-workspace reruns.
+  - Extended GS-V10-018 Listings publish-meta cache reuse (April 19, 2026):
+    - publish workspace now reuses existing `publish_meta` cache for discovered-offer and last-publish diagnostics paths, eliminating duplicate marketplace-details JSON parse passes in the same rerun.
+  - Extended GS-V10-018 Listings publish-draft autosave deferral (April 19, 2026):
+    - publish-workspace workflow-draft autosave writes now run only when draft/preset controls are explicitly enabled (`Load Publish Draft + Presets (slower)`), reducing default rerun draft-write activity.
+  - Extended GS-V10-018 Listings fee-assist deferral (April 19, 2026):
+    - eBay fee estimate metrics now sit behind explicit opt-in (`Load eBay Fee Estimate Assist (slower)`), with lazy estimate computation reused for publish metadata to avoid always-on fee-estimate work in default reruns.
+  - Extended GS-V10-018 Listings volume-pricing lazy resolution (April 19, 2026):
+    - volume-pricing JSON parse now resolves lazily (`_get_volume_pricing_tiers_and_errors`) with explicit opt-in preview (`Load Volume Pricing Preview (slower)`) and on-demand parse in revise/publish paths, removing always-on parse work and eliminating early-reference hazards.
+  - Extended GS-V10-018 Listings diagnostics-card deferral (April 19, 2026):
+    - publish-workspace preflight card and last-publish diagnostics rendering now sit behind explicit opt-in (`Load eBay Diagnostics Cards (slower)`), reducing default diagnostics UI hydration overhead.
+  - Extended GS-V10-018 Listings category-assist init deferral (April 19, 2026):
+    - category-assist seed/session initialization now runs only when category assist is enabled (`Load eBay Category Assist (slower)`), removing default rerun state-setup work for deferred category assist.
+  - Extended GS-V10-018 Listings volume-pricing builder deferral (April 19, 2026):
+    - volume-pricing builder controls now sit behind explicit opt-in (`Load Volume Pricing Builder (slower)`), reducing default publish-workspace widget hydration while leaving submit-path pricing behavior intact.
+  - Extended GS-V10-018 Listings manage-controls deferral (April 19, 2026):
+    - “Manage Existing eBay Listing” form/offer-inspector controls now sit behind explicit opt-in (`Load Manage Existing eBay Listing Controls (slower)`), reducing default publish-workspace widget hydration overhead.
+  - Extended GS-V10-018 Listings aspects-json lazy normalization (April 19, 2026):
+    - publish workspace now uses shared lazy item-specific payload normalization (`_get_aspects_payload`) across editor + payload construction paths, eliminating always-on item-specific JSON parse work when specifics are unchanged.
+  - Extended GS-V10-018 Listings publish runtime-default bulk hydrate (April 19, 2026):
+    - publish workspace now resolves eBay runtime defaults from one bulk runtime-settings snapshot (`get_runtime_values`) instead of many per-key runtime-setting reads, reducing publish-workspace rerun DB lookup overhead.
+  - Extended GS-V10-018 Listings manage-offer details render gate (April 19, 2026):
+    - publish workspace offer-details expander now renders only when manage-existing controls are enabled, avoiding deferred-mode diagnostics-card hydration for stale offer payloads.
+  - Extended GS-V10-018 Listings template-apply runtime-default reuse (April 19, 2026):
+    - fixed/auction template-apply actions now reuse the publish workspace bulk runtime-default snapshot (`get_runtime_values`) for best-offer/auction/category/policy defaults, reducing per-click runtime-setting DB reads.
+  - Extended GS-V10-018 Listings publish category-default runtime lookup removal (April 19, 2026):
+    - publish workspace default/signature-reset category initialization now reuses bulk runtime defaults, eliminating the last per-key `ebay_category_id` runtime lookup in publish-state setup.
+  - Extended GS-V10-018 Listings manage-offer lookup caching (April 19, 2026):
+    - manage-offer resolution now caches SKU offers and resolved offer IDs within a rerun, reducing duplicate `get_offers` API calls across inspect/manage actions for the same listing.
+  - Extended GS-V10-018 Listings merchant-location resolver caching (April 19, 2026):
+    - preflight/revise/publish flows now share rerun-local cached merchant-location resolution (`token` + key), reducing duplicate `resolve_merchant_location_key` API calls in a single publish workflow run.
+  - Extended GS-V10-018 Listings publish autosave debounce (April 19, 2026):
+    - publish-workspace autosave now debounces changed-signature draft writes (5s window), reducing rapid repeated `save_workflow_draft` activity during interactive editing while keeping periodic autosave persistence.
+  - Extended GS-V10-018 Listings readiness-runtime bulk defaults (April 19, 2026):
+    - readiness evaluation and bulk-publish default resolution now use a rerun-local bulk runtime-settings snapshot (`get_runtime_values`) for listing format/duration/token/policy defaults, reducing repeated per-key runtime-setting DB reads in readiness planner flows.
+  - Extended GS-V10-018 Listings readiness bulk-default memoization (April 19, 2026):
+    - `_resolve_bulk_publish_defaults` now memoizes per rerun and returns copies, so repeated readiness planner/history branches reuse one resolved defaults payload instead of recomputing it.
+  - Extended GS-V10-018 Listings preflight-signature reuse (April 19, 2026):
+    - `_run_or_reuse_preflight` now returns the computed signature and callers reuse it for session-state persistence, eliminating duplicate signature recomputation in preflight submit/revise/publish branches.
+  - Extended GS-V10-018 Listings selected-media resolver reuse (April 19, 2026):
+    - publish workspace now resolves selected image/video label mappings once per rerun and reuses them across revise/publish paths, reducing duplicate media-selection mapping work.
+  - Extended GS-V10-018 Listings sandbox-ops runtime lookup reuse (April 19, 2026):
+    - bulk publish and retry-failed branches now share a rerun-local `ebay_allow_sandbox_seller_ops` resolver, removing duplicate runtime-setting reads in readiness/history flows.
+  - Extended GS-V10-018 Listings bulk-history source filtering (April 19, 2026):
+    - bulk publish execution history now scans only active eBay listings for `publish_batch_execution` payloads, reducing metadata parse/row-build overhead on large mixed-marketplace listing sets.
+  - Extended GS-V10-018 Listings bulk-history raw-detail short-circuit (April 19, 2026):
+    - history scan now checks raw `marketplace_details` text for `publish_batch_execution` before JSON decode, reducing unnecessary detail parsing for listings without batch execution metadata.
+  - Extended GS-V10-018 Listings retry-analysis map builder simplification (April 19, 2026):
+    - failed-history retry selector map now builds directly from failed-row dicts instead of DataFrame `iterrows`, reducing pandas overhead in retry analysis.
+  - Extended GS-V10-018 Listings bulk-history row-build constant hoisting (April 19, 2026):
+    - bulk history row builder now resolves listing id/sku/title/url once per listing before iterating batch events, reducing repeated lookup work per event row.
+  - Extended GS-V10-018 Listings bulk-history filter pass consolidation (April 19, 2026):
+    - batch/executor history filters now apply in one combined pass over rows instead of two sequential traversals, reducing list-iteration overhead in history filter paths.
+  - Extended GS-V10-018 Listings bulk-history filtered-empty short-circuit (April 19, 2026):
+    - history section now skips table/export/retry-analysis hydration when filters yield zero rows, avoiding unnecessary DataFrame and retry-control setup work for empty filtered states.
+  - Extended GS-V10-018 Listings bulk-history per-row normalization reuse (April 19, 2026):
+    - bulk-history filter evaluator now computes normalized batch/executor strings once per row during the single pass, removing repeated normalization calls from filter matching.
+  - Extended GS-V10-018 Listings bulk-history blank-filter fast path (April 19, 2026):
+    - bulk-history filter evaluator now bypasses per-row normalization when both batch and executor filters are blank, reusing sorted rows directly for default-history views.
+  - Extended GS-V10-018 Listings bulk-history tiny-set sort fast path (April 19, 2026):
+    - bulk-history ordering now skips `sorted(...)` when history rows are size 0–1, reusing the existing row list directly.
+  - Extended GS-V10-018 Listings review-history tiny-set sort fast path (April 19, 2026):
+    - side-panel review-history ordering now skips `sorted(...)` when review rows are size 0–1, reusing the existing row list directly.
+  - Extended GS-V10-018 Listings full-table export DataFrame reuse (April 19, 2026):
+    - review-history, channel-capability, and media-manager export factories now reuse the already-built render DataFrame in full-table mode, avoiding duplicate full DataFrame construction.
+  - Extended GS-V10-018 Listings filtered-table export DataFrame reuse (April 19, 2026):
+    - main Listings filtered export now reuses the already-built filtered table DataFrame in full-table mode, avoiding duplicate full DataFrame construction.
+  - Extended GS-V10-018 Listings bulk-history/follow-up DataFrame reuse (April 19, 2026):
+    - bulk-history export now reuses the already-built history DataFrame in full-table mode, and blocker follow-up table + CSV export now share one DataFrame instance to avoid duplicate construction.
+  - Extended GS-V10-018 Listings readiness records-map reuse (April 19, 2026):
+    - readiness bulk-review and bulk-publish planner selectors now share one cached `to_dict('records')` snapshot per rerun instead of running separate `iterrows()` passes over the readiness DataFrame.
+  - Extended GS-V10-018 Listings readiness option-sort reuse (April 19, 2026):
+    - blocker/warning option lists now reuse one pre-sorted key snapshot per rerun across follow-up and readiness-filter controls, avoiding duplicate sort passes.
+  - Extended GS-V10-018 Listings readiness filter-series reuse (April 19, 2026):
+    - readiness filtering now reuses precomputed format/blocker/warning string Series during filter branches, reducing repeated per-branch `astype`/`str` conversion setup.
+  - Extended GS-V10-018 Listings readiness single-mask filtering (April 19, 2026):
+    - readiness filter branches now compose one boolean mask and apply a single final DataFrame slice, reducing intermediate filtered-frame allocations during triage reruns.
+  - Extended GS-V10-018 Listings follow-up option-set single-pass extraction (April 19, 2026):
+    - blocker follow-up status/owner/priority/SLA option sets now derive from one row pass instead of separate per-field scans.
+  - Extended GS-V10-018 Listings follow-up filter-loop metrics/map reuse (April 19, 2026):
+    - follow-up filtered-row loop now also computes open/due-soon/overdue counters and open-task label map, removing extra list/dict passes after filtering.
+  - Extended GS-V10-018 Listings follow-up tiny-set sort fast path (April 19, 2026):
+    - follow-up history now skips sort work for 0–1 row sets in both event-ordering and final task-ordering phases.
+  - Extended GS-V10-018 Listings follow-up action-normalization reuse (April 19, 2026):
+    - follow-up history event loop now normalizes event action once per event and reuses it for status/last-action updates.
+  - Extended GS-V10-018 Listings follow-up preset default-resolution single-pass (April 19, 2026):
+    - follow-up preset map build now also resolves owner/shared default labels in the same pass, removing a second pass over preset labels.
+  - Extended GS-V10-018 Listings follow-up preset selection tuple reuse (April 19, 2026):
+    - preset action controls now reuse one selected preset tuple (`row`, `payload`) across apply/default/clear/delete actions, avoiding repeated map lookups.
+  - Extended GS-V10-018 Listings follow-up preset membership-set reuse (April 19, 2026):
+    - quick-preset actions now use precomputed option sets (`status/owner/priority/sla`) for membership checks, avoiding repeated scans over sorted option lists.
+  - Extended GS-V10-018 Listings follow-up preset-row normalization reuse (April 19, 2026):
+    - follow-up preset map loop now normalizes row flags (`username`, `is_shared`, `is_default`) once per row and reuses them for label/default selection decisions.
+  - Extended GS-V10-018 Listings follow-up preset tiny-set label-sort + default-tuple reuse (April 19, 2026):
+    - preset label options now skip `sorted(...)` for 0–1 label sets, and default-preset application now reuses the fetched default tuple payload without an extra map lookup.
+  - Extended GS-V10-018 Listings follow-up option-list tiny-set sorting (April 19, 2026):
+    - follow-up status/owner/priority/sla option-list derivation now skips `sorted(...)` for 0–1 value sets.
+  - Extended GS-V10-018 Listings filter/selector option-list tiny-set sorting (April 19, 2026):
+    - listings marketplace/status/category/listing-ID option-list derivation now skips `sorted(...)` for 0–1 value sets in filter, bulk-create, and media-manager selector paths.
+  - Extended GS-V10-018 Listings cache/profile key tiny-set sorting (April 19, 2026):
+    - audit-log cache limit reuse and create-flow store-profile option keys now skip `sorted(...)` for 0–1 key sets.
+  - Extended GS-V10-018 Listings controls tiny-set sorting (April 19, 2026):
+    - active-filter marketplaces/statuses, blocker/warning reason options, top-blocker quick-filter ranking, and bulk-draft candidate-product sorting now skip `sorted(...)` for 0–1 item sets.
+  - Extended GS-V10-018 Listings item-specifics preview sort reuse (April 19, 2026):
+    - item-specific default/aspect preview rendering now prebuilds key/item lists once and uses tiny-set sort fast paths, reducing repeated sort calls in the same rerun.
+  - Extended GS-V10-018 Listings item-specifics remove-selector key reuse (April 19, 2026):
+    - remove-aspect selector options now prebuild aspect keys once and use tiny-set sort fast path for key ordering.
+  - Extended GS-V10-018 Listings document-source related-row tiny-set sorting (April 19, 2026):
+    - related sale/order sorting in the listing document-source side panel now fast-paths 0–1 row sets and skips unnecessary sorting.
+  - Extended GS-V10-018 Listings audit-cache reusable-limit scan optimization (April 19, 2026):
+    - `_get_audit_logs` now finds smallest reusable cached limit via single-pass candidate scan instead of sorting cache keys each lookup.
+  - Extended GS-V10-018 Listings publish-preset map reuse (April 19, 2026):
+    - eBay publish-preset save flow now prebuilds lowercase preset-name map and reuses it for existing-preset detection, removing repeated linear preset scans.
+  - Extended GS-V10-018 Listings create-preset default resolution single-pass (April 19, 2026):
+    - create-flow default preset selection now resolves fallback/default in one pass over cached preset rows (first-row fallback + break on explicit default).
+  - Extended GS-V10-018 Listings publish-preset dual-map single-pass build (April 19, 2026):
+    - publish-preset UI now constructs label and lowercase-name preset maps in one pass over preset rows, removing duplicate preset-row iteration.
+  - Extended GS-V10-018 Listings readiness default-preset resolver single-pass (April 19, 2026):
+    - readiness default preset resolution now applies first-row fallback with early-break on explicit default in one pass over cached preset rows.
+  - Extended GS-V10-018 Listings volume-tier tiny-set sort fast path (April 19, 2026):
+    - volume pricing tier normalization now skips sorting for 0–1 tiers before min-qty duplicate validation.
+  - Extended GS-V10-018 Listings default-aspect key-sort reuse (April 19, 2026):
+    - item-specific default-aspect apply flow now reuses sorted default-aspect item keys for flash messaging instead of running a second key sort.
+  - Extended GS-V10-018 Listings aspect-preview/remove option sort reuse (April 19, 2026):
+    - item-specific editor now reuses sorted aspect preview items for remove-selector options, avoiding duplicate key sorting in the same rerun.
+  - Extended GS-V10-018 Listings audit-entity filter cache reuse (April 19, 2026):
+    - `_audit_logs_for_entity` now caches filtered entity rows by `(entity_type, limit)` per rerun, avoiding repeated entity-filter scans over identical audit slices.
+  - Extended GS-V10-018 Listings saved-filter normalization single-pass loops (April 19, 2026):
+    - marketplace/status set derivation now uses single-pass normalization loops and avoids repeated string-strip conversions per value.
+  - Extended GS-V10-018 Listings audit-cache exact-limit memoization (April 19, 2026):
+    - reusable-limit audit slices are now memoized back into exact-limit cache entries to avoid repeated slicing for identical limits in the same rerun.
+  - Extended GS-V10-018 Listings entity-audit reusable-limit memoization (April 19, 2026):
+    - entity-filtered audit cache now reuses nearest higher cached limit for the same entity type and memoizes exact-limit slices for repeated nearby limit requests.
+  - Extended GS-V10-018 Listings aspect-remove branch elimination (April 19, 2026):
+    - item-specific remove-selector options now derive directly from prebuilt `aspects_preview_items`, eliminating fallback normalization/sort branching.
+  - Extended GS-V10-018 Listings audit-cache typed-key loop cleanup (April 19, 2026):
+    - reusable-limit scans in raw/entity audit caches now use typed keys directly, removing redundant `int(...)`/`str(...)` conversions.
+  - Extended GS-V10-018 Listings audit-cache redundant-copy elimination (April 19, 2026):
+    - raw/entity audit cache memoization now avoids extra `list(...)` wrapping when storing reusable-limit slices and filtered rows.
+  - Extended GS-V10-018 Listings orchestration-queue pre-DataFrame filtering (April 19, 2026):
+    - orchestration status filter now applies on row dicts before DataFrame materialization, reducing DataFrame filter/copy overhead in queue rendering.
+  - Extended GS-V10-018 Listings orchestration inline filter application (April 19, 2026):
+    - orchestration queue now applies selected status filtering inline during row construction, reducing intermediate row-set size and downstream DataFrame payload for filtered views.
+  - Started GS-V10-017 lifecycle close/archive controls:
+    - added reversible listing archive/restore lifecycle support (`marketplace_details.lifecycle`) and listing hard-delete path for bad/duplicate records with linked-record detachment (sales/order-items/media references set null, history preserved)
+    - added Listings `Danger Zone` controls (archive/restore/delete) and default-hidden archived-listing filtering (`Include Archived` toggle)
+    - added product archive/restore repository + UI controls with active-listing guardrail (block archive unless `force=True`)
+    - added lot archive/restore repository + UI controls with lifecycle metadata in lot notes and default-hidden archived-lot filtering
+    - added media archive/restore model (`media_assets.is_archived`) with repository archive/restore APIs and default-hidden archived media queries
+    - added Media Library and Search/Edit > Media archive/restore actions with `Include Archived` filtering
+    - added Search/Edit lifecycle parity for Listings, Lots, and Media (archive/restore actions + archived visibility filters)
+    - added lot/media archive preflight guardrails and force semantics:
+      - repository blocker APIs (`get_purchase_lot_archive_blockers`, `get_media_asset_archive_blockers`)
+      - lot/media archive operations now block linked active dependencies unless `force=True`
+      - Lots, Media, and Search/Edit lifecycle panels now show blocker summaries + force toggles before archive
+    - added repository regression coverage for listing delete detach, listing archive/restore metadata, product archive guardrails, lot archive/restore metadata, and media archive/restore filtering paths
+    - expanded scheduled lifecycle retention cleanup to archived media/listings/lots/products (`lifecycle_archive_cleanup_enabled/timezone/local_time`, per-entity retain-day settings) with sync-runner integration-event telemetry (`integration=lifecycle_retention`, `action=cleanup`)
+    - added conservative dependency guardrails during retention purge (linked listings/lots/products are skipped rather than deleted, with skipped counts emitted in cleanup details)
+    - added Admin lifecycle retention controls (`lifecycle_archive_cleanup_*` scheduler keys + per-entity retain-day settings) with one-click manual lifecycle cleanup execution and integration-event audit logging (`integration=lifecycle_retention`, `action=manual_cleanup`)
+    - added first lifecycle Playwright coverage scaffold (`tests/e2e/lifecycle_archive_flow.spec.ts`) for Listings danger-zone archive/restore roundtrip, with seed-safe skip behavior when no selectable listing row is present
+    - added strict seeded lifecycle gate (`tests/e2e/lifecycle_archive_flow_strict.spec.ts`) for Listings archive/restore danger-zone transition assertions
+    - added strict seeded lifecycle entities gate (`tests/e2e/lifecycle_entities_strict.spec.ts`) covering Products/Lots/Media lifecycle controls under strict seeded auth
+    - added Admin lifecycle cleanup evidence persistence in Integrations tab (`Last Lifecycle Cleanup Run` JSON/timestamp) for manual-run sign-off artifacts
+    - added Admin lifecycle retention e2e flow (`tests/e2e/admin_lifecycle_retention_flow.spec.ts`) for `Run Lifecycle Cleanup Now` + evidence-block validation
+    - enabled strict lifecycle gates by default in QA CI for PR/push and retained workflow-dispatch strict lifecycle toggle (`qa_enable_strict_lifecycle`) for manual-run override
+    - wired Admin lifecycle retention evidence e2e (`tests/e2e/admin_lifecycle_retention_flow.spec.ts`) into QA CI strict lifecycle gate execution
+    - added Admin `Lifecycle Retention Policy Sign-Off Tracker` (Dev/Prod owner/date/status/evidence + cleanup policy snapshot) with CSV export and Go-Live evidence-pack artifact (`lifecycle_retention_policy_signoffs.csv`)
+    - expanded Admin go-live governance e2e assertions to include lifecycle retention policy tracker visibility + lifecycle sign-off CSV control (`tests/e2e/admin_golive_flow.spec.ts`)
+    - added admin helper regression assertion to keep lifecycle sign-off evidence-pack filename wiring locked (`tests/test_admin_helpers.py`)
+    - latest strict lifecycle evidence runs (April 16, 2026):
+      - Listings strict gate: `1 passed` (`tests/e2e/lifecycle_archive_flow_strict.spec.ts`)
+      - Entities strict gate: `3 passed` (`tests/e2e/lifecycle_entities_strict.spec.ts`, deterministic Products/Lots/Media archive->restore roundtrip)
+
+## GS-V10-018 App Performance Optimization (Completed)
+- Goal: improve app responsiveness on high-density pages (Listings, Reports, Admin, Search/Edit, Intake wizards) without removing workflow capability.
+- Scope:
+  - establish measurable page performance baselines (render time, query count/duration, payload/table size) and set per-page budgets.
+  - reduce DB load on slow pages via targeted rollups, tighter default filters/pagination, and index tuning driven by observed heavy queries.
+  - reduce Streamlit rerun/render overhead by lazy-loading expensive sections, deferring non-critical panels, and minimizing full-page hydration on first load.
+  - optimize table-heavy views with bounded default windows, on-demand expansion, and export-first patterns for large result sets.
+  - optimize media-heavy views with thumbnail-first rendering and deferred full-resolution preview loading.
+  - add System Health/Admin performance insights for ongoing hotspot visibility (slow-page counters, slow-query indicators, latest baseline snapshot).
+  - add performance regression guardrails (baseline artifacts and targeted tests for known heavy repository/report paths).
+- First-wave target pages:
+  - Listings
+  - Reports
+  - Search/Edit
+  - Admin (Governance/System Health)
+  - Inventory/Coin Intake Wizards
+
+## GS-V10-019 Slack AI Ops Bot (Planned)
+- Goal: enable operator workflows directly from Slack (images + commands) while preserving strict in-app controls, approvals, and auditability.
+- Initial Step 1 delivery (April 20, 2026):
+  - added `app/services/slack_ops_bot.py` with canonical command envelope + deterministic idempotency keying.
+  - defined command contract/allowlist intents (`intake`, `comp`, `status`, `operations`) and per-role routing guards.
+  - added audited routing outcomes (`accepted`/`denied`/`rejected`) and integration telemetry (`integration=slack_ops`, `action=command_routed`).
+  - added focused routing/guardrail regression coverage (`tests/test_slack_ops_bot.py`).
+- Initial Step 2 delivery (April 20, 2026):
+  - added `ingest_slack_command_request` queueing flow in `app/services/slack_ops_bot.py`.
+  - queues accepted Slack commands into `integration_queue_jobs` (`integration=slack_ops`, `action=command_ingest`) with canonical request context (requester/channel/thread/message metadata).
+  - added replay protection by idempotency-key dedupe against existing Slack-ops queue jobs and emits `deduped` audit/telemetry outcomes.
+  - expanded Slack ops unit coverage for queued, duplicate, and denied-no-queue ingestion scenarios (`tests/test_slack_ops_bot.py`).
+- Initial Step 3 delivery (April 20, 2026):
+  - added queue execution support for `slack_ops/command_ingest` in `app/services/integration_queue.py`.
+  - Slack file attachments are downloaded with bot-token auth (`url_private`/`url_private_download`), uploaded through existing S3 media storage, and persisted through existing repository pipelines:
+    - image/video -> media assets
+    - application/text documents -> purchase documents
+  - ingestion supports optional target context hints (`product_id`, `listing_id`, `lot_id`, `source_id`, `document_kind`) carried in command payload.
+  - added regression coverage for Slack ops media/document/no-file ingestion branches in `tests/test_integration_queue.py`.
+- Initial Step 4 delivery (April 20, 2026):
+  - added write-intent approval gating in `app/services/slack_ops_bot.py` controlled by runtime key `slack_ops_write_actions_require_approval` (default true).
+  - accepted write commands are persisted with approval metadata and placed into queue `status=blocked` until approved.
+  - added explicit approval helper `approve_slack_ops_queue_job(...)` with role enforcement (`admin`/`ops`) that stamps approval metadata and promotes job to `queued`.
+  - added regression coverage for pending-approval and approval transitions in `tests/test_slack_ops_bot.py`.
+- Initial Step 5 delivery (April 20, 2026):
+  - integrated AI runtime into `slack_ops/command_ingest` queue execution for `comp` and `intake` intents.
+  - comp requests route through `execute_comp_summary(..., workflow=\"comp\")`; intake requests route through `execute_multimodal_task(..., workflow=\"intake\")` using first image attachment when present.
+  - concise operator-safe summary payload is persisted as `ai_response` on the queue job (summary/error/links/timestamp) with contextual links to related in-app records.
+  - optional Slack channel auto-reply support added (runtime-gated, default off) to post AI summary back into originating channel.
+  - added regression coverage for Slack ops AI summary persistence (`tests/test_integration_queue.py`).
+- Initial Step 6 delivery (April 20, 2026):
+  - added Slack ops guardrail runtime controls to ingestion path:
+    - global enable/kill switch (`slack_ops_enabled`)
+    - per-intent toggles (`slack_ops_intent_<intent>_enabled`)
+    - channel allowlist (`slack_ops_allowed_channels`)
+    - user allowlist (`slack_ops_allowed_users`)
+    - request rate limit window + cap (`slack_ops_rate_limit_window_minutes`, `slack_ops_rate_limit_max_requests`)
+  - guardrail rejections now emit explicit audit + integration telemetry outcomes (`command_ingest_rejected`) with rejection reason context.
+  - added regression coverage for key guardrail rejection branches (`tests/test_slack_ops_bot.py`).
+- Initial Step 7 delivery (April 20, 2026, partial):
+  - added Admin Integration `Slack Ops Queue (Bot)` observability + governance panel with:
+    - queue depth/status metrics and pending-approval SLA metrics,
+    - detailed queue table including parsed intent/approval metadata,
+    - triage actions (run due jobs, retry failed, approve pending write-intent jobs).
+  - backed by normalized helper snapshot logic and regression coverage (`tests/test_admin_helpers.py`).
+  - completed Step 7 follow-up: System Health now mirrors Slack Ops KPIs/trends (queue depth, blocked/pending approvals, approval SLA max, and 24h success/queued/failed/rejected counters) with helper test coverage.
+- Initial Step 8 delivery (April 20, 2026):
+  - finalized Slack Ops operational runbook: `SLACK_OPS_RUNBOOK.md` (runtime controls, approval escalation, incident handling, rollback/disable, and evidence expectations).
+  - added lifecycle regression coverage for approval-gated execution (`ingest -> blocked -> approve -> process -> success`) in `tests/test_slack_ops_bot.py`.
+  - fixed Slack Ops idempotency dedupe status matching to include successful queue jobs (`success`), with regression coverage.
+- Initial Step 9 delivery (April 20, 2026):
+  - added inbound Slack Socket Mode worker `app/services/slack_ops_runner.py` to accept `app_mention` and slash-command requests directly from Slack and ingest via `ingest_slack_command_request(...)`.
+  - added in-thread Slack acknowledgements for accepted/duplicate/blocked/denied command outcomes, plus inline help when no intent is supplied.
+  - added automatic due-queue execution loop for `integration=slack_ops` jobs in runner (`slack_ops_process_queue_*` controls) so bot requests can complete without manual Admin run-due actions.
+  - added threaded AI auto-reply propagation in queue execution (`thread_ts` support in `send_slack_message`) for `comp`/`intake` summaries when enabled.
+  - added compose service `slack_ops_worker` and helper tests `tests/test_slack_ops_runner.py`.
+  - added backward-compatible operations aliases for existing bot commands:
+    - `operations run_sync` -> `operations run_due slack_ops`
+    - `operations queue_status` -> `status`
+  - extended `operations` intent execution with:
+    - `run_due <integration> [limit]`
+    - `approve <queue_job_id>`
+    - `create_ebay_draft <product_id> [price] [qty]`
+  - extended `intake` intent execution to auto-create local product drafts when attachments are present and `product_id` is not provided:
+    - AI-assisted field extraction (title/category/description/metal/weight hints)
+    - media auto-link to created product
+    - threaded summary including missing confirmations for operator follow-up
+  - deployed Slack Ops worker as part of existing env stacks (not separate apps):
+    - `k8s/templates/dev/deployment-slack-ops-worker.yaml` included in dev `kustomization.yaml`
+    - `k8s/templates/prod/deployment-slack-ops-worker.yaml` included in prod `kustomization.yaml`
+  - hardened Slack `comp` execution quality:
+    - fixed ingest/audit integer-entity-id failure for hash idempotency keys in route audit writes.
+    - comp execution now uses eBay sold-results HTML as primary eBay evidence source before AI summary generation (Finding path deprecated/non-primary).
+    - added Slack comp web fallback hints path (DuckDuckGo HTML + visible-price parsing) when eBay rows are sparse/unavailable.
+    - comp response metadata now records query/fetch strategy and evidence counts (`eBay rows`, `Web rows`, query, fetch mode) for operator triage.
+    - comp suggested list band now uses runtime-configurable low/high percentages (`slack_ops_comp_band_low_pct`, `slack_ops_comp_band_high_pct`) with decimal-safe parsing and test coverage.
+    - added direct eBay sold-results HTML fallback for Slack `comp` during Finding API throttles/unavailability, ahead of generic web fallback, with runtime controls and regression coverage.
+    - expanded deprecation mitigation across app comp flows: shared `EbayClient` fallback path (`find_completed_items_with_fallback`) now supports Finding -> broadened completed -> eBay sold HTML fallback, and intake/wizard/tools paths are aligned to avoid hard dependency on `findCompletedItems`.
+    - promoted the deprecation mitigation to primary runtime behavior: app comp surfaces now source eBay comps from sold-results HTML first and no longer call `findCompletedItems` in active workflows.
+    - bounded Slack web-fallback detail-page fetches with runtime knobs (`slack_ops_comp_web_detail_fetch_limit`, `slack_ops_comp_web_detail_fetch_timeout_seconds`) to keep queue execution predictable while preserving structured page-price enrichment.
+    - improved Slack web-fallback price robustness by filtering shipping-threshold promo prices (`orders $X`) and using median-selected row price from extracted hints to reduce outlier anchoring.
+    - hardened Slack web-fallback price acceptance: non-product category/search URLs no longer contribute snippet-only prices unless structured page-price extraction succeeds.
+    - added domain-aware product-page preference in Slack web fallback (APMEX product URLs prioritized over category/search URLs when both are present) to reduce false high anchors from category/promotional pages.
+    - expanded product-page preference to additional bullion dealer domains (JM Bullion/SD Bullion/Monument/Provident/Silver.com and similar), reducing category-page noise in web-only comp fallback.
+    - improved structured fallback extraction by parsing JSON-LD product/offer pricing and `og:price:amount`, increasing recovery of true product prices on dealer pages with minimal snippet pricing.
+    - tightened structured fallback extraction to ignore generic raw `"price"` token scraping and JSON-LD range keys (`lowPrice`/`highPrice`), reducing category-page promo threshold contamination in comp pricing.
+    - added confidence-weighted top-comp ranking so summary ordering favors higher-trust evidence (sold rows, structured page prices, product-like URLs) instead of raw highest-price snippet rows.
+    - added explicit Slack comp confidence UX: top-row confidence tags plus aggregate evidence-confidence signal for faster operator trust assessment.
+    - added runtime minimum-confidence gate so low-evidence comp runs suppress suggested list bands and emit explicit caution guidance in Slack summaries.
+    - added runtime minimum-qualified-rows gate so thin comp samples (too few priced rows) cannot produce suggested list bands without explicit caution.
+    - added runtime trusted-source-only mode for web fallback so comp rows can be constrained to approved bullion domains during stricter pricing operations.
+    - added per-request `trusted_only=true|false` override for Slack comp commands, enabling strict trusted-source filtering on demand without toggling global runtime settings.
+    - added per-request comp gate overrides (`confidence_gate`, `rows_gate`, `min_confidence`, `min_rows`) so operators can adjust strictness per command with explicit summary-link traceability.
+    - added per-request `trusted_domains=` override for Slack comp commands to temporarily restrict trusted-source filtering to specific domains for a single request.
+    - tightened `trusted_domains=` semantics so domain override auto-enables trusted-source filtering unless explicitly negated with `trusted_only=false`.
+    - normalized evidence-gated AI field output in Slack comp summaries (including inline single-line markdown chains) so `Confidence`, `Suggested Range`, and `Recommendation` stay consistent with gate outcomes.
+    - replaced generic gate metadata suffix with reason-specific fetch-mode tags (`evidence_gate_rows`, `evidence_gate_confidence`, `evidence_gate_confidence_rows`) for clearer operator/debug traceability.
+    - dampened overall comp confidence for thin evidence sets (single-row or 2-row single-domain evidence) to avoid surfacing `high` confidence labels from one-source comps.
+    - expanded comp summary observability with explicit `Qualified comps` and `Distinct sources` header metrics and `Min qualified comps` link metadata so operators can immediately compare observed evidence vs active gate threshold.
+- Scope:
+  - Slack bot command surface for:
+    - image/document intake requests (inventory/purchase docs),
+    - comp requests (manual query or image-seeded),
+    - read operations (status, queue, KPI snapshots),
+    - action requests (create draft, run sync job, trigger approved automations).
+  - approval-gated write path:
+    - all write-impacting requests become pending actions requiring explicit approval by authorized app users/roles.
+    - no direct bypass of existing app permissions, readiness checks, or workflow guardrails.
+  - secure artifact handling:
+    - ingest Slack images/files into existing media/document pipelines without exposing private storage.
+    - map Slack request context to workflow drafts for resume/review in app pages.
+  - AI orchestration integration:
+    - route Slack requests through existing AI runtime profiles/fallback chain with workflow-scoped prompt policy.
+    - support image-assisted extraction/comp summaries with operator-visible diagnostics.
+  - observability + governance:
+    - full request/decision/execution audit trail (requestor, approver, action, payload hash, outcome).
+    - operational metrics in Admin/System Health (queue depth, success/failure, median action time, approval SLA).
+  - safety controls:
+    - runtime kill switch, allowlisted Slack channels/users, per-command rate limits, replay/idempotency keys.
 
 ## Cross-Phase Technical Standards
 - Migrations required for all schema changes

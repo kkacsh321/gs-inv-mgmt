@@ -69,6 +69,49 @@ class _Uploaded:
         return self._data
 
 
+class _Ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSt:
+    def __init__(self, *, button_value: bool = False):
+        self.button_value = bool(button_value)
+        self.captions = []
+        self.markdowns = []
+        self.successes = []
+        self.codes = []
+        self.dataframes = []
+        self.rerun_called = False
+
+    def expander(self, *_a, **_k):
+        return _Ctx()
+
+    def caption(self, msg):
+        self.captions.append(str(msg))
+
+    def markdown(self, msg, **_k):
+        self.markdowns.append(str(msg))
+
+    def button(self, *_a, **_k):
+        return self.button_value
+
+    def success(self, msg):
+        self.successes.append(str(msg))
+
+    def rerun(self):
+        self.rerun_called = True
+
+    def dataframe(self, data, **_k):
+        self.dataframes.append(data)
+
+    def code(self, data, **_k):
+        self.codes.append(str(data))
+
+
 class ToolsHelpersTests(unittest.TestCase):
     def test_coin_csv_helpers(self):
         df = pd.DataFrame([{"Coin Name": "A", "year from": "1900"}])
@@ -123,6 +166,28 @@ class ToolsHelpersTests(unittest.TestCase):
         self.assertEqual(tools._uploaded_file_name(non_img), "v.mp4")
         self.assertEqual(tools._parse_photo_comp_retry_preset('{"a":1}')["a"], 1)
         self.assertEqual(tools._parse_photo_comp_retry_preset("bad"), {})
+
+    def test_render_grader_summary_text_renders_plain_code_block(self):
+        fake_st = _FakeSt()
+        original_st = tools.st
+        try:
+            tools.st = fake_st
+            tools._render_grader_summary_text("Line one\n*Line two*")
+        finally:
+            tools.st = original_st
+        self.assertIn("##### Grader Summary", fake_st.markdowns)
+        self.assertEqual(fake_st.codes, ["Line one\n*Line two*"])
+
+    def test_render_grader_summary_text_ignores_empty(self):
+        fake_st = _FakeSt()
+        original_st = tools.st
+        try:
+            tools.st = fake_st
+            tools._render_grader_summary_text("   ")
+        finally:
+            tools.st = original_st
+        self.assertEqual(fake_st.markdowns, [])
+        self.assertEqual(fake_st.codes, [])
 
     def test_media_persist(self):
         created = []
@@ -234,6 +299,30 @@ class ToolsHelpersTests(unittest.TestCase):
         prices2 = tools._extract_domain_specific_prices("https://www.amazon.com/dp/x", amz_html)
         self.assertIn(9.99, prices2)
 
+
+    def test_build_inventory_mode_query_prefill_applies_once(self):
+        product = SimpleNamespace(title="Credit Suisse 100 gram bar", sku="CS-100G", metal_type="silver")
+        derived_query = tools._build_inventory_mode_query(
+            selected_product=product,
+            use_title=True,
+            use_sku=False,
+            use_metal=True,
+            prefill_query="stale prefill query",
+            prefill_apply_once=False,
+        )
+        self.assertIn("Credit Suisse", derived_query)
+        self.assertIn("silver", derived_query)
+        self.assertNotIn("stale prefill query", derived_query)
+
+        prefilled_query = tools._build_inventory_mode_query(
+            selected_product=product,
+            use_title=True,
+            use_sku=False,
+            use_metal=True,
+            prefill_query="apply once prefill",
+            prefill_apply_once=True,
+        )
+        self.assertEqual(prefilled_query, "apply once prefill")
 
 if __name__ == "__main__":
     unittest.main()

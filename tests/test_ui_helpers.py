@@ -64,6 +64,24 @@ class UiHelpersTests(unittest.TestCase):
         today_low, today_high = ui_helpers.dataframe_date_bounds([])
         self.assertEqual(today_low, today_high)
 
+    def test_format_ebay_sync_note_for_customer(self):
+        raw = (
+            "Updated by eBay sync pull. buyer=micorn_78; shipping_service=USPSParcel; "
+            "ship_to=Miles Cornwall, 1580 summer way, Idaho falls, ID, 83404-8258, US; "
+            'fee_breakdown_json={"price_subtotal":325.0,"delivery_cost":6.78,"order_total":331.78}'
+        )
+        formatted = ui_helpers.format_ebay_sync_note_for_customer(raw)
+        self.assertIn("Imported from eBay sync pull.", formatted)
+        self.assertIn("Buyer: micorn_78", formatted)
+        self.assertIn("Shipping Service: USPSParcel", formatted)
+        self.assertIn("Ship To: Miles Cornwall, 1580 summer way, Idaho falls, ID, 83404-8258, US", formatted)
+        self.assertNotIn("fee_breakdown_json", formatted)
+        self.assertNotIn("price_subtotal", formatted)
+
+    def test_format_ebay_sync_note_for_customer_passthrough(self):
+        raw = "Manual order note from local sale"
+        self.assertEqual(ui_helpers.format_ebay_sync_note_for_customer(raw), raw)
+
 
 if __name__ == "__main__":
     unittest.main()

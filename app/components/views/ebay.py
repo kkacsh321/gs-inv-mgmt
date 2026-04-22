@@ -18,6 +18,25 @@ from app.services.sync_jobs import execute_sync_job, is_sync_job_enabled
 from app.utils.time import utcnow_naive
 
 
+_PENDING_INPUT_UPDATES_KEY = "ebay_pending_input_updates"
+
+
+def _queue_input_update(key: str, value: object) -> None:
+    pending = st.session_state.get(_PENDING_INPUT_UPDATES_KEY)
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[str(key)] = value
+    st.session_state[_PENDING_INPUT_UPDATES_KEY] = pending
+
+
+def _apply_pending_input_updates() -> None:
+    pending = st.session_state.pop(_PENDING_INPUT_UPDATES_KEY, None)
+    if not isinstance(pending, dict):
+        return
+    for key, value in pending.items():
+        st.session_state[str(key)] = value
+
+
 def _read_query_param(name: str) -> str:
     params = getattr(st, "query_params", None)
     if params is None:
@@ -131,6 +150,7 @@ def render_ebay_connection_status_card(repo: InventoryRepository) -> None:
 
 
 def render_ebay(client: EbayClient, repo: InventoryRepository) -> None:
+    _apply_pending_input_updates()
     user = current_user()
     ebay_pull_enabled = is_sync_job_enabled("ebay_orders_pull_import", repo=repo)
     workspace_token = str(st.session_state.get("ebay_workspace_access_token") or "").strip()
@@ -166,7 +186,7 @@ def render_ebay(client: EbayClient, repo: InventoryRepository) -> None:
                 st.session_state["ebay_verify_access_token"] = token_val
                 st.session_state["ebay_pull_access_token"] = token_val
             st.session_state["ebay_workspace_status_filter"] = list(
-                payload.get("status_filter") or ["draft", "active", "ended"]
+                payload.get("status_filter") or ["draft", "active", "ended", "sold"]
             )
             st.session_state["ebay_workspace_linked_only"] = bool(payload.get("linked_only"))
             st.session_state["ebay_workspace_search"] = str(payload.get("search") or "").strip()
@@ -226,12 +246,13 @@ def render_ebay(client: EbayClient, repo: InventoryRepository) -> None:
         if (l.listing_status or "").strip().lower() == "active" and (l.external_listing_id or "").strip()
     ]
     ended_rows = [l for l in ebay_listings if (l.listing_status or "").strip().lower() == "ended"]
+    sold_rows = [l for l in ebay_listings if (l.listing_status or "").strip().lower() == "sold"]
     failed_syncs = [r for r in sync_runs if (r.status or "").strip().lower() in {"failed", "partial"}]
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Drafts Pending Publish", len(pending_publish))
     m2.metric("Active eBay Listings", len(active_linked))
-    m3.metric("Ended eBay Listings", len(ended_rows))
+    m3.metric("Ended/Sold eBay Listings", len(ended_rows) + len(sold_rows))
     m4.metric("Failed/Partial Sync Runs", len(failed_syncs))
 
     if pending_publish:
@@ -372,7 +393,7 @@ def render_ebay(client: EbayClient, repo: InventoryRepository) -> None:
         if st.button("Use Last Captured Code", key="ebay_oauth_use_cached_code_btn"):
             cached = str(st.session_state.get("ebay_oauth_last_code") or "").strip()
             if cached:
-                st.session_state["ebay_oauth_code_input"] = cached
+                _queue_input_update("ebay_oauth_code_input", cached)
                 st.rerun()
 
     if oauth_error:
@@ -424,8 +445,9 @@ def render_ebay(client: EbayClient, repo: InventoryRepository) -> None:
             st.session_state["ebay_oauth_last_code"] = ""
             st.session_state["ebay_oauth_last_code_pending_exchange"] = False
             st.session_state["ebay_oauth_auto_attempted_code"] = ""
-            st.session_state["ebay_oauth_code_input"] = ""
+            _queue_input_update("ebay_oauth_code_input", "")
             _clear_oauth_query_params()
+            st.rerun()
         except Exception as exc:
             st.error(f"Token exchange failed: {exc}")
             if isinstance(exc, requests.HTTPError):

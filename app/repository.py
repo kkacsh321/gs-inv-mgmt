@@ -1,11 +1,13 @@
 import base64
 import hashlib
 import json
-from datetime import datetime
+import re
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import String, and_, case, cast, delete, func, inspect, literal, or_, select, text
 
 try:
     from app.db.models import (
@@ -17,6 +19,7 @@ try:
         DocumentArtifact,
         DocumentTemplateProfile,
         EbayPublishPreset,
+        EbayCategorySuggestion,
         EbayListingTemplateProfile,
         InventoryMovement,
         InventorySource,
@@ -25,7 +28,9 @@ try:
         IntegrationQueueJob,
         MarketplaceListing,
         MediaAsset,
+        NotificationOutbox,
         Order,
+        OrderFinanceEntry,
         OrderItem,
         Product,
         ProductLotAssignment,
@@ -40,6 +45,8 @@ try:
         SyncEvent,
         SyncRun,
         ShippingPreset,
+        WorkflowDraft,
+        WorkflowEvent,
     )
     from app.services.validation import ValidationService
     from app.services.security import hash_password, verify_password
@@ -56,6 +63,7 @@ except ModuleNotFoundError:
         DocumentArtifact,
         DocumentTemplateProfile,
         EbayPublishPreset,
+        EbayCategorySuggestion,
         EbayListingTemplateProfile,
         InventoryMovement,
         InventorySource,
@@ -64,7 +72,9 @@ except ModuleNotFoundError:
         IntegrationQueueJob,
         MarketplaceListing,
         MediaAsset,
+        NotificationOutbox,
         Order,
+        OrderFinanceEntry,
         OrderItem,
         Product,
         ProductLotAssignment,
@@ -79,6 +89,8 @@ except ModuleNotFoundError:
         SyncEvent,
         SyncRun,
         ShippingPreset,
+        WorkflowDraft,
+        WorkflowEvent,
     )
     from services.validation import ValidationService
     from services.security import hash_password, verify_password
@@ -90,12 +102,61 @@ class InventoryRepository:
     def __init__(self, db_session):
         self.db = db_session
 
+    @staticmethod
+    def _landed_unit_cost_decimal(
+        *,
+        unit_cost: Decimal | None,
+        unit_tax_paid: Decimal | None = None,
+        unit_shipping_paid: Decimal | None = None,
+        unit_handling_paid: Decimal | None = None,
+    ) -> Decimal | None:
+        values = [unit_cost, unit_tax_paid, unit_shipping_paid, unit_handling_paid]
+        if not any(v is not None for v in values):
+            return None
+        total = Decimal("0")
+        for value in values:
+            if value is not None:
+                total += Decimal(value)
+        return total
+
     def _serialize_audit_value(self, value: Any) -> Any:
         if isinstance(value, Decimal):
             return float(value)
         if isinstance(value, datetime):
             return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
         return value
+
+    def _listing_is_archived(self, listing: MarketplaceListing) -> bool:
+        raw = str(getattr(listing, "marketplace_details", "") or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        lifecycle = parsed.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            return False
+        return bool(lifecycle.get("archived"))
+
+    def _lot_is_archived(self, lot: PurchaseLot) -> bool:
+        raw = str(getattr(lot, "notes", "") or "").strip()
+        if not raw:
+            return False
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        lifecycle = parsed.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            return False
+        return bool(lifecycle.get("archived"))
 
     def _allocate_lot_tax_paid(
         self,
@@ -316,12 +377,18 @@ class InventoryRepository:
             self.db.add(assignment)
 
         if current_quantity > 0:
+            landed_unit_cost = self._landed_unit_cost_decimal(
+                unit_cost=acquisition_cost,
+                unit_tax_paid=acquisition_tax_paid,
+                unit_shipping_paid=acquisition_shipping_paid,
+                unit_handling_paid=acquisition_handling_paid,
+            )
             self._record_inventory_movement(
                 product_id=product.id,
                 movement_type="initial_stock",
                 quantity_before=0,
                 quantity_after=current_quantity,
-                unit_cost=acquisition_cost,
+                unit_cost=(landed_unit_cost if landed_unit_cost is not None else acquisition_cost),
                 reference_type="product",
                 reference_id=product.id,
                 notes="Initial inventory created with product record.",
@@ -420,6 +487,11 @@ class InventoryRepository:
         fees: Decimal,
         shipping_cost: Decimal,
         quantity_sold: int,
+        shipping_label_cost: Decimal | None = None,
+        shipping_label_currency: str = "USD",
+        shipping_label_id: str = "",
+        shipping_label_url: str = "",
+        shipping_label_purchased_at: datetime | None = None,
         shipping_provider: str = "",
         shipping_service: str = "",
         shipping_package_type: str = "",
@@ -439,6 +511,7 @@ class InventoryRepository:
         ValidationService.require_non_negative_decimal("Sold price", sold_price)
         ValidationService.require_non_negative_decimal("Fees", fees)
         ValidationService.require_non_negative_decimal("Shipping cost", shipping_cost)
+        ValidationService.require_non_negative_decimal("Shipping label cost", shipping_label_cost)
         ValidationService.validate_sale_tracking_requirements(tracking_status, tracking_number)
         ValidationService.validate_shipping_dates(tracking_status, shipped_at, delivered_at)
         ValidationService.ensure_tracking_number_not_reused(
@@ -453,6 +526,11 @@ class InventoryRepository:
             sold_price=sold_price,
             fees=fees,
             shipping_cost=shipping_cost,
+            shipping_label_cost=shipping_label_cost,
+            shipping_label_currency=(shipping_label_currency or "USD").strip().upper() or "USD",
+            shipping_label_id=(shipping_label_id or "").strip(),
+            shipping_label_url=(shipping_label_url or "").strip(),
+            shipping_label_purchased_at=shipping_label_purchased_at,
             shipping_provider=shipping_provider,
             shipping_service=shipping_service,
             shipping_package_type=shipping_package_type,
@@ -511,6 +589,14 @@ class InventoryRepository:
 
     def list_sales(self) -> list[Sale]:
         return self.db.scalars(select(Sale).order_by(Sale.created_at.desc())).all()
+
+    def list_sales_for_listing(self, listing_id: int) -> list[Sale]:
+        listing_id_int = int(listing_id)
+        return self.db.scalars(
+            select(Sale)
+            .where(Sale.listing_id == listing_id_int)
+            .order_by(Sale.created_at.desc())
+        ).all()
 
     def create_shipping_preset(
         self,
@@ -962,6 +1048,106 @@ class InventoryRepository:
         )
         return self.db.scalars(query).all()
 
+    @staticmethod
+    def _normalize_ebay_category_query(query: str) -> str:
+        parts = [part.strip().lower() for part in str(query or "").split() if part.strip()]
+        return " ".join(parts)
+
+    def list_cached_ebay_category_suggestions(
+        self,
+        *,
+        environment: str,
+        marketplace_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_marketplace = (marketplace_id or "EBAY_US").strip().upper()
+        query_norm = self._normalize_ebay_category_query(query)
+        if not query_norm:
+            return []
+        rows = self.db.scalars(
+            select(EbayCategorySuggestion).where(
+                EbayCategorySuggestion.environment == resolved_env,
+                EbayCategorySuggestion.marketplace_id == resolved_marketplace,
+                EbayCategorySuggestion.query_norm == query_norm,
+            ).order_by(
+                EbayCategorySuggestion.hit_count.desc(),
+                EbayCategorySuggestion.last_seen_at.desc(),
+                EbayCategorySuggestion.updated_at.desc(),
+            ).limit(max(1, min(int(limit), 100)))
+        ).all()
+        return [
+            {
+                "category_id": str(row.category_id or "").strip(),
+                "category_name": str(row.category_name or "").strip(),
+                "path": str(row.path or "").strip(),
+                "source": "db_cache",
+                "hit_count": int(row.hit_count or 0),
+                "last_seen_at": (
+                    row.last_seen_at.isoformat() if getattr(row, "last_seen_at", None) is not None else ""
+                ),
+            }
+            for row in rows
+            if str(row.category_id or "").strip()
+        ]
+
+    def cache_ebay_category_suggestions(
+        self,
+        *,
+        environment: str,
+        marketplace_id: str,
+        query: str,
+        suggestions: list[dict],
+        actor: str = "system",
+    ) -> int:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_marketplace = (marketplace_id or "EBAY_US").strip().upper()
+        query_raw = str(query or "").strip()
+        query_norm = self._normalize_ebay_category_query(query_raw)
+        if not query_norm:
+            return 0
+        upserted = 0
+        for row in suggestions or []:
+            category_id = str((row or {}).get("category_id") or "").strip()
+            if not category_id:
+                continue
+            category_name = str((row or {}).get("category_name") or "").strip()
+            path = str((row or {}).get("path") or "").strip()
+            existing = self.db.scalar(
+                select(EbayCategorySuggestion).where(
+                    EbayCategorySuggestion.environment == resolved_env,
+                    EbayCategorySuggestion.marketplace_id == resolved_marketplace,
+                    EbayCategorySuggestion.query_norm == query_norm,
+                    EbayCategorySuggestion.category_id == category_id,
+                )
+            )
+            if existing is None:
+                existing = EbayCategorySuggestion(
+                    environment=resolved_env,
+                    marketplace_id=resolved_marketplace,
+                    query_raw=query_raw,
+                    query_norm=query_norm,
+                    category_id=category_id,
+                    category_name=category_name,
+                    path=path,
+                    source="ebay_taxonomy",
+                    hit_count=1,
+                    last_seen_at=utcnow_naive(),
+                    created_by=(actor or "system").strip() or "system",
+                )
+                self.db.add(existing)
+            else:
+                existing.query_raw = query_raw or existing.query_raw
+                existing.category_name = category_name or existing.category_name
+                existing.path = path or existing.path
+                existing.hit_count = int(existing.hit_count or 0) + 1
+                existing.last_seen_at = utcnow_naive()
+            upserted += 1
+        if upserted:
+            self.db.commit()
+        return upserted
+
     def update_ebay_listing_template_profile(
         self,
         template_id: int,
@@ -1369,6 +1555,368 @@ class InventoryRepository:
         )
         self.db.commit()
         return True
+
+    def load_workflow_draft(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str,
+        scope_key: str = "",
+        active_only: bool = True,
+    ) -> WorkflowDraft | None:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        resolved_user = (username or "").strip()
+        resolved_scope = (scope_key or "").strip()
+        if not resolved_workflow or not resolved_user:
+            return None
+        query = select(WorkflowDraft).where(
+            WorkflowDraft.environment == resolved_env,
+            WorkflowDraft.workflow_key == resolved_workflow,
+            WorkflowDraft.username == resolved_user,
+            WorkflowDraft.scope_key == resolved_scope,
+        )
+        if active_only:
+            query = query.where(WorkflowDraft.is_active.is_(True))
+        return self.db.scalar(query)
+
+    def resume_latest_workflow_draft(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str,
+        active_only: bool = True,
+    ) -> WorkflowDraft | None:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        resolved_user = (username or "").strip()
+        if not resolved_workflow or not resolved_user:
+            return None
+        query = select(WorkflowDraft).where(
+            WorkflowDraft.environment == resolved_env,
+            WorkflowDraft.workflow_key == resolved_workflow,
+            WorkflowDraft.username == resolved_user,
+        )
+        if active_only:
+            query = query.where(WorkflowDraft.is_active.is_(True))
+        query = query.order_by(WorkflowDraft.updated_at.desc(), WorkflowDraft.id.desc())
+        row = self.db.scalar(query)
+        if row is not None:
+            row.resumed_at = utcnow_naive()
+            self.db.commit()
+            self.db.refresh(row)
+        return row
+
+    def save_workflow_draft(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str,
+        scope_key: str = "",
+        draft_payload: dict[str, Any] | None = None,
+        schema_version: str = "v1",
+        status: str = "active",
+        last_step: str = "",
+        expires_at: datetime | None = None,
+        actor: str = "system",
+    ) -> WorkflowDraft:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        resolved_user = (username or "").strip()
+        resolved_scope = (scope_key or "").strip()
+        if not resolved_workflow:
+            raise ValueError("Workflow key is required.")
+        if not resolved_user:
+            raise ValueError("Username is required.")
+        payload = draft_payload if isinstance(draft_payload, dict) else {}
+        payload_json = json.dumps(payload, default=self._serialize_audit_value)
+
+        row = self.db.scalar(
+            select(WorkflowDraft).where(
+                WorkflowDraft.environment == resolved_env,
+                WorkflowDraft.workflow_key == resolved_workflow,
+                WorkflowDraft.username == resolved_user,
+                WorkflowDraft.scope_key == resolved_scope,
+            )
+        )
+        resolved_actor = (actor or "system").strip() or "system"
+        if row is None:
+            row = WorkflowDraft(
+                environment=resolved_env,
+                workflow_key=resolved_workflow,
+                username=resolved_user,
+                scope_key=resolved_scope,
+                schema_version=(schema_version or "v1").strip() or "v1",
+                status=(status or "active").strip().lower() or "active",
+                draft_json=payload_json,
+                autosave_count=1,
+                last_step=(last_step or "").strip(),
+                expires_at=expires_at,
+                updated_by=resolved_actor,
+                is_active=True,
+                cleared_at=None,
+            )
+            self.db.add(row)
+            self.db.flush()
+            self._record_audit(
+                "workflow_draft",
+                row.id,
+                "create",
+                resolved_actor,
+                {
+                    "after": {
+                        "environment": row.environment,
+                        "workflow_key": row.workflow_key,
+                        "username": row.username,
+                        "scope_key": row.scope_key,
+                        "status": row.status,
+                    }
+                },
+            )
+        else:
+            changes: dict[str, dict[str, Any]] = {}
+            updates = {
+                "schema_version": (schema_version or "v1").strip() or "v1",
+                "status": (status or "active").strip().lower() or "active",
+                "draft_json": payload_json,
+                "last_step": (last_step or "").strip(),
+                "expires_at": expires_at,
+                "updated_by": resolved_actor,
+                "is_active": True,
+                "cleared_at": None,
+            }
+            for field, new_value in updates.items():
+                old_value = getattr(row, field)
+                if old_value != new_value:
+                    changes[field] = {
+                        "before": self._serialize_audit_value(old_value),
+                        "after": self._serialize_audit_value(new_value),
+                    }
+                    setattr(row, field, new_value)
+            row.autosave_count = int(row.autosave_count or 0) + 1
+            if changes:
+                self._record_audit("workflow_draft", row.id, "update", resolved_actor, changes)
+
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def clear_workflow_draft(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str,
+        scope_key: str = "",
+        actor: str = "system",
+        reason: str = "",
+    ) -> bool:
+        row = self.load_workflow_draft(
+            environment=environment,
+            workflow_key=workflow_key,
+            username=username,
+            scope_key=scope_key,
+            active_only=False,
+        )
+        if row is None:
+            return False
+        row.is_active = False
+        row.status = "cleared"
+        row.cleared_at = utcnow_naive()
+        row.updated_by = (actor or "system").strip() or "system"
+        self._record_audit(
+            "workflow_draft",
+            row.id,
+            "clear",
+            actor,
+            {
+                "workflow_key": row.workflow_key,
+                "scope_key": row.scope_key,
+                "reason": (reason or "").strip(),
+            },
+        )
+        self.db.commit()
+        return True
+
+    def append_workflow_event(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str,
+        scope_key: str = "",
+        action: str,
+        status: str = "ok",
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+        draft_id: int | None = None,
+        actor: str = "system",
+    ) -> WorkflowEvent:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        resolved_user = (username or "").strip()
+        if not resolved_workflow:
+            raise ValueError("Workflow key is required.")
+        if not resolved_user:
+            raise ValueError("Username is required.")
+        resolved_action = (action or "").strip()
+        if not resolved_action:
+            raise ValueError("Workflow event action is required.")
+        row = WorkflowEvent(
+            draft_id=int(draft_id) if draft_id else None,
+            environment=resolved_env,
+            workflow_key=resolved_workflow,
+            username=resolved_user,
+            scope_key=(scope_key or "").strip(),
+            action=resolved_action,
+            status=(status or "ok").strip().lower() or "ok",
+            message=(message or "").strip(),
+            payload_json=json.dumps(payload or {}, default=self._serialize_audit_value),
+            created_by=(actor or "system").strip() or "system",
+            created_at=utcnow_naive(),
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def list_workflow_events(
+        self,
+        *,
+        environment: str,
+        workflow_key: str,
+        username: str = "",
+        scope_key: str = "",
+        limit: int = 100,
+    ) -> list[WorkflowEvent]:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        query = select(WorkflowEvent).where(
+            WorkflowEvent.environment == resolved_env,
+            WorkflowEvent.workflow_key == resolved_workflow,
+        )
+        if (username or "").strip():
+            query = query.where(WorkflowEvent.username == (username or "").strip())
+        if (scope_key or "").strip():
+            query = query.where(WorkflowEvent.scope_key == (scope_key or "").strip())
+        query = query.order_by(WorkflowEvent.created_at.desc(), WorkflowEvent.id.desc()).limit(
+            max(1, min(int(limit), 1000))
+        )
+        return self.db.scalars(query).all()
+
+    def list_workflow_drafts(
+        self,
+        *,
+        environment: str,
+        workflow_key: str = "",
+        username: str = "",
+        scope_key: str = "",
+        active_only: bool = False,
+        limit: int = 500,
+    ) -> list[WorkflowDraft]:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_workflow = (workflow_key or "").strip().lower()
+        resolved_user = (username or "").strip()
+        resolved_scope = (scope_key or "").strip()
+        query = select(WorkflowDraft).where(WorkflowDraft.environment == resolved_env)
+        if resolved_workflow:
+            query = query.where(WorkflowDraft.workflow_key == resolved_workflow)
+        if resolved_user:
+            query = query.where(WorkflowDraft.username == resolved_user)
+        if resolved_scope:
+            query = query.where(WorkflowDraft.scope_key == resolved_scope)
+        if active_only:
+            query = query.where(WorkflowDraft.is_active.is_(True))
+        query = query.order_by(WorkflowDraft.updated_at.desc(), WorkflowDraft.id.desc()).limit(
+            max(1, min(int(limit), 5000))
+        )
+        return self.db.scalars(query).all()
+
+    def cleanup_workflow_state(
+        self,
+        *,
+        environment: str,
+        draft_retention_days: int = 30,
+        event_retention_days: int = 90,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        resolved_env = (environment or "local").strip().lower()
+        draft_days = max(1, int(draft_retention_days))
+        event_days = max(1, int(event_retention_days))
+        now = utcnow_naive()
+        draft_cutoff = now - timedelta(days=draft_days)
+        event_cutoff = now - timedelta(days=event_days)
+
+        stale_draft_ids = self.db.scalars(
+            select(WorkflowDraft.id).where(
+                WorkflowDraft.environment == resolved_env,
+                or_(
+                    WorkflowDraft.is_active.is_(False),
+                    WorkflowDraft.cleared_at.is_not(None),
+                    WorkflowDraft.expires_at.is_not(None),
+                ),
+                WorkflowDraft.updated_at <= draft_cutoff,
+            )
+        ).all()
+        stale_draft_ids = [int(x) for x in stale_draft_ids]
+
+        deleted_events_for_stale_drafts = 0
+        deleted_stale_drafts = 0
+        if stale_draft_ids:
+            deleted_events_for_stale_drafts = int(
+                self.db.execute(
+                    delete(WorkflowEvent).where(
+                        WorkflowEvent.environment == resolved_env,
+                        WorkflowEvent.draft_id.in_(stale_draft_ids),
+                    )
+                ).rowcount
+                or 0
+            )
+            deleted_stale_drafts = int(
+                self.db.execute(
+                    delete(WorkflowDraft).where(
+                        WorkflowDraft.environment == resolved_env,
+                        WorkflowDraft.id.in_(stale_draft_ids),
+                    )
+                ).rowcount
+                or 0
+            )
+
+        deleted_old_events = int(
+            self.db.execute(
+                delete(WorkflowEvent).where(
+                    WorkflowEvent.environment == resolved_env,
+                    WorkflowEvent.created_at <= event_cutoff,
+                )
+            ).rowcount
+            or 0
+        )
+        self.db.commit()
+
+        resolved_actor = (actor or "system").strip() or "system"
+        self._record_audit(
+            "workflow_state",
+            None,
+            "cleanup",
+            resolved_actor,
+            {
+                "environment": resolved_env,
+                "draft_retention_days": draft_days,
+                "event_retention_days": event_days,
+                "deleted_stale_drafts": deleted_stale_drafts,
+                "deleted_events_for_stale_drafts": deleted_events_for_stale_drafts,
+                "deleted_old_events": deleted_old_events,
+            },
+        )
+        self.db.commit()
+        return {
+            "deleted_stale_drafts": deleted_stale_drafts,
+            "deleted_events_for_stale_drafts": deleted_events_for_stale_drafts,
+            "deleted_old_events": deleted_old_events,
+        }
 
     def list_saved_filter_profiles(
         self,
@@ -2002,14 +2550,33 @@ class InventoryRepository:
         items: list[dict[str, Any]],
         external_order_id: str = "",
         order_status: str = "paid",
+        buyer_username: str = "",
+        buyer_name: str = "",
+        buyer_email: str = "",
+        ship_to_city: str = "",
+        ship_to_state: str = "",
+        ship_to_postal_code: str = "",
+        ship_to_country: str = "",
         fees: Decimal | None = None,
         shipping_cost: Decimal | None = None,
+        shipping_label_cost: Decimal | None = None,
+        shipping_label_currency: str = "USD",
+        shipping_provider: str = "",
+        shipping_service: str = "",
+        tracking_number: str = "",
+        tracking_status: str = "",
+        shipped_at: datetime | None = None,
+        delivered_at: datetime | None = None,
+        marketplace_payload_json: str = "{}",
         notes: str = "",
         actor: str = "system",
     ) -> Order:
         ValidationService.require_non_empty("Marketplace", marketplace)
         ValidationService.require_non_negative_decimal("Order fees", fees)
         ValidationService.require_non_negative_decimal("Order shipping cost", shipping_cost)
+        ValidationService.require_non_negative_decimal("Order shipping label cost", shipping_label_cost)
+        ValidationService.validate_tracking_number((tracking_number or "").strip())
+        ValidationService.validate_shipping_dates(tracking_status, shipped_at, delivered_at)
 
         valid_items = [i for i in items if int(i.get("quantity", 0)) > 0]
         if not valid_items:
@@ -2031,17 +2598,34 @@ class InventoryRepository:
 
         fees_value = fees if fees is not None else Decimal("0")
         shipping_cost_value = shipping_cost if shipping_cost is not None else Decimal("0")
+        shipping_label_cost_value = shipping_label_cost if shipping_label_cost is not None else None
         total_amount = subtotal
 
         order = Order(
             marketplace=marketplace,
             external_order_id=resolved_external_order_id,
             order_status=order_status,
+            buyer_username=(buyer_username or "").strip(),
+            buyer_name=(buyer_name or "").strip(),
+            buyer_email=(buyer_email or "").strip(),
+            ship_to_city=(ship_to_city or "").strip(),
+            ship_to_state=(ship_to_state or "").strip(),
+            ship_to_postal_code=(ship_to_postal_code or "").strip(),
+            ship_to_country=(ship_to_country or "").strip().upper(),
             subtotal_amount=subtotal,
             fees=fees_value,
             shipping_cost=shipping_cost_value,
+            shipping_label_cost=shipping_label_cost_value,
+            shipping_label_currency=(shipping_label_currency or "USD").strip().upper() or "USD",
+            shipping_provider=(shipping_provider or "").strip(),
+            shipping_service=(shipping_service or "").strip(),
+            tracking_number=(tracking_number or "").strip(),
+            tracking_status=(tracking_status or "").strip(),
+            shipped_at=shipped_at,
+            delivered_at=delivered_at,
             total_amount=total_amount,
             sold_at=sold_at,
+            marketplace_payload_json=marketplace_payload_json if str(marketplace_payload_json or "").strip() else "{}",
             notes=notes,
         )
         self.db.add(order)
@@ -2089,8 +2673,26 @@ class InventoryRepository:
     def list_orders(self) -> list[Order]:
         return self.db.scalars(select(Order).order_by(Order.sold_at.desc())).all()
 
+    def list_orders_by_ids(self, order_ids: set[int] | list[int] | tuple[int, ...]) -> list[Order]:
+        normalized_ids = sorted({int(v) for v in (order_ids or []) if v is not None})
+        if not normalized_ids:
+            return []
+        return self.db.scalars(
+            select(Order)
+            .where(Order.id.in_(normalized_ids))
+            .order_by(Order.sold_at.desc())
+        ).all()
+
     def list_order_items(self) -> list[OrderItem]:
         return self.db.scalars(select(OrderItem).order_by(OrderItem.created_at.desc())).all()
+
+    def list_order_items_for_listing(self, listing_id: int) -> list[OrderItem]:
+        listing_id_int = int(listing_id)
+        return self.db.scalars(
+            select(OrderItem)
+            .where(OrderItem.listing_id == listing_id_int)
+            .order_by(OrderItem.created_at.desc())
+        ).all()
 
     def update_order(self, order_id: int, updates: dict[str, Any], actor: str = "system") -> Order:
         order = self.db.get(Order, order_id)
@@ -2101,9 +2703,33 @@ class InventoryRepository:
         new_external_order_id = updates.get("external_order_id", order.external_order_id)
         new_fees = updates.get("fees", order.fees)
         new_shipping_cost = updates.get("shipping_cost", order.shipping_cost)
+        new_shipping_label_cost = updates.get("shipping_label_cost", order.shipping_label_cost)
+        new_tracking_number = updates.get("tracking_number", order.tracking_number)
+        new_tracking_status = updates.get("tracking_status", order.tracking_status)
+        new_shipped_at = updates.get("shipped_at", order.shipped_at)
+        new_delivered_at = updates.get("delivered_at", order.delivered_at)
         ValidationService.require_non_empty("Marketplace", new_marketplace)
         ValidationService.require_non_negative_decimal("Order fees", new_fees)
         ValidationService.require_non_negative_decimal("Order shipping cost", new_shipping_cost)
+        ValidationService.require_non_negative_decimal("Order shipping label cost", new_shipping_label_cost)
+        ValidationService.validate_tracking_number((new_tracking_number or "").strip())
+        ValidationService.validate_shipping_dates(new_tracking_status, new_shipped_at, new_delivered_at)
+        if "shipping_label_currency" in updates:
+            updates["shipping_label_currency"] = (
+                str(updates.get("shipping_label_currency") or "USD").strip().upper() or "USD"
+            )
+        if "ship_to_country" in updates:
+            updates["ship_to_country"] = str(updates.get("ship_to_country") or "").strip().upper()
+        for _field in (
+            "buyer_username",
+            "buyer_name",
+            "buyer_email",
+            "ship_to_city",
+            "ship_to_state",
+            "ship_to_postal_code",
+        ):
+            if _field in updates:
+                updates[_field] = str(updates.get(_field) or "").strip()
         ValidationService.ensure_unique_marketplace_order(
             self.db,
             new_marketplace,
@@ -2128,6 +2754,62 @@ class InventoryRepository:
             self.db.commit()
             self.db.refresh(order)
         return order
+
+    def replace_order_finance_entries(
+        self,
+        order_id: int,
+        entries: list[dict[str, Any]],
+        actor: str = "system",
+    ) -> int:
+        order = self.db.get(Order, int(order_id))
+        if order is None:
+            raise ValueError(f"Order {order_id} not found.")
+
+        self.db.execute(delete(OrderFinanceEntry).where(OrderFinanceEntry.order_id == order.id))
+        inserted = 0
+        for row in entries or []:
+            if not isinstance(row, dict):
+                continue
+            amount = Decimal(str(row.get("amount", 0) or 0))
+            if amount == 0:
+                continue
+            entry = OrderFinanceEntry(
+                order_id=order.id,
+                marketplace=(str(row.get("marketplace") or order.marketplace or "ebay").strip().lower() or "ebay"),
+                external_order_id=str(row.get("external_order_id") or order.external_order_id or "").strip(),
+                transaction_id=str(row.get("transaction_id") or "").strip(),
+                line_item_id=str(row.get("line_item_id") or "").strip(),
+                legacy_item_id=str(row.get("legacy_item_id") or "").strip(),
+                sku=str(row.get("sku") or "").strip(),
+                entry_kind=str(row.get("entry_kind") or "other").strip().lower() or "other",
+                fee_type=str(row.get("fee_type") or "").strip(),
+                amount=amount,
+                currency=(str(row.get("currency") or "USD").strip().upper() or "USD"),
+                booking_entry=str(row.get("booking_entry") or "").strip().upper(),
+                transaction_type=str(row.get("transaction_type") or "").strip().upper(),
+                transaction_status=str(row.get("transaction_status") or "").strip().upper(),
+                transaction_date=row.get("transaction_date"),
+                memo=str(row.get("memo") or "").strip(),
+                source=str(row.get("source") or "ebay_finances").strip(),
+                raw_json=json.dumps(row.get("raw") or {}, default=str),
+            )
+            self.db.add(entry)
+            inserted += 1
+
+        self._record_audit(
+            entity_type="order",
+            entity_id=order.id,
+            action="sync_finance_entries",
+            actor=actor,
+            changes={
+                "after": {
+                    "entry_count": inserted,
+                    "external_order_id": order.external_order_id,
+                }
+            },
+        )
+        self.db.commit()
+        return inserted
 
     def create_media_asset(
         self,
@@ -2273,22 +2955,104 @@ class InventoryRepository:
             self.db.refresh(row)
         return row
 
-    def list_media_assets(self) -> list[MediaAsset]:
-        return self.db.scalars(select(MediaAsset).order_by(MediaAsset.created_at.desc())).all()
+    def list_media_assets(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int | None = None,
+    ) -> list[MediaAsset]:
+        query = select(MediaAsset)
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        query = query.order_by(MediaAsset.created_at.desc())
+        if limit is not None:
+            query = query.limit(max(1, int(limit)))
+        return self.db.scalars(query).all()
 
-    def list_media_assets_for_product(self, product_id: int) -> list[MediaAsset]:
-        return self.db.scalars(
-            select(MediaAsset)
-            .where(MediaAsset.product_id == product_id)
-            .order_by(MediaAsset.created_at.desc())
-        ).all()
+    def list_media_assets_for_product(
+        self,
+        product_id: int,
+        *,
+        include_archived: bool = False,
+    ) -> list[MediaAsset]:
+        query = select(MediaAsset).where(MediaAsset.product_id == product_id)
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        return self.db.scalars(query.order_by(MediaAsset.created_at.desc())).all()
 
-    def list_media_assets_for_listing(self, listing_id: int) -> list[MediaAsset]:
-        return self.db.scalars(
-            select(MediaAsset)
-            .where(MediaAsset.listing_id == listing_id)
-            .order_by(MediaAsset.created_at.desc())
-        ).all()
+    def list_media_assets_for_listing(
+        self,
+        listing_id: int,
+        *,
+        include_archived: bool = False,
+    ) -> list[MediaAsset]:
+        query = select(MediaAsset).where(MediaAsset.listing_id == listing_id)
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        return self.db.scalars(query.order_by(MediaAsset.created_at.desc())).all()
+
+    def count_media_assets_for_listing(
+        self,
+        listing_id: int,
+        *,
+        include_archived: bool = False,
+    ) -> int:
+        query = select(func.count()).select_from(MediaAsset).where(MediaAsset.listing_id == int(listing_id))
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        return int(self.db.scalar(query) or 0)
+
+    def list_media_assets_by_ids(
+        self,
+        media_ids: list[int],
+        *,
+        include_archived: bool = True,
+    ) -> list[MediaAsset]:
+        normalized_ids = sorted({int(v) for v in (media_ids or []) if int(v) > 0})
+        if not normalized_ids:
+            return []
+        query = select(MediaAsset).where(MediaAsset.id.in_(normalized_ids))
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        return self.db.scalars(query.order_by(MediaAsset.created_at.desc())).all()
+
+    def list_unlinked_product_media_ids(
+        self,
+        product_id: int,
+        *,
+        include_archived: bool = False,
+    ) -> list[int]:
+        query = select(MediaAsset.id).where(
+            MediaAsset.product_id == int(product_id),
+            MediaAsset.listing_id.is_(None),
+        )
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        rows = self.db.execute(query).all()
+        return [int(getattr(row, "id", 0) or 0) for row in rows if int(getattr(row, "id", 0) or 0) > 0]
+
+    def listing_media_count_map(
+        self,
+        *,
+        listing_ids: list[int] | None = None,
+        include_archived: bool = False,
+    ) -> dict[int, int]:
+        query = select(
+            MediaAsset.listing_id,
+            func.count(MediaAsset.id).label("media_count"),
+        ).where(MediaAsset.listing_id.is_not(None))
+        if not include_archived:
+            query = query.where(MediaAsset.is_archived.is_(False))
+        normalized_ids = [int(v) for v in (listing_ids or []) if int(v) > 0]
+        if normalized_ids:
+            query = query.where(MediaAsset.listing_id.in_(normalized_ids))
+        query = query.group_by(MediaAsset.listing_id)
+        rows = self.db.execute(query).all()
+        return {
+            int(getattr(row, "listing_id", 0) or 0): int(getattr(row, "media_count", 0) or 0)
+            for row in rows
+            if int(getattr(row, "listing_id", 0) or 0) > 0
+        }
 
     def create_purchase_lot(
         self,
@@ -2472,6 +3236,129 @@ class InventoryRepository:
             self.db.refresh(lot)
         return lot
 
+    def get_purchase_lot_archive_blockers(self, lot_id: int) -> dict[str, int]:
+        lot = self.db.get(PurchaseLot, int(lot_id))
+        if lot is None:
+            raise ValueError(f"Purchase lot {lot_id} not found.")
+        lot_id_int = int(lot.id)
+        assignments_count = int(
+            self.db.scalar(
+                select(func.count()).select_from(ProductLotAssignment).where(ProductLotAssignment.lot_id == lot_id_int)
+            )
+            or 0
+        )
+        documents_count = int(
+            self.db.scalar(select(func.count()).select_from(PurchaseDocument).where(PurchaseDocument.lot_id == lot_id_int))
+            or 0
+        )
+        active_products_count = int(
+            self.db.scalar(
+                select(func.count())
+                .select_from(Product)
+                .join(ProductLotAssignment, ProductLotAssignment.product_id == Product.id)
+                .where(
+                    ProductLotAssignment.lot_id == lot_id_int,
+                    func.lower(func.trim(func.coalesce(cast(Product.status, String), ""))) != "archived",
+                )
+            )
+            or 0
+        )
+        active_listings_count = int(
+            self.db.scalar(
+                select(func.count())
+                .select_from(MarketplaceListing)
+                .join(ProductLotAssignment, ProductLotAssignment.product_id == MarketplaceListing.product_id)
+                .where(
+                    ProductLotAssignment.lot_id == lot_id_int,
+                    func.lower(func.trim(func.coalesce(cast(MarketplaceListing.listing_status, String), ""))) == "active",
+                )
+            )
+            or 0
+        )
+        return {
+            "product_assignments": assignments_count,
+            "purchase_documents": documents_count,
+            "active_products": active_products_count,
+            "active_listings": active_listings_count,
+        }
+
+    def archive_purchase_lot(
+        self,
+        lot_id: int,
+        *,
+        actor: str = "system",
+        reason: str = "",
+        force: bool = False,
+    ) -> PurchaseLot:
+        lot = self.db.get(PurchaseLot, int(lot_id))
+        if lot is None:
+            raise ValueError(f"Purchase lot {lot_id} not found.")
+        blockers = self.get_purchase_lot_archive_blockers(int(lot.id))
+        has_blockers = any(int(v or 0) > 0 for v in blockers.values())
+        if has_blockers and not bool(force):
+            raise ValueError(
+                "Cannot archive lot with linked records. "
+                "Use force=True to confirm archive despite dependencies."
+            )
+
+        notes_raw = str(lot.notes or "").strip()
+        notes_obj: dict[str, Any] = {}
+        if notes_raw:
+            try:
+                parsed = json.loads(notes_raw)
+                if isinstance(parsed, dict):
+                    notes_obj = parsed
+                else:
+                    notes_obj = {"notes": notes_raw}
+            except Exception:
+                notes_obj = {"notes": notes_raw}
+
+        lifecycle = notes_obj.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+        lifecycle["archived"] = True
+        lifecycle["archived_at"] = utcnow_naive().isoformat()
+        lifecycle["archived_by"] = (actor or "system").strip() or "system"
+        lifecycle["archive_reason"] = str(reason or "").strip()
+        lifecycle["archive_forced"] = bool(force)
+        lifecycle["archive_blockers"] = blockers
+        notes_obj["lifecycle"] = lifecycle
+        return self.update_purchase_lot(
+            int(lot_id),
+            {"notes": json.dumps(notes_obj, indent=2)},
+            actor=actor,
+        )
+
+    def restore_purchase_lot(self, lot_id: int, *, actor: str = "system") -> PurchaseLot:
+        lot = self.db.get(PurchaseLot, int(lot_id))
+        if lot is None:
+            raise ValueError(f"Purchase lot {lot_id} not found.")
+
+        notes_raw = str(lot.notes or "").strip()
+        notes_obj: dict[str, Any] = {}
+        if notes_raw:
+            try:
+                parsed = json.loads(notes_raw)
+                if isinstance(parsed, dict):
+                    notes_obj = parsed
+                else:
+                    notes_obj = {"notes": notes_raw}
+            except Exception:
+                notes_obj = {"notes": notes_raw}
+
+        lifecycle = notes_obj.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+        lifecycle["archived"] = False
+        lifecycle["restored_at"] = utcnow_naive().isoformat()
+        lifecycle["restored_by"] = (actor or "system").strip() or "system"
+        notes_obj["lifecycle"] = lifecycle
+        return self.update_purchase_lot(
+            int(lot_id),
+            {"notes": json.dumps(notes_obj, indent=2)},
+            actor=actor,
+        )
+
     def assign_product_to_lot(
         self,
         product_id: int,
@@ -2547,6 +3434,10 @@ class InventoryRepository:
         product_id: int,
         quantity_acquired: int,
         unit_cost: Decimal | None,
+        unit_tax_paid: Decimal | None = None,
+        unit_shipping_paid: Decimal | None = None,
+        unit_handling_paid: Decimal | None = None,
+        unit_product_cost: Decimal | None = None,
         acquired_at: datetime | None = None,
         lot_id: int | None = None,
         notes: str = "",
@@ -2557,6 +3448,10 @@ class InventoryRepository:
             raise ValueError(f"Product {product_id} not found.")
         ValidationService.require_positive_int("Repurchase quantity", quantity_acquired, min_value=1)
         ValidationService.require_non_negative_decimal("Repurchase unit cost", unit_cost)
+        ValidationService.require_non_negative_decimal("Repurchase unit tax paid", unit_tax_paid)
+        ValidationService.require_non_negative_decimal("Repurchase unit shipping paid", unit_shipping_paid)
+        ValidationService.require_non_negative_decimal("Repurchase unit handling paid", unit_handling_paid)
+        ValidationService.require_non_negative_decimal("Repurchase unit product cost", unit_product_cost)
 
         occurred = acquired_at or utcnow_naive()
         qty_before = int(product.current_quantity or 0)
@@ -2564,37 +3459,77 @@ class InventoryRepository:
 
         assignment = None
         allocated_cost = (unit_cost * int(quantity_acquired)) if unit_cost is not None else None
+        allocated_tax_paid = (unit_tax_paid * int(quantity_acquired)) if unit_tax_paid is not None else None
+        allocated_shipping_paid = (
+            (unit_shipping_paid * int(quantity_acquired)) if unit_shipping_paid is not None else None
+        )
+        allocated_handling_paid = (
+            (unit_handling_paid * int(quantity_acquired)) if unit_handling_paid is not None else None
+        )
         if lot_id is not None:
             assignment = ProductLotAssignment(
                 product_id=product.id,
                 lot_id=lot_id,
                 quantity_acquired=int(quantity_acquired),
                 unit_cost=unit_cost,
+                unit_tax_paid=unit_tax_paid,
+                unit_shipping_paid=unit_shipping_paid,
+                unit_handling_paid=unit_handling_paid,
                 allocated_cost=allocated_cost,
+                allocated_tax_paid=allocated_tax_paid,
+                allocated_shipping_paid=allocated_shipping_paid,
+                allocated_handling_paid=allocated_handling_paid,
                 acquired_at=occurred,
             )
             self.db.add(assignment)
             self.db.flush()
 
+        def _weighted_average(
+            existing_value: Decimal | None,
+            new_value: Decimal | None,
+        ) -> Decimal | None:
+            resolved_existing = existing_value if existing_value is not None else Decimal("0")
+            if new_value is None:
+                return existing_value
+            if qty_before > 0:
+                weighted_total = (resolved_existing * qty_before) + (new_value * int(quantity_acquired))
+                return weighted_total / Decimal(qty_after)
+            return new_value
+
         existing_unit_cost = product.acquisition_cost
-        new_unit_cost = existing_unit_cost
-        if unit_cost is not None:
-            if existing_unit_cost is not None and qty_before > 0:
-                weighted_total = (existing_unit_cost * qty_before) + (unit_cost * int(quantity_acquired))
-                new_unit_cost = weighted_total / Decimal(qty_after)
-            else:
-                new_unit_cost = unit_cost
+        existing_unit_tax = product.acquisition_tax_paid
+        existing_unit_shipping = product.acquisition_shipping_paid
+        existing_unit_handling = product.acquisition_handling_paid
+        existing_unit_product_cost = product.product_cost
+
+        new_unit_cost = _weighted_average(existing_unit_cost, unit_cost)
+        new_unit_tax = _weighted_average(existing_unit_tax, unit_tax_paid)
+        new_unit_shipping = _weighted_average(existing_unit_shipping, unit_shipping_paid)
+        new_unit_handling = _weighted_average(existing_unit_handling, unit_handling_paid)
+        if unit_product_cost is None:
+            unit_product_cost = unit_cost
+        new_unit_product_cost = _weighted_average(existing_unit_product_cost, unit_product_cost)
 
         product.current_quantity = qty_after
         product.acquisition_cost = new_unit_cost
+        product.acquisition_tax_paid = new_unit_tax
+        product.acquisition_shipping_paid = new_unit_shipping
+        product.acquisition_handling_paid = new_unit_handling
+        product.product_cost = new_unit_product_cost
         product.acquired_at = occurred
+        landed_unit_cost = self._landed_unit_cost_decimal(
+            unit_cost=unit_cost,
+            unit_tax_paid=unit_tax_paid,
+            unit_shipping_paid=unit_shipping_paid,
+            unit_handling_paid=unit_handling_paid,
+        )
 
         self._record_inventory_movement(
             product_id=product.id,
             movement_type="repurchase_in",
             quantity_before=qty_before,
             quantity_after=qty_after,
-            unit_cost=unit_cost,
+            unit_cost=(landed_unit_cost if landed_unit_cost is not None else unit_cost),
             reference_type="purchase_lot" if assignment is not None else "product",
             reference_id=(assignment.id if assignment is not None else product.id),
             notes=(notes or "").strip() or "Repurchase/restock recorded for existing product.",
@@ -2611,10 +3546,34 @@ class InventoryRepository:
                     "before": self._serialize_audit_value(existing_unit_cost),
                     "after": self._serialize_audit_value(new_unit_cost),
                 },
+                "acquisition_tax_paid": {
+                    "before": self._serialize_audit_value(existing_unit_tax),
+                    "after": self._serialize_audit_value(new_unit_tax),
+                },
+                "acquisition_shipping_paid": {
+                    "before": self._serialize_audit_value(existing_unit_shipping),
+                    "after": self._serialize_audit_value(new_unit_shipping),
+                },
+                "acquisition_handling_paid": {
+                    "before": self._serialize_audit_value(existing_unit_handling),
+                    "after": self._serialize_audit_value(new_unit_handling),
+                },
+                "product_cost": {
+                    "before": self._serialize_audit_value(existing_unit_product_cost),
+                    "after": self._serialize_audit_value(new_unit_product_cost),
+                },
                 "repurchase": {
                     "quantity_acquired": int(quantity_acquired),
                     "unit_cost": self._serialize_audit_value(unit_cost),
                     "allocated_cost": self._serialize_audit_value(allocated_cost),
+                    "unit_tax_paid": self._serialize_audit_value(unit_tax_paid),
+                    "unit_shipping_paid": self._serialize_audit_value(unit_shipping_paid),
+                    "unit_handling_paid": self._serialize_audit_value(unit_handling_paid),
+                    "unit_product_cost": self._serialize_audit_value(unit_product_cost),
+                    "allocated_tax_paid": self._serialize_audit_value(allocated_tax_paid),
+                    "allocated_shipping_paid": self._serialize_audit_value(allocated_shipping_paid),
+                    "allocated_handling_paid": self._serialize_audit_value(allocated_handling_paid),
+                    "landed_unit_cost": self._serialize_audit_value(landed_unit_cost),
                     "lot_id": lot_id,
                     "product_lot_assignment_id": (assignment.id if assignment is not None else None),
                     "notes": (notes or "").strip(),
@@ -2634,6 +3593,824 @@ class InventoryRepository:
         return self.db.scalars(
             select(InventoryMovement).order_by(InventoryMovement.occurred_at.desc()).limit(limit)
         ).all()
+
+    def report_inventory_movement_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                InventoryMovement.id.label("movement_id"),
+                InventoryMovement.occurred_at.label("occurred_at"),
+                InventoryMovement.product_id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                cast(InventoryMovement.movement_type, String).label("movement_type"),
+                InventoryMovement.quantity_delta.label("quantity_delta"),
+                InventoryMovement.quantity_before.label("quantity_before"),
+                InventoryMovement.quantity_after.label("quantity_after"),
+                InventoryMovement.unit_cost.label("unit_cost"),
+                InventoryMovement.reference_type.label("reference_type"),
+                InventoryMovement.reference_id.label("reference_id"),
+                InventoryMovement.notes.label("notes"),
+            )
+            .select_from(InventoryMovement)
+            .join(Product, Product.id == InventoryMovement.product_id, isouter=True)
+            .where(
+                or_(
+                    InventoryMovement.occurred_at.is_(None),
+                    InventoryMovement.occurred_at.between(start_dt, end_dt),
+                )
+            )
+            .order_by(InventoryMovement.occurred_at.desc(), InventoryMovement.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "movement_id": int(row.movement_id or 0),
+                    "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+                    "product_id": int(row.product_id) if row.product_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "movement_type": str(row.movement_type or "").strip(),
+                    "quantity_delta": int(row.quantity_delta or 0),
+                    "quantity_before": int(row.quantity_before or 0),
+                    "quantity_after": int(row.quantity_after or 0),
+                    "unit_cost": float(row.unit_cost) if row.unit_cost is not None else None,
+                    "reference_type": str(row.reference_type or "").strip() or None,
+                    "reference_id": int(row.reference_id) if row.reference_id is not None else None,
+                    "notes": str(row.notes or "").strip(),
+                }
+            )
+        return output
+
+    def report_orders_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        item_count_sq = (
+            select(
+                OrderItem.order_id.label("order_id"),
+                func.count(OrderItem.id).label("item_count"),
+            )
+            .group_by(OrderItem.order_id)
+            .subquery()
+        )
+        query = (
+            select(
+                Order.id.label("order_id"),
+                Order.sold_at.label("sold_at"),
+                Order.marketplace.label("marketplace"),
+                Order.external_order_id.label("external_order_id"),
+                Order.order_status.label("status"),
+                Order.subtotal_amount.label("subtotal_amount"),
+                Order.fees.label("fees"),
+                Order.shipping_cost.label("shipping_cost"),
+                Order.shipping_label_cost.label("shipping_label_cost"),
+                Order.shipping_label_currency.label("shipping_label_currency"),
+                Order.total_amount.label("total_amount"),
+                func.coalesce(item_count_sq.c.item_count, 0).label("item_count"),
+                Order.notes.label("notes"),
+            )
+            .select_from(Order)
+            .join(item_count_sq, item_count_sq.c.order_id == Order.id, isouter=True)
+            .where(Order.sold_at.between(start_dt, end_dt))
+            .order_by(Order.sold_at.desc(), Order.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            shipping_cost = float(row.shipping_cost or 0)
+            label_cost = float(row.shipping_label_cost or 0)
+            output.append(
+                {
+                    "order_id": int(row.order_id or 0),
+                    "sold_at": row.sold_at.isoformat() if row.sold_at else None,
+                    "marketplace": str(row.marketplace or "").strip(),
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "status": str(row.status or "").strip(),
+                    "subtotal_amount": float(row.subtotal_amount or 0),
+                    "fees": float(row.fees or 0),
+                    "shipping_cost": shipping_cost,
+                    "shipping_label_cost": label_cost,
+                    "shipping_label_currency": str(row.shipping_label_currency or "").strip(),
+                    "shipping_delta_charged_minus_actual": round(shipping_cost - label_cost, 2),
+                    "total_amount": float(row.total_amount or 0),
+                    "item_count": int(row.item_count or 0),
+                    "notes": str(row.notes or "").strip(),
+                }
+            )
+        return output
+
+    def report_order_items_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                OrderItem.id.label("order_item_id"),
+                OrderItem.order_id.label("order_id"),
+                Order.sold_at.label("sold_at"),
+                Order.marketplace.label("marketplace"),
+                Order.external_order_id.label("external_order_id"),
+                OrderItem.product_id.label("product_id"),
+                OrderItem.listing_id.label("listing_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                OrderItem.quantity.label("quantity"),
+                OrderItem.unit_price.label("unit_price"),
+                OrderItem.line_total.label("line_total"),
+                OrderItem.line_fees.label("line_fees"),
+                OrderItem.line_shipping.label("line_shipping"),
+                OrderItem.notes.label("notes"),
+            )
+            .select_from(OrderItem)
+            .join(Order, Order.id == OrderItem.order_id)
+            .join(Product, Product.id == OrderItem.product_id, isouter=True)
+            .where(Order.sold_at.between(start_dt, end_dt))
+            .order_by(Order.sold_at.desc(), OrderItem.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "order_item_id": int(row.order_item_id or 0),
+                    "order_id": int(row.order_id or 0),
+                    "sold_at": row.sold_at.isoformat() if row.sold_at else None,
+                    "marketplace": str(row.marketplace or "").strip() or None,
+                    "external_order_id": str(row.external_order_id or "").strip() or None,
+                    "product_id": int(row.product_id) if row.product_id is not None else None,
+                    "listing_id": int(row.listing_id) if row.listing_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "quantity": int(row.quantity or 0),
+                    "unit_price": float(row.unit_price or 0),
+                    "line_total": float(row.line_total or 0),
+                    "line_fees": float(row.line_fees or 0),
+                    "line_shipping": float(row.line_shipping or 0),
+                    "notes": str(row.notes or "").strip(),
+                }
+            )
+        return output
+
+    def report_products_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                Product.id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("title"),
+                Product.description.label("description"),
+                Product.category.label("category"),
+                Product.metal_type.label("metal_type"),
+                Product.current_quantity.label("current_quantity"),
+                Product.acquisition_cost.label("acquisition_cost"),
+                Product.acquired_at.label("acquired_at"),
+                Product.acquisition_tax_paid.label("acquisition_tax_paid"),
+                Product.acquisition_shipping_paid.label("acquisition_shipping_paid"),
+                Product.acquisition_handling_paid.label("acquisition_handling_paid"),
+                Product.weight_oz.label("weight_oz"),
+                Product.package_weight_oz.label("package_weight_oz"),
+                Product.package_length_in.label("package_length_in"),
+                Product.package_width_in.label("package_width_in"),
+                Product.package_height_in.label("package_height_in"),
+            )
+            .select_from(Product)
+            .where(
+                or_(
+                    Product.acquired_at.between(start_dt, end_dt),
+                    and_(
+                        Product.acquired_at.is_(None),
+                        Product.created_at.between(start_dt, end_dt),
+                    ),
+                )
+            )
+            .order_by(Product.acquired_at.desc(), Product.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "product_id": int(row.product_id or 0),
+                    "sku": str(row.sku or "").strip() or None,
+                    "title": str(row.title or "").strip() or None,
+                    "description": str(row.description or "").strip(),
+                    "category": str(row.category or "").strip(),
+                    "metal_type": str(row.metal_type or "").strip(),
+                    "current_quantity": int(row.current_quantity or 0),
+                    "acquisition_cost": float(row.acquisition_cost) if row.acquisition_cost is not None else None,
+                    "acquired_at": row.acquired_at.isoformat() if row.acquired_at else None,
+                    "acquisition_tax_paid": (
+                        float(row.acquisition_tax_paid) if row.acquisition_tax_paid is not None else None
+                    ),
+                    "acquisition_shipping_paid": (
+                        float(row.acquisition_shipping_paid)
+                        if row.acquisition_shipping_paid is not None
+                        else None
+                    ),
+                    "acquisition_handling_paid": (
+                        float(row.acquisition_handling_paid)
+                        if row.acquisition_handling_paid is not None
+                        else None
+                    ),
+                    "weight_oz": float(row.weight_oz) if row.weight_oz is not None else None,
+                    "package_weight_oz": (
+                        float(row.package_weight_oz) if row.package_weight_oz is not None else None
+                    ),
+                    "package_length_in": float(row.package_length_in) if row.package_length_in is not None else None,
+                    "package_width_in": float(row.package_width_in) if row.package_width_in is not None else None,
+                    "package_height_in": float(row.package_height_in) if row.package_height_in is not None else None,
+                }
+            )
+        return output
+
+    def report_listings_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                MarketplaceListing.id.label("listing_id"),
+                MarketplaceListing.listed_at.label("listed_at"),
+                MarketplaceListing.marketplace.label("marketplace"),
+                MarketplaceListing.product_id.label("product_id"),
+                Product.sku.label("sku"),
+                MarketplaceListing.listing_title.label("listing_title"),
+                MarketplaceListing.listing_status.label("listing_status"),
+                MarketplaceListing.marketplace_url.label("marketplace_url"),
+                MarketplaceListing.marketplace_details.label("marketplace_details"),
+                MarketplaceListing.quantity_listed.label("quantity_listed"),
+                MarketplaceListing.listing_price.label("listing_price"),
+                MarketplaceListing.external_listing_id.label("external_listing_id"),
+            )
+            .select_from(MarketplaceListing)
+            .join(Product, Product.id == MarketplaceListing.product_id, isouter=True)
+            .where(
+                or_(
+                    MarketplaceListing.listed_at.between(start_dt, end_dt),
+                    and_(
+                        MarketplaceListing.listed_at.is_(None),
+                        MarketplaceListing.created_at.between(start_dt, end_dt),
+                    ),
+                )
+            )
+            .order_by(MarketplaceListing.listed_at.desc(), MarketplaceListing.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "listing_id": int(row.listing_id or 0),
+                    "listed_at": row.listed_at.isoformat() if row.listed_at else None,
+                    "marketplace": str(row.marketplace or "").strip() or None,
+                    "product_id": int(row.product_id) if row.product_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "listing_title": str(row.listing_title or "").strip() or None,
+                    "listing_status": str(row.listing_status or "").strip() or None,
+                    "marketplace_url": str(row.marketplace_url or "").strip(),
+                    "marketplace_details": str(row.marketplace_details or "").strip(),
+                    "quantity_listed": int(row.quantity_listed or 0),
+                    "listing_price": float(row.listing_price or 0),
+                    "external_listing_id": str(row.external_listing_id or "").strip(),
+                }
+            )
+        return output
+
+    def report_sales_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.marketplace.label("marketplace"),
+                Sale.order_id.label("order_id"),
+                Sale.product_id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                Product.acquisition_cost.label("product_acquisition_cost"),
+                Sale.listing_id.label("listing_id"),
+                Sale.external_order_id.label("external_order_id"),
+                Sale.quantity_sold.label("quantity_sold"),
+                Sale.sold_price.label("sold_price"),
+                Sale.fees.label("fees"),
+                Sale.shipping_cost.label("shipping_cost"),
+                Sale.shipping_provider.label("shipping_provider"),
+                Sale.shipping_service.label("shipping_service"),
+                Sale.shipping_package_type.label("shipping_package_type"),
+                Sale.tracking_number.label("tracking_number"),
+                Sale.tracking_status.label("tracking_status"),
+                Sale.shipping_exception_code.label("shipping_exception_code"),
+                Sale.shipping_exception_action.label("shipping_exception_action"),
+                Sale.shipping_exception_notes.label("shipping_exception_notes"),
+                Sale.shipping_exception_resolved_at.label("shipping_exception_resolved_at"),
+                Sale.shipping_exception_resolved_by.label("shipping_exception_resolved_by"),
+                Sale.shipment_exported_at.label("shipment_exported_at"),
+                Sale.shipped_at.label("shipped_at"),
+                Sale.delivered_at.label("delivered_at"),
+                Sale.shipping_label_cost.label("shipping_label_cost"),
+            )
+            .select_from(Sale)
+            .join(Product, Product.id == Sale.product_id, isouter=True)
+            .where(Sale.sold_at.between(start_dt, end_dt))
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "sale_id": int(row.sale_id or 0),
+                    "sold_at": row.sold_at.isoformat() if row.sold_at else None,
+                    "marketplace": str(row.marketplace or "").strip() or None,
+                    "order_id": int(row.order_id) if row.order_id is not None else None,
+                    "product_id": int(row.product_id) if row.product_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "product_acquisition_cost": (
+                        float(row.product_acquisition_cost)
+                        if row.product_acquisition_cost is not None
+                        else None
+                    ),
+                    "listing_id": int(row.listing_id) if row.listing_id is not None else None,
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "quantity_sold": int(row.quantity_sold or 0),
+                    "sold_price": float(row.sold_price or 0),
+                    "fees": float(row.fees or 0),
+                    "shipping_cost": float(row.shipping_cost or 0),
+                    "shipping_provider": str(row.shipping_provider or "").strip(),
+                    "shipping_service": str(row.shipping_service or "").strip(),
+                    "shipping_package_type": str(row.shipping_package_type or "").strip(),
+                    "tracking_number": str(row.tracking_number or "").strip(),
+                    "tracking_status": str(row.tracking_status or "").strip(),
+                    "shipping_exception_code": str(row.shipping_exception_code or "").strip(),
+                    "shipping_exception_action": str(row.shipping_exception_action or "").strip(),
+                    "shipping_exception_notes": str(row.shipping_exception_notes or "").strip(),
+                    "shipping_exception_resolved_at": (
+                        row.shipping_exception_resolved_at.isoformat()
+                        if row.shipping_exception_resolved_at
+                        else None
+                    ),
+                    "shipping_exception_resolved_by": str(row.shipping_exception_resolved_by or "").strip(),
+                    "shipment_exported_at": row.shipment_exported_at.isoformat() if row.shipment_exported_at else None,
+                    "shipped_at": row.shipped_at.isoformat() if row.shipped_at else None,
+                    "delivered_at": row.delivered_at.isoformat() if row.delivered_at else None,
+                    "shipping_label_cost": (
+                        float(row.shipping_label_cost)
+                        if row.shipping_label_cost is not None
+                        else None
+                    ),
+                }
+            )
+        return output
+
+    def report_returns_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                ReturnRecord.id.label("return_id"),
+                ReturnRecord.returned_at.label("returned_at"),
+                ReturnRecord.processed_at.label("processed_at"),
+                ReturnRecord.marketplace.label("marketplace"),
+                ReturnRecord.external_return_id.label("external_return_id"),
+                ReturnRecord.sale_id.label("sale_id"),
+                ReturnRecord.order_id.label("order_id"),
+                ReturnRecord.product_id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                ReturnRecord.return_status.label("status"),
+                ReturnRecord.reason.label("reason"),
+                ReturnRecord.disposition.label("disposition"),
+                ReturnRecord.quantity.label("quantity"),
+                ReturnRecord.refund_amount.label("refund_amount"),
+                ReturnRecord.refund_fees.label("refund_fees"),
+                ReturnRecord.refund_shipping.label("refund_shipping"),
+                ReturnRecord.restocked.label("restocked"),
+                ReturnRecord.notes.label("notes"),
+                Sale.external_order_id.label("source_order"),
+            )
+            .select_from(ReturnRecord)
+            .join(Product, Product.id == ReturnRecord.product_id, isouter=True)
+            .join(Sale, Sale.id == ReturnRecord.sale_id, isouter=True)
+            .where(ReturnRecord.returned_at.between(start_dt, end_dt))
+            .order_by(ReturnRecord.returned_at.desc(), ReturnRecord.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "return_id": int(row.return_id or 0),
+                    "returned_at": row.returned_at.isoformat() if row.returned_at else None,
+                    "processed_at": row.processed_at.isoformat() if row.processed_at else None,
+                    "marketplace": str(row.marketplace or "").strip(),
+                    "external_return_id": str(row.external_return_id or "").strip(),
+                    "sale_id": int(row.sale_id) if row.sale_id is not None else None,
+                    "order_id": int(row.order_id) if row.order_id is not None else None,
+                    "product_id": int(row.product_id) if row.product_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "status": str(row.status or "").strip(),
+                    "reason": str(row.reason or "").strip(),
+                    "disposition": str(row.disposition or "").strip(),
+                    "quantity": int(row.quantity or 0),
+                    "refund_amount": float(row.refund_amount or 0),
+                    "refund_fees": float(row.refund_fees or 0),
+                    "refund_shipping": float(row.refund_shipping or 0),
+                    "restocked": bool(row.restocked),
+                    "notes": str(row.notes or "").strip(),
+                    "source_order": str(row.source_order or "").strip(),
+                }
+            )
+        return output
+
+    def report_lot_assignment_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                ProductLotAssignment.id.label("assignment_id"),
+                PurchaseLot.lot_code.label("lot_code"),
+                InventorySource.name.label("source_name"),
+                InventorySource.source_type.label("source_type"),
+                PurchaseLot.vendor.label("vendor"),
+                PurchaseLot.purchase_date.label("purchase_date"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                ProductLotAssignment.unit_cost.label("unit_cost"),
+                ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                ProductLotAssignment.acquired_at.label("acquired_at"),
+            )
+            .select_from(ProductLotAssignment)
+            .join(PurchaseLot, PurchaseLot.id == ProductLotAssignment.lot_id, isouter=True)
+            .join(InventorySource, InventorySource.id == PurchaseLot.source_id, isouter=True)
+            .join(Product, Product.id == ProductLotAssignment.product_id, isouter=True)
+            .where(
+                or_(
+                    ProductLotAssignment.acquired_at.between(start_dt, end_dt),
+                    and_(
+                        ProductLotAssignment.acquired_at.is_(None),
+                        ProductLotAssignment.created_at.between(start_dt, end_dt),
+                    ),
+                )
+            )
+            .order_by(ProductLotAssignment.acquired_at.desc(), ProductLotAssignment.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        output: list[dict] = []
+        for row in rows:
+            output.append(
+                {
+                    "assignment_id": int(row.assignment_id or 0),
+                    "lot_code": str(row.lot_code or "").strip() or None,
+                    "source_name": str(row.source_name or "").strip() or None,
+                    "source_type": str(row.source_type or "").strip() or None,
+                    "vendor": str(row.vendor or "").strip() or None,
+                    "purchase_date": row.purchase_date.isoformat() if row.purchase_date else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "quantity_acquired": int(row.quantity_acquired or 0),
+                    "unit_cost": float(row.unit_cost) if row.unit_cost is not None else None,
+                    "allocated_cost": float(row.allocated_cost) if row.allocated_cost is not None else None,
+                    "acquired_at": row.acquired_at.isoformat() if row.acquired_at else None,
+                }
+            )
+        return output
+
+    def lot_profitability_snapshot(self, lot_id: int) -> dict[str, Any]:
+        lot = self.db.get(PurchaseLot, int(lot_id))
+        if lot is None:
+            raise ValueError(f"Purchase lot {int(lot_id)} not found.")
+        assignment_rows = self.db.execute(
+            select(
+                ProductLotAssignment.product_id.label("product_id"),
+                ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
+                ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
+                ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                ProductLotAssignment.unit_cost.label("unit_cost"),
+                ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
+                ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
+                ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+            )
+            .select_from(ProductLotAssignment)
+            .join(Product, Product.id == ProductLotAssignment.product_id, isouter=True)
+            .where(ProductLotAssignment.lot_id == int(lot_id))
+        ).all()
+        if not assignment_rows:
+            return {
+                "lot_id": int(lot.id),
+                "lot_code": str(lot.lot_code or "").strip(),
+                "vendor": str(lot.vendor or "").strip(),
+                "purchase_date": lot.purchase_date.isoformat() if lot.purchase_date else None,
+                "summary": {
+                    "assigned_products": 0,
+                    "assigned_qty": 0,
+                    "allocated_landed_cost": 0.0,
+                    "estimated_gross_sales": 0.0,
+                    "estimated_net_before_cogs": 0.0,
+                    "estimated_lot_cogs": 0.0,
+                    "estimated_lot_profit": 0.0,
+                },
+                "rows": [],
+            }
+
+        product_rollup: dict[int, dict[str, Any]] = {}
+        for row in assignment_rows:
+            product_id = int(row.product_id or 0)
+            if product_id <= 0:
+                continue
+            qty = max(0, int(row.quantity_acquired or 0))
+            allocated_landed = (
+                float(row.allocated_cost or 0)
+                + float(row.allocated_tax_paid or 0)
+                + float(row.allocated_shipping_paid or 0)
+                + float(row.allocated_handling_paid or 0)
+            )
+            unit_landed = (
+                float(row.unit_cost or 0)
+                + float(row.unit_tax_paid or 0)
+                + float(row.unit_shipping_paid or 0)
+                + float(row.unit_handling_paid or 0)
+            )
+            if unit_landed <= 0 and qty > 0 and allocated_landed > 0:
+                unit_landed = allocated_landed / float(qty)
+            current = product_rollup.setdefault(
+                product_id,
+                {
+                    "product_id": product_id,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "assigned_qty": 0,
+                    "allocated_landed_cost": 0.0,
+                    "unit_landed_cost": 0.0,
+                },
+            )
+            current["assigned_qty"] += int(qty)
+            current["allocated_landed_cost"] += float(allocated_landed or 0.0)
+            if current["assigned_qty"] > 0:
+                current["unit_landed_cost"] = (
+                    float(current["allocated_landed_cost"]) / float(current["assigned_qty"])
+                )
+            elif unit_landed > 0:
+                current["unit_landed_cost"] = float(unit_landed)
+
+        product_ids = [int(pid) for pid in product_rollup.keys()]
+        sales_rows = []
+        if product_ids:
+            sales_rows = self.db.execute(
+                select(
+                    Sale.product_id.label("product_id"),
+                    func.coalesce(func.sum(Sale.quantity_sold), 0).label("qty_sold"),
+                    func.coalesce(func.sum(Sale.sold_price), 0).label("gross_sales"),
+                    func.coalesce(func.sum(Sale.fees), 0).label("fees"),
+                    func.coalesce(func.sum(Sale.shipping_cost), 0).label("shipping_cost"),
+                )
+                .select_from(Sale)
+                .where(Sale.product_id.in_(product_ids))
+                .group_by(Sale.product_id)
+            ).all()
+        sales_map = {
+            int(row.product_id): {
+                "qty_sold": int(row.qty_sold or 0),
+                "gross_sales": float(row.gross_sales or 0),
+                "fees": float(row.fees or 0),
+                "shipping_cost": float(row.shipping_cost or 0),
+            }
+            for row in sales_rows
+            if int(row.product_id or 0) > 0
+        }
+
+        rows: list[dict[str, Any]] = []
+        summary_assigned_qty = 0
+        summary_allocated_cost = 0.0
+        summary_est_gross = 0.0
+        summary_est_net_before_cogs = 0.0
+        summary_est_cogs = 0.0
+        for product_id, data in product_rollup.items():
+            assigned_qty = int(data.get("assigned_qty") or 0)
+            unit_landed = float(data.get("unit_landed_cost") or 0)
+            allocated_landed = float(data.get("allocated_landed_cost") or 0)
+            sold = sales_map.get(product_id) or {}
+            qty_sold_total = int(sold.get("qty_sold") or 0)
+            gross_sales_total = float(sold.get("gross_sales") or 0.0)
+            fees_total = float(sold.get("fees") or 0.0)
+            shipping_total = float(sold.get("shipping_cost") or 0.0)
+
+            qty_sold_est_from_lot = min(max(0, assigned_qty), max(0, qty_sold_total))
+            alloc_ratio = (
+                float(qty_sold_est_from_lot) / float(qty_sold_total)
+                if qty_sold_total > 0
+                else 0.0
+            )
+            est_gross_sales = gross_sales_total * alloc_ratio
+            est_net_before_cogs = (gross_sales_total - fees_total - shipping_total) * alloc_ratio
+            est_lot_cogs = unit_landed * float(qty_sold_est_from_lot)
+            est_lot_profit = est_net_before_cogs - est_lot_cogs
+
+            summary_assigned_qty += assigned_qty
+            summary_allocated_cost += allocated_landed
+            summary_est_gross += est_gross_sales
+            summary_est_net_before_cogs += est_net_before_cogs
+            summary_est_cogs += est_lot_cogs
+            rows.append(
+                {
+                    "product_id": int(product_id),
+                    "sku": data.get("sku"),
+                    "product_title": data.get("product_title"),
+                    "assigned_qty": assigned_qty,
+                    "qty_sold_total": qty_sold_total,
+                    "qty_sold_est_from_lot": int(qty_sold_est_from_lot),
+                    "unit_landed_cost": round(unit_landed, 4),
+                    "allocated_landed_cost": round(allocated_landed, 2),
+                    "estimated_gross_sales_from_lot": round(est_gross_sales, 2),
+                    "estimated_net_before_cogs_from_lot": round(est_net_before_cogs, 2),
+                    "estimated_lot_cogs": round(est_lot_cogs, 2),
+                    "estimated_lot_profit": round(est_lot_profit, 2),
+                }
+            )
+
+        return {
+            "lot_id": int(lot.id),
+            "lot_code": str(lot.lot_code or "").strip(),
+            "vendor": str(lot.vendor or "").strip(),
+            "purchase_date": lot.purchase_date.isoformat() if lot.purchase_date else None,
+            "summary": {
+                "assigned_products": int(len(rows)),
+                "assigned_qty": int(summary_assigned_qty),
+                "allocated_landed_cost": round(float(summary_allocated_cost), 2),
+                "estimated_gross_sales": round(float(summary_est_gross), 2),
+                "estimated_net_before_cogs": round(float(summary_est_net_before_cogs), 2),
+                "estimated_lot_cogs": round(float(summary_est_cogs), 2),
+                "estimated_lot_profit": round(float(summary_est_net_before_cogs - summary_est_cogs), 2),
+            },
+            "rows": sorted(rows, key=lambda x: str(x.get("sku") or "")),
+        }
+
+    def report_sale_unit_cost_maps(
+        self,
+        *,
+        end_dt: datetime,
+        default_unit_cost_by_product: dict[int, float] | None = None,
+    ) -> dict[str, dict[int, float]]:
+        def _safe_float(value: Any) -> float:
+            try:
+                if value is None:
+                    return 0.0
+                return float(value)
+            except Exception:
+                return 0.0
+
+        defaults = {
+            int(k): max(0.0, _safe_float(v))
+            for k, v in (default_unit_cost_by_product or {}).items()
+            if k is not None
+        }
+
+        assignment_rows = self.db.execute(
+            select(
+                ProductLotAssignment.id.label("assignment_id"),
+                ProductLotAssignment.product_id.label("product_id"),
+                ProductLotAssignment.acquired_at.label("acquired_at"),
+                ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                ProductLotAssignment.unit_cost.label("unit_cost"),
+                ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
+                ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
+                ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
+                ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
+                ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
+                ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+            )
+            .select_from(ProductLotAssignment)
+            .where(
+                ProductLotAssignment.product_id.is_not(None),
+                ProductLotAssignment.acquired_at <= end_dt,
+            )
+            .order_by(ProductLotAssignment.acquired_at.asc(), ProductLotAssignment.id.asc())
+        ).all()
+
+        sale_rows = self.db.execute(
+            select(
+                Sale.id.label("sale_id"),
+                Sale.product_id.label("product_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.quantity_sold.label("quantity_sold"),
+            )
+            .select_from(Sale)
+            .where(
+                Sale.product_id.is_not(None),
+                Sale.sold_at.is_not(None),
+                Sale.sold_at <= end_dt,
+            )
+            .order_by(Sale.sold_at.asc(), Sale.id.asc())
+        ).all()
+
+        lots_by_product: dict[int, list[dict[str, float | int]]] = {}
+        totals: dict[int, dict[str, float]] = {}
+        for row in assignment_rows:
+            pid = int(row.product_id or 0)
+            qty = float(max(0, int(row.quantity_acquired or 0)))
+            if pid <= 0 or qty <= 0:
+                continue
+            base_cost = _safe_float(row.unit_cost)
+            tax_cost = _safe_float(row.unit_tax_paid)
+            shipping_cost = _safe_float(row.unit_shipping_paid)
+            handling_cost = _safe_float(row.unit_handling_paid)
+            unit_cost = base_cost + tax_cost + shipping_cost + handling_cost
+            if unit_cost <= 0:
+                allocated_landed = (
+                    _safe_float(row.allocated_cost)
+                    + _safe_float(row.allocated_tax_paid)
+                    + _safe_float(row.allocated_shipping_paid)
+                    + _safe_float(row.allocated_handling_paid)
+                )
+                if allocated_landed > 0:
+                    unit_cost = allocated_landed / qty
+            lots_by_product.setdefault(pid, []).append(
+                {
+                    "remaining_qty": int(qty),
+                    "unit_cost": float(unit_cost),
+                }
+            )
+            totals.setdefault(pid, {"qty": 0.0, "cost": 0.0})
+            totals[pid]["qty"] += qty
+            totals[pid]["cost"] += float(unit_cost) * qty
+
+        lot_weighted_unit_cost_by_product: dict[int, float] = {}
+        for pid, agg in totals.items():
+            if float(agg["qty"] or 0) > 0:
+                lot_weighted_unit_cost_by_product[pid] = float(agg["cost"] / agg["qty"])
+        for pid, default_cost in defaults.items():
+            lot_weighted_unit_cost_by_product.setdefault(pid, max(0.0, _safe_float(default_cost)))
+
+        from collections import deque
+
+        queues = {pid: deque(rows) for pid, rows in lots_by_product.items()}
+        fifo_unit_cost_by_sale: dict[int, float] = {}
+        for row in sale_rows:
+            sale_id = int(row.sale_id or 0)
+            pid = int(row.product_id or 0)
+            qty = max(1, int(row.quantity_sold or 1))
+            if sale_id <= 0 or pid <= 0:
+                continue
+
+            queue = queues.get(pid)
+            if queue is None:
+                queue = deque()
+                queues[pid] = queue
+            default_cost = max(0.0, _safe_float(defaults.get(pid)))
+
+            qty_remaining = qty
+            total_cost = 0.0
+            while qty_remaining > 0:
+                if queue and int(queue[0]["remaining_qty"]) > 0:
+                    use_qty = min(qty_remaining, int(queue[0]["remaining_qty"]))
+                    total_cost += float(use_qty) * _safe_float(queue[0]["unit_cost"])
+                    queue[0]["remaining_qty"] = int(queue[0]["remaining_qty"]) - use_qty
+                    qty_remaining -= use_qty
+                    if int(queue[0]["remaining_qty"]) <= 0:
+                        queue.popleft()
+                else:
+                    total_cost += float(qty_remaining) * default_cost
+                    qty_remaining = 0
+            fifo_unit_cost_by_sale[sale_id] = (total_cost / float(qty)) if qty > 0 else 0.0
+
+        return {
+            "fifo_unit_cost_by_sale": fifo_unit_cost_by_sale,
+            "lot_weighted_unit_cost_by_product": lot_weighted_unit_cost_by_product,
+        }
 
     def update_product(self, product_id: int, updates: dict[str, Any], actor: str = "system") -> Product:
         product = self.db.get(Product, product_id)
@@ -2686,6 +4463,38 @@ class InventoryRepository:
             self.db.commit()
             self.db.refresh(product)
         return product
+
+    def archive_product(
+        self,
+        product_id: int,
+        *,
+        actor: str = "system",
+        force: bool = False,
+    ) -> Product:
+        product = self.db.get(Product, int(product_id))
+        if product is None:
+            raise ValueError(f"Product {product_id} not found.")
+
+        active_listing_count = int(
+            self.db.query(func.count(MarketplaceListing.id))
+            .filter(
+                MarketplaceListing.product_id == int(product_id),
+                MarketplaceListing.listing_status == "active",
+            )
+            .scalar()
+            or 0
+        )
+        if active_listing_count > 0 and not bool(force):
+            raise ValueError(
+                "Cannot archive product with active listings. End/archive linked listings first, or force archive."
+            )
+        return self.update_product(int(product_id), {"status": "archived"}, actor=actor)
+
+    def restore_product(self, product_id: int, *, actor: str = "system") -> Product:
+        product = self.db.get(Product, int(product_id))
+        if product is None:
+            raise ValueError(f"Product {product_id} not found.")
+        return self.update_product(int(product_id), {"status": "active"}, actor=actor)
 
     def convert_inventory_to_product(
         self,
@@ -3118,6 +4927,147 @@ class InventoryRepository:
             self.db.refresh(listing)
         return listing
 
+    def delete_listing(self, listing_id: int, actor: str = "system") -> bool:
+        listing = self.db.get(MarketplaceListing, listing_id)
+        if listing is None:
+            return False
+
+        linked_sales_count = int(
+            self.db.query(func.count(Sale.id)).filter(Sale.listing_id == int(listing_id)).scalar() or 0
+        )
+        linked_order_items_count = int(
+            self.db.query(func.count(OrderItem.id)).filter(OrderItem.listing_id == int(listing_id)).scalar() or 0
+        )
+        linked_media_count = int(
+            self.db.query(func.count(MediaAsset.id)).filter(MediaAsset.listing_id == int(listing_id)).scalar() or 0
+        )
+
+        listing_snapshot = {
+            "id": int(listing.id),
+            "product_id": int(listing.product_id),
+            "marketplace": str(listing.marketplace or "").strip(),
+            "external_listing_id": str(listing.external_listing_id or "").strip(),
+            "listing_status": str(listing.listing_status or "").strip(),
+            "review_status": str(listing.review_status or "").strip(),
+            "listing_title": str(listing.listing_title or "").strip(),
+        }
+
+        # Preserve related operational records while removing the bad/duplicate listing record.
+        self.db.query(Sale).filter(Sale.listing_id == int(listing_id)).update(
+            {Sale.listing_id: None},
+            synchronize_session=False,
+        )
+        self.db.query(OrderItem).filter(OrderItem.listing_id == int(listing_id)).update(
+            {OrderItem.listing_id: None},
+            synchronize_session=False,
+        )
+        self.db.query(MediaAsset).filter(MediaAsset.listing_id == int(listing_id)).update(
+            {MediaAsset.listing_id: None},
+            synchronize_session=False,
+        )
+
+        self.db.delete(listing)
+        self._record_audit(
+            "listing",
+            int(listing_id),
+            "delete",
+            actor,
+            {
+                "listing": {
+                    "before": listing_snapshot,
+                    "after": None,
+                },
+                "linked_sales_count": {
+                    "before": linked_sales_count,
+                    "after": 0,
+                },
+                "linked_order_items_count": {
+                    "before": linked_order_items_count,
+                    "after": 0,
+                },
+                "linked_media_count": {
+                    "before": linked_media_count,
+                    "after": 0,
+                },
+            },
+        )
+        self.db.commit()
+        return True
+
+    def archive_listing(
+        self,
+        listing_id: int,
+        *,
+        actor: str = "system",
+        reason: str = "",
+    ) -> MarketplaceListing:
+        listing = self.db.get(MarketplaceListing, listing_id)
+        if listing is None:
+            raise ValueError(f"Listing {listing_id} not found.")
+
+        details_obj: dict[str, Any] = {}
+        raw = str(listing.marketplace_details or "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    details_obj = parsed
+                else:
+                    details_obj = {"notes": raw}
+            except Exception:
+                details_obj = {"notes": raw}
+
+        lifecycle = details_obj.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+        lifecycle["archived"] = True
+        lifecycle["archived_at"] = utcnow_naive().isoformat()
+        lifecycle["archived_by"] = (actor or "system").strip() or "system"
+        lifecycle["archive_reason"] = str(reason or "").strip()
+        details_obj["lifecycle"] = lifecycle
+
+        updates: dict[str, Any] = {
+            "marketplace_details": json.dumps(details_obj, indent=2),
+        }
+        if str(listing.listing_status or "").strip().lower() == "active":
+            updates["listing_status"] = "ended"
+        return self.update_listing(int(listing_id), updates, actor=actor)
+
+    def restore_listing(
+        self,
+        listing_id: int,
+        *,
+        actor: str = "system",
+    ) -> MarketplaceListing:
+        listing = self.db.get(MarketplaceListing, listing_id)
+        if listing is None:
+            raise ValueError(f"Listing {listing_id} not found.")
+
+        details_obj: dict[str, Any] = {}
+        raw = str(listing.marketplace_details or "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    details_obj = parsed
+                else:
+                    details_obj = {"notes": raw}
+            except Exception:
+                details_obj = {"notes": raw}
+
+        lifecycle = details_obj.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+        lifecycle["archived"] = False
+        lifecycle["restored_at"] = utcnow_naive().isoformat()
+        lifecycle["restored_by"] = (actor or "system").strip() or "system"
+        details_obj["lifecycle"] = lifecycle
+        return self.update_listing(
+            int(listing_id),
+            {"marketplace_details": json.dumps(details_obj, indent=2)},
+            actor=actor,
+        )
+
     def review_listing(
         self,
         listing_id: int,
@@ -3291,6 +5241,43 @@ class InventoryRepository:
             self.db.refresh(media)
         return media
 
+    def bulk_update_media_assets(
+        self,
+        media_ids: list[int],
+        updates: dict[str, Any],
+        actor: str = "system",
+    ) -> dict[str, list[int]]:
+        normalized_ids = sorted({int(v) for v in (media_ids or []) if int(v) > 0})
+        if not normalized_ids:
+            return {"updated_ids": [], "missing_ids": []}
+        rows = self.db.scalars(
+            select(MediaAsset).where(MediaAsset.id.in_(normalized_ids))
+        ).all()
+        row_by_id = {int(row.id): row for row in rows}
+        missing_ids = [mid for mid in normalized_ids if mid not in row_by_id]
+        updated_ids: list[int] = []
+        for media_id in normalized_ids:
+            media = row_by_id.get(media_id)
+            if media is None:
+                continue
+            changes: dict[str, dict[str, Any]] = {}
+            for field, new_value in updates.items():
+                if not hasattr(media, field):
+                    continue
+                old_value = getattr(media, field)
+                if old_value != new_value:
+                    changes[field] = {
+                        "before": self._serialize_audit_value(old_value),
+                        "after": self._serialize_audit_value(new_value),
+                    }
+                    setattr(media, field, new_value)
+            if changes:
+                self._record_audit("media_asset", media.id, "update", actor, changes)
+                updated_ids.append(int(media.id))
+        if updated_ids:
+            self.db.commit()
+        return {"updated_ids": updated_ids, "missing_ids": missing_ids}
+
     def delete_media_asset(self, media_id: int, actor: str = "system") -> bool:
         media = self.db.get(MediaAsset, int(media_id))
         if media is None:
@@ -3315,6 +5302,98 @@ class InventoryRepository:
         )
         self.db.commit()
         return True
+
+    def get_media_asset_archive_blockers(self, media_id: int) -> dict[str, int]:
+        media = self.db.get(MediaAsset, int(media_id))
+        if media is None:
+            raise ValueError(f"Media asset {media_id} not found.")
+        linked_listing_active = 0
+        if media.listing_id is not None:
+            linked_listing_active = int(
+                self.db.scalar(
+                    select(func.count())
+                    .select_from(MarketplaceListing)
+                    .where(
+                        MarketplaceListing.id == int(media.listing_id),
+                        func.lower(func.trim(func.coalesce(cast(MarketplaceListing.listing_status, String), "")))
+                        == "active",
+                    )
+                )
+                or 0
+            )
+        linked_product_active_listings = 0
+        if media.product_id is not None:
+            linked_product_active_listings = int(
+                self.db.scalar(
+                    select(func.count())
+                    .select_from(MarketplaceListing)
+                    .where(
+                        MarketplaceListing.product_id == int(media.product_id),
+                        func.lower(func.trim(func.coalesce(cast(MarketplaceListing.listing_status, String), "")))
+                        == "active",
+                    )
+                )
+                or 0
+            )
+        return {
+            "linked_listing_active": int(linked_listing_active),
+            "linked_product_active_listings": int(linked_product_active_listings),
+        }
+
+    def archive_media_asset(self, media_id: int, *, actor: str = "system", force: bool = False) -> MediaAsset:
+        media = self.db.get(MediaAsset, int(media_id))
+        if media is None:
+            raise ValueError(f"Media asset {media_id} not found.")
+        if media.is_archived:
+            return media
+        blockers = self.get_media_asset_archive_blockers(int(media.id))
+        has_blockers = any(int(v or 0) > 0 for v in blockers.values())
+        if has_blockers and not bool(force):
+            raise ValueError(
+                "Cannot archive media linked to active listing context. "
+                "Use force=True to confirm archive despite active links."
+            )
+        media.is_archived = True
+        self._record_audit(
+            "media_asset",
+            media.id,
+            "archive",
+            actor,
+            {
+                "is_archived": {
+                    "before": False,
+                    "after": True,
+                },
+                "force": {"before": False, "after": bool(force)},
+                "blockers": {"before": None, "after": blockers},
+            },
+        )
+        self.db.commit()
+        self.db.refresh(media)
+        return media
+
+    def restore_media_asset(self, media_id: int, *, actor: str = "system") -> MediaAsset:
+        media = self.db.get(MediaAsset, int(media_id))
+        if media is None:
+            raise ValueError(f"Media asset {media_id} not found.")
+        if not media.is_archived:
+            return media
+        media.is_archived = False
+        self._record_audit(
+            "media_asset",
+            media.id,
+            "restore",
+            actor,
+            {
+                "is_archived": {
+                    "before": True,
+                    "after": False,
+                }
+            },
+        )
+        self.db.commit()
+        self.db.refresh(media)
+        return media
 
     def list_audit_logs(self, limit: int = 200) -> list[AuditLog]:
         return self.db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)).all()
@@ -4043,6 +6122,444 @@ class InventoryRepository:
             self.db.refresh(row)
         return row
 
+    def enqueue_notification_outbox(
+        self,
+        *,
+        environment: str,
+        channel: str,
+        event_type: str,
+        payload_json: str,
+        requested_by: str,
+        entity_type: str = "",
+        entity_id: str = "",
+        dedupe_key: str = "",
+        next_attempt_at: datetime | None = None,
+        max_attempts: int = 6,
+        actor: str = "system",
+    ) -> NotificationOutbox:
+        normalized_env = (environment or settings.app_env or "local").strip().lower()
+        normalized_channel = (channel or "slack").strip().lower()
+        normalized_event_type = (event_type or "").strip().lower()
+        normalized_entity_type = (entity_type or "").strip().lower()
+        normalized_entity_id = (entity_id or "").strip()
+        normalized_dedupe_key = (dedupe_key or "").strip()
+        if normalized_dedupe_key:
+            existing = self.db.scalar(
+                select(NotificationOutbox).where(
+                    NotificationOutbox.environment == normalized_env,
+                    NotificationOutbox.channel == normalized_channel,
+                    NotificationOutbox.dedupe_key == normalized_dedupe_key,
+                    NotificationOutbox.status.in_(["queued", "retrying", "processing", "sent"]),
+                )
+            )
+            if existing is not None:
+                return existing
+        row = NotificationOutbox(
+            environment=normalized_env,
+            channel=normalized_channel,
+            event_type=normalized_event_type,
+            entity_type=normalized_entity_type,
+            entity_id=normalized_entity_id,
+            dedupe_key=normalized_dedupe_key,
+            status="queued",
+            payload_json=(payload_json or "{}").strip() or "{}",
+            attempt_count=0,
+            max_attempts=max(1, int(max_attempts)),
+            next_attempt_at=next_attempt_at or utcnow_naive(),
+            requested_by=(requested_by or actor or "system").strip() or "system",
+            updated_by=(actor or "system").strip() or "system",
+            last_error="",
+            locked_by="",
+            locked_at=None,
+            dispatched_at=None,
+            last_attempt_at=None,
+        )
+        self.db.add(row)
+        self.db.flush()
+        self._record_audit(
+            "notification_outbox",
+            row.id,
+            "create",
+            actor,
+            {
+                "after": {
+                    "environment": row.environment,
+                    "channel": row.channel,
+                    "event_type": row.event_type,
+                    "entity_type": row.entity_type,
+                    "entity_id": row.entity_id,
+                    "status": row.status,
+                    "next_attempt_at": self._serialize_audit_value(row.next_attempt_at),
+                    "max_attempts": row.max_attempts,
+                }
+            },
+        )
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def get_notification_outbox(
+        self,
+        outbox_id: int,
+        *,
+        environment: str | None = None,
+    ) -> NotificationOutbox | None:
+        row = self.db.get(NotificationOutbox, int(outbox_id))
+        if row is None:
+            return None
+        if environment and str(getattr(row, "environment", "") or "").strip().lower() != environment.strip().lower():
+            return None
+        return row
+
+    def list_notification_outbox(
+        self,
+        *,
+        environment: str,
+        channel: str | None = None,
+        statuses: set[str] | None = None,
+        due_before: datetime | None = None,
+        limit: int = 200,
+    ) -> list[NotificationOutbox]:
+        query = select(NotificationOutbox).where(
+            NotificationOutbox.environment == (environment or settings.app_env or "local").strip().lower()
+        )
+        if channel and channel.strip():
+            query = query.where(NotificationOutbox.channel == channel.strip().lower())
+        if statuses:
+            normalized = {str(s).strip().lower() for s in statuses if str(s).strip()}
+            if normalized:
+                query = query.where(NotificationOutbox.status.in_(sorted(normalized)))
+        if due_before is not None:
+            query = query.where(
+                or_(
+                    NotificationOutbox.next_attempt_at.is_(None),
+                    NotificationOutbox.next_attempt_at <= due_before,
+                )
+            )
+        query = query.order_by(
+            NotificationOutbox.next_attempt_at.asc(),
+            NotificationOutbox.id.asc(),
+        ).limit(max(1, int(limit)))
+        return self.db.scalars(query).all()
+
+    def update_notification_outbox(
+        self,
+        outbox_id: int,
+        updates: dict[str, Any],
+        actor: str = "system",
+    ) -> NotificationOutbox:
+        row = self.db.get(NotificationOutbox, int(outbox_id))
+        if row is None:
+            raise ValueError(f"Notification outbox row {outbox_id} not found.")
+
+        changes: dict[str, dict[str, Any]] = {}
+        for field, new_value in updates.items():
+            if not hasattr(row, field):
+                continue
+            old_value = getattr(row, field)
+            if old_value != new_value:
+                changes[field] = {
+                    "before": self._serialize_audit_value(old_value),
+                    "after": self._serialize_audit_value(new_value),
+                }
+                setattr(row, field, new_value)
+        if changes:
+            row.updated_by = (actor or "system").strip() or "system"
+            self._record_audit("notification_outbox", row.id, "update", actor, changes)
+            self.db.commit()
+            self.db.refresh(row)
+        return row
+
+    def cleanup_notification_outbox(
+        self,
+        *,
+        environment: str,
+        retain_sent_days: int = 14,
+        retain_failed_days: int = 30,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        env = (environment or settings.app_env or "local").strip().lower()
+        sent_cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_sent_days)))
+        failed_cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_failed_days)))
+
+        sent_rows = self.db.scalars(
+            select(NotificationOutbox).where(
+                NotificationOutbox.environment == env,
+                NotificationOutbox.status == "sent",
+                NotificationOutbox.created_at < sent_cutoff,
+            )
+        ).all()
+        failed_rows = self.db.scalars(
+            select(NotificationOutbox).where(
+                NotificationOutbox.environment == env,
+                NotificationOutbox.status == "failed",
+                NotificationOutbox.created_at < failed_cutoff,
+            )
+        ).all()
+        sent_ids = [int(r.id) for r in sent_rows]
+        failed_ids = [int(r.id) for r in failed_rows]
+
+        if sent_ids:
+            self.db.execute(delete(NotificationOutbox).where(NotificationOutbox.id.in_(sent_ids)))
+        if failed_ids:
+            self.db.execute(delete(NotificationOutbox).where(NotificationOutbox.id.in_(failed_ids)))
+
+        result = {
+            "deleted_sent": len(sent_ids),
+            "deleted_failed": len(failed_ids),
+            "deleted_total": len(sent_ids) + len(failed_ids),
+        }
+        self._record_audit(
+            "notification_outbox",
+            None,
+            "cleanup",
+            actor,
+            {
+                "after": {
+                    "environment": env,
+                    "retain_sent_days": int(retain_sent_days),
+                    "retain_failed_days": int(retain_failed_days),
+                    **result,
+                }
+            },
+        )
+        self.db.commit()
+        return result
+
+    def cleanup_archived_media_assets(
+        self,
+        *,
+        retain_days: int = 180,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_days)))
+        archived_rows = self.db.scalars(
+            select(MediaAsset).where(
+                MediaAsset.is_archived.is_(True),
+                MediaAsset.updated_at <= cutoff,
+            )
+        ).all()
+        archived_ids = [int(r.id) for r in archived_rows]
+        if archived_ids:
+            self.db.execute(delete(MediaAsset).where(MediaAsset.id.in_(archived_ids)))
+        result = {
+            "deleted_archived_media": len(archived_ids),
+        }
+        self._record_audit(
+            "media_asset",
+            None,
+            "retention_cleanup",
+            actor,
+            {
+                "after": {
+                    "retain_days": int(retain_days),
+                    "cutoff": cutoff.isoformat(timespec="seconds"),
+                    **result,
+                }
+            },
+        )
+        self.db.commit()
+        return result
+
+    def cleanup_archived_listings(
+        self,
+        *,
+        retain_days: int = 365,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_days)))
+        candidates = self.db.scalars(
+            select(MarketplaceListing).where(
+                MarketplaceListing.updated_at <= cutoff,
+            )
+        ).all()
+        deleted = 0
+        skipped_with_dependencies = 0
+        for row in candidates:
+            if not self._listing_is_archived(row):
+                continue
+            listing_id = int(row.id)
+            has_dependencies = bool(
+                self.db.scalar(
+                    select(func.count()).select_from(Sale).where(Sale.listing_id == listing_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(OrderItem).where(OrderItem.listing_id == listing_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(MediaAsset).where(MediaAsset.listing_id == listing_id)
+                )
+                or 0
+            )
+            if has_dependencies:
+                skipped_with_dependencies += 1
+                continue
+            self.db.delete(row)
+            deleted += 1
+
+        result = {
+            "deleted_archived_listings": int(deleted),
+            "skipped_listings_with_dependencies": int(skipped_with_dependencies),
+        }
+        self._record_audit(
+            "listing",
+            None,
+            "retention_cleanup",
+            actor,
+            {
+                "after": {
+                    "retain_days": int(retain_days),
+                    "cutoff": cutoff.isoformat(timespec="seconds"),
+                    **result,
+                }
+            },
+        )
+        self.db.commit()
+        return result
+
+    def cleanup_archived_purchase_lots(
+        self,
+        *,
+        retain_days: int = 365,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_days)))
+        candidates = self.db.scalars(
+            select(PurchaseLot).where(
+                PurchaseLot.updated_at <= cutoff,
+            )
+        ).all()
+        deleted = 0
+        skipped_with_dependencies = 0
+        for row in candidates:
+            if not self._lot_is_archived(row):
+                continue
+            lot_id = int(row.id)
+            has_dependencies = bool(
+                self.db.scalar(
+                    select(func.count()).select_from(ProductLotAssignment).where(ProductLotAssignment.lot_id == lot_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(PurchaseDocument).where(PurchaseDocument.lot_id == lot_id)
+                )
+                or 0
+            )
+            if has_dependencies:
+                skipped_with_dependencies += 1
+                continue
+            self.db.delete(row)
+            deleted += 1
+
+        result = {
+            "deleted_archived_lots": int(deleted),
+            "skipped_lots_with_dependencies": int(skipped_with_dependencies),
+        }
+        self._record_audit(
+            "purchase_lot",
+            None,
+            "retention_cleanup",
+            actor,
+            {
+                "after": {
+                    "retain_days": int(retain_days),
+                    "cutoff": cutoff.isoformat(timespec="seconds"),
+                    **result,
+                }
+            },
+        )
+        self.db.commit()
+        return result
+
+    def cleanup_archived_products(
+        self,
+        *,
+        retain_days: int = 365,
+        actor: str = "system",
+    ) -> dict[str, int]:
+        cutoff = utcnow_naive() - timedelta(days=max(1, int(retain_days)))
+        candidates = self.db.scalars(
+            select(Product).where(
+                Product.status == "archived",
+                Product.updated_at <= cutoff,
+            )
+        ).all()
+        deleted = 0
+        skipped_with_dependencies = 0
+        for row in candidates:
+            product_id = int(row.id)
+            has_dependencies = bool(
+                self.db.scalar(
+                    select(func.count()).select_from(MarketplaceListing).where(MarketplaceListing.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(Sale).where(Sale.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(OrderItem).where(OrderItem.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(ReturnRecord).where(ReturnRecord.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(ProductLotAssignment).where(ProductLotAssignment.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(MediaAsset).where(MediaAsset.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(PurchaseDocument).where(PurchaseDocument.product_id == product_id)
+                )
+                or 0
+            ) or bool(
+                self.db.scalar(
+                    select(func.count()).select_from(CoinAIRun).where(CoinAIRun.product_id == product_id)
+                )
+                or 0
+            )
+            if has_dependencies:
+                skipped_with_dependencies += 1
+                continue
+            self.db.delete(row)
+            deleted += 1
+
+        result = {
+            "deleted_archived_products": int(deleted),
+            "skipped_products_with_dependencies": int(skipped_with_dependencies),
+        }
+        self._record_audit(
+            "product",
+            None,
+            "retention_cleanup",
+            actor,
+            {
+                "after": {
+                    "retain_days": int(retain_days),
+                    "cutoff": cutoff.isoformat(timespec="seconds"),
+                    **result,
+                }
+            },
+        )
+        self.db.commit()
+        return result
+
     def add_sync_event(
         self,
         *,
@@ -4171,13 +6688,26 @@ class InventoryRepository:
         return self.db.scalars(query).all()
 
     def dashboard_metrics(self) -> dict:
+        landed_unit_cost_expr = (
+            func.coalesce(Product.acquisition_cost, 0)
+            + func.coalesce(Product.acquisition_tax_paid, 0)
+            + func.coalesce(Product.acquisition_shipping_paid, 0)
+            + func.coalesce(Product.acquisition_handling_paid, 0)
+        )
         product_count = self.db.scalar(select(func.count()).select_from(Product)) or 0
-        listing_count = self.db.scalar(select(func.count()).select_from(MarketplaceListing)) or 0
+        listing_count = (
+            self.db.scalar(
+                select(func.count())
+                .select_from(MarketplaceListing)
+                .where(MarketplaceListing.listing_status == "active")
+            )
+            or 0
+        )
         sale_count = self.db.scalar(select(func.count()).select_from(Sale)) or 0
 
         inventory_cost = (
             self.db.scalar(
-                select(func.coalesce(func.sum(Product.acquisition_cost * Product.current_quantity), 0))
+                select(func.coalesce(func.sum(landed_unit_cost_expr * Product.current_quantity), 0))
             )
             or 0
         )
@@ -4198,6 +6728,2427 @@ class InventoryRepository:
             "gross_sales": float(gross_sales),
             "net_sales": float(net_sales),
         }
+
+    def dashboard_live_metrics(
+        self,
+        *,
+        now: datetime | None = None,
+        include_fee_type_breakdown: bool = True,
+    ) -> dict:
+        snapshot = now or utcnow_naive()
+        window_7d = snapshot - timedelta(days=7)
+        window_30d = snapshot - timedelta(days=30)
+        landed_unit_cost_expr = (
+            func.coalesce(Product.acquisition_cost, 0)
+            + func.coalesce(Product.acquisition_tax_paid, 0)
+            + func.coalesce(Product.acquisition_shipping_paid, 0)
+            + func.coalesce(Product.acquisition_handling_paid, 0)
+        )
+
+        sales_windows = self.db.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (Sale.sold_at >= window_7d, 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("sales_7d_count"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (Sale.sold_at >= window_7d, func.coalesce(Sale.sold_price, 0)),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("sales_7d_gross"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (Sale.sold_at >= window_7d, func.coalesce(Sale.fees, 0)),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("sales_7d_fees"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (Sale.sold_at >= window_7d, func.coalesce(Sale.shipping_cost, 0)),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("sales_7d_shipping"),
+                func.coalesce(func.sum(func.coalesce(Sale.sold_price, 0)), 0).label("sales_30d_gross"),
+                func.coalesce(func.sum(func.coalesce(Sale.fees, 0)), 0).label("sales_30d_fees"),
+                func.coalesce(func.sum(func.coalesce(Sale.shipping_cost, 0)), 0).label("sales_30d_shipping"),
+                func.coalesce(func.sum(func.coalesce(Sale.shipping_label_cost, 0)), 0).label("sales_30d_label_spend"),
+                func.coalesce(func.count(Sale.id), 0).label("sales_30d_count"),
+                func.coalesce(
+                    func.sum(landed_unit_cost_expr * func.coalesce(Sale.quantity_sold, 0)),
+                    0,
+                ).label("sales_30d_est_cogs"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .where(Sale.sold_at >= window_30d)
+        ).one()
+
+        order_metrics_30d = self.db.execute(
+            select(
+                func.count(Order.id),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                func.lower(func.coalesce(cast(Order.order_status, String), "")).in_(
+                                    ["shipped", "delivered"]
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ~func.lower(func.coalesce(cast(Order.order_status, String), "")).in_(
+                                    ["shipped", "delivered", "cancelled", "refunded"]
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(func.sum(func.coalesce(Order.shipping_cost, 0)), 0),
+                func.coalesce(func.sum(func.coalesce(Order.shipping_label_cost, 0)), 0),
+            ).where(Order.sold_at >= window_30d)
+        ).one()
+        normalized_label_spend_30d = self.db.scalar(
+            select(func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0)).where(
+                OrderFinanceEntry.entry_kind == "shipping_label",
+                or_(
+                    OrderFinanceEntry.transaction_date >= window_30d,
+                    and_(
+                        OrderFinanceEntry.transaction_date.is_(None),
+                        OrderFinanceEntry.created_at >= window_30d,
+                    ),
+                ),
+            )
+        ) or 0
+        normalized_fee_type_rows = []
+        if include_fee_type_breakdown:
+            normalized_fee_type_rows = self.db.execute(
+                select(
+                    OrderFinanceEntry.fee_type,
+                    func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                )
+                .where(
+                    OrderFinanceEntry.entry_kind == "marketplace_fee",
+                    or_(
+                        OrderFinanceEntry.transaction_date >= window_30d,
+                        and_(
+                            OrderFinanceEntry.transaction_date.is_(None),
+                            OrderFinanceEntry.created_at >= window_30d,
+                        ),
+                    ),
+                )
+                .group_by(OrderFinanceEntry.fee_type)
+            ).all()
+
+        orders_7d_count = self.db.scalar(
+            select(func.count(Order.id)).where(Order.sold_at >= window_7d)
+        ) or 0
+
+        sales_7d_count = int(sales_windows[0] or 0)
+        sales_7d_gross = float(sales_windows[1] or 0)
+        sales_7d_fees = float(sales_windows[2] or 0)
+        sales_7d_shipping = float(sales_windows[3] or 0)
+        sales_7d_net = sales_7d_gross - sales_7d_fees - sales_7d_shipping
+
+        sales_30d_count = int(sales_windows[8] or 0)
+        sales_30d_gross = float(sales_windows[4] or 0)
+        sales_30d_fees = float(sales_windows[5] or 0)
+        sales_30d_shipping = float(sales_windows[6] or 0)
+        sales_30d_label_spend = float(sales_windows[7] or 0)
+        sales_30d_est_cogs = float(sales_windows[9] or 0)
+        sales_30d_net = sales_30d_gross - sales_30d_fees - sales_30d_shipping
+
+        orders_30d_count = int(order_metrics_30d[0] or 0)
+        orders_30d_shipped = int(order_metrics_30d[1] or 0)
+        orders_30d_not_shipped = int(order_metrics_30d[2] or 0)
+        orders_30d_shipping_charged = float(order_metrics_30d[3] or 0)
+        orders_30d_label_spend = float(order_metrics_30d[4] or 0)
+        normalized_label_spend_30d_value = float(normalized_label_spend_30d or 0)
+        normalized_fee_type_totals: dict[str, float] = {}
+        for fee_type, fee_total in normalized_fee_type_rows:
+            key = str(fee_type or "").strip().upper()
+            if not key:
+                key = "UNKNOWN"
+            normalized_fee_type_totals[key] = round(float(fee_total or 0), 2)
+        normalized_fee_total_30d = round(sum(normalized_fee_type_totals.values()), 2)
+        if normalized_fee_total_30d <= 0:
+            normalized_fee_total_30d = round(float(sales_30d_fees or 0), 2)
+        if orders_30d_shipping_charged > 0 or orders_30d_label_spend > 0:
+            shipping_charged_30d = orders_30d_shipping_charged
+            shipping_label_spend_30d = (
+                normalized_label_spend_30d_value
+                if normalized_label_spend_30d_value > 0
+                else orders_30d_label_spend
+            )
+        else:
+            shipping_charged_30d = sales_30d_shipping
+            shipping_label_spend_30d = (
+                normalized_label_spend_30d_value
+                if normalized_label_spend_30d_value > 0
+                else sales_30d_label_spend
+            )
+
+        return {
+            "orders_7d_count": int(orders_7d_count),
+            "orders_30d_count": orders_30d_count,
+            "orders_30d_shipped": orders_30d_shipped,
+            "orders_30d_not_shipped": orders_30d_not_shipped,
+            "sales_7d_count": sales_7d_count,
+            "sales_30d_count": sales_30d_count,
+            "sales_7d_gross": sales_7d_gross,
+            "sales_7d_net": sales_7d_net,
+            "sales_30d_gross": sales_30d_gross,
+            "sales_30d_net": sales_30d_net,
+            "sales_30d_shipping_charged": shipping_charged_30d,
+            "sales_30d_shipping_label_spend": shipping_label_spend_30d,
+            "sales_30d_shipping_delta": shipping_charged_30d - shipping_label_spend_30d,
+            "sales_30d_est_cogs": sales_30d_est_cogs,
+            "sales_30d_est_profit": sales_30d_net - sales_30d_est_cogs,
+            "ebay_fees_30d_total": normalized_fee_total_30d,
+            "ebay_fee_type_breakdown_30d": normalized_fee_type_totals,
+        }
+
+    def report_shipping_economics_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        marketplaces: set[str] | None = None,
+    ) -> list[dict]:
+        marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
+        marketplace_expr = func.lower(func.coalesce(Sale.marketplace, ""))
+        order_sale_count_expr = case(
+            (
+                Sale.order_id.is_not(None),
+                func.count(Sale.id).over(partition_by=Sale.order_id),
+            ),
+            else_=1,
+        )
+        order_shipping_alloc_expr = func.coalesce(Order.shipping_cost, 0) / func.nullif(order_sale_count_expr, 0)
+        order_label_alloc_expr = func.coalesce(Order.shipping_label_cost, 0) / func.nullif(order_sale_count_expr, 0)
+        effective_shipping_charged_expr = case(
+            (func.coalesce(Sale.shipping_cost, 0) > 0, func.coalesce(Sale.shipping_cost, 0)),
+            else_=func.coalesce(order_shipping_alloc_expr, 0),
+        )
+        effective_label_spend_expr = case(
+            (func.coalesce(Sale.shipping_label_cost, 0) > 0, func.coalesce(Sale.shipping_label_cost, 0)),
+            else_=func.coalesce(order_label_alloc_expr, 0),
+        )
+        query = (
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                marketplace_expr.label("marketplace"),
+                Sale.external_order_id.label("external_order_id"),
+                Sale.order_id.label("order_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                Sale.quantity_sold.label("qty"),
+                effective_shipping_charged_expr.label("shipping_charged_to_buyer"),
+                effective_label_spend_expr.label("shipping_label_spend"),
+                (effective_shipping_charged_expr - effective_label_spend_expr).label(
+                    "shipping_delta_charged_minus_spend"
+                ),
+                func.coalesce(Sale.shipping_label_currency, func.coalesce(Order.shipping_label_currency, "")).label("shipping_label_currency"),
+                func.coalesce(Sale.shipping_label_id, "").label("shipping_label_id"),
+                Sale.shipping_label_purchased_at.label("shipping_label_purchased_at"),
+                func.coalesce(Sale.shipping_provider, "").label("shipping_provider"),
+                func.coalesce(Sale.shipping_service, "").label("shipping_service"),
+                func.coalesce(Sale.tracking_number, "").label("tracking_number"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(Order, Order.id == Sale.order_id)
+            .where(Sale.sold_at.is_not(None), Sale.sold_at >= start_dt, Sale.sold_at <= end_dt)
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        )
+        if marketplace_filter:
+            query = query.where(marketplace_expr.in_(sorted(marketplace_filter)))
+        rows = self.db.execute(query).all()
+        result: list[dict] = []
+        for row in rows:
+            result.append(
+                {
+                    "sale_id": int(row.sale_id),
+                    "sold_at": row.sold_at,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "order_id": int(row.order_id) if row.order_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "qty": int(row.qty or 0),
+                    "shipping_charged_to_buyer": round(float(row.shipping_charged_to_buyer or 0), 2),
+                    "shipping_label_spend": round(float(row.shipping_label_spend or 0), 2),
+                    "shipping_delta_charged_minus_spend": round(float(row.shipping_delta_charged_minus_spend or 0), 2),
+                    "shipping_label_currency": str(row.shipping_label_currency or "").strip(),
+                    "shipping_label_id": str(row.shipping_label_id or "").strip(),
+                    "shipping_label_purchased_at": row.shipping_label_purchased_at,
+                    "shipping_provider": str(row.shipping_provider or "").strip(),
+                    "shipping_service": str(row.shipping_service or "").strip(),
+                    "tracking_number": str(row.tracking_number or "").strip(),
+                }
+            )
+        return result
+
+    def report_shipping_economics_summary(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        marketplaces: set[str] | None = None,
+    ) -> list[dict]:
+        rows = self.report_shipping_economics_rows(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            marketplaces=marketplaces,
+        )
+        grouped: dict[str, dict[str, float | int | str]] = {}
+        for row in rows:
+            marketplace = str(row.get("marketplace") or "").strip().lower()
+            if marketplace not in grouped:
+                grouped[marketplace] = {
+                    "marketplace": marketplace,
+                    "sales_count": 0,
+                    "total_shipping_charged": 0.0,
+                    "total_label_spend": 0.0,
+                    "label_spend_covered_count": 0,
+                }
+            bucket = grouped[marketplace]
+            bucket["sales_count"] = int(bucket["sales_count"] or 0) + 1
+            charged = float(row.get("shipping_charged_to_buyer") or 0.0)
+            label = float(row.get("shipping_label_spend") or 0.0)
+            bucket["total_shipping_charged"] = float(bucket["total_shipping_charged"] or 0.0) + charged
+            bucket["total_label_spend"] = float(bucket["total_label_spend"] or 0.0) + label
+            if label > 0:
+                bucket["label_spend_covered_count"] = int(bucket["label_spend_covered_count"] or 0) + 1
+
+        result: list[dict] = []
+        for marketplace, bucket in sorted(
+            grouped.items(),
+            key=lambda item: (-int(item[1]["sales_count"] or 0), str(item[0])),
+        ):
+            sales_count = int(bucket["sales_count"] or 0)
+            total_shipping_charged = float(bucket["total_shipping_charged"] or 0.0)
+            total_label_spend = float(bucket["total_label_spend"] or 0.0)
+            covered_count = int(bucket["label_spend_covered_count"] or 0)
+            coverage_pct = (float(covered_count) / float(sales_count) * 100.0) if sales_count > 0 else 0.0
+            result.append(
+                {
+                    "marketplace": marketplace,
+                    "sales_count": sales_count,
+                    "total_shipping_charged": round(total_shipping_charged, 2),
+                    "total_label_spend": round(total_label_spend, 2),
+                    "shipping_delta_charged_minus_spend": round(total_shipping_charged - total_label_spend, 2),
+                    "label_spend_covered_count": covered_count,
+                    "label_spend_coverage_percent": round(coverage_pct, 2),
+                }
+            )
+        return result
+
+    def report_tax_estimate_detail_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        tax_rate_percent: float,
+        shipping_taxable: bool,
+        tax_exempt_categories: set[str] | None = None,
+        marketplaces: set[str] | None = None,
+    ) -> list[dict]:
+        exempt_categories = {
+            str(v).strip().lower() for v in (tax_exempt_categories or set()) if str(v).strip()
+        }
+        marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
+        category_expr = func.lower(func.coalesce(Product.category, ""))
+        marketplace_expr = func.lower(func.coalesce(Sale.marketplace, ""))
+        is_exempt_expr = (
+            category_expr.in_(sorted(exempt_categories)) if exempt_categories else literal(False)
+        )
+        taxable_item_expr = case(
+            (is_exempt_expr, 0),
+            else_=func.coalesce(Sale.sold_price, 0),
+        )
+        taxable_shipping_expr = (
+            func.coalesce(Sale.shipping_cost, 0) if bool(shipping_taxable) else literal(0)
+        )
+        taxable_subtotal_expr = taxable_item_expr + taxable_shipping_expr
+        tax_rate_multiplier = float(max(0.0, float(tax_rate_percent or 0.0))) / 100.0
+        estimated_tax_expr = taxable_subtotal_expr * tax_rate_multiplier
+
+        query = (
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                marketplace_expr.label("marketplace"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                category_expr.label("category"),
+                func.coalesce(Sale.sold_price, 0).label("gross_sales"),
+                func.coalesce(Sale.shipping_cost, 0).label("shipping_cost"),
+                is_exempt_expr.label("is_tax_exempt_category"),
+                taxable_item_expr.label("taxable_item_subtotal"),
+                taxable_shipping_expr.label("taxable_shipping_subtotal"),
+                taxable_subtotal_expr.label("taxable_subtotal"),
+                estimated_tax_expr.label("estimated_tax_collected"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .where(Sale.sold_at.is_not(None), Sale.sold_at >= start_dt, Sale.sold_at <= end_dt)
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        )
+        if marketplace_filter:
+            query = query.where(marketplace_expr.in_(sorted(marketplace_filter)))
+        rows = self.db.execute(query).all()
+        result: list[dict] = []
+        for row in rows:
+            result.append(
+                {
+                    "sale_id": int(row.sale_id),
+                    "sold_at": row.sold_at,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "category": str(row.category or "").strip().lower(),
+                    "gross_sales": round(float(row.gross_sales or 0), 2),
+                    "shipping_cost": round(float(row.shipping_cost or 0), 2),
+                    "is_tax_exempt_category": bool(row.is_tax_exempt_category),
+                    "taxable_item_subtotal": round(float(row.taxable_item_subtotal or 0), 2),
+                    "taxable_shipping_subtotal": round(float(row.taxable_shipping_subtotal or 0), 2),
+                    "taxable_subtotal": round(float(row.taxable_subtotal or 0), 2),
+                    "estimated_tax_collected": round(float(row.estimated_tax_collected or 0), 2),
+                }
+            )
+        return result
+
+    def report_sales_actual_econ_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        sold_price_expr = func.coalesce(Sale.sold_price, 0)
+        sibling_gross_total_expr = func.sum(sold_price_expr).over(partition_by=Sale.order_id)
+        sibling_count_expr = func.count(Sale.id).over(partition_by=Sale.order_id)
+        weight_expr = case(
+            (Sale.order_id.is_(None), literal(1.0)),
+            (sibling_gross_total_expr > 0, sold_price_expr / func.nullif(sibling_gross_total_expr, 0)),
+            (sibling_count_expr > 0, literal(1.0) / func.nullif(sibling_count_expr, 0)),
+            else_=literal(1.0),
+        )
+        order_fee_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.fees, 0)),
+            else_=func.coalesce(Sale.fees, 0),
+        )
+        order_shipping_charged_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0)),
+            else_=func.coalesce(Sale.shipping_cost, 0),
+        )
+        order_shipping_actual_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0)),
+            else_=func.coalesce(Sale.shipping_label_cost, 0),
+        )
+        allocated_fee_expr = order_fee_total_expr * weight_expr
+        allocated_shipping_charged_expr = order_shipping_charged_total_expr * weight_expr
+        allocated_shipping_actual_expr = order_shipping_actual_total_expr * weight_expr
+        net_before_cogs_actual_expr = sold_price_expr - allocated_fee_expr - allocated_shipping_actual_expr
+
+        rows = self.db.execute(
+            select(
+                Sale.id.label("sale_id"),
+                Sale.order_id.label("order_id"),
+                func.lower(func.coalesce(cast(Sale.marketplace, String), "")).label("marketplace"),
+                Sale.external_order_id.label("external_order_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                func.coalesce(Sale.quantity_sold, 0).label("qty"),
+                sold_price_expr.label("sold_price"),
+                weight_expr.label("allocation_weight"),
+                order_fee_total_expr.label("order_fee_total_actual"),
+                order_shipping_charged_total_expr.label("order_shipping_charged_total"),
+                order_shipping_actual_total_expr.label("order_shipping_actual_total"),
+                allocated_fee_expr.label("allocated_fee_actual"),
+                allocated_shipping_charged_expr.label("allocated_shipping_charged"),
+                allocated_shipping_actual_expr.label("allocated_shipping_actual"),
+                (allocated_shipping_charged_expr - allocated_shipping_actual_expr).label(
+                    "shipping_delta_charged_minus_actual"
+                ),
+                net_before_cogs_actual_expr.label("net_before_cogs_actual"),
+            )
+            .select_from(Sale)
+            .outerjoin(Order, Order.id == Sale.order_id)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .where(
+                Sale.sold_at.is_not(None),
+                Sale.sold_at >= start_dt,
+                Sale.sold_at <= end_dt,
+            )
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        ).all()
+        result: list[dict] = []
+        for row in rows:
+            result.append(
+                {
+                    "sale_id": int(row.sale_id or 0),
+                    "order_id": int(row.order_id or 0) if row.order_id is not None else None,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "qty": int(row.qty or 0),
+                    "sold_price": round(float(row.sold_price or 0), 2),
+                    "allocation_weight": round(float(row.allocation_weight or 0), 6),
+                    "order_fee_total_actual": round(float(row.order_fee_total_actual or 0), 2),
+                    "order_shipping_charged_total": round(float(row.order_shipping_charged_total or 0), 2),
+                    "order_shipping_actual_total": round(float(row.order_shipping_actual_total or 0), 2),
+                    "allocated_fee_actual": round(float(row.allocated_fee_actual or 0), 2),
+                    "allocated_shipping_charged": round(float(row.allocated_shipping_charged or 0), 2),
+                    "allocated_shipping_actual": round(float(row.allocated_shipping_actual or 0), 2),
+                    "shipping_delta_charged_minus_actual": round(float(row.shipping_delta_charged_minus_actual or 0), 2),
+                    "net_before_cogs_actual": round(float(row.net_before_cogs_actual or 0), 2),
+                }
+            )
+        return result
+
+    def report_economics_intelligence_fact_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        marketplaces: set[str] | None = None,
+    ) -> list[dict]:
+        def _safe_float(value: Any) -> float:
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _extract_listing_fee_estimate(details_raw: str | None) -> dict:
+            payload_raw = str(details_raw or "").strip()
+            if not payload_raw:
+                return {}
+            try:
+                payload = json.loads(payload_raw)
+            except Exception:
+                return {}
+            if not isinstance(payload, dict):
+                return {}
+            ebay_publish = payload.get("ebay_publish")
+            if not isinstance(ebay_publish, dict):
+                return {}
+            fee_estimate = ebay_publish.get("fee_estimate")
+            return fee_estimate if isinstance(fee_estimate, dict) else {}
+
+        marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
+
+        sold_price_expr = func.coalesce(Sale.sold_price, 0)
+        sibling_gross_total_expr = func.sum(sold_price_expr).over(partition_by=Sale.order_id)
+        sibling_count_expr = func.count(Sale.id).over(partition_by=Sale.order_id)
+        weight_expr = case(
+            (Sale.order_id.is_(None), literal(1.0)),
+            (sibling_gross_total_expr > 0, sold_price_expr / func.nullif(sibling_gross_total_expr, 0)),
+            (sibling_count_expr > 0, literal(1.0) / func.nullif(sibling_count_expr, 0)),
+            else_=literal(1.0),
+        )
+        order_fee_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.fees, 0)),
+            else_=func.coalesce(Sale.fees, 0),
+        )
+        order_shipping_charged_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0)),
+            else_=func.coalesce(Sale.shipping_cost, 0),
+        )
+        order_shipping_actual_total_expr = case(
+            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0)),
+            else_=func.coalesce(Sale.shipping_label_cost, 0),
+        )
+        allocated_fee_expr = order_fee_total_expr * weight_expr
+        allocated_shipping_charged_expr = order_shipping_charged_total_expr * weight_expr
+        allocated_shipping_actual_expr = order_shipping_actual_total_expr * weight_expr
+        net_before_cogs_actual_expr = sold_price_expr - allocated_fee_expr - allocated_shipping_actual_expr
+
+        query = (
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.order_id.label("order_id"),
+                Sale.listing_id.label("listing_id"),
+                func.lower(func.coalesce(cast(Sale.marketplace, String), "")).label("marketplace"),
+                Sale.external_order_id.label("external_order_id"),
+                Product.id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                func.coalesce(Sale.quantity_sold, 0).label("qty"),
+                sold_price_expr.label("sold_price"),
+                weight_expr.label("allocation_weight"),
+                order_fee_total_expr.label("order_fee_total_actual"),
+                order_shipping_charged_total_expr.label("order_shipping_charged_total"),
+                order_shipping_actual_total_expr.label("order_shipping_actual_total"),
+                allocated_fee_expr.label("allocated_fee_actual"),
+                allocated_shipping_charged_expr.label("allocated_shipping_charged"),
+                allocated_shipping_actual_expr.label("allocated_shipping_actual"),
+                net_before_cogs_actual_expr.label("net_before_cogs_actual"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
+                MarketplaceListing.quantity_listed.label("listing_quantity"),
+            )
+            .select_from(Sale)
+            .outerjoin(Order, Order.id == Sale.order_id)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .where(
+                Sale.sold_at.is_not(None),
+                Sale.sold_at >= start_dt,
+                Sale.sold_at <= end_dt,
+            )
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        )
+        if marketplace_filter:
+            query = query.where(func.lower(func.coalesce(cast(Sale.marketplace, String), "")).in_(sorted(marketplace_filter)))
+        rows = self.db.execute(query).all()
+
+        result: list[dict] = []
+        for row in rows:
+            qty = max(1, int(row.qty or 0))
+            sold_price = round(float(row.sold_price or 0), 2)
+            actual_fee_alloc = round(float(row.allocated_fee_actual or 0), 2)
+            expected_shipping_alloc = round(float(row.allocated_shipping_charged or 0), 2)
+            actual_shipping_alloc = round(float(row.allocated_shipping_actual or 0), 2)
+            actual_net_before_cogs = round(float(row.net_before_cogs_actual or 0), 2)
+
+            fee_estimate = _extract_listing_fee_estimate(getattr(row, "listing_marketplace_details", None))
+            fee_estimate_total = _safe_float(fee_estimate.get("estimated_total_fees"))
+            fee_estimate_qty = int(_safe_float(fee_estimate.get("quantity") or 0))
+            if fee_estimate_qty <= 0:
+                fee_estimate_qty = int(row.listing_quantity or 0)
+            estimate_available = bool(fee_estimate_total > 0 and fee_estimate_qty > 0)
+            estimated_fee_alloc: float | None = None
+            estimated_net_before_cogs: float | None = None
+            fee_variance_actual_minus_estimated: float | None = None
+            net_variance_actual_minus_estimated: float | None = None
+            if estimate_available:
+                estimated_fee_alloc = round((fee_estimate_total / max(1, fee_estimate_qty)) * qty, 2)
+                estimated_net_before_cogs = round(sold_price - estimated_fee_alloc - expected_shipping_alloc, 2)
+                fee_variance_actual_minus_estimated = round(actual_fee_alloc - estimated_fee_alloc, 2)
+                net_variance_actual_minus_estimated = round(actual_net_before_cogs - estimated_net_before_cogs, 2)
+
+            result.append(
+                {
+                    "sale_id": int(row.sale_id or 0),
+                    "sold_at": row.sold_at,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "order_id": int(row.order_id or 0) if row.order_id is not None else None,
+                    "listing_id": int(row.listing_id or 0) if row.listing_id is not None else None,
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "product_id": int(row.product_id or 0) if row.product_id is not None else None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "qty": qty,
+                    "sold_price": sold_price,
+                    "allocation_weight": round(float(row.allocation_weight or 0), 6),
+                    "estimated_fee_alloc": estimated_fee_alloc,
+                    "expected_shipping_alloc": expected_shipping_alloc,
+                    "estimated_net_before_cogs": estimated_net_before_cogs,
+                    "actual_fee_alloc": actual_fee_alloc,
+                    "actual_shipping_alloc": actual_shipping_alloc,
+                    "actual_net_before_cogs": actual_net_before_cogs,
+                    "fee_variance_actual_minus_estimated": fee_variance_actual_minus_estimated,
+                    "shipping_delta_expected_minus_actual": round(expected_shipping_alloc - actual_shipping_alloc, 2),
+                    "net_variance_actual_minus_estimated": net_variance_actual_minus_estimated,
+                    "estimate_available": estimate_available,
+                }
+            )
+        return result
+
+    def report_listing_review_activity_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        rows = self.db.execute(
+            select(
+                MarketplaceListing.id.label("listing_id"),
+                func.lower(func.coalesce(cast(MarketplaceListing.marketplace, String), "")).label("marketplace"),
+                Product.sku.label("sku"),
+                MarketplaceListing.listing_title.label("listing_title"),
+                MarketplaceListing.marketplace_details.label("marketplace_details"),
+            )
+            .select_from(MarketplaceListing)
+            .outerjoin(Product, Product.id == MarketplaceListing.product_id)
+            .where(
+                MarketplaceListing.marketplace_details.is_not(None),
+                func.length(func.trim(func.coalesce(MarketplaceListing.marketplace_details, ""))) > 0,
+            )
+            .order_by(MarketplaceListing.id.desc())
+        ).all()
+
+        result: list[dict] = []
+        for row in rows:
+            payload_raw = str(row.marketplace_details or "").strip()
+            if not payload_raw:
+                continue
+            try:
+                payload = json.loads(payload_raw)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            history = payload.get("review_history")
+            if not isinstance(history, list):
+                continue
+            for event in history:
+                if not isinstance(event, dict):
+                    continue
+                reviewed_at_raw = str(event.get("reviewed_at") or "").strip()
+                if not reviewed_at_raw:
+                    continue
+                try:
+                    reviewed_at_dt = datetime.fromisoformat(reviewed_at_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                except Exception:
+                    continue
+                if not (start_dt <= reviewed_at_dt <= end_dt):
+                    continue
+                result.append(
+                    {
+                        "listing_id": int(row.listing_id or 0),
+                        "marketplace": str(row.marketplace or "").strip().lower(),
+                        "sku": str(row.sku or "").strip() or None,
+                        "listing_title": str(row.listing_title or "").strip(),
+                        "review_decision": str(event.get("decision") or "").strip().lower(),
+                        "reviewed_by": str(event.get("actor") or "").strip(),
+                        "reviewed_at": reviewed_at_dt.isoformat(),
+                        "review_date": reviewed_at_dt.date().isoformat(),
+                        "review_notes": str(event.get("notes") or "").strip(),
+                    }
+                )
+        return sorted(result, key=lambda x: (x.get("reviewed_at") or "", x.get("listing_id") or 0), reverse=True)
+
+    def report_listing_format_outcome_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        rows = self.db.execute(
+            select(
+                MarketplaceListing.id.label("listing_id"),
+                MarketplaceListing.listed_at.label("listed_at"),
+                func.lower(func.coalesce(cast(MarketplaceListing.marketplace, String), "")).label("marketplace"),
+                Product.sku.label("sku"),
+                MarketplaceListing.listing_title.label("listing_title"),
+                MarketplaceListing.review_status.label("review_status"),
+                MarketplaceListing.listing_status.label("listing_status"),
+                MarketplaceListing.external_listing_id.label("external_listing_id"),
+                MarketplaceListing.marketplace_details.label("marketplace_details"),
+            )
+            .select_from(MarketplaceListing)
+            .outerjoin(Product, Product.id == MarketplaceListing.product_id)
+            .order_by(MarketplaceListing.id.desc())
+        ).all()
+        # Keep null-listed rows as prior behavior did, while filtering dated rows in python
+        result: list[dict] = []
+        for row in rows:
+            listed_at = row.listed_at
+            if listed_at is not None and not (start_dt <= listed_at <= end_dt):
+                continue
+            meta: dict[str, Any] = {}
+            details_raw = str(row.marketplace_details or "").strip()
+            if details_raw:
+                try:
+                    parsed = json.loads(details_raw)
+                    if isinstance(parsed, dict):
+                        publish_meta = parsed.get("ebay_publish")
+                        if isinstance(publish_meta, dict):
+                            meta = publish_meta
+                except Exception:
+                    meta = {}
+            intent_format = str(meta.get("format") or meta.get("format_type") or "FIXED_PRICE").strip().upper()
+            if intent_format not in {"FIXED_PRICE", "AUCTION"}:
+                intent_format = "FIXED_PRICE"
+            intent_duration = str(meta.get("listing_duration") or "").strip().upper()
+            publish_history = meta.get("history") if isinstance(meta.get("history"), list) else []
+            publish_attempt_count = len(publish_history)
+            publish_success_count = len(
+                [
+                    h
+                    for h in publish_history
+                    if str((h or {}).get("status") or "").strip().lower() in {"published", "success"}
+                ]
+            )
+            publish_error_events = [
+                h for h in publish_history if str((h or {}).get("status") or "").strip().lower() in {"error", "failed"}
+            ]
+            publish_error_count = len(publish_error_events)
+            last_error = ""
+            if publish_error_events:
+                last_error = str((publish_error_events[-1] or {}).get("error") or "").strip()
+            published_at = str(meta.get("published_at") or "").strip()
+            external_listing_id = str(row.external_listing_id or "").strip()
+            listing_state = str(row.listing_status or "").strip().lower()
+            if external_listing_id and listing_state in {"active", "ended", "sold"}:
+                publish_outcome = "published"
+            elif publish_error_count > 0:
+                publish_outcome = "publish_error"
+            elif publish_attempt_count > 0:
+                publish_outcome = "attempted_no_publish"
+            else:
+                publish_outcome = "not_attempted"
+            result.append(
+                {
+                    "listing_id": int(row.listing_id or 0),
+                    "listed_at": listed_at.isoformat() if listed_at is not None else None,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "sku": str(row.sku or "").strip() or None,
+                    "listing_title": str(row.listing_title or "").strip(),
+                    "review_status": str(row.review_status or "").strip().lower(),
+                    "listing_status": listing_state,
+                    "intent_format": intent_format,
+                    "intent_duration": intent_duration,
+                    "intent_best_offer_enabled": bool(meta.get("best_offer_enabled")),
+                    "intent_auction_start_price": round(float(meta.get("auction_start_price") or 0), 2),
+                    "intent_auction_reserve_price": round(float(meta.get("auction_reserve_price") or 0), 2),
+                    "intent_auction_buy_now_price": round(float(meta.get("auction_buy_now_price") or 0), 2),
+                    "publish_attempt_count": int(publish_attempt_count),
+                    "publish_success_count": int(publish_success_count),
+                    "publish_error_count": int(publish_error_count),
+                    "publish_outcome": publish_outcome,
+                    "published_at": published_at or None,
+                    "published_listing_id": external_listing_id or None,
+                    "last_publish_error": last_error or None,
+                }
+            )
+        return sorted(
+            result,
+            key=lambda x: (str(x.get("listed_at") or ""), int(x.get("listing_id") or 0)),
+            reverse=True,
+        )
+
+    def report_rebuy_cost_trend_rows(
+        self,
+        *,
+        end_dt: datetime | None = None,
+    ) -> list[dict]:
+        cutoff = end_dt or utcnow_naive()
+
+        product_rows = self.db.execute(
+            select(
+                Product.id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("title"),
+            )
+            .select_from(Product)
+        ).all()
+        product_by_id = {
+            int(row.product_id): {
+                "sku": str(row.sku or "").strip() or None,
+                "title": str(row.title or "").strip() or None,
+            }
+            for row in product_rows
+            if int(row.product_id or 0) > 0
+        }
+
+        assignment_rows = self.db.execute(
+            select(
+                ProductLotAssignment.id.label("assignment_id"),
+                ProductLotAssignment.product_id.label("product_id"),
+                ProductLotAssignment.acquired_at.label("acquired_at"),
+                ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                ProductLotAssignment.unit_cost.label("unit_cost"),
+            )
+            .select_from(ProductLotAssignment)
+            .where(
+                ProductLotAssignment.product_id.is_not(None),
+                ProductLotAssignment.acquired_at <= cutoff,
+            )
+        ).all()
+
+        movement_rows = self.db.execute(
+            select(
+                InventoryMovement.id.label("movement_id"),
+                InventoryMovement.product_id.label("product_id"),
+                InventoryMovement.occurred_at.label("occurred_at"),
+                func.lower(func.coalesce(cast(InventoryMovement.movement_type, String), "")).label("movement_type"),
+                InventoryMovement.quantity_delta.label("quantity_delta"),
+                InventoryMovement.unit_cost.label("unit_cost"),
+            )
+            .select_from(InventoryMovement)
+            .where(
+                InventoryMovement.product_id.is_not(None),
+                InventoryMovement.occurred_at <= cutoff,
+                func.lower(func.coalesce(cast(InventoryMovement.movement_type, String), "")).in_(
+                    ["initial_stock", "repurchase_in"]
+                ),
+            )
+        ).all()
+
+        assignment_keys = set()
+        acquisition_events: dict[int, list[dict]] = {}
+
+        for row in assignment_rows:
+            pid = int(row.product_id or 0)
+            qty = max(0, int(row.quantity_acquired or 0))
+            unit_cost = float(row.unit_cost or 0)
+            if pid <= 0 or qty <= 0 or unit_cost <= 0:
+                continue
+            ts = row.acquired_at or datetime.min
+            key = (pid, ts, qty, round(unit_cost, 6))
+            assignment_keys.add(key)
+            acquisition_events.setdefault(pid, []).append(
+                {
+                    "occurred_at": ts,
+                    "event_type": "lot_assignment",
+                    "qty_in": qty,
+                    "unit_cost": unit_cost,
+                    "source_ref": f"assignment:{int(row.assignment_id or 0)}",
+                }
+            )
+
+        for row in movement_rows:
+            pid = int(row.product_id or 0)
+            qty = max(0, int(row.quantity_delta or 0))
+            unit_cost = float(row.unit_cost or 0)
+            if pid <= 0 or qty <= 0 or unit_cost <= 0:
+                continue
+            ts = row.occurred_at or datetime.min
+            key = (pid, ts, qty, round(unit_cost, 6))
+            if key in assignment_keys:
+                continue
+            acquisition_events.setdefault(pid, []).append(
+                {
+                    "occurred_at": ts,
+                    "event_type": str(row.movement_type or "").strip().lower() or "repurchase_in",
+                    "qty_in": qty,
+                    "unit_cost": unit_cost,
+                    "source_ref": f"movement:{int(row.movement_id or 0)}",
+                }
+            )
+
+        rows: list[dict] = []
+        for pid, events in acquisition_events.items():
+            product_meta = product_by_id.get(pid) or {}
+            cumulative_qty = 0.0
+            cumulative_cost = 0.0
+            for idx, event in enumerate(
+                sorted(events, key=lambda x: (x["occurred_at"], x["event_type"], x["source_ref"])),
+                start=1,
+            ):
+                qty = float(event["qty_in"])
+                unit_cost = float(event["unit_cost"] or 0)
+                cumulative_qty += qty
+                cumulative_cost += qty * unit_cost
+                weighted_unit_cost = (cumulative_cost / cumulative_qty) if cumulative_qty > 0 else 0.0
+                rows.append(
+                    {
+                        "product_id": int(pid),
+                        "sku": product_meta.get("sku"),
+                        "product_title": product_meta.get("title"),
+                        "event_index": int(idx),
+                        "as_of": event["occurred_at"].isoformat() if event["occurred_at"] else None,
+                        "event_type": event["event_type"],
+                        "qty_in": int(qty),
+                        "unit_cost": round(unit_cost, 4),
+                        "acquisition_value": round(qty * unit_cost, 2),
+                        "cumulative_qty_acquired": round(cumulative_qty, 2),
+                        "cumulative_acquisition_cost": round(cumulative_cost, 2),
+                        "weighted_unit_cost": round(weighted_unit_cost, 4),
+                        "source_ref": event["source_ref"],
+                    }
+                )
+
+        return sorted(rows, key=lambda x: (x.get("sku") or "", x.get("event_index") or 0))
+
+    def report_inventory_cycle_rows(
+        self,
+        *,
+        end_dt: datetime | None = None,
+    ) -> list[dict]:
+        cutoff = end_dt or utcnow_naive()
+
+        product_rows = self.db.execute(
+            select(
+                Product.id.label("product_id"),
+                Product.sku.label("sku"),
+                Product.title.label("title"),
+            ).select_from(Product)
+        ).all()
+        product_by_id = {
+            int(row.product_id): {
+                "sku": str(row.sku or "").strip() or None,
+                "title": str(row.title or "").strip() or None,
+            }
+            for row in product_rows
+            if int(row.product_id or 0) > 0
+        }
+
+        movement_rows = self.db.execute(
+            select(
+                InventoryMovement.id.label("movement_id"),
+                InventoryMovement.product_id.label("product_id"),
+                InventoryMovement.occurred_at.label("occurred_at"),
+                InventoryMovement.quantity_before.label("quantity_before"),
+                InventoryMovement.quantity_after.label("quantity_after"),
+                InventoryMovement.quantity_delta.label("quantity_delta"),
+                InventoryMovement.unit_cost.label("unit_cost"),
+            )
+            .select_from(InventoryMovement)
+            .where(
+                InventoryMovement.product_id.is_not(None),
+                InventoryMovement.occurred_at <= cutoff,
+            )
+            .order_by(InventoryMovement.occurred_at.asc(), InventoryMovement.id.asc())
+        ).all()
+        sales_rows = self.db.execute(
+            select(
+                Sale.id.label("sale_id"),
+                Sale.product_id.label("product_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.quantity_sold.label("quantity_sold"),
+                Sale.sold_price.label("sold_price"),
+                Sale.fees.label("fees"),
+                Sale.shipping_cost.label("shipping_cost"),
+            )
+            .select_from(Sale)
+            .where(
+                Sale.product_id.is_not(None),
+                Sale.sold_at.is_not(None),
+                Sale.sold_at <= cutoff,
+            )
+            .order_by(Sale.sold_at.asc(), Sale.id.asc())
+        ).all()
+
+        movements_by_product: dict[int, list[Any]] = {}
+        for row in movement_rows:
+            pid = int(row.product_id or 0)
+            if pid <= 0:
+                continue
+            movements_by_product.setdefault(pid, []).append(row)
+        sales_by_product: dict[int, list[Any]] = {}
+        for row in sales_rows:
+            pid = int(row.product_id or 0)
+            if pid <= 0:
+                continue
+            sales_by_product.setdefault(pid, []).append(row)
+
+        rows: list[dict] = []
+        for product_id, product_movements in movements_by_product.items():
+            product_meta = product_by_id.get(product_id) or {}
+            product_sales = sorted(
+                sales_by_product.get(product_id, []),
+                key=lambda x: (x.sold_at or datetime.min, int(x.sale_id or 0)),
+            )
+            sales_idx = 0
+            sorted_movements = sorted(
+                product_movements,
+                key=lambda x: (x.occurred_at or datetime.min, int(x.movement_id or 0)),
+            )
+            current_cycle: dict | None = None
+            cycle_number = 0
+
+            for mv in sorted_movements:
+                before_qty = int(mv.quantity_before or 0)
+                after_qty = int(mv.quantity_after or 0)
+                qty_delta = int(mv.quantity_delta or 0)
+                started_new_cycle = current_cycle is None and after_qty > 0
+                if started_new_cycle:
+                    cycle_number += 1
+                    current_cycle = {
+                        "product_id": int(product_id),
+                        "sku": product_meta.get("sku"),
+                        "product_title": product_meta.get("title"),
+                        "cycle_number": int(cycle_number),
+                        "cycle_id": f"{product_meta.get('sku') or product_id}-C{cycle_number}",
+                        "cycle_start": mv.occurred_at,
+                        "cycle_end": None,
+                        "cycle_status": "open",
+                        "start_qty_before": int(before_qty),
+                        "end_qty_after": int(after_qty),
+                        "qty_in": 0,
+                        "qty_out_movements": 0,
+                        "acquisition_cost_known": 0.0,
+                        "movement_count": 0,
+                        "sale_count": 0,
+                        "qty_sold_sales": 0,
+                        "gross_sales": 0.0,
+                        "fees": 0.0,
+                        "shipping_cost": 0.0,
+                        "net_sales": 0.0,
+                    }
+                if current_cycle is None:
+                    continue
+
+                current_cycle["movement_count"] += 1
+                current_cycle["end_qty_after"] = after_qty
+                if qty_delta > 0:
+                    current_cycle["qty_in"] += qty_delta
+                    if mv.unit_cost is not None:
+                        current_cycle["acquisition_cost_known"] += float(mv.unit_cost) * float(qty_delta)
+                elif qty_delta < 0:
+                    current_cycle["qty_out_movements"] += abs(qty_delta)
+
+                cycle_start = current_cycle["cycle_start"] or datetime.min
+                cycle_end_candidate = mv.occurred_at or datetime.min
+                while sales_idx < len(product_sales):
+                    sale = product_sales[sales_idx]
+                    sold_at = sale.sold_at or datetime.min
+                    if sold_at < cycle_start:
+                        sales_idx += 1
+                        continue
+                    if sold_at > cycle_end_candidate:
+                        break
+                    current_cycle["sale_count"] += 1
+                    current_cycle["qty_sold_sales"] += int(sale.quantity_sold or 0)
+                    current_cycle["gross_sales"] += float(sale.sold_price or 0)
+                    current_cycle["fees"] += float(sale.fees or 0)
+                    current_cycle["shipping_cost"] += float(sale.shipping_cost or 0)
+                    current_cycle["net_sales"] += (
+                        float(sale.sold_price or 0)
+                        - float(sale.fees or 0)
+                        - float(sale.shipping_cost or 0)
+                    )
+                    sales_idx += 1
+
+                if after_qty <= 0:
+                    current_cycle["cycle_end"] = mv.occurred_at
+                    current_cycle["cycle_status"] = "closed"
+                    known_cost = float(current_cycle.get("acquisition_cost_known") or 0.0)
+                    current_cycle["estimated_margin_vs_known_cost"] = float(current_cycle.get("net_sales") or 0.0) - known_cost
+                    rows.append(current_cycle)
+                    current_cycle = None
+
+            if current_cycle is not None:
+                while sales_idx < len(product_sales):
+                    sale = product_sales[sales_idx]
+                    sold_at = sale.sold_at or datetime.min
+                    if sold_at < (current_cycle["cycle_start"] or datetime.min):
+                        sales_idx += 1
+                        continue
+                    current_cycle["sale_count"] += 1
+                    current_cycle["qty_sold_sales"] += int(sale.quantity_sold or 0)
+                    current_cycle["gross_sales"] += float(sale.sold_price or 0)
+                    current_cycle["fees"] += float(sale.fees or 0)
+                    current_cycle["shipping_cost"] += float(sale.shipping_cost or 0)
+                    current_cycle["net_sales"] += (
+                        float(sale.sold_price or 0)
+                        - float(sale.fees or 0)
+                        - float(sale.shipping_cost or 0)
+                    )
+                    sales_idx += 1
+                current_cycle["cycle_status"] = "open"
+                known_cost = float(current_cycle.get("acquisition_cost_known") or 0.0)
+                current_cycle["estimated_margin_vs_known_cost"] = float(current_cycle.get("net_sales") or 0.0) - known_cost
+                rows.append(current_cycle)
+
+        output = []
+        for row in rows:
+            output.append(
+                {
+                    "product_id": int(row["product_id"]),
+                    "sku": row["sku"],
+                    "product_title": row["product_title"],
+                    "cycle_number": int(row["cycle_number"]),
+                    "cycle_id": row["cycle_id"],
+                    "cycle_status": row["cycle_status"],
+                    "cycle_start": row["cycle_start"].isoformat() if row["cycle_start"] is not None else None,
+                    "cycle_end": row["cycle_end"].isoformat() if row["cycle_end"] is not None else None,
+                    "start_qty_before": int(row["start_qty_before"]),
+                    "end_qty_after": int(row["end_qty_after"]),
+                    "qty_in": int(row["qty_in"]),
+                    "qty_out_movements": int(row["qty_out_movements"]),
+                    "qty_sold_sales": int(row["qty_sold_sales"]),
+                    "movement_count": int(row["movement_count"]),
+                    "sale_count": int(row["sale_count"]),
+                    "acquisition_cost_known": round(float(row["acquisition_cost_known"] or 0), 2),
+                    "gross_sales": round(float(row["gross_sales"] or 0), 2),
+                    "fees": round(float(row["fees"] or 0), 2),
+                    "shipping_cost": round(float(row["shipping_cost"] or 0), 2),
+                    "net_sales": round(float(row["net_sales"] or 0), 2),
+                    "estimated_margin_vs_known_cost": round(float(row["estimated_margin_vs_known_cost"] or 0), 2),
+                }
+            )
+        return sorted(output, key=lambda x: (x.get("sku") or "", int(x.get("cycle_number") or 0)))
+
+    def report_ebay_fee_reconciliation_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        def _safe_float(value: Any) -> float:
+            try:
+                if value is None:
+                    return 0.0
+                return float(value)
+            except Exception:
+                return 0.0
+
+        def _extract_order_fee_breakdown_from_notes(notes: str | None) -> dict:
+            raw = str(notes or "").strip()
+            if not raw:
+                return {}
+            marker = "fee_breakdown_json="
+            idx = raw.find(marker)
+            if idx < 0:
+                return {}
+            json_raw = raw[idx + len(marker):].strip()
+            if "; " in json_raw:
+                json_raw = json_raw.split("; ", 1)[0].strip()
+            if not json_raw:
+                return {}
+            try:
+                payload = json.loads(json_raw)
+            except Exception:
+                return {}
+            return payload if isinstance(payload, dict) else {}
+
+        def _parse_listing_fee_estimate_payload(listing_marketplace_details: str | None) -> dict:
+            raw = str(listing_marketplace_details or "").strip()
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return {}
+            if not isinstance(parsed, dict):
+                return {}
+            publish_meta = parsed.get("ebay_publish")
+            if not isinstance(publish_meta, dict):
+                return {}
+            fee_estimate = publish_meta.get("fee_estimate")
+            return fee_estimate if isinstance(fee_estimate, dict) else {}
+
+        query = (
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.external_order_id.label("external_order_id"),
+                Sale.order_id.label("order_id"),
+                Sale.listing_id.label("listing_id"),
+                Sale.quantity_sold.label("quantity_sold"),
+                Sale.sold_price.label("sale_gross"),
+                Sale.fees.label("sale_fee_field"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                MarketplaceListing.external_listing_id.label("external_listing_id"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
+                Order.notes.label("order_notes"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(Order, Order.id == Sale.order_id)
+            .where(
+                func.lower(func.coalesce(Sale.marketplace, "")) == "ebay",
+                Sale.sold_at.is_not(None),
+                Sale.sold_at >= start_dt,
+                Sale.sold_at <= end_dt,
+            )
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        order_ids = [int(getattr(row, "order_id", 0) or 0) for row in rows if int(getattr(row, "order_id", 0) or 0) > 0]
+        normalized_fee_by_order: dict[int, float] = {}
+        if order_ids:
+            grouped_fee_rows = self.db.execute(
+                select(
+                    OrderFinanceEntry.order_id,
+                    func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0).label("total_fee"),
+                )
+                .where(
+                    OrderFinanceEntry.order_id.in_(order_ids),
+                    OrderFinanceEntry.entry_kind == "marketplace_fee",
+                )
+                .group_by(OrderFinanceEntry.order_id)
+            ).all()
+            for fee_row in grouped_fee_rows:
+                oid = int(getattr(fee_row, "order_id", 0) or 0)
+                if oid <= 0:
+                    continue
+                normalized_fee_by_order[oid] = _safe_float(getattr(fee_row, "total_fee", 0))
+        result: list[dict] = []
+        for row in rows:
+            fee_estimate = _parse_listing_fee_estimate_payload(row.listing_marketplace_details)
+            est_total_raw = _safe_float(fee_estimate.get("estimated_total_fees"))
+            est_basis_qty_raw = int(_safe_float(fee_estimate.get("quantity") or 0))
+            sale_qty = max(1, int(row.quantity_sold or 1))
+            est_basis_qty = max(1, est_basis_qty_raw) if est_total_raw > 0 else 0
+            est_scaled = est_total_raw * (float(sale_qty) / float(est_basis_qty)) if est_total_raw > 0 and est_basis_qty > 0 else 0.0
+
+            order_fee_breakdown = _extract_order_fee_breakdown_from_notes(row.order_notes)
+            order_marketplace_fee = _safe_float(order_fee_breakdown.get("total_marketplace_fee"))
+            sale_fee_field = _safe_float(row.sale_fee_field)
+            normalized_order_fee_total = _safe_float(normalized_fee_by_order.get(int(row.order_id or 0), 0))
+            if normalized_order_fee_total > 0:
+                actual_fee = normalized_order_fee_total
+                actual_fee_source = "normalized_order_finance_entries_marketplace_fee_sum"
+            elif order_marketplace_fee > 0:
+                actual_fee = order_marketplace_fee
+                actual_fee_source = "order_fee_breakdown_total_marketplace_fee"
+            else:
+                actual_fee = sale_fee_field
+                actual_fee_source = "sale_fees_field"
+
+            variance = actual_fee - est_scaled
+            variance_pct = (variance / est_scaled * 100.0) if est_scaled > 0 else 0.0
+            estimate_final_value_rate_percent = _safe_float(fee_estimate.get("final_value_rate_percent"))
+            estimate_final_value_fixed_usd = _safe_float(fee_estimate.get("final_value_fixed_usd"))
+            estimate_payment_rate_percent = _safe_float(fee_estimate.get("payment_rate_percent"))
+            estimate_payment_fixed_usd = _safe_float(fee_estimate.get("payment_fixed_usd"))
+            estimate_promoted_rate_percent = _safe_float(fee_estimate.get("promoted_rate_percent"))
+            sale_gross = _safe_float(row.sale_gross)
+            implied_final_value_rate = 0.0
+            if sale_gross > 0:
+                non_fv_component = (
+                    (sale_gross * estimate_payment_rate_percent / 100.0)
+                    + estimate_payment_fixed_usd
+                    + (sale_gross * estimate_promoted_rate_percent / 100.0)
+                    + estimate_final_value_fixed_usd
+                )
+                implied_final_value_rate = ((actual_fee - non_fv_component) / sale_gross) * 100.0
+
+            result.append(
+                {
+                    "sale_id": int(row.sale_id or 0),
+                    "sold_at": row.sold_at.isoformat() if row.sold_at is not None else None,
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "listing_id": int(row.listing_id or 0) or None,
+                    "external_listing_id": str(row.external_listing_id or "").strip(),
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "quantity_sold": sale_qty,
+                    "sale_gross": round(sale_gross, 2),
+                    "actual_fee": round(actual_fee, 2),
+                    "actual_fee_source": actual_fee_source,
+                    "sale_fee_field": round(sale_fee_field, 2),
+                    "normalized_order_finance_marketplace_fee_total": round(normalized_order_fee_total, 2),
+                    "normalized_order_finance_marketplace_fee_present": bool(normalized_order_fee_total > 0),
+                    "order_fee_breakdown_total_marketplace_fee": round(order_marketplace_fee, 2),
+                    "order_fee_breakdown_present": bool(order_marketplace_fee > 0),
+                    "delta_sale_fee_field_vs_order_breakdown": round(sale_fee_field - order_marketplace_fee, 2)
+                    if order_marketplace_fee > 0
+                    else 0.0,
+                    "estimated_fee_scaled": round(est_scaled, 2),
+                    "estimated_fee_source_total": round(est_total_raw, 2),
+                    "estimated_fee_source_qty": int(est_basis_qty_raw or 0),
+                    "variance_actual_minus_estimate": round(variance, 2),
+                    "variance_percent_of_estimate": round(variance_pct, 2),
+                    "fee_estimate_present": bool(est_total_raw > 0),
+                    "estimate_final_value_rate_percent": round(estimate_final_value_rate_percent, 4),
+                    "estimate_final_value_fixed_usd": round(estimate_final_value_fixed_usd, 2),
+                    "estimate_payment_rate_percent": round(estimate_payment_rate_percent, 4),
+                    "estimate_payment_fixed_usd": round(estimate_payment_fixed_usd, 2),
+                    "estimate_promoted_rate_percent": round(estimate_promoted_rate_percent, 4),
+                    "implied_final_value_rate_percent": round(implied_final_value_rate, 4),
+                }
+            )
+        return result
+
+    def report_ebay_marketplace_fee_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        query = (
+            select(
+                OrderFinanceEntry.order_id.label("order_id"),
+                Order.sold_at.label("sold_at"),
+                Order.external_order_id.label("external_order_id"),
+                OrderFinanceEntry.line_item_id.label("line_item_id"),
+                OrderFinanceEntry.sku.label("sku"),
+                OrderFinanceEntry.legacy_item_id.label("legacy_item_id"),
+                OrderFinanceEntry.fee_type.label("fee_type"),
+                OrderFinanceEntry.amount.label("fee_amount"),
+                OrderFinanceEntry.currency.label("fee_currency"),
+                OrderFinanceEntry.memo.label("fee_memo"),
+                OrderFinanceEntry.transaction_id.label("transaction_id"),
+                OrderFinanceEntry.transaction_date.label("transaction_date"),
+                OrderFinanceEntry.transaction_type.label("transaction_type"),
+                OrderFinanceEntry.transaction_status.label("transaction_status"),
+                OrderFinanceEntry.source.label("source"),
+            )
+            .select_from(OrderFinanceEntry)
+            .join(Order, Order.id == OrderFinanceEntry.order_id)
+            .where(
+                OrderFinanceEntry.entry_kind == "marketplace_fee",
+                func.lower(func.coalesce(cast(Order.marketplace, String), "")) == "ebay",
+                Order.sold_at.is_not(None),
+                Order.sold_at >= start_dt,
+                Order.sold_at <= end_dt,
+            )
+            .order_by(Order.sold_at.desc(), OrderFinanceEntry.order_id.desc(), OrderFinanceEntry.id.desc())
+        )
+        rows = self.db.execute(query).all()
+        result: list[dict] = []
+        for row in rows:
+            result.append(
+                {
+                    "order_id": int(row.order_id or 0),
+                    "sold_at": row.sold_at.isoformat() if row.sold_at is not None else "",
+                    "external_order_id": str(row.external_order_id or "").strip(),
+                    "line_item_id": str(row.line_item_id or "").strip(),
+                    "sku": str(row.sku or "").strip(),
+                    "product_title": "",
+                    "legacy_item_id": str(row.legacy_item_id or "").strip(),
+                    "fee_type": str(row.fee_type or "").strip(),
+                    "fee_amount": round(float(row.fee_amount or 0), 2),
+                    "fee_currency": str(row.fee_currency or "").strip(),
+                    "fee_memo": str(row.fee_memo or "").strip(),
+                    "transaction_id": str(row.transaction_id or "").strip(),
+                    "transaction_date": row.transaction_date.isoformat() if row.transaction_date is not None else "",
+                    "transaction_type": str(row.transaction_type or "").strip(),
+                    "transaction_status": str(row.transaction_status or "").strip(),
+                    "source": str(row.source or "").strip() or "normalized_order_finance_entries",
+                }
+            )
+        return result
+
+    def report_marketplace_reconciliation_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        sales_rows = self.db.execute(
+            select(
+                func.lower(func.coalesce(cast(Sale.marketplace, String), "")).label("marketplace"),
+                func.count(Sale.id).label("sales_count"),
+                func.coalesce(func.sum(Sale.sold_price), 0).label("sales_gross"),
+                func.coalesce(func.sum(Sale.fees), 0).label("sales_fees"),
+                func.coalesce(func.sum(Sale.shipping_cost), 0).label("sales_shipping_cost"),
+                func.coalesce(func.sum(Sale.sold_price - Sale.fees - Sale.shipping_cost), 0).label(
+                    "sales_net_before_returns"
+                ),
+            )
+            .where(
+                Sale.sold_at.is_not(None),
+                Sale.sold_at >= start_dt,
+                Sale.sold_at <= end_dt,
+                func.length(func.trim(func.coalesce(cast(Sale.marketplace, String), ""))) > 0,
+            )
+            .group_by(func.lower(func.coalesce(cast(Sale.marketplace, String), "")))
+        ).all()
+
+        order_rows = self.db.execute(
+            select(
+                func.lower(func.coalesce(cast(Order.marketplace, String), "")).label("marketplace"),
+                func.count(Order.id).label("orders_count"),
+                func.coalesce(func.sum(Order.total_amount), 0).label("order_total_sum"),
+            )
+            .where(
+                Order.sold_at.is_not(None),
+                Order.sold_at >= start_dt,
+                Order.sold_at <= end_dt,
+                func.length(func.trim(func.coalesce(cast(Order.marketplace, String), ""))) > 0,
+            )
+            .group_by(func.lower(func.coalesce(cast(Order.marketplace, String), "")))
+        ).all()
+
+        return_rows = self.db.execute(
+            select(
+                func.lower(func.coalesce(cast(ReturnRecord.marketplace, String), "")).label("marketplace"),
+                func.count(ReturnRecord.id).label("returns_count"),
+                func.coalesce(
+                    func.sum(
+                        func.coalesce(ReturnRecord.refund_amount, 0)
+                        + func.coalesce(ReturnRecord.refund_fees, 0)
+                        + func.coalesce(ReturnRecord.refund_shipping, 0)
+                    ),
+                    0,
+                ).label("returns_refund_total"),
+            )
+            .where(
+                ReturnRecord.returned_at.is_not(None),
+                ReturnRecord.returned_at >= start_dt,
+                ReturnRecord.returned_at <= end_dt,
+                func.length(func.trim(func.coalesce(cast(ReturnRecord.marketplace, String), ""))) > 0,
+            )
+            .group_by(func.lower(func.coalesce(cast(ReturnRecord.marketplace, String), "")))
+        ).all()
+
+        by_marketplace: dict[str, dict[str, float | int | str | bool]] = {}
+
+        def _bucket(marketplace: str) -> dict[str, float | int | str | bool]:
+            key = str(marketplace or "").strip().lower()
+            if key not in by_marketplace:
+                by_marketplace[key] = {
+                    "marketplace": key,
+                    "sales_count": 0,
+                    "orders_count": 0,
+                    "returns_count": 0,
+                    "sales_gross": 0.0,
+                    "sales_fees": 0.0,
+                    "sales_shipping_cost": 0.0,
+                    "sales_net_before_returns": 0.0,
+                    "returns_refund_total": 0.0,
+                    "net_after_returns": 0.0,
+                    "order_total_sum": 0.0,
+                    "delta_order_total_vs_sales_gross": 0.0,
+                    "reconcile_flag": False,
+                }
+            return by_marketplace[key]
+
+        for row in sales_rows:
+            bucket = _bucket(str(row.marketplace or ""))
+            bucket["sales_count"] = int(row.sales_count or 0)
+            bucket["sales_gross"] = float(row.sales_gross or 0.0)
+            bucket["sales_fees"] = float(row.sales_fees or 0.0)
+            bucket["sales_shipping_cost"] = float(row.sales_shipping_cost or 0.0)
+            bucket["sales_net_before_returns"] = float(row.sales_net_before_returns or 0.0)
+
+        for row in order_rows:
+            bucket = _bucket(str(row.marketplace or ""))
+            bucket["orders_count"] = int(row.orders_count or 0)
+            bucket["order_total_sum"] = float(row.order_total_sum or 0.0)
+
+        for row in return_rows:
+            bucket = _bucket(str(row.marketplace or ""))
+            bucket["returns_count"] = int(row.returns_count or 0)
+            bucket["returns_refund_total"] = float(row.returns_refund_total or 0.0)
+
+        result: list[dict] = []
+        for marketplace in sorted(by_marketplace.keys()):
+            bucket = by_marketplace[marketplace]
+            sales_gross = float(bucket.get("sales_gross") or 0.0)
+            order_total_sum = float(bucket.get("order_total_sum") or 0.0)
+            sales_net_before_returns = float(bucket.get("sales_net_before_returns") or 0.0)
+            returns_refund_total = float(bucket.get("returns_refund_total") or 0.0)
+            delta = order_total_sum - sales_gross
+            net_after_returns = sales_net_before_returns - returns_refund_total
+            result.append(
+                {
+                    "marketplace": str(bucket.get("marketplace") or ""),
+                    "sales_count": int(bucket.get("sales_count") or 0),
+                    "orders_count": int(bucket.get("orders_count") or 0),
+                    "returns_count": int(bucket.get("returns_count") or 0),
+                    "sales_gross": round(sales_gross, 2),
+                    "sales_fees": round(float(bucket.get("sales_fees") or 0.0), 2),
+                    "sales_shipping_cost": round(float(bucket.get("sales_shipping_cost") or 0.0), 2),
+                    "sales_net_before_returns": round(sales_net_before_returns, 2),
+                    "returns_refund_total": round(returns_refund_total, 2),
+                    "net_after_returns": round(net_after_returns, 2),
+                    "order_total_sum": round(order_total_sum, 2),
+                    "delta_order_total_vs_sales_gross": round(delta, 2),
+                    "reconcile_flag": bool(abs(delta) > 0.01),
+                }
+            )
+        return result
+
+    def collect_rollup_latency_baseline(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        tax_rate_percent: float = 7.5,
+        shipping_taxable: bool = True,
+        tax_exempt_categories: set[str] | None = None,
+        marketplaces: set[str] | None = None,
+    ) -> list[dict]:
+        baseline_rows: list[dict] = []
+
+        def _run(name: str, fn) -> None:
+            started = perf_counter()
+            value = fn()
+            elapsed_ms = (perf_counter() - started) * 1000.0
+            if isinstance(value, dict):
+                row_count = len(value.keys())
+            elif isinstance(value, list):
+                row_count = len(value)
+            else:
+                try:
+                    row_count = len(value)  # type: ignore[arg-type]
+                except Exception:
+                    row_count = 1 if value is not None else 0
+            baseline_rows.append(
+                {
+                    "rollup_name": name,
+                    "elapsed_ms": round(float(elapsed_ms), 3),
+                    "result_count": int(row_count),
+                    "window_start": start_dt.isoformat(),
+                    "window_end": end_dt.isoformat(),
+                }
+            )
+
+        _run("dashboard_live_metrics", lambda: self.dashboard_live_metrics(now=end_dt))
+        _run(
+            "report_shipping_economics_rows",
+            lambda: self.report_shipping_economics_rows(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                marketplaces=marketplaces,
+            ),
+        )
+        _run(
+            "report_shipping_economics_summary",
+            lambda: self.report_shipping_economics_summary(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                marketplaces=marketplaces,
+            ),
+        )
+        _run(
+            "report_tax_estimate_detail_rows",
+            lambda: self.report_tax_estimate_detail_rows(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                tax_rate_percent=float(tax_rate_percent or 0.0),
+                shipping_taxable=bool(shipping_taxable),
+                tax_exempt_categories=set(tax_exempt_categories or set()),
+                marketplaces=marketplaces,
+            ),
+        )
+        _run(
+            "report_ebay_fee_reconciliation_rows",
+            lambda: self.report_ebay_fee_reconciliation_rows(
+                start_dt=start_dt,
+                end_dt=end_dt,
+            ),
+        )
+
+        return baseline_rows
+
+    def collect_rollup_explain_baseline(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        sample_limit: int = 2000,
+    ) -> list[dict]:
+        limit = max(100, min(10000, int(sample_limit or 2000)))
+        window_7d = end_dt - timedelta(days=7)
+        window_30d = end_dt - timedelta(days=30)
+
+        explain_rows: list[dict] = []
+        inspector = inspect(self.db.get_bind())
+
+        def _table_exists(table_name: str) -> bool:
+            try:
+                return bool(inspector.has_table(table_name))
+            except Exception:
+                return False
+
+        def _parse_plan_ms(plan_lines: list[str], key: str) -> float:
+            prefix = f"{key}:"
+            for line in plan_lines:
+                raw = str(line or "").strip()
+                if not raw.startswith(prefix):
+                    continue
+                value_raw = raw[len(prefix) :].strip()
+                if value_raw.lower().endswith("ms"):
+                    value_raw = value_raw[:-2].strip()
+                try:
+                    return round(float(value_raw), 3)
+                except Exception:
+                    return 0.0
+            return 0.0
+
+        def _run(name: str, sql: str, params: dict[str, Any]) -> None:
+            explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}"
+            started = perf_counter()
+            try:
+                rows = self.db.execute(text(explain_sql), params).all()
+                elapsed_ms = (perf_counter() - started) * 1000.0
+                plan_lines = [str((row[0] if isinstance(row, (list, tuple)) else row) or "") for row in rows]
+                planning_ms = _parse_plan_ms(plan_lines, "Planning Time")
+                execution_ms = _parse_plan_ms(plan_lines, "Execution Time")
+                explain_rows.append(
+                    {
+                        "rollup_name": name,
+                        "elapsed_ms": round(float(elapsed_ms), 3),
+                        "planning_ms": float(planning_ms),
+                        "execution_ms": float(execution_ms),
+                        "plan_lines": int(len(plan_lines)),
+                        "window_start": start_dt.isoformat(),
+                        "window_end": end_dt.isoformat(),
+                        "sample_limit": int(limit),
+                        "plan_text": "\n".join(plan_lines),
+                    }
+                )
+            except Exception as exc:
+                try:
+                    self.db.rollback()
+                except Exception:
+                    pass
+                elapsed_ms = (perf_counter() - started) * 1000.0
+                error_text = str(exc)
+                missing_relation = re.search(r'relation "([^"]+)" does not exist', error_text, flags=re.IGNORECASE)
+                if missing_relation:
+                    explain_rows.append(
+                        {
+                            "rollup_name": name,
+                            "elapsed_ms": round(float(elapsed_ms), 3),
+                            "planning_ms": 0.0,
+                            "execution_ms": 0.0,
+                            "plan_lines": 0,
+                            "window_start": start_dt.isoformat(),
+                            "window_end": end_dt.isoformat(),
+                            "sample_limit": int(limit),
+                            "plan_text": "",
+                            "skipped": True,
+                            "skip_reason": f'table {missing_relation.group(1)} not present',
+                        }
+                    )
+                    return
+                explain_rows.append(
+                    {
+                        "rollup_name": name,
+                        "elapsed_ms": round(float(elapsed_ms), 3),
+                        "planning_ms": 0.0,
+                        "execution_ms": 0.0,
+                        "plan_lines": 0,
+                        "window_start": start_dt.isoformat(),
+                        "window_end": end_dt.isoformat(),
+                        "sample_limit": int(limit),
+                        "plan_text": "",
+                        "error": error_text,
+                    }
+                )
+
+        _run(
+            "dashboard_live_metrics",
+            """
+            WITH sales_30d AS (
+                SELECT sold_at, sold_price
+                FROM sales
+                WHERE sold_at >= :window_30d
+            ),
+            sales_rollup AS (
+                SELECT
+                    COALESCE(SUM(CASE WHEN sold_at >= :window_7d THEN 1 ELSE 0 END), 0) AS sales_7d_count,
+                    COALESCE(SUM(CASE WHEN sold_at >= :window_7d THEN COALESCE(sold_price, 0) ELSE 0 END), 0) AS sales_7d_gross,
+                    COUNT(*) AS sales_30d_count,
+                    COALESCE(SUM(COALESCE(sold_price, 0)), 0) AS sales_30d_gross
+                FROM sales_30d
+            ),
+            orders_rollup AS (
+                SELECT COUNT(*) AS orders_30d_count
+                FROM orders
+                WHERE sold_at >= :window_30d
+            ),
+            label_spend_rollup AS (
+                SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) AS normalized_label_spend_30d
+                FROM order_finance_entries
+                WHERE entry_kind = 'shipping_label'
+                  AND (
+                    transaction_date >= :window_30d
+                    OR (transaction_date IS NULL AND created_at >= :window_30d)
+                  )
+            )
+            SELECT
+                sales_rollup.sales_7d_count,
+                sales_rollup.sales_7d_gross,
+                sales_rollup.sales_30d_count,
+                sales_rollup.sales_30d_gross,
+                orders_rollup.orders_30d_count,
+                label_spend_rollup.normalized_label_spend_30d
+            FROM sales_rollup
+            CROSS JOIN orders_rollup
+            CROSS JOIN label_spend_rollup
+            """,
+            {
+                "window_7d": window_7d,
+                "window_30d": window_30d,
+            },
+        )
+
+        _run(
+            "report_shipping_economics_rows",
+            """
+            SELECT
+                s.id,
+                s.sold_at,
+                LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                s.external_order_id,
+                s.order_id,
+                p.sku,
+                p.title,
+                s.quantity_sold,
+                COALESCE(s.shipping_cost, 0) AS shipping_charged_to_buyer,
+                COALESCE(s.shipping_label_cost, 0) AS shipping_label_spend
+            FROM sales s
+            LEFT JOIN products p ON p.id = s.product_id
+            WHERE s.sold_at IS NOT NULL
+              AND s.sold_at >= :start_dt
+              AND s.sold_at <= :end_dt
+            ORDER BY s.sold_at DESC, s.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_shipping_economics_summary",
+            """
+            SELECT
+                LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                COUNT(*) AS sales_count,
+                COALESCE(SUM(COALESCE(s.shipping_cost, 0)), 0) AS total_shipping_charged,
+                COALESCE(SUM(COALESCE(s.shipping_label_cost, 0)), 0) AS total_label_spend
+            FROM sales s
+            WHERE s.sold_at IS NOT NULL
+              AND s.sold_at >= :start_dt
+              AND s.sold_at <= :end_dt
+            GROUP BY LOWER(COALESCE(s.marketplace, ''))
+            ORDER BY sales_count DESC, marketplace
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            },
+        )
+
+        _run(
+            "report_tax_estimate_detail_rows",
+            """
+            SELECT
+                s.id,
+                s.sold_at,
+                LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                COALESCE(s.sold_price, 0) AS sold_price,
+                COALESCE(s.shipping_cost, 0) AS shipping_cost,
+                LOWER(COALESCE(p.category, '')) AS product_category
+            FROM sales s
+            LEFT JOIN products p ON p.id = s.product_id
+            WHERE s.sold_at IS NOT NULL
+              AND s.sold_at >= :start_dt
+              AND s.sold_at <= :end_dt
+            ORDER BY s.sold_at DESC, s.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_ebay_fee_reconciliation_rows",
+            """
+            SELECT
+                s.id,
+                s.sold_at,
+                s.external_order_id,
+                LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                COALESCE(s.fees, 0) AS sale_fee_field,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(ofe.entry_kind, '')) = 'marketplace_fee'
+                            THEN COALESCE(ofe.amount, 0)
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS order_marketplace_fee
+            FROM sales s
+            LEFT JOIN order_finance_entries ofe ON ofe.order_id = s.order_id
+            WHERE s.sold_at IS NOT NULL
+              AND s.sold_at >= :start_dt
+              AND s.sold_at <= :end_dt
+            GROUP BY
+                s.id,
+                s.sold_at,
+                s.external_order_id,
+                LOWER(COALESCE(s.marketplace, '')),
+                COALESCE(s.fees, 0)
+            ORDER BY s.sold_at DESC, s.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "dashboard_ebay_fee_type_breakdown_30d",
+            """
+            SELECT
+                UPPER(COALESCE(ofe.fee_type, 'UNKNOWN')) AS fee_type,
+                COALESCE(SUM(COALESCE(ofe.amount, 0)), 0) AS total_fee_amount
+            FROM order_finance_entries ofe
+            WHERE ofe.entry_kind = 'marketplace_fee'
+              AND (
+                ofe.transaction_date >= :window_30d
+                OR (ofe.transaction_date IS NULL AND ofe.created_at >= :window_30d)
+              )
+            GROUP BY UPPER(COALESCE(ofe.fee_type, 'UNKNOWN'))
+            ORDER BY total_fee_amount DESC, fee_type
+            """,
+            {
+                "window_30d": window_30d,
+            },
+        )
+
+        if _table_exists("audit_logs"):
+            _run(
+                "notification_outbox_runner_activity_14d",
+                """
+                SELECT
+                    created_at,
+                    actor,
+                    COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'action', '') AS action,
+                    COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'status', '') AS status
+                FROM audit_logs
+                WHERE entity_type = 'integration_event'
+                  AND created_at >= :window_14d
+                  AND COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'integration', '') = 'notification_outbox'
+                  AND COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'environment', '') = :app_env
+                  AND COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'action', '') IN ('process_due', 'cleanup', 'manual_process_due', 'manual_cleanup')
+                ORDER BY created_at DESC
+                LIMIT :sample_limit
+                """,
+                {
+                    "window_14d": end_dt - timedelta(days=14),
+                    "app_env": str(getattr(settings, "app_env", "") or ""),
+                    "sample_limit": limit,
+                },
+            )
+        else:
+            explain_rows.append(
+                {
+                    "rollup_name": "notification_outbox_runner_activity_14d",
+                    "elapsed_ms": 0.0,
+                    "planning_ms": 0.0,
+                    "execution_ms": 0.0,
+                    "plan_lines": 0,
+                    "window_start": start_dt.isoformat(),
+                    "window_end": end_dt.isoformat(),
+                    "sample_limit": int(limit),
+                    "plan_text": "",
+                    "skipped": True,
+                    "skip_reason": "table audit_logs not present",
+                }
+            )
+
+        if _table_exists("integration_queue_jobs"):
+            _run(
+                "slack_ops_queue_health_rows",
+                """
+                SELECT
+                    id,
+                    status,
+                    requested_by,
+                    next_attempt_at,
+                    created_at,
+                    updated_at
+                FROM integration_queue_jobs
+                WHERE environment = :app_env
+                  AND integration = 'slack_ops'
+                  AND status IN ('queued', 'running', 'blocked', 'failed', 'success')
+                ORDER BY created_at DESC
+                LIMIT :sample_limit
+                """,
+                {
+                    "app_env": str(getattr(settings, "app_env", "") or ""),
+                    "sample_limit": limit,
+                },
+            )
+        else:
+            explain_rows.append(
+                {
+                    "rollup_name": "slack_ops_queue_health_rows",
+                    "elapsed_ms": 0.0,
+                    "planning_ms": 0.0,
+                    "execution_ms": 0.0,
+                    "plan_lines": 0,
+                    "window_start": start_dt.isoformat(),
+                    "window_end": end_dt.isoformat(),
+                    "sample_limit": int(limit),
+                    "plan_text": "",
+                    "skipped": True,
+                    "skip_reason": "table integration_queue_jobs not present",
+                }
+            )
+
+        if _table_exists("audit_logs"):
+            _run(
+                "slack_ops_events_24h",
+                """
+                SELECT
+                    created_at,
+                    actor,
+                    COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'integration', '') AS integration,
+                    COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'action', '') AS action,
+                    COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'status', '') AS status
+                FROM audit_logs
+                WHERE entity_type = 'integration_event'
+                  AND created_at >= :window_24h
+                  AND COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'environment', '') = :app_env
+                  AND COALESCE(CAST(changes_json AS JSONB) -> 'after' ->> 'integration', '') = 'slack_ops'
+                ORDER BY created_at DESC
+                LIMIT :sample_limit
+                """,
+                {
+                    "window_24h": end_dt - timedelta(hours=24),
+                    "app_env": str(getattr(settings, "app_env", "") or ""),
+                    "sample_limit": limit,
+                },
+            )
+        else:
+            explain_rows.append(
+                {
+                    "rollup_name": "slack_ops_events_24h",
+                    "elapsed_ms": 0.0,
+                    "planning_ms": 0.0,
+                    "execution_ms": 0.0,
+                    "plan_lines": 0,
+                    "window_start": start_dt.isoformat(),
+                    "window_end": end_dt.isoformat(),
+                    "sample_limit": int(limit),
+                    "plan_text": "",
+                    "skipped": True,
+                    "skip_reason": "table audit_logs not present",
+                }
+            )
+
+        _run(
+            "report_orders_rows",
+            """
+            SELECT
+                o.id,
+                o.sold_at,
+                LOWER(COALESCE(o.marketplace, '')) AS marketplace,
+                o.external_order_id,
+                LOWER(COALESCE(o.order_status, '')) AS order_status,
+                COALESCE(o.subtotal_amount, 0) AS subtotal_amount,
+                COALESCE(o.fees, 0) AS fees,
+                COALESCE(o.shipping_cost, 0) AS shipping_cost,
+                COALESCE(o.total_amount, 0) AS total_amount
+            FROM orders o
+            WHERE o.sold_at >= :start_dt
+              AND o.sold_at <= :end_dt
+            ORDER BY o.sold_at DESC, o.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_order_items_rows",
+            """
+            SELECT
+                oi.id,
+                oi.order_id,
+                o.sold_at,
+                LOWER(COALESCE(o.marketplace, '')) AS marketplace,
+                o.external_order_id,
+                oi.product_id,
+                oi.listing_id,
+                oi.quantity,
+                COALESCE(oi.unit_price, 0) AS unit_price,
+                COALESCE(oi.line_fees, 0) AS line_fees,
+                COALESCE(oi.line_shipping, 0) AS line_shipping,
+                COALESCE(oi.line_total, 0) AS line_total
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            WHERE o.sold_at >= :start_dt
+              AND o.sold_at <= :end_dt
+            ORDER BY o.sold_at DESC, oi.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_sales_rows",
+            """
+            SELECT
+                s.id,
+                s.order_id,
+                s.product_id,
+                s.listing_id,
+                s.sold_at,
+                LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                s.external_order_id,
+                s.quantity_sold,
+                COALESCE(s.sold_price, 0) AS sold_price,
+                COALESCE(s.fees, 0) AS fees,
+                COALESCE(s.shipping_cost, 0) AS shipping_cost
+            FROM sales s
+            WHERE s.sold_at >= :start_dt
+              AND s.sold_at <= :end_dt
+            ORDER BY s.sold_at DESC, s.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_returns_rows",
+            """
+            SELECT
+                r.id,
+                r.returned_at,
+                LOWER(COALESCE(r.marketplace, '')) AS marketplace,
+                r.external_return_id,
+                LOWER(COALESCE(r.return_status, '')) AS return_status,
+                COALESCE(r.refund_amount, 0) AS refund_amount,
+                COALESCE(r.refund_fees, 0) AS refund_fees,
+                COALESCE(r.refund_shipping, 0) AS refund_shipping
+            FROM returns r
+            WHERE r.returned_at >= :start_dt
+              AND r.returned_at <= :end_dt
+            ORDER BY r.returned_at DESC, r.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_listings_rows",
+            """
+            SELECT
+                l.id,
+                l.product_id,
+                l.created_at,
+                l.updated_at,
+                l.listed_at,
+                LOWER(COALESCE(l.marketplace, '')) AS marketplace,
+                LOWER(COALESCE(CAST(l.listing_status AS TEXT), '')) AS listing_status,
+                l.external_listing_id
+            FROM marketplace_listings l
+            WHERE (l.listed_at >= :start_dt AND l.listed_at <= :end_dt)
+               OR (l.created_at >= :start_dt AND l.created_at <= :end_dt)
+            ORDER BY l.listed_at DESC NULLS LAST, l.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_products_rows",
+            """
+            SELECT
+                p.id,
+                p.sku,
+                p.title,
+                p.acquired_at,
+                p.created_at,
+                LOWER(COALESCE(p.category, '')) AS category,
+                LOWER(COALESCE(p.metal_type, '')) AS metal_type,
+                COALESCE(p.current_quantity, 0) AS current_quantity,
+                COALESCE(p.acquisition_cost, 0) AS acquisition_cost
+            FROM products p
+            WHERE (p.acquired_at >= :start_dt AND p.acquired_at <= :end_dt)
+               OR (p.acquired_at IS NULL AND p.created_at >= :start_dt AND p.created_at <= :end_dt)
+            ORDER BY p.acquired_at DESC NULLS LAST, p.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_lot_assignment_rows",
+            """
+            SELECT
+                pla.id,
+                pla.acquired_at,
+                pla.created_at,
+                COALESCE(pla.quantity_acquired, 0) AS quantity_acquired,
+                COALESCE(pla.unit_cost, 0) AS unit_cost,
+                COALESCE(pla.allocated_cost, 0) AS allocated_cost,
+                pl.id AS lot_id,
+                pl.lot_code,
+                p.id AS product_id,
+                p.sku
+            FROM product_lot_assignments pla
+            LEFT JOIN purchase_lots pl ON pl.id = pla.lot_id
+            LEFT JOIN products p ON p.id = pla.product_id
+            WHERE (pla.acquired_at >= :start_dt AND pla.acquired_at <= :end_dt)
+               OR (pla.acquired_at IS NULL AND pla.created_at >= :start_dt AND pla.created_at <= :end_dt)
+            ORDER BY pla.acquired_at DESC NULLS LAST, pla.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_inventory_movement_rows",
+            """
+            SELECT
+                im.id,
+                im.occurred_at,
+                im.product_id,
+                p.sku,
+                p.title,
+                LOWER(COALESCE(im.movement_type, '')) AS movement_type,
+                COALESCE(im.quantity_delta, 0) AS quantity_delta,
+                COALESCE(im.quantity_before, 0) AS quantity_before,
+                COALESCE(im.quantity_after, 0) AS quantity_after,
+                COALESCE(im.unit_cost, 0) AS unit_cost,
+                LOWER(COALESCE(im.reference_type, '')) AS reference_type,
+                im.reference_id
+            FROM inventory_movements im
+            LEFT JOIN products p ON p.id = im.product_id
+            WHERE im.occurred_at >= :start_dt
+              AND im.occurred_at <= :end_dt
+            ORDER BY im.occurred_at DESC, im.id DESC
+            LIMIT :sample_limit
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "sample_limit": limit,
+            },
+        )
+
+        _run(
+            "report_marketplace_reconciliation_rows",
+            """
+            WITH sales_rows AS (
+                SELECT
+                    LOWER(COALESCE(s.marketplace, '')) AS marketplace,
+                    COUNT(s.id) AS sales_count,
+                    COALESCE(SUM(COALESCE(s.sold_price, 0)), 0) AS gross_sales_amount,
+                    COALESCE(SUM(COALESCE(s.fees, 0)), 0) AS sale_fees_amount,
+                    COALESCE(SUM(COALESCE(s.shipping_cost, 0)), 0) AS shipping_charged_amount
+                FROM sales s
+                WHERE s.sold_at >= :start_dt
+                  AND s.sold_at <= :end_dt
+                GROUP BY LOWER(COALESCE(s.marketplace, ''))
+            ),
+            order_rows AS (
+                SELECT
+                    LOWER(COALESCE(o.marketplace, '')) AS marketplace,
+                    COUNT(o.id) AS orders_count,
+                    COALESCE(SUM(COALESCE(o.total_amount, 0)), 0) AS order_total_amount
+                FROM orders o
+                WHERE o.sold_at >= :start_dt
+                  AND o.sold_at <= :end_dt
+                GROUP BY LOWER(COALESCE(o.marketplace, ''))
+            ),
+            return_rows AS (
+                SELECT
+                    LOWER(COALESCE(r.marketplace, '')) AS marketplace,
+                    COUNT(r.id) AS returns_count,
+                    COALESCE(
+                        SUM(
+                            COALESCE(r.refund_amount, 0)
+                            + COALESCE(r.refund_fees, 0)
+                            + COALESCE(r.refund_shipping, 0)
+                        ),
+                        0
+                    ) AS refunds_amount
+                FROM returns r
+                WHERE r.returned_at >= :start_dt
+                  AND r.returned_at <= :end_dt
+                GROUP BY LOWER(COALESCE(r.marketplace, ''))
+            ),
+            marketplaces AS (
+                SELECT marketplace FROM sales_rows
+                UNION
+                SELECT marketplace FROM order_rows
+                UNION
+                SELECT marketplace FROM return_rows
+            )
+            SELECT
+                m.marketplace,
+                COALESCE(s.sales_count, 0) AS sales_count,
+                COALESCE(s.gross_sales_amount, 0) AS gross_sales_amount,
+                COALESCE(s.sale_fees_amount, 0) AS sale_fees_amount,
+                COALESCE(s.shipping_charged_amount, 0) AS shipping_charged_amount,
+                COALESCE(o.orders_count, 0) AS orders_count,
+                COALESCE(o.order_total_amount, 0) AS order_total_amount,
+                COALESCE(r.returns_count, 0) AS returns_count,
+                COALESCE(r.refunds_amount, 0) AS refunds_amount
+            FROM marketplaces m
+            LEFT JOIN sales_rows s ON s.marketplace = m.marketplace
+            LEFT JOIN order_rows o ON o.marketplace = m.marketplace
+            LEFT JOIN return_rows r ON r.marketplace = m.marketplace
+            ORDER BY sales_count DESC, m.marketplace
+            """,
+            {
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            },
+        )
+
+        return explain_rows
+
+    def collect_page_latency_baseline(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+        tax_rate_percent: float = 7.5,
+        shipping_taxable: bool = True,
+        tax_exempt_categories: set[str] | None = None,
+        marketplaces: set[str] | None = None,
+        include_heavy_list_reads: bool = False,
+        include_integrations_reads: bool = False,
+    ) -> list[dict]:
+        baseline_rows: list[dict] = []
+
+        def _run(name: str, fn) -> None:
+            started = perf_counter()
+            value = fn()
+            elapsed_ms = (perf_counter() - started) * 1000.0
+            if isinstance(value, dict):
+                row_count = len(value.keys())
+            elif isinstance(value, list):
+                row_count = len(value)
+            else:
+                try:
+                    row_count = len(value)  # type: ignore[arg-type]
+                except Exception:
+                    row_count = 1 if value is not None else 0
+            baseline_rows.append(
+                {
+                    "probe_name": name,
+                    "elapsed_ms": round(float(elapsed_ms), 3),
+                    "result_count": int(row_count),
+                    "window_start": start_dt.isoformat(),
+                    "window_end": end_dt.isoformat(),
+                    "include_heavy_list_reads": bool(include_heavy_list_reads),
+                    "include_integrations_reads": bool(include_integrations_reads),
+                }
+            )
+
+        _run("dashboard_metrics", lambda: self.dashboard_metrics())
+        _run("dashboard_live_metrics", lambda: self.dashboard_live_metrics(now=end_dt))
+        _run(
+            "report_shipping_economics_summary",
+            lambda: self.report_shipping_economics_summary(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                marketplaces=marketplaces,
+            ),
+        )
+        _run(
+            "report_shipping_economics_rows",
+            lambda: self.report_shipping_economics_rows(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                marketplaces=marketplaces,
+            ),
+        )
+        _run(
+            "report_tax_estimate_detail_rows",
+            lambda: self.report_tax_estimate_detail_rows(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                tax_rate_percent=float(tax_rate_percent or 0.0),
+                shipping_taxable=bool(shipping_taxable),
+                tax_exempt_categories=set(tax_exempt_categories or set()),
+                marketplaces=marketplaces,
+            ),
+        )
+
+        if bool(include_heavy_list_reads):
+            _run(
+                "report_ebay_fee_reconciliation_rows_extended",
+                lambda: self.report_ebay_fee_reconciliation_rows(
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                ),
+            )
+            _run("list_products", lambda: self.list_products())
+            _run("list_listings", lambda: self.list_listings())
+            _run("list_orders", lambda: self.list_orders())
+
+        if bool(include_integrations_reads):
+            _run(
+                "list_integration_queue_jobs_slack",
+                lambda: self.list_integration_queue_jobs(
+                    environment=settings.app_env,
+                    integration="slack",
+                    statuses={"queued", "running", "failed", "success"},
+                    limit=500,
+                ),
+            )
+            _run(
+                "list_integration_queue_jobs_google",
+                lambda: self.list_integration_queue_jobs(
+                    environment=settings.app_env,
+                    integration="google",
+                    statuses={"queued", "running", "failed", "success"},
+                    limit=500,
+                ),
+            )
+            _run(
+                "integration_event_rows_shared_14d",
+                lambda: self.db.scalars(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.entity_type == "integration_event",
+                        AuditLog.created_at >= (end_dt - timedelta(days=14)),
+                    )
+                    .order_by(AuditLog.created_at.desc())
+                    .limit(500)
+                ).all(),
+            )
+            _run(
+                "integration_event_rows_shipping_validation_30d",
+                lambda: self.db.scalars(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.entity_type == "integration_event",
+                        AuditLog.created_at >= (end_dt - timedelta(days=30)),
+                    )
+                    .order_by(AuditLog.created_at.desc())
+                    .limit(1000)
+                ).all(),
+            )
+
+        return baseline_rows
 
     def create_coin_ai_run(
         self,

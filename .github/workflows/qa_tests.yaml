@@ -2,6 +2,17 @@ name: QA Test Suite
 
 on:
   workflow_dispatch:
+    inputs:
+      qa_enable_strict_listings:
+        description: "Run strict seeded Listings Playwright gate"
+        required: false
+        default: false
+        type: boolean
+      qa_enable_strict_lifecycle:
+        description: "Run strict seeded lifecycle Playwright gates (Listings + Entities)"
+        required: false
+        default: false
+        type: boolean
   pull_request:
     branches:
       - main
@@ -15,8 +26,10 @@ jobs:
     runs-on: [gs-inv-mgmt-runner]
     timeout-minutes: 30
     env:
-      COVERAGE_FAIL_UNDER: "30"
-      COVERAGE_FAIL_UNDER_CORE: "85"
+      COVERAGE_FAIL_UNDER: "38"
+      COVERAGE_FAIL_UNDER_CORE: "88"
+      QA_ENABLE_STRICT_LISTINGS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.qa_enable_strict_listings == 'true' && '1' || '0' }}
+      QA_ENABLE_STRICT_LIFECYCLE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.qa_enable_strict_lifecycle == 'true' && '1' || github.event_name != 'workflow_dispatch' && '1' || '0' }}
     permissions:
       contents: read
 
@@ -34,6 +47,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install coverage
+
+      - name: Build segmented test-suite manifests
+        run: |
+          python scripts/run_test_suites.py --suite fast --list-only --json-out qa-evidence/suite_fast_manifest.json --verbosity 1
+          python scripts/run_test_suites.py --suite integration --list-only --json-out qa-evidence/suite_integration_manifest.json --verbosity 1
 
       - name: Run unit tests with coverage
         id: unit_coverage
@@ -72,6 +90,9 @@ jobs:
           cp .env.example .env
           echo "APP_REQUIRE_PASSWORD_AUTH=false" >> .env
           echo "DB_AUTO_MIGRATE=false" >> .env
+          # Keep seller-op controls enabled in sandbox during CI so direct-post
+          # preflight flows run non-skipped in Listings/Listing Wizard e2e specs.
+          echo "EBAY_ALLOW_SANDBOX_SELLER_OPS=true" >> .env
 
       - name: Start app stack
         run: docker compose up -d db migrate app
@@ -95,6 +116,37 @@ jobs:
           PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
           PLAYWRIGHT_JSON_OUTPUT_NAME: playwright-results.json
         run: npx playwright test --project=chromium --reporter=line,json
+
+      - name: Run Playwright strict listings gate
+        if: env.QA_ENABLE_STRICT_LISTINGS == '1'
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
+          E2E_STRICT_LISTINGS: "1"
+          PLAYWRIGHT_REQUIRE_SEED: "1"
+        run: npx playwright test tests/e2e/listings_flow_strict.spec.ts --project=chromium --reporter=line
+
+      - name: Run Playwright strict lifecycle listings gate
+        if: env.QA_ENABLE_STRICT_LIFECYCLE == '1'
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
+          E2E_STRICT_LIFECYCLE: "1"
+          PLAYWRIGHT_REQUIRE_SEED: "1"
+        run: npx playwright test tests/e2e/lifecycle_archive_flow_strict.spec.ts --project=chromium --reporter=line
+
+      - name: Run Playwright strict lifecycle entities gate
+        if: env.QA_ENABLE_STRICT_LIFECYCLE == '1'
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
+          E2E_STRICT_LIFECYCLE: "1"
+          PLAYWRIGHT_REQUIRE_SEED: "1"
+        run: npx playwright test tests/e2e/lifecycle_entities_strict.spec.ts --project=chromium --reporter=line
+
+      - name: Run Playwright admin lifecycle retention evidence flow
+        if: env.QA_ENABLE_STRICT_LIFECYCLE == '1'
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8501
+          PLAYWRIGHT_REQUIRE_SEED: "1"
+        run: npx playwright test tests/e2e/admin_lifecycle_retention_flow.spec.ts --project=chromium --reporter=line
 
       - name: Upload Playwright report
         if: always()
@@ -121,6 +173,8 @@ jobs:
             --output-dir qa-evidence \
             --unit-outcome "${{ steps.unit_coverage.outcome }}" \
             --playwright-outcome "${{ steps.playwright.outcome }}" \
+            --coverage-gate-global "${COVERAGE_FAIL_UNDER}" \
+            --coverage-gate-core "${COVERAGE_FAIL_UNDER_CORE}" \
             --summary-out qa-evidence-summary.md
           cat qa-evidence-summary.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -133,6 +187,7 @@ jobs:
             qa-evidence
             qa-evidence-summary.md
             playwright-results.json
+            coverage.json
           if-no-files-found: ignore
 
       - name: Dump container logs on failure

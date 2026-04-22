@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from app.auth import current_user
-from app.components.views.shared import as_money, render_help_panel
+from app.components.views.shared import as_money, render_help_panel, safe_switch_page
 from app.components.views.entity_ops import render_saved_filter_bar, render_standard_row_actions
 from app.components.views.workspace_shell import (
     normalize_status_semantic,
@@ -32,7 +32,7 @@ def _format_dt(value: datetime | None) -> str:
 def _page_button(label: str, page_path: str, *, key: str) -> None:
     if st.button(label, key=key, use_container_width=True):
         if hasattr(st, "switch_page"):
-            st.switch_page(page_path)
+            safe_switch_page(page_path)
         else:
             st.info(f"Open `{page_path}` from the sidebar.")
 
@@ -306,26 +306,26 @@ def _listing_format_hint(row, *, default_format_type: str, default_auction_durat
 def _action_rows_for_role(role: str) -> list[tuple[str, str, str]]:
     if role == "admin":
         return [
-            ("Listings: Publish Queue", "app/pages/03_Listings.py", "create listing, publish/revise/end"),
-            ("Shipping: Needs Label", "app/pages/11_Shipping.py", "print/export shipment batches"),
-            ("Sync: Failed Runs", "app/pages/18_Sync.py", "retry failed marketplace sync jobs"),
-            ("Admin: Migrations + Backups", "app/pages/17_Admin.py", "schema, maintenance, backups"),
-            ("Reports: Accounting Export", "app/pages/09_Reports.py", "sales/shipping/refund exports"),
-            ("Search & Edit", "app/pages/10_Search_Edit.py", "cross-entity corrections + audit trail"),
+            ("Listings: Publish Queue", "pages/03_Listings.py", "create listing, publish/revise/end"),
+            ("Shipping: Needs Label", "pages/11_Shipping.py", "print/export shipment batches"),
+            ("Sync: Failed Runs", "pages/18_Sync.py", "retry failed marketplace sync jobs"),
+            ("Admin: Migrations + Backups", "pages/17_Admin.py", "schema, maintenance, backups"),
+            ("Reports: Accounting Export", "pages/09_Reports.py", "sales/shipping/refund exports"),
+            ("Search & Edit", "pages/10_Search_Edit.py", "cross-entity corrections + audit trail"),
         ]
     if role == "ops":
         return [
-            ("Listings: Publish Queue", "app/pages/03_Listings.py", "create listing, publish/revise/end"),
-            ("eBay Workspace", "app/pages/22_eBay_Workspace.py", "integration + bulk end/relist/revise + policies"),
-            ("Shipping: Needs Label", "app/pages/11_Shipping.py", "print/export shipment batches"),
-            ("Orders", "app/pages/14_Orders.py", "review incoming marketplace orders"),
-            ("Sales", "app/pages/04_Sales.py", "tracking and shipment updates"),
-            ("Sync: Failed Runs", "app/pages/18_Sync.py", "retry failed marketplace sync jobs"),
+            ("Listings: Publish Queue", "pages/03_Listings.py", "create listing, publish/revise/end"),
+            ("eBay Workspace", "pages/22_eBay_Workspace.py", "integration + bulk end/relist/revise + policies"),
+            ("Shipping: Needs Label", "pages/11_Shipping.py", "print/export shipment batches"),
+            ("Orders", "pages/14_Orders.py", "review incoming marketplace orders"),
+            ("Sales", "pages/04_Sales.py", "tracking and shipment updates"),
+            ("Sync: Failed Runs", "pages/18_Sync.py", "retry failed marketplace sync jobs"),
         ]
     return [
-        ("Dashboard", "app/pages/01_Dashboard.py", "high-level inventory and sales health"),
-        ("Reports", "app/pages/09_Reports.py", "read-only exports and snapshots"),
-        ("Search & Edit", "app/pages/10_Search_Edit.py", "audit-focused record lookup"),
+        ("Dashboard", "pages/01_Dashboard.py", "high-level inventory and sales health"),
+        ("Reports", "pages/09_Reports.py", "read-only exports and snapshots"),
+        ("Search & Edit", "pages/10_Search_Edit.py", "audit-focused record lookup"),
     ]
 
 
@@ -611,7 +611,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             except Exception:
                 pass
             if hasattr(st, "switch_page"):
-                st.switch_page("pages/03_Listings.py")
+                safe_switch_page("pages/03_Listings.py")
     m11, m12 = st.columns(2)
     m11.metric("Format Fix Needed", len(format_fix_listings))
     with m12:
@@ -646,7 +646,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             except Exception:
                 pass
             if hasattr(st, "switch_page"):
-                st.switch_page("pages/03_Listings.py")
+                safe_switch_page("pages/03_Listings.py")
     m13, m14, m15 = st.columns(3)
     m13.metric("Open Blocker Follow-ups", len(open_blocker_followups))
     with m14:
@@ -674,7 +674,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             except Exception:
                 pass
             if hasattr(st, "switch_page"):
-                st.switch_page("pages/03_Listings.py")
+                safe_switch_page("pages/03_Listings.py")
     with m15:
         st.metric("Governance Cadence Follow-ups", len(open_governance_cadence_followups))
         if st.button(
@@ -683,7 +683,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             use_container_width=True,
         ):
             if hasattr(st, "switch_page"):
-                st.switch_page("pages/17_Admin.py")
+                safe_switch_page("pages/17_Admin.py")
 
     metrics = repo.dashboard_metrics()
     st.caption(
@@ -699,7 +699,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "done",
             "focus": "Items available to list",
             "target_page": "Products",
-            "path": "app/pages/02_Products.py",
+            "path": "pages/02_Products.py",
         },
         {
             "stage": "Needs Listing",
@@ -707,7 +707,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "needs_action",
             "focus": "In-stock items not yet active on a listing",
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "stage": "eBay Draft Listings",
@@ -715,7 +715,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "needs_action",
             "focus": "Drafts waiting for publish",
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "stage": "eBay Active Listings",
@@ -723,7 +723,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "in_progress",
             "focus": "Live offers/listings",
             "target_page": "eBay Workspace",
-            "path": "app/pages/22_eBay_Workspace.py",
+            "path": "pages/22_eBay_Workspace.py",
         },
         {
             "stage": "eBay Needs Shipment",
@@ -731,7 +731,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "needs_action",
             "focus": "Orders requiring label/ship updates",
             "target_page": "Shipping",
-            "path": "app/pages/11_Shipping.py",
+            "path": "pages/11_Shipping.py",
         },
         {
             "stage": "eBay Delivery Exceptions",
@@ -739,7 +739,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "blocked",
             "focus": "Tracking and delivery issues",
             "target_page": "Shipping",
-            "path": "app/pages/11_Shipping.py",
+            "path": "pages/11_Shipping.py",
         },
     ]
     st.dataframe(pd.DataFrame(workflow_rows), use_container_width=True)
@@ -778,56 +778,56 @@ def render_operations_home(repo: InventoryRepository) -> None:
             "semantic": "needs_action",
             "open_count": len(needs_listing_products),
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "queue": "Photo-Comp Pending Review",
             "semantic": "needs_action",
             "open_count": len(photo_comp_pending_review_listings),
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "queue": "eBay Format Fix Queue",
             "semantic": "needs_action",
             "open_count": len(format_fix_listings),
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "queue": "Listings Blocker Follow-ups",
             "semantic": "blocked",
             "open_count": len(open_blocker_followups),
             "target_page": "Listings",
-            "path": "app/pages/03_Listings.py",
+            "path": "pages/03_Listings.py",
         },
         {
             "queue": "Governance Cadence Follow-ups",
             "semantic": "blocked",
             "open_count": len(open_governance_cadence_followups),
             "target_page": "Admin",
-            "path": "app/pages/17_Admin.py",
+            "path": "pages/17_Admin.py",
         },
         {
             "queue": "Needs Shipment",
             "semantic": "needs_action",
             "open_count": len(needs_shipment_sales),
             "target_page": "Shipping",
-            "path": "app/pages/11_Shipping.py",
+            "path": "pages/11_Shipping.py",
         },
         {
             "queue": "Sync Failures",
             "semantic": "blocked",
             "open_count": len(recent_failed_sync),
             "target_page": "Sync",
-            "path": "app/pages/18_Sync.py",
+            "path": "pages/18_Sync.py",
         },
         {
             "queue": "Accounting Exceptions",
             "semantic": "blocked",
             "open_count": len(accounting_exception_rows),
             "target_page": "Reports",
-            "path": "app/pages/09_Reports.py",
+            "path": "pages/09_Reports.py",
         },
     ]
     st.dataframe(pd.DataFrame(queue_router_rows), use_container_width=True)
@@ -978,7 +978,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
                 rows=queue_rows,
                 id_field="id",
                 title="Photo-Comp Review Actions",
-                search_edit_page="app/pages/03_Listings.py",
+                search_edit_page="pages/03_Listings.py",
                 edit_action_label="Open Listings Queue",
                 edit_action_caption="Use Listings page for review and publish workflow.",
             )
@@ -1020,7 +1020,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
                 rows=queue_rows,
                 id_field="id",
                 title="Format Fix Actions",
-                search_edit_page="app/pages/03_Listings.py",
+                search_edit_page="pages/03_Listings.py",
                 edit_action_label="Open Listings Queue",
                 edit_action_caption="Use Listings page with 'Format Issue Only' to fix and publish.",
             )
@@ -1365,7 +1365,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
                 st.session_state["workspace_handoff_from"] = "operations_home"
                 st.session_state["workspace_handoff_target"] = "listings"
                 if hasattr(st, "switch_page"):
-                    st.switch_page("pages/03_Listings.py")
+                    safe_switch_page("pages/03_Listings.py")
 
     def _render_governance_cadence_followups_queue() -> None:
         queue_rows = [
@@ -1452,7 +1452,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
             use_container_width=True,
         ):
             if hasattr(st, "switch_page"):
-                st.switch_page("pages/17_Admin.py")
+                safe_switch_page("pages/17_Admin.py")
 
     def _render_sync_failures() -> None:
         if not recent_failed_sync:
@@ -1489,7 +1489,7 @@ def render_operations_home(repo: InventoryRepository) -> None:
                 rows=queue_rows,
                 id_field="id",
                 title="Sync Failure Actions",
-                search_edit_page="app/pages/18_Sync.py",
+                search_edit_page="pages/18_Sync.py",
                 edit_action_label="Open Sync Queue",
                 edit_action_caption="Use Sync page to retry failed runs and resolve errors.",
             )

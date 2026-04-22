@@ -54,6 +54,115 @@ system_health = _load_system_health_module()
 
 
 class SystemHealthHelpersTests(unittest.TestCase):
+    def test_rollup_explain_failures_filters_and_normalizes(self):
+        rows = [
+            {
+                "rollup_name": "dashboard_live_metrics",
+                "error": "",
+                "elapsed_ms": 10.5,
+                "sample_limit": 2000,
+            },
+            {
+                "rollup_name": "report_orders_rows",
+                "error": "probe failed",
+                "elapsed_ms": 7.2,
+                "sample_limit": 1500,
+            },
+        ]
+        failures = system_health._rollup_explain_failures(rows)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["rollup_name"], "report_orders_rows")
+        self.assertEqual(failures[0]["error"], "probe failed")
+        self.assertEqual(failures[0]["sample_limit"], 1500)
+
+    def test_rollup_explain_failures_handles_none(self):
+        self.assertEqual(system_health._rollup_explain_failures(None), [])
+
+    def test_rollup_explain_skips_filters_and_normalizes(self):
+        rows = [
+            {
+                "rollup_name": "slack_ops_events_24h",
+                "skipped": True,
+                "skip_reason": "table audit_logs not present",
+                "sample_limit": 2000,
+            },
+            {
+                "rollup_name": "dashboard_live_metrics",
+                "skipped": False,
+                "skip_reason": "",
+                "sample_limit": 2000,
+            },
+        ]
+        skips = system_health._rollup_explain_skips(rows)
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["rollup_name"], "slack_ops_events_24h")
+        self.assertEqual(skips[0]["skip_reason"], "table audit_logs not present")
+        self.assertEqual(skips[0]["sample_limit"], 2000)
+
+    def test_slack_ops_health_snapshot_metrics(self):
+        now = datetime(2026, 4, 20, 12, 0, 0)
+        rows = [
+            types.SimpleNamespace(
+                status="queued",
+                next_attempt_at=now,
+                payload_json='{"approval":{"required":false}}',
+            ),
+            types.SimpleNamespace(
+                status="blocked",
+                next_attempt_at=None,
+                payload_json='{"approval":{"required":true,"status":"pending","requested_at":"2026-04-20T10:00:00"}}',
+            ),
+            types.SimpleNamespace(
+                status="failed",
+                next_attempt_at=None,
+                payload_json='{}',
+            ),
+            types.SimpleNamespace(
+                status="success",
+                next_attempt_at=None,
+                payload_json='{}',
+            ),
+        ]
+        out = system_health._slack_ops_health_snapshot(rows, now=now)
+        self.assertEqual(out["total_count"], 4)
+        self.assertEqual(out["queued_count"], 1)
+        self.assertEqual(out["blocked_count"], 1)
+        self.assertEqual(out["failed_count"], 1)
+        self.assertEqual(out["success_count"], 1)
+        self.assertEqual(out["pending_approval_count"], 1)
+        self.assertGreater(out["pending_approval_avg_hours"], 1.9)
+        self.assertGreater(out["pending_approval_max_hours"], 1.9)
+
+    def test_normalize_page_baseline_rows_adds_budget_and_over_budget(self):
+        with patch.object(system_health, "_probe_budget_ms", return_value=100.0):
+            normalized = system_health._normalize_page_baseline_rows(
+                repo=types.SimpleNamespace(),
+                rows=[
+                    {"probe_name": "dashboard_metrics", "elapsed_ms": 120.0},
+                    {"probe_name": "list_products", "elapsed_ms": 80.0},
+                ],
+            )
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(normalized[0]["budget_ms"], 100.0)
+        self.assertTrue(normalized[0]["over_budget"])
+        self.assertFalse(normalized[1]["over_budget"])
+
+    def test_page_baseline_summary_handles_empty_and_non_empty(self):
+        empty = system_health._page_baseline_summary([])
+        self.assertEqual(empty["total_count"], 0)
+        self.assertEqual(empty["over_budget_count"], 0)
+        self.assertEqual(empty["worst_elapsed_ms"], 0.0)
+
+        summary = system_health._page_baseline_summary(
+            [
+                {"elapsed_ms": 120.0, "over_budget": True},
+                {"elapsed_ms": 80.0, "over_budget": False},
+            ]
+        )
+        self.assertEqual(summary["total_count"], 2)
+        self.assertEqual(summary["over_budget_count"], 1)
+        self.assertEqual(summary["worst_elapsed_ms"], 120.0)
+
     def test_format_helpers_and_status_row(self):
         self.assertEqual(system_health._fmt_gb_from_kb(None), "n/a")
         self.assertIn("GB", system_health._fmt_gb_from_kb(1024 * 1024))
@@ -83,6 +192,9 @@ class SystemHealthHelpersTests(unittest.TestCase):
 
     def test_render_system_health_permission_denied(self):
         class _FakeSt:
+            def __init__(self):
+                self.session_state = {}
+
             def subheader(self, *_a, **_k):
                 return None
 
@@ -192,6 +304,9 @@ class SystemHealthHelpersTests(unittest.TestCase):
             def checkbox(self, _label, value=False, **_k):
                 return bool(value)
 
+            def number_input(self, _label, value=0.0, **_k):
+                return value
+
             def metric(self, *_a, **_k):
                 return None
 
@@ -245,6 +360,12 @@ class SystemHealthHelpersTests(unittest.TestCase):
                 return []
 
             def list_sync_runs(self, limit=1000):
+                return []
+
+            def list_notification_outbox(self, *, environment, statuses=None, limit=200, channel=None):
+                return []
+
+            def list_integration_queue_jobs(self, *, environment, integration=None, statuses=None, limit=200):
                 return []
 
         fake_st = _FakeSt()

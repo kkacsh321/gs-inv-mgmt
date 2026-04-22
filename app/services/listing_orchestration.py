@@ -21,6 +21,8 @@ class BaseChannelAdapter:
         status = (listing_status or "").strip().lower()
         readiness = (readiness_status or "").strip().lower()
         has_external_id = bool((external_listing_id or "").strip())
+        if status == "sold":
+            return "completed"
         if status == "ended":
             return "error"
         if status == "active" and has_external_id:

@@ -94,7 +94,10 @@ class _EncryptedCookieStore:
         return self._cookie_manager is not None and bool(self._cookie_manager.ready())
 
     def save(self):
-        return self._cookie_manager.save()
+        try:
+            return self._cookie_manager.save()
+        except Exception:
+            return False
 
     def _setup_fernet(self):
         if self._fernet is not None:
@@ -126,13 +129,18 @@ class _EncryptedCookieStore:
         salt = os.urandom(16)
         iterations = 390000
         magic = os.urandom(16)
-        self._cookie_manager[self.KEY_PARAMS_COOKIE] = b":".join(
+        payload = b":".join(
             [
                 base64.b64encode(salt),
                 str(iterations).encode("ascii"),
                 base64.b64encode(magic),
             ]
         ).decode("ascii")
+        setter = getattr(self._cookie_manager, "set", None)
+        if callable(setter):
+            setter(self.KEY_PARAMS_COOKIE, payload)
+        else:
+            self._cookie_manager[self.KEY_PARAMS_COOKIE] = payload
         return salt, iterations, magic
 
     def get(self, key: str, default: str = "") -> str:
@@ -149,57 +157,151 @@ class _EncryptedCookieStore:
     def set(self, key: str, value: str):
         self._setup_fernet()
         encrypted = self._fernet.encrypt(str(value or "").encode("utf-8")).decode("utf-8")
-        self._cookie_manager[key] = encrypted
+        setter = getattr(self._cookie_manager, "set", None)
+        if callable(setter):
+            setter(key, encrypted)
+        else:
+            self._cookie_manager[key] = encrypted
 
     def delete(self, key: str):
         try:
-            if key in self._cookie_manager:
+            deleter = getattr(self._cookie_manager, "delete", None)
+            if callable(deleter):
+                deleter(key)
+            elif key in self._cookie_manager:
                 del self._cookie_manager[key]
         except Exception:
             return
 
 
-def _get_cookie_manager():
-    if not bool(settings.app_auth_cookie_enabled):
-        return None
-    try:
-        from streamlit_cookies_manager import CookieManager
-    except Exception:
-        return None
+class _CookieManagerAdapter:
+    def __init__(self, *, backend, prefix: str):
+        self._backend = backend
+        self._prefix = str(prefix or "").strip()
 
-    key = "auth_cookie_manager"
-    if key not in st.session_state:
-        prefix = (settings.app_name or "gs").strip().lower().replace(" ", "_")
-        raw_manager = CookieManager(prefix=f"{prefix}/")
-        st.session_state[key] = _EncryptedCookieStore(
-            cookie_manager=raw_manager,
+    def _k(self, key: str) -> str:
+        return f"{self._prefix}{str(key or '').strip()}"
+
+    def ready(self) -> bool:
+        try:
+            ready_fn = getattr(self._backend, "ready", None)
+            if callable(ready_fn):
+                return bool(ready_fn())
+            return True
+        except Exception:
+            return False
+
+    def save(self) -> bool:
+        try:
+            save_fn = getattr(self._backend, "save", None)
+            if callable(save_fn):
+                return bool(save_fn())
+            return True
+        except Exception:
+            return False
+
+    def get(self, key: str, default: str = "") -> str:
+        resolved = self._k(key)
+        try:
+            value = self._backend.get(resolved)
+        except Exception:
+            return default
+        if value is None:
+            return default
+        return str(value)
+
+    def set(self, key: str, value: str):
+        resolved = self._k(key)
+        setter = getattr(self._backend, "set", None)
+        if callable(setter):
+            try:
+                setter(resolved, str(value or ""))
+                return
+            except TypeError:
+                # Some managers require an explicit key argument.
+                setter(resolved, str(value or ""), key=f"set_{resolved}")
+                return
+        self._backend[resolved] = str(value or "")
+
+    def delete(self, key: str):
+        resolved = self._k(key)
+        deleter = getattr(self._backend, "delete", None)
+        if callable(deleter):
+            try:
+                deleter(resolved)
+                return
+            except TypeError:
+                deleter(resolved, key=f"del_{resolved}")
+                return
+        try:
+            if resolved in self._backend:
+                del self._backend[resolved]
+        except Exception:
+            return
+
+
+def _cookie_manager_backend():
+    try:
+        from extra_streamlit_components import CookieManager as CookieManagerClass
+
+        return CookieManagerClass, "extra_streamlit_components"
+    except Exception:
+        return None, ""
+
+
+def _build_cookie_manager():
+    if not bool(settings.app_auth_cookie_enabled):
+        st.session_state["auth_cookie_backend"] = ""
+        return None, "disabled", ""
+    cookie_cls, backend_name = _cookie_manager_backend()
+    if cookie_cls is None:
+        st.session_state["auth_cookie_backend"] = ""
+        return None, "unavailable", "cookie_backend_missing"
+    st.session_state["auth_cookie_backend"] = str(backend_name or "")
+    prefix = (settings.app_name or "gs").strip().lower().replace(" ", "_") + "/"
+    try:
+        if backend_name == "extra_streamlit_components":
+            raw_manager = cookie_cls(key=f"{prefix}init")
+        else:
+            try:
+                raw_manager = cookie_cls(prefix=prefix)
+            except TypeError:
+                raw_manager = cookie_cls()
+        adapted = _CookieManagerAdapter(backend=raw_manager, prefix=prefix)
+        wrapped = _EncryptedCookieStore(
+            cookie_manager=adapted,
             password=_auth_signing_key() or "change-me-signing-key",
         )
+        if wrapped.ready():
+            return wrapped, "ready", ""
+        return wrapped, "pending", ""
+    except Exception as exc:
+        return None, "error", f"{type(exc).__name__}: {exc}"
+
+
+def _get_cookie_manager():
+    key = "auth_cookie_manager"
+    if key not in st.session_state:
+        manager, _state, _err = _build_cookie_manager()
+        st.session_state[key] = manager
     manager = st.session_state.get(key)
+    if manager is None:
+        return None
     try:
-        if manager is None or not manager.ready():
-            return None
+        return manager if manager.ready() else None
     except Exception:
         return None
-    return manager
 
 
 def _cookie_manager_status() -> tuple[object | None, str, str]:
-    if not bool(settings.app_auth_cookie_enabled):
-        return None, "disabled", ""
-    try:
-        from streamlit_cookies_manager import CookieManager
-    except Exception as exc:
-        return None, "unavailable", f"{type(exc).__name__}: {exc}"
     key = "auth_cookie_manager"
     if key not in st.session_state:
-        prefix = (settings.app_name or "gs").strip().lower().replace(" ", "_")
-        raw_manager = CookieManager(prefix=f"{prefix}/")
-        st.session_state[key] = _EncryptedCookieStore(
-            cookie_manager=raw_manager,
-            password=_auth_signing_key() or "change-me-signing-key",
-        )
+        manager, state, err = _build_cookie_manager()
+        st.session_state[key] = manager
+        return manager, state, err
     manager = st.session_state.get(key)
+    if not bool(settings.app_auth_cookie_enabled):
+        return None, "disabled", ""
     if manager is None:
         return None, "error", "manager_none"
     try:
@@ -733,6 +835,7 @@ def auth_debug_snapshot() -> dict[str, object]:
         "cookie_enabled": bool(settings.app_auth_cookie_enabled),
         "cookie_manager_state": str(st.session_state.get("auth_cookie_manager_state") or ""),
         "cookie_manager_error": str(st.session_state.get("auth_cookie_manager_error") or ""),
+        "cookie_manager_backend": str(st.session_state.get("auth_cookie_backend") or ""),
         "cookie_manager_ready": bool(cookie_manager_ready),
         "cookie_token_present": bool(cookie_token),
         "cookie_token_valid": bool(cookie_claims and int(cookie_claims.get("exp") or 0) > now_ts),

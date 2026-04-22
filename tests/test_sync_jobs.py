@@ -133,6 +133,28 @@ class _UpsertRepo:
         return SimpleNamespace(id=sale_id)
 
 
+class _ListingReconcileDB:
+    def __init__(self, *, listing=None, total_sold: int = 0):
+        self._listing = listing
+        self._total_sold = total_sold
+
+    def get(self, _model, _id):
+        return self._listing
+
+    def scalar(self, _query):
+        return self._total_sold
+
+
+class _ListingReconcileRepo:
+    def __init__(self, *, listing=None, total_sold: int = 0):
+        self.db = _ListingReconcileDB(listing=listing, total_sold=total_sold)
+        self.updated = []
+
+    def update_listing(self, listing_id: int, updates: dict, *, actor: str):
+        self.updated.append((listing_id, updates, actor))
+        return SimpleNamespace(id=listing_id)
+
+
 class _FakeSlackConfig:
     def __init__(self, enabled: bool, notify_sync_failures: bool) -> None:
         self.enabled = enabled
@@ -140,6 +162,183 @@ class _FakeSlackConfig:
 
 
 class SyncJobsTests(unittest.TestCase):
+    def test_maybe_auto_refresh_skips_during_failure_cooldown(self) -> None:
+        repo = _FakeRepo()
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        with patch("app.services.sync_jobs.get_runtime_bool", return_value=True), patch(
+            "app.services.sync_jobs._resolve_ebay_tokens",
+            return_value=("access", "refresh"),
+        ), patch("app.services.sync_jobs.get_runtime_int", side_effect=[12, 45, 30]), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=[
+                "2026-04-18T15:00:00",  # expires_at
+                "2026-04-18T11:00:00",  # refreshed_at
+                "2026-04-18T11:45:00",  # failed_at => cooldown active until 12:15
+            ],
+        ), patch("app.services.sync_jobs.utcnow_naive", return_value=now), patch(
+            "app.services.sync_jobs._refresh_ebay_access_token",
+        ) as refresh_mock, patch("app.services.sync_jobs.EbayClient") as client_cls:
+            client_cls.return_value.is_configured.return_value = True
+            result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
+        refresh_mock.assert_not_called()
+        self.assertEqual(result.get("status"), "skipped")
+        self.assertEqual(result.get("reason"), "failure_cooldown_active")
+        self.assertEqual(result.get("retry_at"), "2026-04-18T12:15:00")
+
+    def test_maybe_auto_refresh_skips_when_refresh_token_missing(self) -> None:
+        repo = _FakeRepo()
+        with patch("app.services.sync_jobs.get_runtime_bool", return_value=True), patch(
+            "app.services.sync_jobs._resolve_ebay_tokens",
+            return_value=("access", ""),
+        ), patch(
+            "app.services.sync_jobs.EbayClient"
+        ) as client_cls:
+            client_cls.return_value.is_configured.return_value = True
+            result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
+        self.assertEqual(result.get("status"), "skipped")
+        self.assertEqual(result.get("reason"), "missing_refresh_token")
+
+    def test_maybe_auto_refresh_refreshes_when_near_expiry(self) -> None:
+        repo = _FakeRepo()
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        with patch("app.services.sync_jobs.get_runtime_bool", return_value=True), patch(
+            "app.services.sync_jobs._resolve_ebay_tokens",
+            return_value=("access", "refresh"),
+        ), patch("app.services.sync_jobs.get_runtime_int", side_effect=[12, 45, 30]), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=[
+                "2026-04-18T12:10:00",  # expires_at
+                "2026-04-18T10:00:00",  # refreshed_at
+                "",  # failed_at
+                "2026-04-18T14:00:00",  # post-refresh expires_at lookup
+            ],
+        ), patch("app.services.sync_jobs.utcnow_naive", return_value=now), patch(
+            "app.services.sync_jobs._refresh_ebay_access_token",
+            return_value=("new-access", "new-refresh"),
+        ) as refresh_mock, patch("app.services.sync_jobs.EbayClient") as client_cls:
+            client_cls.return_value.is_configured.return_value = True
+            result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
+        refresh_mock.assert_called_once()
+        self.assertEqual(result.get("status"), "refreshed")
+        self.assertEqual(result.get("reason"), "near_expiry")
+        self.assertTrue(result.get("access_token_present"))
+
+    def test_maybe_auto_refresh_returns_failed_when_refresh_raises(self) -> None:
+        class _Repo(_FakeRepo):
+            def __init__(self) -> None:
+                super().__init__()
+                self.runtime_upserts = []
+
+            def upsert_runtime_setting(self, **kwargs):
+                self.runtime_upserts.append(kwargs)
+
+        repo = _Repo()
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        with patch("app.services.sync_jobs.get_runtime_bool", return_value=True), patch(
+            "app.services.sync_jobs._resolve_ebay_tokens",
+            return_value=("access", "refresh"),
+        ), patch("app.services.sync_jobs.get_runtime_int", side_effect=[12, 45, 30]), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=[
+                "2026-04-18T12:10:00",  # expires_at (near expiry => due)
+                "2026-04-18T10:00:00",  # refreshed_at
+                "",  # failed_at
+            ],
+        ), patch("app.services.sync_jobs.utcnow_naive", return_value=now), patch(
+            "app.services.sync_jobs._refresh_ebay_access_token",
+            side_effect=RuntimeError("refresh broke"),
+        ), patch("app.services.sync_jobs.EbayClient") as client_cls:
+            client_cls.return_value.is_configured.return_value = True
+            result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
+        self.assertEqual(result.get("status"), "failed")
+        self.assertEqual(result.get("reason"), "refresh_failed")
+        self.assertIn("refresh broke", str(result.get("error")))
+        keys = {str(row.get("key") or "") for row in repo.runtime_upserts}
+        self.assertIn("ebay_user_access_token_refresh_failed_at", keys)
+        self.assertIn("ebay_user_access_token_refresh_last_error", keys)
+
+    def test_persist_ebay_tokens_writes_expiry_timestamp_in_future(self) -> None:
+        class _Repo:
+            def __init__(self):
+                self.calls = []
+
+            def upsert_runtime_setting(self, **kwargs):
+                self.calls.append(kwargs)
+
+        repo = _Repo()
+        fixed_now = datetime(2026, 4, 18, 12, 0, 0)
+        with patch("app.services.sync_jobs.utcnow_naive", return_value=fixed_now):
+            sync_jobs._persist_ebay_tokens(
+                repo,
+                actor="qa",
+                access_token="tok",
+                refresh_token="ref",
+                expires_in=7200,
+            )
+        expires_call = next((c for c in repo.calls if c.get("key") == "ebay_user_access_token_expires_at"), None)
+        self.assertIsNotNone(expires_call)
+        self.assertEqual(expires_call.get("value"), "2026-04-18T14:00:00")
+
+    def test_reconcile_listing_status_marks_sold_only_when_depleted(self) -> None:
+        listing = SimpleNamespace(id=5, quantity_listed=2, listing_status="active")
+        repo = _ListingReconcileRepo(listing=listing, total_sold=1)
+        updated = sync_jobs._reconcile_listing_status_after_sale_import(
+            repo=repo,
+            listing_ids={5},
+            actor="qa",
+        )
+        self.assertEqual(updated, 0)
+        self.assertEqual(len(repo.updated), 0)
+
+        repo2 = _ListingReconcileRepo(listing=listing, total_sold=2)
+        updated2 = sync_jobs._reconcile_listing_status_after_sale_import(
+            repo=repo2,
+            listing_ids={5},
+            actor="qa",
+        )
+        self.assertEqual(updated2, 1)
+        self.assertEqual(repo2.updated[0][1].get("listing_status"), "sold")
+
+    def test_persist_ebay_tokens_swallow_upsert_failures(self) -> None:
+        class _Repo:
+            def upsert_runtime_setting(self, **_kwargs):
+                raise RuntimeError("db down")
+
+        # Should not raise; persistence is best-effort.
+        sync_jobs._persist_ebay_tokens(
+            _Repo(),
+            actor="qa",
+            access_token="tok",
+            refresh_token="ref",
+            expires_in=7200,
+        )
+
+    def test_refresh_ebay_access_token_raises_when_access_missing(self) -> None:
+        client = SimpleNamespace(refresh_user_token=lambda _refresh: {"refresh_token": "new-ref"})
+        with self.assertRaisesRegex(ValueError, "returned no access_token"):
+            sync_jobs._refresh_ebay_access_token(
+                object(),
+                ebay_client=client,
+                actor="qa",
+                refresh_token="ref",
+            )
+
+    def test_notify_ebay_order_import_slack_swallows_dispatch_errors(self) -> None:
+        with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
+            "app.services.sync_jobs.get_runtime_bool", return_value=True
+        ), patch("app.services.sync_jobs.get_runtime_str", return_value=""), patch(
+            "app.services.sync_jobs.build_slack_alert_text",
+            return_value="order-alert",
+        ), patch(
+            "app.services.sync_jobs.dispatch_slack_alert",
+            side_effect=RuntimeError("boom"),
+        ):
+            sync_jobs._notify_ebay_order_import_slack(
+                object(),
+                ebay_order={"orderId": "1", "buyer": {"username": "u1"}},
+                actor="qa",
+            )
+
     def test_csv_set_uses_default_for_empty(self) -> None:
         self.assertEqual(sync_jobs._csv_set("", {"a", "b"}), {"a", "b"})
         self.assertEqual(sync_jobs._csv_set("  ", {"a"}), {"a"})
@@ -152,6 +351,38 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(sync_jobs._to_decimal("1.25"), Decimal("1.25"))
         self.assertEqual(sync_jobs._to_decimal("bad"), Decimal("0"))
         self.assertEqual(sync_jobs._sum_line_totals([{"unit_price": "2.5", "quantity": 2}]), Decimal("5.0"))
+
+    def test_build_ebay_sync_order_note_includes_buyer_shipping_and_tax(self) -> None:
+        ebay_order = {
+            "buyer": {"username": "goldbuyer01"},
+            "fulfillmentStartInstructions": [
+                {
+                    "shippingStep": {
+                        "shippingServiceCode": "USPSGround",
+                        "shipTo": {
+                            "fullName": "Keith K",
+                            "contactAddress": {
+                                "addressLine1": "15892 W 1st Dr",
+                                "city": "Golden",
+                                "stateOrProvince": "CO",
+                                "postalCode": "80401",
+                                "countryCode": "US",
+                            },
+                        },
+                    }
+                }
+            ],
+        }
+        pricing = {"totalTax": {"value": "2.33"}}
+        note = sync_jobs._build_ebay_sync_order_note(
+            prefix="Imported from eBay sync pull.",
+            ebay_order=ebay_order,
+            pricing=pricing,
+        )
+        self.assertIn("buyer=goldbuyer01", note)
+        self.assertIn("shipping_service=USPSGround", note)
+        self.assertIn("ship_to=Keith K, 15892 W 1st Dr, Golden, CO, 80401, US", note)
+        self.assertIn("tax=2.33", note)
 
     def test_sync_job_retry_policy_defaults_without_repo(self) -> None:
         policy = sync_jobs.sync_job_retry_policy("ebay_orders_pull_import", repo=None)
@@ -186,15 +417,95 @@ class SyncJobsTests(unittest.TestCase):
         self.assertIsNone(sync_jobs._parse_ebay_datetime(""))
         self.assertIsNone(sync_jobs._parse_ebay_datetime("   "))
 
+    def test_extract_shipping_service_fallback_paths(self) -> None:
+        nested = sync_jobs._extract_ebay_shipping_service(
+            {
+                "fulfillmentStartInstructions": [
+                    {"shippingStep": {"shippingService": {"name": "NestedService"}}}
+                ]
+            }
+        )
+        pricing = sync_jobs._extract_ebay_shipping_service(
+            {"pricingSummary": {"deliveryCost": {"serviceName": "DeliveryName"}}}
+        )
+        self.assertEqual(nested, "NestedService")
+        self.assertEqual(pricing, "DeliveryName")
+
+    def test_extract_shipping_address_and_party_fields_with_shipping_address_fallback(self) -> None:
+        order = {
+            "buyer": {
+                "username": "buyer-x",
+                "buyerRegistrationAddress": {
+                    "fullName": "Reg Name",
+                    "email": "reg@example.com",
+                    "contactAddress": {
+                        "city": "Denver",
+                        "stateOrProvince": "CO",
+                        "postalCode": "80202",
+                        "countryCode": "us",
+                    },
+                },
+            },
+            "fulfillmentStartInstructions": [5],
+            "shippingAddress": {
+                "name": "Ship Name",
+                "addressLine1": "123 Main",
+                "city": "Golden",
+                "stateOrProvince": "CO",
+                "postalCode": "80401",
+                "countryCode": "US",
+            },
+        }
+        address = sync_jobs._extract_ebay_shipping_address(order)
+        party = sync_jobs._extract_ebay_party_fields(order)
+        self.assertIn("Ship Name, 123 Main, Golden, CO, 80401, US", address)
+        self.assertEqual(party["buyer_username"], "buyer-x")
+        self.assertEqual(party["buyer_name"], "Reg Name")
+        self.assertEqual(party["buyer_email"], "reg@example.com")
+        self.assertEqual(party["ship_to_city"], "Denver")
+        self.assertEqual(party["ship_to_country"], "US")
+
+    def test_extract_ebay_tax_amount_fallbacks(self) -> None:
+        self.assertEqual(sync_jobs._extract_ebay_tax_amount({"salesTax": {"value": "1.20"}}), Decimal("1.20"))
+        self.assertEqual(sync_jobs._extract_ebay_tax_amount({"tax": {"value": "0.60"}}), Decimal("0.60"))
+        self.assertEqual(sync_jobs._extract_ebay_tax_amount("bad"), Decimal("0"))
+
+    def test_line_item_shipping_and_fee_helpers_cover_non_dict_and_nested_rows(self) -> None:
+        shipping = sync_jobs._extract_order_shipping_charged(
+            {
+                "lineItems": [
+                    "bad-row",
+                    {"deliveryCost": {"shippingCost": {"value": "3.00"}, "handlingCost": {"value": "1.00"}}},
+                    {"lineItemShippingCost": "2.50"},
+                ]
+            },
+            {},
+        )
+        fee = sync_jobs._extract_line_item_fee(
+            {"marketplaceFees": [{"amount": {"value": "1.15"}}, {"value": "0.25"}, "bad"]}
+        )
+        non_dict_fee = sync_jobs._extract_line_item_fee("x")
+        nested_shipping = sync_jobs._extract_line_item_shipping(
+            {"deliveryCost": {"value": "5.00", "discountAmount": {"value": "1.00"}}}
+        )
+        non_dict_shipping = sync_jobs._extract_line_item_shipping("x")
+        self.assertEqual(shipping, Decimal("6.50"))
+        self.assertEqual(fee, Decimal("1.40"))
+        self.assertEqual(non_dict_fee, Decimal("0"))
+        self.assertEqual(nested_shipping, Decimal("4.00"))
+        self.assertEqual(non_dict_shipping, Decimal("0"))
+
     def test_map_order_status(self) -> None:
-        self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "fulfilled"}), "delivered")
+        self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "fulfilled"}), "shipped")
         self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "shipped"}), "shipped")
+        self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "in_progress"}), "packaging")
         self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "cancelled"}), "cancelled")
         self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "payment_failed"}), "refunded")
-        self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "other"}), "paid")
+        self.assertEqual(sync_jobs._map_order_status({"orderFulfillmentStatus": "other"}), "not_shipped")
 
     def test_map_tracking_status(self) -> None:
         self.assertEqual(sync_jobs._map_tracking_status("delivered", True), "delivered")
+        self.assertEqual(sync_jobs._map_tracking_status("fulfilled", True), "in_transit")
         self.assertEqual(sync_jobs._map_tracking_status("shipped", True), "in_transit")
         self.assertEqual(sync_jobs._map_tracking_status("cancelled", True), "exception")
         self.assertEqual(sync_jobs._map_tracking_status("unknown", False), "")
@@ -220,13 +531,40 @@ class SyncJobsTests(unittest.TestCase):
 
     def test_extract_shipping_enrichment_delivered_fallback(self) -> None:
         order = {
-            "orderFulfillmentStatus": "fulfilled",
+            "orderFulfillmentStatus": "delivered",
             "creationDate": "2026-03-01T01:00:00Z",
             "lastModifiedDate": "2026-03-05T03:00:00Z",
         }
         out = sync_jobs._extract_shipping_enrichment(order, fulfillments=[])
         self.assertEqual(out["tracking_status"], "label_created")
         self.assertEqual(out["delivered_at"], datetime(2026, 3, 5, 3, 0, 0))
+
+    def test_extract_shipping_enrichment_fulfilled_without_delivery_date_not_delivered(self) -> None:
+        order = {
+            "orderFulfillmentStatus": "fulfilled",
+            "creationDate": "2026-03-01T01:00:00Z",
+            "lastModifiedDate": "2026-03-05T03:00:00Z",
+        }
+        out = sync_jobs._extract_shipping_enrichment(order, fulfillments=[])
+        self.assertEqual(out["tracking_status"], "label_created")
+        self.assertIsNone(out["delivered_at"])
+
+    def test_extract_shipping_enrichment_shipped_delivery_date_without_delivered_signal(self) -> None:
+        order = {
+            "orderFulfillmentStatus": "shipped",
+            "creationDate": "2026-03-01T01:00:00Z",
+        }
+        fulfillments = [
+            {
+                "trackingNumber": "TRACK123",
+                "shippingCarrierCode": "usps",
+                # Some payloads include a deliveryDate estimate while still in transit.
+                "deliveryDate": "2026-03-06T12:00:00Z",
+            }
+        ]
+        out = sync_jobs._extract_shipping_enrichment(order, fulfillments=fulfillments)
+        self.assertEqual(out["tracking_status"], "in_transit")
+        self.assertIsNone(out["delivered_at"])
 
     def test_extract_shipping_enrichment_sort_fallback_on_bad_rows(self) -> None:
         order = {"orderFulfillmentStatus": "shipped", "creationDate": "2026-03-01T01:00:00Z"}
@@ -236,6 +574,140 @@ class SyncJobsTests(unittest.TestCase):
         )
         self.assertEqual(out["tracking_number"], "A1")
         self.assertEqual(out["shipping_provider"], "usps")
+
+    def test_extract_shipping_label_spend_prefers_fulfillment_label_cost(self) -> None:
+        amount, currency = sync_jobs._extract_shipping_label_spend(
+            ebay_order={},
+            fulfillments=[
+                {"shippingLabelCost": {"value": "4.25", "currency": "USD"}},
+                {"shippingLabelCost": {"value": "1.00", "currency": "USD"}},
+            ],
+        )
+        self.assertEqual(amount, Decimal("5.25"))
+        self.assertEqual(currency, "USD")
+
+    def test_extract_shipping_label_spend_uses_payment_summary_fallback(self) -> None:
+        amount, currency = sync_jobs._extract_shipping_label_spend(
+            ebay_order={"paymentSummary": {"shippingLabelCost": {"value": "7.10", "currency": "USD"}}},
+            fulfillments=[],
+        )
+        self.assertEqual(amount, Decimal("7.10"))
+        self.assertEqual(currency, "USD")
+
+    def test_extract_shipping_label_spend_supports_shipping_label_charges_shape(self) -> None:
+        amount, currency = sync_jobs._extract_shipping_label_spend(
+            ebay_order={},
+            fulfillments=[
+                {
+                    "shippingLabelCharges": [
+                        {"amount": {"value": "3.40", "currency": "USD"}},
+                        {"amount": {"value": "0.60", "currency": "USD"}},
+                    ]
+                }
+            ],
+        )
+        self.assertEqual(amount, Decimal("4.00"))
+        self.assertEqual(currency, "USD")
+
+    def test_extract_shipping_label_spend_from_finance_transactions(self) -> None:
+        amount, currency = sync_jobs._extract_shipping_label_spend_from_transactions(
+            order_id="23-14477-17302",
+            transactions=[
+                {
+                    "transactionType": "SHIPPING_LABEL",
+                    "orderId": "23-14477-17302",
+                    "amount": {"value": "-8.12", "currency": "USD"},
+                },
+                {
+                    "transactionType": "FINAL_VALUE_FEE",
+                    "orderId": "23-14477-17302",
+                    "amount": {"value": "-22.05", "currency": "USD"},
+                },
+            ],
+        )
+        self.assertEqual(amount, Decimal("8.12"))
+        self.assertEqual(currency, "USD")
+
+    def test_extract_shipping_label_spend_from_finance_transactions_matches_description_text(self) -> None:
+        amount, currency = sync_jobs._extract_shipping_label_spend_from_transactions(
+            order_id="23-14477-17302",
+            transactions=[
+                {
+                    "transactionType": "OTHER",
+                    "description": "Shipping label for order no. 23-14477-17302",
+                    "amount": {"value": "-8.97", "currency": "USD"},
+                    "totalFunds": {"value": "135.56", "currency": "USD"},
+                }
+            ],
+        )
+        self.assertEqual(amount, Decimal("8.97"))
+        self.assertEqual(currency, "USD")
+
+    def test_extract_marketplace_fee_from_finance_transactions_sale_total_fee(self) -> None:
+        amount, currency = sync_jobs._extract_marketplace_fee_from_transactions(
+            order_id="23-14477-17302",
+            transactions=[
+                {
+                    "transactionType": "SALE",
+                    "orderId": "23-14477-17302",
+                    "totalFeeAmount": {"value": "22.05", "currency": "USD"},
+                },
+                {
+                    "transactionType": "SHIPPING_LABEL",
+                    "orderId": "23-14477-17302",
+                    "amount": {"value": "8.97", "currency": "USD"},
+                },
+            ],
+        )
+        self.assertEqual(amount, Decimal("22.05"))
+        self.assertEqual(currency, "USD")
+
+    def test_build_order_finance_entries_creates_marketplace_fee_and_shipping_label_rows(self) -> None:
+        rows = sync_jobs._build_order_finance_entries(
+            order_id=2,
+            external_order_id="23-14477-17302",
+            marketplace="ebay",
+            ebay_order={
+                "lineItems": [
+                    {
+                        "lineItemId": "10080248303323",
+                        "legacyItemId": "137217809542",
+                        "sku": "DOC-44-0408",
+                        "title": "Item",
+                    }
+                ]
+            },
+            finance_transactions=[
+                {
+                    "transactionId": "T-LABEL",
+                    "orderId": "23-14477-17302",
+                    "transactionType": "SHIPPING_LABEL",
+                    "amount": {"value": "8.97", "currency": "USD"},
+                    "bookingEntry": "DEBIT",
+                    "transactionDate": "2026-04-13T13:16:09.905Z",
+                },
+                {
+                    "transactionId": "T-SALE",
+                    "orderId": "23-14477-17302",
+                    "transactionType": "SALE",
+                    "totalFeeAmount": {"value": "22.05", "currency": "USD"},
+                    "orderLineItems": [
+                        {
+                            "lineItemId": "10080248303323",
+                            "marketplaceFees": [
+                                {
+                                    "feeType": "FINAL_VALUE_FEE",
+                                    "amount": {"value": "19.31", "currency": "USD"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        )
+        kinds = {str(r.get("entry_kind")) for r in rows}
+        self.assertIn("shipping_label", kinds)
+        self.assertIn("marketplace_fee", kinds)
 
     def test_build_order_items_fallback_when_no_line_items(self) -> None:
         rows, listings_created, linked, unmapped = sync_jobs._build_order_items(
@@ -391,6 +863,64 @@ class SyncJobsTests(unittest.TestCase):
                 failed=1,
                 actor="qa",
             )
+
+    def test_notify_ebay_order_import_slack_dispatches_for_created_order(self) -> None:
+        ebay_order = {
+            "orderId": "12-34567-89012",
+            "orderFulfillmentStatus": "in_progress",
+            "creationDate": "2026-04-11T18:00:00Z",
+            "buyer": {"username": "goldbuyer01"},
+            "pricingSummary": {
+                "total": {"value": "104.55"},
+                "deliveryCost": {"value": "9.99"},
+                "totalTax": {"value": "5.56"},
+            },
+            "lineItems": [{"lineItemId": "x1"}, {"lineItemId": "x2"}],
+            "fulfillmentStartInstructions": [
+                {
+                    "shippingStep": {
+                        "shippingServiceCode": "USPSGround",
+                        "shipTo": {
+                            "fullName": "Keith K",
+                            "contactAddress": {
+                                "addressLine1": "15892 W 1st Dr",
+                                "city": "Golden",
+                                "stateOrProvince": "CO",
+                                "postalCode": "80401",
+                                "countryCode": "US",
+                            },
+                        },
+                    }
+                }
+            ],
+        }
+        with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
+            "app.services.sync_jobs.get_runtime_bool", return_value=True
+        ), patch("app.services.sync_jobs.get_runtime_str", return_value="#orders"), patch(
+            "app.services.sync_jobs.build_slack_alert_text",
+            return_value="order-alert",
+        ) as build_text, patch("app.services.sync_jobs.dispatch_slack_alert") as dispatch:
+            sync_jobs._notify_ebay_order_import_slack(
+                object(),
+                ebay_order=ebay_order,
+                actor="qa",
+            )
+            build_text.assert_called_once()
+            dispatch.assert_called_once()
+            kwargs = dispatch.call_args.kwargs
+            self.assertEqual(kwargs["event_type"], "order_imported")
+            self.assertEqual(kwargs["override_channel"], "#orders")
+
+    def test_notify_ebay_order_import_slack_respects_runtime_toggle(self) -> None:
+        with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
+            "app.services.sync_jobs.get_runtime_bool", return_value=False
+        ), patch("app.services.sync_jobs.dispatch_slack_alert") as dispatch:
+            sync_jobs._notify_ebay_order_import_slack(
+                object(),
+                ebay_order={"orderId": "1"},
+                actor="qa",
+            )
+            dispatch.assert_not_called()
 
     def test_execute_sync_job_rejects_disabled(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=False):
@@ -600,6 +1130,94 @@ class SyncJobsTests(unittest.TestCase):
             )
         self.assertEqual(out2["status"], "failed")
 
+    def test_execute_ebay_orders_pull_import_hydrates_order_details_before_upsert(self) -> None:
+        class _Client:
+            def pull_recent_orders(self, *_args, **_kwargs):
+                return {"orders": [{"orderId": "A", "buyer": {"username": "summary-user"}}]}
+
+            def get_order(self, *, access_token: str, order_id: str):
+                _ = access_token
+                return {"orderId": order_id, "buyer": {"username": "detail-user"}}
+
+        db = _FakeDB(products=[], listings=[])
+        repo = _FakeRepoWithDB(db=db)
+        captured_orders: list[dict] = []
+
+        def _capture_order(_repo, ebay_order, **_kwargs):
+            captured_orders.append(dict(ebay_order))
+            return {
+                "orders_created": 0,
+                "orders_updated": 1,
+                "sales_created": 0,
+                "sales_skipped": 0,
+                "sales_updated": 0,
+                "listings_created": 0,
+                "line_items_with_listing_link": 0,
+                "line_items_unmapped_sku": 0,
+            }
+
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs._upsert_ebay_order_into_local",
+            side_effect=_capture_order,
+        ):
+            out = sync_jobs.execute_ebay_orders_pull_import(
+                repo,
+                access_token="tok",
+                actor="qa",
+                client=_Client(),
+            )
+
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(len(captured_orders), 1)
+        self.assertEqual(captured_orders[0].get("buyer", {}).get("username"), "detail-user")
+
+    def test_execute_ebay_orders_pull_import_hydrate_failure_falls_back_to_summary_payload(self) -> None:
+        class _Client:
+            def pull_recent_orders(self, *_args, **_kwargs):
+                return {"orders": [{"orderId": "A", "buyer": {"username": "summary-user"}}]}
+
+            def get_order(self, *, access_token: str, order_id: str):
+                _ = (access_token, order_id)
+                raise RuntimeError("detail unavailable")
+
+        db = _FakeDB(products=[], listings=[])
+        repo = _FakeRepoWithDB(db=db)
+        captured_orders: list[dict] = []
+
+        def _capture_order(_repo, ebay_order, **_kwargs):
+            captured_orders.append(dict(ebay_order))
+            return {
+                "orders_created": 0,
+                "orders_updated": 1,
+                "sales_created": 0,
+                "sales_skipped": 0,
+                "sales_updated": 0,
+                "listings_created": 0,
+                "line_items_with_listing_link": 0,
+                "line_items_unmapped_sku": 0,
+            }
+
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs._upsert_ebay_order_into_local",
+            side_effect=_capture_order,
+        ):
+            out = sync_jobs.execute_ebay_orders_pull_import(
+                repo,
+                access_token="tok",
+                actor="qa",
+                client=_Client(),
+            )
+
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(len(captured_orders), 1)
+        self.assertEqual(captured_orders[0].get("buyer", {}).get("username"), "summary-user")
+        self.assertTrue(
+            any(
+                e.get("action") == "pull_order_hydrate" and e.get("status") == "warning"
+                for e in repo.events
+            )
+        )
+
     def test_execute_ebay_orders_pull_import_pull_failure_updates_run_and_reraises(self) -> None:
         repo = _FakeRepoWithDB(db=_FakeDB())
         client = SimpleNamespace(pull_recent_orders=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("pull fail")))
@@ -665,7 +1283,27 @@ class SyncJobsTests(unittest.TestCase):
         ):
             out = sync_jobs._upsert_ebay_order_into_local(
                 repo,
-                {"orderId": "ORD-1", "creationDate": "2026-03-01T01:00:00Z", "pricingSummary": {}},
+                {
+                    "orderId": "ORD-1",
+                    "creationDate": "2026-03-01T01:00:00Z",
+                    "pricingSummary": {},
+                    "buyer": {"username": "updated-buyer"},
+                    "fulfillmentStartInstructions": [
+                        {
+                            "shippingStep": {
+                                "shipTo": {
+                                    "fullName": "Updated Buyer",
+                                    "contactAddress": {
+                                        "city": "Golden",
+                                        "stateOrProvince": "CO",
+                                        "postalCode": "80401",
+                                        "countryCode": "US",
+                                    },
+                                }
+                            }
+                        }
+                    ],
+                },
                 actor="qa",
                 product_map={},
                 listing_map={},
@@ -680,6 +1318,11 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(out["sales_updated"], 2)
         self.assertEqual(len(repo.updated_orders), 1)
         self.assertEqual(len(repo.updated_sales), 2)
+        order_updates = repo.updated_orders[0][1]
+        self.assertEqual(order_updates.get("buyer_username"), "updated-buyer")
+        self.assertEqual(order_updates.get("ship_to_city"), "Golden")
+        self.assertIn('"orderId": "ORD-1"', str(order_updates.get("marketplace_payload_json") or ""))
+        self.assertIn("listings_marked_sold", out)
 
     def test_upsert_ebay_order_creates_order_and_sales_even_when_fulfillment_enrich_fails(self) -> None:
         repo = _UpsertRepo(existing_order=None, existing_sales=[])
@@ -721,6 +1364,340 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(len(repo.created_orders), 1)
         self.assertEqual(len(repo.created_sales), 2)
         self.assertTrue(any(err.get("code") == "EBAY_ORDER_FULFILLMENT_ENRICH_FAILED" for err in repo.errors))
+
+    def test_upsert_ebay_order_notes_use_nested_buyer_fallback(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(list_shipping_fulfillments=lambda **_kwargs: [])
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [{"product_id": 1, "listing_id": 5, "quantity": 1, "unit_price": Decimal("10.00")}],
+                0,
+                1,
+                0,
+            ),
+        ):
+            out = sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {
+                    "orderId": "ORD-3",
+                    "buyer": {"username": "nestedbuyer"},
+                    "creationDate": "2026-03-01T01:00:00Z",
+                    "pricingSummary": {"totalTax": {"value": "1.11"}},
+                },
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=125,
+            )
+        self.assertEqual(out["orders_created"], 1)
+        self.assertEqual(len(repo.created_orders), 1)
+        created_note = str(repo.created_orders[0].get("notes") or "")
+        self.assertIn("buyer=nestedbuyer", created_note)
+        self.assertIn("tax=1.11", created_note)
+
+    def test_upsert_ebay_order_persists_buyer_ship_to_and_raw_payload(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(list_shipping_fulfillments=lambda **_kwargs: [])
+        ebay_order = {
+            "orderId": "23-14477-17302",
+            "creationDate": "2026-04-13T05:54:42.000Z",
+            "buyer": {
+                "username": "mart2303",
+                "buyerRegistrationAddress": {
+                    "fullName": "Rumondang hasibuan",
+                    "email": "45d0751ab0b48a6a9420@members.ebay.com",
+                    "contactAddress": {
+                        "city": "Jakarta pusat",
+                        "stateOrProvince": "JK",
+                        "postalCode": "10130",
+                        "countryCode": "ID",
+                    },
+                },
+            },
+            "fulfillmentStartInstructions": [
+                {
+                    "shippingStep": {
+                        "shipTo": {
+                            "fullName": "Nopemwan Ede JBO",
+                            "contactAddress": {
+                                "city": "Newark",
+                                "stateOrProvince": "DE",
+                                "postalCode": "19711-8036",
+                                "countryCode": "US",
+                            },
+                            "email": "45d0751ab0b48a6a9420@members.ebay.com",
+                        }
+                    }
+                }
+            ],
+            "lineItems": [],
+            "pricingSummary": {"total": {"value": "142.01"}},
+        }
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [{"product_id": 1, "listing_id": 5, "quantity": 1, "unit_price": Decimal("142.01")}],
+                0,
+                1,
+                0,
+            ),
+        ):
+            sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                ebay_order,
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=203,
+            )
+        self.assertEqual(len(repo.created_orders), 1)
+        created_order = repo.created_orders[0]
+        self.assertEqual(created_order.get("buyer_username"), "mart2303")
+        self.assertEqual(created_order.get("buyer_name"), "Nopemwan Ede JBO")
+        self.assertEqual(created_order.get("buyer_email"), "45d0751ab0b48a6a9420@members.ebay.com")
+        self.assertEqual(created_order.get("ship_to_city"), "Newark")
+        self.assertEqual(created_order.get("ship_to_state"), "DE")
+        self.assertEqual(created_order.get("ship_to_postal_code"), "19711-8036")
+        self.assertEqual(created_order.get("ship_to_country"), "US")
+        payload = created_order.get("marketplace_payload_json") or ""
+        self.assertIn('"orderId": "23-14477-17302"', payload)
+        self.assertIn('"username": "mart2303"', payload)
+
+    def test_upsert_ebay_order_uses_line_item_fallback_for_fees_and_shipping(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(list_shipping_fulfillments=lambda **_kwargs: [])
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [
+                    {
+                        "product_id": 1,
+                        "listing_id": 5,
+                        "quantity": 1,
+                        "unit_price": Decimal("25.00"),
+                        "line_fees": Decimal("2.20"),
+                        "line_shipping": Decimal("4.10"),
+                    }
+                ],
+                0,
+                1,
+                0,
+            ),
+        ):
+            sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {"orderId": "ORD-LINE-FALLBACK", "creationDate": "2026-03-01T01:00:00Z", "pricingSummary": {}},
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=200,
+            )
+        self.assertEqual(len(repo.created_orders), 1)
+        created_order = repo.created_orders[0]
+        self.assertEqual(created_order.get("fees"), Decimal("2.20"))
+        self.assertEqual(created_order.get("shipping_cost"), Decimal("4.10"))
+
+    def test_upsert_ebay_order_reads_top_level_marketplace_fee_and_discounted_shipping(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(list_shipping_fulfillments=lambda **_kwargs: [])
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [
+                    {
+                        "product_id": 1,
+                        "listing_id": 5,
+                        "quantity": 1,
+                        "unit_price": Decimal("130.00"),
+                        "line_fees": Decimal("0"),
+                        "line_shipping": Decimal("0"),
+                    }
+                ],
+                0,
+                1,
+                0,
+            ),
+        ):
+            sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {
+                    "orderId": "ORD-TOPLEVEL-FEE",
+                    "creationDate": "2026-04-13T05:54:42.000Z",
+                    "pricingSummary": {
+                        "deliveryCost": {"value": "25.88", "currency": "USD"},
+                        "deliveryDiscount": {"value": "-13.87", "currency": "USD"},
+                    },
+                    "totalMarketplaceFee": {"value": "22.05", "currency": "USD"},
+                },
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=201,
+            )
+        self.assertEqual(len(repo.created_orders), 1)
+        created_order = repo.created_orders[0]
+        self.assertEqual(created_order.get("fees"), Decimal("22.05"))
+        self.assertEqual(created_order.get("shipping_cost"), Decimal("12.01"))
+
+    def test_upsert_ebay_order_uses_finance_transactions_for_label_spend_fallback(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(
+            list_shipping_fulfillments=lambda **_kwargs: [],
+            list_finance_transactions_for_order=lambda **_kwargs: [
+                {
+                    "transactionType": "SHIPPING_LABEL",
+                    "orderId": "23-14477-17302",
+                    "amount": {"value": "-7.45", "currency": "USD"},
+                }
+            ],
+        )
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [
+                    {
+                        "product_id": 1,
+                        "listing_id": 5,
+                        "quantity": 1,
+                        "unit_price": Decimal("130.00"),
+                        "line_fees": Decimal("0"),
+                        "line_shipping": Decimal("0"),
+                    }
+                ],
+                0,
+                1,
+                0,
+            ),
+        ):
+            sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {
+                    "orderId": "23-14477-17302",
+                    "creationDate": "2026-04-13T05:54:42.000Z",
+                    "pricingSummary": {"deliveryCost": {"value": "12.01", "currency": "USD"}},
+                },
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=202,
+            )
+        self.assertEqual(len(repo.created_orders), 1)
+        created_order = repo.created_orders[0]
+        self.assertEqual(created_order.get("shipping_label_cost"), Decimal("7.45"))
+        self.assertEqual(created_order.get("shipping_label_currency"), "USD")
+
+    def test_upsert_ebay_order_uses_finance_transactions_for_fee_fallback(self) -> None:
+        repo = _UpsertRepo(existing_order=None, existing_sales=[])
+        ebay_client = SimpleNamespace(
+            list_shipping_fulfillments=lambda **_kwargs: [],
+            list_finance_transactions_for_order=lambda **_kwargs: [
+                {
+                    "transactionType": "SALE",
+                    "orderId": "23-14477-17302",
+                    "totalFeeAmount": {"value": "22.05", "currency": "USD"},
+                }
+            ],
+        )
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [
+                    {
+                        "product_id": 1,
+                        "listing_id": 5,
+                        "quantity": 1,
+                        "unit_price": Decimal("130.00"),
+                        "line_fees": Decimal("0"),
+                        "line_shipping": Decimal("0"),
+                    }
+                ],
+                0,
+                1,
+                0,
+            ),
+        ):
+            sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {
+                    "orderId": "23-14477-17302",
+                    "creationDate": "2026-04-13T05:54:42.000Z",
+                    "pricingSummary": {"deliveryCost": {"value": "12.01", "currency": "USD"}},
+                },
+                actor="qa",
+                product_map={},
+                listing_map={},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=204,
+            )
+        self.assertEqual(len(repo.created_orders), 1)
+        created_order = repo.created_orders[0]
+        self.assertEqual(created_order.get("fees"), Decimal("22.05"))
+        payload = str(created_order.get("marketplace_payload_json") or "")
+        self.assertIn("_finance_transactions", payload)
+
+    def test_build_ebay_order_financial_diagnostics_returns_expected_keys(self) -> None:
+        payload = sync_jobs.build_ebay_order_financial_diagnostics(
+            {
+                "orderId": "ORD-DIAG-1",
+                "pricingSummary": {
+                    "priceSubtotal": {"value": "25.00"},
+                    "total": {"value": "31.50"},
+                    "deliveryCost": {"shippingCost": {"value": "4.00"}},
+                    "totalMarketplaceFee": {"value": "2.10"},
+                },
+                "lineItems": [
+                    {"lineItemFee": {"value": "2.10"}, "lineItemShippingCost": {"value": "4.00"}},
+                ],
+            },
+            fulfillments=[{"shippingLabelCost": {"value": "3.45", "currency": "USD"}}],
+        )
+        self.assertEqual(payload.get("order_id"), "ORD-DIAG-1")
+        self.assertEqual(payload.get("marketplace_fee_extracted"), 2.1)
+        self.assertEqual(payload.get("shipping_charged_extracted"), 4.0)
+        self.assertEqual(payload.get("shipping_label_spend_extracted"), 3.45)
+
+    def test_build_ebay_order_financial_diagnostics_uses_finance_transactions_fallback(self) -> None:
+        payload = sync_jobs.build_ebay_order_financial_diagnostics(
+            {
+                "orderId": "23-14477-17302",
+                "pricingSummary": {"deliveryCost": {"value": "12.01", "currency": "USD"}},
+            },
+            fulfillments=[],
+            finance_transactions=[
+                {
+                    "transactionType": "SHIPPING_LABEL",
+                    "orderId": "23-14477-17302",
+                    "amount": {"value": "-6.55", "currency": "USD"},
+                },
+                {
+                    "transactionType": "SALE",
+                    "orderId": "23-14477-17302",
+                    "totalFeeAmount": {"value": "22.05", "currency": "USD"},
+                },
+            ],
+        )
+        self.assertEqual(payload.get("shipping_label_spend_extracted"), 6.55)
+        self.assertEqual(payload.get("shipping_label_spend_source"), "finance_transactions")
+        self.assertEqual(payload.get("marketplace_fee_extracted"), 22.05)
+        self.assertEqual(payload.get("marketplace_fee_source"), "finance_transactions")
 
     def test_execute_ebay_shipping_tracking_push_validation(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,6 +33,11 @@ class _FakeResponse:
 
 
 class EbayClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        EbayClient._finding_rate_limited_until = None
+        EbayClient._finding_last_probe_at = None
+        EbayClient._finding_last_error = {}
+
     def _settings(self, **overrides):
         base = {
             "ebay_environment": "sandbox",
@@ -39,6 +45,9 @@ class EbayClientTests(unittest.TestCase):
             "ebay_client_secret": "csecret",
             "ebay_ru_name": "runame",
             "ebay_marketplace_id": "EBAY_US",
+            "ebay_finding_rate_limit_cooldown_seconds": 600,
+            "ebay_finding_rate_limit_severe_cooldown_seconds": 3600,
+            "ebay_finding_rate_limit_probe_interval_seconds": 120,
         }
         base.update(overrides)
         return SimpleNamespace(**base)
@@ -158,6 +167,23 @@ class EbayClientTests(unittest.TestCase):
         self.assertEqual(rows[0]["merchantLocationKey"], "LOC1")
         self.assertEqual(req_get.call_count, 2)
 
+    def test_finance_transactions_use_apiz_host_and_marketplace_header(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production", ebay_marketplace_id="EBAY_US")):
+            client = EbayClient()
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(status_code=200, payload={"transactions": []}, text="ok"),
+        ) as req_get:
+            _ = client.list_finance_transactions(access_token="tok", limit=5)
+            _ = client.list_finance_transactions_for_order(access_token="tok", order_id="23-1-1", limit=5)
+        self.assertEqual(req_get.call_count, 2)
+        first_url = req_get.call_args_list[0].args[0]
+        second_url = req_get.call_args_list[1].args[0]
+        first_headers = req_get.call_args_list[0].kwargs.get("headers") or {}
+        self.assertIn("apiz.ebay.com/sell/finances/v1/transaction", first_url)
+        self.assertIn("apiz.ebay.com/sell/finances/v1/transaction", second_url)
+        self.assertEqual(first_headers.get("X-EBAY-C-MARKETPLACE-ID"), "EBAY_US")
+
     def test_create_video_prefers_location_header(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
@@ -203,7 +229,11 @@ class EbayClientTests(unittest.TestCase):
     def test_find_completed_items_parses_rows_and_global_id_retry(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
-        bad = _FakeResponse(status_code=400, payload={"error": "bad"}, text="bad")
+        bad = _FakeResponse(
+            status_code=400,
+            payload={"errorMessage": [{"error": [{"message": ["Please specify a valid GLOBAL-ID"]}]}]},
+            text='{"errorMessage":[{"error":[{"message":["Please specify a valid GLOBAL-ID"]}]}]}',
+        )
         ok = _FakeResponse(
             status_code=200,
             payload={
@@ -237,6 +267,84 @@ class EbayClientTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["item_id"], "123")
         self.assertEqual(rows[0]["total_price"], 13.0)
+
+    def test_find_completed_items_rate_limited_raises_runtime_error(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        rate_limited = _FakeResponse(
+            status_code=500,
+            payload={
+                "errorMessage": [
+                    {
+                        "error": [
+                            {
+                                "errorId": ["10001"],
+                                "domain": ["Security"],
+                                "subdomain": ["RateLimiter"],
+                                "message": ["Service call has exceeded the number of times the operation is allowed to be called"],
+                            }
+                        ]
+                    }
+                ]
+            },
+            text='{"errorMessage":[{"error":[{"errorId":["10001"],"subdomain":["RateLimiter"],"message":["Service call has exceeded the number of times the operation is allowed to be called"]}]}]}',
+        )
+        with patch("app.services.ebay.requests.get", return_value=rate_limited):
+            with self.assertRaisesRegex(RuntimeError, "EBAY_FINDING_RATE_LIMITED"):
+                client.find_completed_items(keywords="silver bar")
+        self.assertGreater(EbayClient.finding_rate_limit_cooldown_remaining_seconds(), 0)
+        err = EbayClient.finding_last_error()
+        self.assertEqual(err.get("type"), "remote_rate_limited")
+        self.assertEqual(err.get("rate_limit_scope"), "severe_quota_exhausted")
+        self.assertGreaterEqual(int(err.get("cooldown_seconds") or 0), 3600)
+
+    def test_find_completed_items_rate_limit_cooldown_short_circuit(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        EbayClient._set_finding_rate_limit_cooldown()
+        # Simulate a recent probe so this call must short-circuit locally.
+        EbayClient._finding_last_probe_at = datetime.now(timezone.utc)
+        with patch("app.services.ebay.requests.get") as req_get:
+            with self.assertRaisesRegex(RuntimeError, "EBAY_FINDING_RATE_LIMITED"):
+                client.find_completed_items(keywords="silver")
+        req_get.assert_not_called()
+
+    def test_find_completed_items_allows_probe_during_cooldown_and_clears_on_success(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        EbayClient._set_finding_rate_limit_cooldown()
+        ok = _FakeResponse(
+            status_code=200,
+            payload={
+                "findCompletedItemsResponse": [
+                    {"ack": ["Success"], "searchResult": [{"item": []}]}
+                ]
+            },
+            text="ok",
+        )
+        with patch("app.services.ebay.requests.get", return_value=ok) as req_get:
+            rows = client.find_completed_items(keywords="silver", source="unit_test_probe")
+        self.assertEqual(rows, [])
+        req_get.assert_called_once()
+        self.assertEqual(EbayClient.finding_rate_limit_cooldown_remaining_seconds(), 0)
+
+    def test_find_completed_items_telemetry_snapshot(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        ok = _FakeResponse(
+            status_code=200,
+            payload={
+                "findCompletedItemsResponse": [
+                    {"ack": ["Success"], "searchResult": [{"item": []}]}
+                ]
+            },
+            text="ok",
+        )
+        with patch("app.services.ebay.requests.get", return_value=ok):
+            client.find_completed_items(keywords="credit suisse", source="unit_test_source")
+        snap = EbayClient.finding_call_snapshot(window_seconds=600)
+        self.assertGreaterEqual(int(snap.get("count") or 0), 1)
+        self.assertIn("unit_test_source", snap.get("by_source") or {})
 
     def test_pull_get_and_fulfillment_calls(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
@@ -314,6 +422,50 @@ class EbayClientTests(unittest.TestCase):
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
         self.assertEqual(client.find_completed_items(keywords=""), [])
+
+    def test_search_sold_items_html_parses_rows(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        html = """
+        <li class="s-item">
+          <a class="s-item__link" href="https://www.ebay.com/itm/137217809542">
+            <h3 class="s-item__title">APMEX 1 oz Silver Bar .999 Fine</h3>
+          </a>
+          <span class="s-item__price">$39.95</span>
+          <span class="s-item__shipping">$4.99 shipping</span>
+        </li>
+        """
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(status_code=200, text=html, payload={}),
+        ):
+            rows = client.search_sold_items_html(keywords="apmex 1oz silver bar", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["item_id"], "137217809542")
+        self.assertEqual(rows[0]["sold_price"], 39.95)
+        self.assertEqual(rows[0]["shipping_cost"], 4.99)
+        self.assertAlmostEqual(float(rows[0]["total_price"]), 44.94, places=2)
+
+    def test_find_completed_items_with_fallback_uses_html_on_rate_limit(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        with patch.object(
+            client,
+            "find_completed_items",
+            side_effect=RuntimeError("EBAY_FINDING_RATE_LIMITED: eBay Finding API rate limit exceeded for findCompletedItems."),
+        ), patch.object(
+            client,
+            "search_sold_items_html",
+            return_value=[{"item_id": "1", "title": "fallback", "sold_price": 10.0, "shipping_cost": 0.0, "total_price": 10.0}],
+        ):
+            outcome = client.find_completed_items_with_fallback(
+                keywords="silver bar",
+                sold_only=True,
+                entries_per_page=25,
+                source="unit_test",
+            )
+        self.assertEqual(outcome.get("mode"), "ebay_sold_html_primary")
+        self.assertEqual(len(outcome.get("rows") or []), 1)
 
     def test_listing_url_for_environment(self) -> None:
         with patch("app.services.ebay.settings", self._settings(ebay_environment="sandbox")):

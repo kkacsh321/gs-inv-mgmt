@@ -5,7 +5,14 @@ import streamlit as st
 from sqlalchemy.exc import IntegrityError
 
 from app.auth import current_user, ensure_permission
-from app.components.ui_helpers import build_listing_options, build_product_options, iso_or_none, to_decimal
+from app.components.ui_helpers import (
+    build_listing_options,
+    build_product_options,
+    format_ebay_sync_note_for_customer,
+    iso_or_none,
+    normalize_multiselect_values,
+    to_decimal,
+)
 from app.components.views.shared import (
     MARKETPLACES,
     handoff_to_documents_draft,
@@ -21,6 +28,18 @@ from app.repository import InventoryRepository
 from app.services.ai_orchestration import execute_comp_summary
 from app.services.runtime_settings import get_runtime_str
 from app.utils.time import utc_today
+
+
+ORDER_STATUS_OPTIONS = [
+    "draft",
+    "not_shipped",
+    "packaging",
+    "paid",
+    "shipped",
+    "delivered",
+    "cancelled",
+    "refunded",
+]
 
 
 def render_orders(repo: InventoryRepository) -> None:
@@ -49,8 +68,8 @@ def render_orders(repo: InventoryRepository) -> None:
         external_order_id = st.text_input("External Order ID (optional)")
         order_status = st.selectbox(
             "Order Status",
-            ["draft", "paid", "shipped", "delivered", "cancelled", "refunded"],
-            index=1,
+            ORDER_STATUS_OPTIONS,
+            index=ORDER_STATUS_OPTIONS.index("not_shipped"),
         )
         sold_date = st.date_input("Order Date", value=utc_today())
         c1, c2 = st.columns(2)
@@ -177,27 +196,50 @@ def render_orders(repo: InventoryRepository) -> None:
             "subtotal_amount": float(o.subtotal_amount),
             "fees": float(o.fees),
             "shipping_cost": float(o.shipping_cost),
+            "shipping_label_cost": float(getattr(o, "shipping_label_cost", 0) or 0),
+            "shipping_delta": float(o.shipping_cost or 0) - float(getattr(o, "shipping_label_cost", 0) or 0),
+            "shipping_label_currency": str(getattr(o, "shipping_label_currency", "") or "USD"),
+            "shipping_provider": str(getattr(o, "shipping_provider", "") or ""),
+            "shipping_service": str(getattr(o, "shipping_service", "") or ""),
+            "tracking_number": str(getattr(o, "tracking_number", "") or ""),
+            "tracking_status": str(getattr(o, "tracking_status", "") or ""),
+            "shipped_at": iso_or_none(getattr(o, "shipped_at", None)),
+            "delivered_at": iso_or_none(getattr(o, "delivered_at", None)),
             "total_amount": float(o.total_amount),
             "item_count": len(o.items),
         }
         for o in orders
     ]
     st.markdown("### Order Filters")
+    order_marketplace_options = sorted(
+        {str(row["marketplace"]) for row in order_rows if row.get("marketplace")}
+    )
+    order_status_options = sorted({str(row["status"]) for row in order_rows if row.get("status")})
+    normalized_marketplace_filters = normalize_multiselect_values(
+        st.session_state.get("orders_filter_marketplaces"),
+        order_marketplace_options,
+    )
+    normalized_status_filters = normalize_multiselect_values(
+        st.session_state.get("orders_filter_status"),
+        order_status_options,
+    )
+    if list(st.session_state.get("orders_filter_marketplaces") or []) != normalized_marketplace_filters:
+        st.session_state["orders_filter_marketplaces"] = normalized_marketplace_filters
+    if list(st.session_state.get("orders_filter_status") or []) != normalized_status_filters:
+        st.session_state["orders_filter_status"] = normalized_status_filters
     f1, f2, f3 = st.columns(3)
     with f1:
         order_filter_query = st.text_input("Search External Order ID", key="orders_filter_query")
     with f2:
         order_filter_marketplaces = st.multiselect(
             "Marketplace",
-            options=sorted({str(row["marketplace"]) for row in order_rows if row.get("marketplace")}),
-            default=[],
+            options=order_marketplace_options,
             key="orders_filter_marketplaces",
         )
     with f3:
         order_filter_status = st.multiselect(
             "Status",
-            options=sorted({str(row["status"]) for row in order_rows if row.get("status")}),
-            default=[],
+            options=order_status_options,
             key="orders_filter_status",
         )
     effective_filter = render_saved_filter_bar(
@@ -279,6 +321,9 @@ def render_orders(repo: InventoryRepository) -> None:
                         "subtotal_amount": float(selected_order.subtotal_amount or 0),
                         "fees": float(selected_order.fees or 0),
                         "shipping_cost": float(selected_order.shipping_cost or 0),
+                        "shipping_label_cost": float(getattr(selected_order, "shipping_label_cost", 0) or 0),
+                        "shipping_delta": float(selected_order.shipping_cost or 0)
+                        - float(getattr(selected_order, "shipping_label_cost", 0) or 0),
                         "total_amount": float(selected_order.total_amount or 0),
                         "notes": str(selected_order.notes or ""),
                         "item_count": len(order_items),
@@ -364,9 +409,9 @@ def render_orders(repo: InventoryRepository) -> None:
                     )
                     edit_status = st.selectbox(
                         "Status",
-                        ["draft", "paid", "shipped", "delivered", "cancelled", "refunded"],
-                        index=["draft", "paid", "shipped", "delivered", "cancelled", "refunded"].index(selected_order.order_status)
-                        if selected_order.order_status in {"draft", "paid", "shipped", "delivered", "cancelled", "refunded"}
+                        ORDER_STATUS_OPTIONS,
+                        index=ORDER_STATUS_OPTIONS.index(selected_order.order_status)
+                        if selected_order.order_status in set(ORDER_STATUS_OPTIONS)
                         else 0,
                     )
                     sold_default = selected_order.sold_at.date() if selected_order.sold_at else utc_today()
@@ -379,9 +424,15 @@ def render_orders(repo: InventoryRepository) -> None:
                         step=1.0,
                     )
                     edit_shipping_cost = st.number_input(
-                        "Shipping Cost",
+                        "Shipping Charged to Buyer",
                         min_value=0.0,
                         value=float(selected_order.shipping_cost or 0),
+                        step=1.0,
+                    )
+                    edit_shipping_label_cost = st.number_input(
+                        "Actual Shipping Label Spend (Internal)",
+                        min_value=0.0,
+                        value=float(getattr(selected_order, "shipping_label_cost", 0) or 0),
                         step=1.0,
                     )
                     edit_subtotal = st.number_input(
@@ -396,7 +447,50 @@ def render_orders(repo: InventoryRepository) -> None:
                         value=float(selected_order.total_amount or 0),
                         step=1.0,
                     )
+                sh1, sh2 = st.columns(2)
+                with sh1:
+                    edit_shipping_provider = st.text_input(
+                        "Shipping Provider",
+                        value=str(getattr(selected_order, "shipping_provider", "") or ""),
+                    )
+                    edit_shipping_service = st.text_input(
+                        "Shipping Service",
+                        value=str(getattr(selected_order, "shipping_service", "") or ""),
+                    )
+                    edit_tracking_number = st.text_input(
+                        "Tracking Number",
+                        value=str(getattr(selected_order, "tracking_number", "") or ""),
+                    )
+                    edit_tracking_status = st.text_input(
+                        "Tracking Status",
+                        value=str(getattr(selected_order, "tracking_status", "") or ""),
+                    )
+                with sh2:
+                    existing_shipped_at = getattr(selected_order, "shipped_at", None)
+                    existing_delivered_at = getattr(selected_order, "delivered_at", None)
+                    shipped_enabled = st.checkbox(
+                        "Set Shipped Date",
+                        value=existing_shipped_at is not None,
+                    )
+                    edit_shipped_date = st.date_input(
+                        "Shipped Date",
+                        value=(existing_shipped_at.date() if existing_shipped_at is not None else utc_today()),
+                        disabled=not shipped_enabled,
+                    )
+                    delivered_enabled = st.checkbox(
+                        "Set Delivered Date",
+                        value=existing_delivered_at is not None,
+                    )
+                    edit_delivered_date = st.date_input(
+                        "Delivered Date",
+                        value=(existing_delivered_at.date() if existing_delivered_at is not None else utc_today()),
+                        disabled=not delivered_enabled,
+                    )
                 edit_notes = st.text_area("Notes", value=selected_order.notes or "")
+                formatted_sync_note = format_ebay_sync_note_for_customer(selected_order.notes or "")
+                if formatted_sync_note and formatted_sync_note != str(selected_order.notes or "").strip():
+                    st.caption("Parsed eBay sync note (customer/shipping)")
+                    st.code(formatted_sync_note, language="text")
                 save_side_panel = st.form_submit_button("Save Order Changes")
 
             if save_side_panel:
@@ -412,6 +506,24 @@ def render_orders(repo: InventoryRepository) -> None:
                             "sold_at": datetime.combine(edit_sold_date, datetime.min.time()),
                             "fees": to_decimal(edit_fees),
                             "shipping_cost": to_decimal(edit_shipping_cost),
+                            "shipping_label_cost": to_decimal(edit_shipping_label_cost),
+                            "shipping_label_currency": str(
+                                getattr(selected_order, "shipping_label_currency", "USD") or "USD"
+                            ).strip().upper(),
+                            "shipping_provider": edit_shipping_provider.strip(),
+                            "shipping_service": edit_shipping_service.strip(),
+                            "tracking_number": edit_tracking_number.strip(),
+                            "tracking_status": edit_tracking_status.strip(),
+                            "shipped_at": (
+                                datetime.combine(edit_shipped_date, datetime.min.time())
+                                if shipped_enabled
+                                else None
+                            ),
+                            "delivered_at": (
+                                datetime.combine(edit_delivered_date, datetime.min.time())
+                                if delivered_enabled
+                                else None
+                            ),
                             "subtotal_amount": to_decimal(edit_subtotal),
                             "total_amount": to_decimal(edit_total),
                             "notes": edit_notes.strip(),
@@ -426,30 +538,39 @@ def render_orders(repo: InventoryRepository) -> None:
 
     st.caption("Quick status updates are available from the side-panel edit form above.")
 
-    order_items = repo.list_order_items()
-    if not order_items:
-        return
-    st.markdown("### Order Items")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "id": i.id,
-                    "order_id": i.order_id,
-                    "product_id": i.product_id,
-                    "listing_id": i.listing_id,
-                    "sku": i.product.sku if i.product else None,
-                    "quantity": i.quantity,
-                    "unit_price": float(i.unit_price),
-                    "line_total": float(i.line_total),
-                    "line_fees": float(i.line_fees),
-                    "line_shipping": float(i.line_shipping),
-                }
-                for i in order_items
-            ]
-        ),
-        use_container_width=True,
+    load_order_items_table = st.checkbox(
+        "Load Order Items Table (slower)",
+        value=False,
+        key="orders_load_items_table",
     )
+    if load_order_items_table:
+        order_items = repo.list_order_items()
+        if order_items:
+            st.markdown("### Order Items")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": i.id,
+                            "order_id": i.order_id,
+                            "product_id": i.product_id,
+                            "listing_id": i.listing_id,
+                            "sku": i.product.sku if i.product else None,
+                            "quantity": i.quantity,
+                            "unit_price": float(i.unit_price),
+                            "line_total": float(i.line_total),
+                            "line_fees": float(i.line_fees),
+                            "line_shipping": float(i.line_shipping),
+                        }
+                        for i in order_items
+                    ]
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.caption("No order items found.")
+    else:
+        st.caption("Enable order-item table loading to query and render all order lines.")
     render_workspace_feedback(
         repo=repo,
         actor=user.username,

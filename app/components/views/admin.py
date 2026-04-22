@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from decimal import Decimal
 from urllib.parse import urlparse
@@ -43,6 +43,8 @@ from app.db.models import (
     Sale,
     SavedFilterProfile,
     ShippingPreset,
+    WorkflowDraft,
+    WorkflowEvent,
 )
 from app.db.seed import seed_dev_data
 from app.repository import InventoryRepository
@@ -87,16 +89,39 @@ from app.services.llm_runtime import (
     validate_llm_runtime_config,
 )
 from app.services.sync_jobs import is_sync_job_enabled, sync_job_catalog
-from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
+from app.services.runtime_settings import (
+    get_runtime_bool,
+    get_runtime_float,
+    get_runtime_int,
+    get_runtime_str,
+    get_runtime_value,
+)
+from app.services.ai_prompt_registry import (
+    active_prompt_version,
+    create_prompt_version,
+    list_prompt_versions,
+    restore_prompt_version,
+)
 from app.services.integration_automation import preview_rule_impact, simulate_rule_evaluation_for_job
 from app.services.integration_queue import (
     process_due_google_queue_jobs,
     process_due_integration_queue_jobs,
     process_integration_queue_job,
 )
+from app.services.slack_ops_bot import approve_slack_ops_queue_job
 from app.services.shipping_labels import purchase_shipping_label
 from app.services.slack_notify import build_slack_alert_text, dispatch_slack_alert, send_slack_message
+from app.services.notification_outbox import (
+    cleanup_notification_outbox_retention,
+    process_due_notification_outbox,
+)
+from app.services.lifecycle_retention import cleanup_lifecycle_retention
 from app.components.views.tools import DEFAULT_COMP_DEALER_DOMAINS
+from app.components.views.listing_wizard import (
+    DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE,
+    DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT,
+    DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE,
+)
 from app.utils.time import utcnow_naive
 
 
@@ -108,6 +133,338 @@ def _audit_changes(row: AuditLog) -> dict:
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def _build_business_status_context(repo: InventoryRepository, *, days: int = 1) -> dict[str, Any]:
+    now = utcnow_naive()
+    since = now - timedelta(days=max(1, int(days)))
+    metrics = repo.dashboard_metrics()
+    products = repo.list_products()
+    listings = repo.list_listings()
+    sales = repo.list_sales()
+    orders = repo.list_orders()
+
+    sales_window = [s for s in sales if getattr(s, "sold_at", None) and s.sold_at >= since]
+    gross_window = float(sum(float(getattr(s, "sold_price", 0.0) or 0.0) for s in sales_window))
+    fees_window = float(sum(float(getattr(s, "fees", 0.0) or 0.0) for s in sales_window))
+    shipping_window = float(sum(float(getattr(s, "shipping_cost", 0.0) or 0.0) for s in sales_window))
+    net_window = gross_window - fees_window - shipping_window
+
+    low_stock = [p for p in products if int(getattr(p, "current_quantity", 0) or 0) <= 1]
+    draft_listings = [l for l in listings if str(getattr(l, "listing_status", "") or "").strip().lower() == "draft"]
+    active_listings = [l for l in listings if str(getattr(l, "listing_status", "") or "").strip().lower() == "active"]
+    unlisted_products = [p for p in products if not bool(getattr(p, "listing_id", None))]
+    orders_window = [o for o in orders if getattr(o, "order_date", None) and o.order_date >= since]
+
+    return {
+        "env": settings.app_env,
+        "window_days": int(days),
+        "as_of_utc": now.isoformat(timespec="seconds"),
+        "product_count": int(metrics.get("product_count", len(products))),
+        "listing_count": int(metrics.get("listing_count", len(listings))),
+        "active_count": int(len(active_listings)),
+        "draft_count": int(len(draft_listings)),
+        "unlisted_count": int(len(unlisted_products)),
+        "low_stock_count": int(len(low_stock)),
+        "sale_count": int(metrics.get("sale_count", len(sales))),
+        "sales_window_count": int(len(sales_window)),
+        "gross_window": f"{gross_window:,.2f}",
+        "net_window": f"{net_window:,.2f}",
+        "order_count": int(len(orders)),
+        "orders_window_count": int(len(orders_window)),
+        "inventory_cost": f"{float(metrics.get('inventory_cost', 0.0)):,.2f}",
+    }
+
+
+def _slack_ops_queue_snapshot(rows: list[Any], *, now: datetime | None = None) -> dict[str, Any]:
+    now_dt = now or utcnow_naive()
+    normalized_rows: list[dict[str, Any]] = []
+    status_counts: Counter[str] = Counter()
+    pending_approval_ages_hours: list[float] = []
+    for row in rows or []:
+        status = str(getattr(row, "status", "") or "").strip().lower()
+        status_counts[status] += 1
+        payload = {}
+        try:
+            payload_raw = json.loads(str(getattr(row, "payload_json", "") or "{}"))
+            if isinstance(payload_raw, dict):
+                payload = payload_raw
+        except Exception:
+            payload = {}
+        approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else {}
+        approval_required = bool(approval.get("required", False))
+        approval_status = str(approval.get("status") or "").strip().lower()
+        requested_at_raw = str(approval.get("requested_at") or "").strip()
+        requested_at = None
+        try:
+            if requested_at_raw:
+                requested_at = datetime.fromisoformat(requested_at_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            requested_at = None
+        age_hours = None
+        if status == "blocked" and approval_required and approval_status == "pending" and requested_at is not None:
+            age_hours = max(0.0, (now_dt - requested_at).total_seconds() / 3600.0)
+            pending_approval_ages_hours.append(age_hours)
+        normalized_rows.append(
+            {
+                "id": int(getattr(row, "id", 0) or 0),
+                "action": str(getattr(row, "action", "") or ""),
+                "status": status,
+                "retry_count": int(getattr(row, "retry_count", 0) or 0),
+                "max_retries": int(getattr(row, "max_retries", 0) or 0),
+                "next_attempt_at": getattr(row, "next_attempt_at", None),
+                "requested_by": str(getattr(row, "requested_by", "") or ""),
+                "created_at": getattr(row, "created_at", None),
+                "last_error": str(getattr(row, "last_error", "") or ""),
+                "intent": str(((payload.get("command") or {}).get("intent") or "")).strip().lower(),
+                "approval_required": approval_required,
+                "approval_status": approval_status,
+                "approval_requested_at": requested_at_raw,
+                "approval_requested_by": str(approval.get("requested_by") or "").strip(),
+                "approval_approved_at": str(approval.get("approved_at") or "").strip(),
+                "approval_approved_by": str(approval.get("approved_by") or "").strip(),
+                "pending_approval_age_hours": None if age_hours is None else round(float(age_hours), 2),
+            }
+        )
+    pending_count = int(sum(1 for row in normalized_rows if row["status"] == "blocked" and row["approval_required"] and row["approval_status"] == "pending"))
+    return {
+        "rows": normalized_rows,
+        "total_count": int(len(normalized_rows)),
+        "queued_count": int(status_counts.get("queued", 0)),
+        "running_count": int(status_counts.get("running", 0)),
+        "blocked_count": int(status_counts.get("blocked", 0)),
+        "success_count": int(status_counts.get("success", 0)),
+        "failed_count": int(status_counts.get("failed", 0)),
+        "pending_approval_count": pending_count,
+        "pending_approval_avg_hours": round(sum(pending_approval_ages_hours) / len(pending_approval_ages_hours), 2) if pending_approval_ages_hours else 0.0,
+        "pending_approval_max_hours": round(max(pending_approval_ages_hours), 2) if pending_approval_ages_hours else 0.0,
+    }
+
+
+def _summarize_ai_quality_metrics(
+    ai_metric_rows: list[tuple[Any, Any, Any, Any]],
+    *,
+    workflow_filter: str = "all",
+) -> dict[str, Any]:
+    apply_events = 0
+    outcome_events = 0
+    accepted_as_is_count = 0
+    edited_count = 0
+    workflow_totals: dict[str, dict[str, int]] = {}
+    version_totals: dict[str, dict[str, int]] = {}
+    daily_totals: dict[str, dict[str, int]] = {}
+    workflow_daily_totals: dict[str, dict[str, int]] = {}
+    edited_field_totals_by_workflow: dict[str, Counter[str]] = {}
+    recent_rows: list[dict[str, str]] = []
+
+    wf_filter = str(workflow_filter or "all").strip().lower()
+
+    for created_at, actor, action, changes_json in ai_metric_rows or []:
+        try:
+            payload = json.loads(str(changes_json or "{}"))
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        workflow_name = str(payload.get("workflow") or "").strip().lower() or "unknown"
+        if wf_filter != "all" and workflow_name != wf_filter:
+            continue
+
+        action_name = str(action or "").strip().lower()
+        if action_name == "listing_wizard_apply":
+            apply_events += 1
+            continue
+        if action_name != "listing_wizard_outcome":
+            continue
+
+        outcome_events += 1
+        outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
+        accepted_as_is = bool(outcome.get("accepted_as_is"))
+        if accepted_as_is:
+            accepted_as_is_count += 1
+        else:
+            edited_count += 1
+
+        wf_row = workflow_totals.setdefault(workflow_name, {"accepted_as_is": 0, "edited": 0, "total": 0})
+        wf_row["total"] += 1
+        if accepted_as_is:
+            wf_row["accepted_as_is"] += 1
+        else:
+            wf_row["edited"] += 1
+
+        acceptance = payload.get("acceptance") if isinstance(payload.get("acceptance"), dict) else {}
+        prompt_version = str(acceptance.get("prompt_version_id") or "").strip() or "(unversioned)"
+        pv_row = version_totals.setdefault(prompt_version, {"accepted_as_is": 0, "edited": 0, "total": 0})
+        pv_row["total"] += 1
+        if accepted_as_is:
+            pv_row["accepted_as_is"] += 1
+        else:
+            pv_row["edited"] += 1
+
+        created_dt = created_at if isinstance(created_at, datetime) else None
+        if created_dt is not None:
+            date_key = created_dt.date().isoformat()
+            day_row = daily_totals.setdefault(date_key, {"accepted_as_is": 0, "edited": 0, "total": 0})
+            wf_day_key = f"{workflow_name}::{date_key}"
+            wf_day_row = workflow_daily_totals.setdefault(
+                wf_day_key,
+                {"workflow": workflow_name, "date": date_key, "accepted_as_is": 0, "edited": 0, "total": 0},
+            )
+            day_row["total"] += 1
+            wf_day_row["total"] += 1
+            if accepted_as_is:
+                day_row["accepted_as_is"] += 1
+                wf_day_row["accepted_as_is"] += 1
+            else:
+                day_row["edited"] += 1
+                wf_day_row["edited"] += 1
+
+        edited_fields = outcome.get("edited_fields") if isinstance(outcome.get("edited_fields"), list) else []
+        if edited_fields:
+            wf_counter = edited_field_totals_by_workflow.setdefault(workflow_name, Counter())
+            for item in edited_fields:
+                key = str(item or "").strip()
+                if key:
+                    wf_counter[key] += 1
+        recent_rows.append(
+            {
+                "created_at": str(created_at or ""),
+                "actor": str(actor or ""),
+                "workflow": workflow_name,
+                "prompt_version_id": prompt_version,
+                "accepted_as_is": str(accepted_as_is),
+                "edited_fields": ", ".join(str(x) for x in edited_fields[:8]),
+            }
+        )
+
+    daily_rows = []
+    for date_key in sorted(daily_totals.keys()):
+        item = daily_totals[date_key]
+        total = int(item.get("total") or 0)
+        accepted = int(item.get("accepted_as_is") or 0)
+        edited = int(item.get("edited") or 0)
+        daily_rows.append(
+            {
+                "date": date_key,
+                "total": total,
+                "accepted_as_is": accepted,
+                "edited": edited,
+                "accept_rate_pct": round((float(accepted) / float(total) * 100.0) if total else 0.0, 2),
+            }
+        )
+    workflow_daily_rows = []
+    for key in sorted(workflow_daily_totals.keys()):
+        item = workflow_daily_totals[key]
+        total = int(item.get("total") or 0)
+        accepted = int(item.get("accepted_as_is") or 0)
+        edited = int(item.get("edited") or 0)
+        workflow_daily_rows.append(
+            {
+                "workflow": str(item.get("workflow") or ""),
+                "date": str(item.get("date") or ""),
+                "total": total,
+                "accepted_as_is": accepted,
+                "edited": edited,
+                "accept_rate_pct": round((float(accepted) / float(total) * 100.0) if total else 0.0, 2),
+            }
+        )
+
+    edited_fields_top_rows = []
+    for workflow_name, counter in edited_field_totals_by_workflow.items():
+        for field_name, count in counter.most_common():
+            edited_fields_top_rows.append(
+                {
+                    "workflow": workflow_name,
+                    "field": field_name,
+                    "edit_count": int(count),
+                }
+            )
+
+    return {
+        "apply_events": int(apply_events),
+        "outcome_events": int(outcome_events),
+        "accepted_as_is_count": int(accepted_as_is_count),
+        "edited_count": int(edited_count),
+        "workflow_totals": workflow_totals,
+        "version_totals": version_totals,
+        "daily_rows": daily_rows,
+        "workflow_daily_rows": workflow_daily_rows,
+        "recent_rows": recent_rows,
+        "edited_fields_top_rows": edited_fields_top_rows,
+    }
+
+
+def _build_normalized_fee_coverage_admin_summary(
+    repo: InventoryRepository,
+    *,
+    lookback_weeks: int,
+    threshold_percent: float,
+    min_consecutive_weeks: int,
+) -> dict[str, Any]:
+    now = utcnow_naive()
+    start_dt = now - timedelta(days=max(2, int(lookback_weeks)) * 7)
+    if not hasattr(repo, "report_ebay_fee_reconciliation_rows"):
+        return {
+            "error": "reconciliation_not_supported",
+            "triggered": False,
+            "latest_week_start": "",
+            "latest_week_coverage_pct": 0.0,
+            "consecutive_below": 0,
+            "weekly_rows": [],
+        }
+
+    rows = repo.report_ebay_fee_reconciliation_rows(start_dt=start_dt, end_dt=now)
+    weekly: dict[str, dict[str, int]] = {}
+    for row in rows or []:
+        sold_at_raw = str(row.get("sold_at") or "").strip()
+        source = str(row.get("actual_fee_source") or "").strip().lower()
+        if not sold_at_raw:
+            continue
+        try:
+            sold_at_dt = datetime.fromisoformat(sold_at_raw.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                sold_at_dt = datetime.fromisoformat(sold_at_raw)
+            except Exception:
+                continue
+        week_start = (sold_at_dt.date() - timedelta(days=sold_at_dt.weekday())).isoformat()
+        bucket = weekly.setdefault(week_start, {"total": 0, "normalized": 0})
+        bucket["total"] += 1
+        if source == "normalized_order_finance_entries_marketplace_fee_sum":
+            bucket["normalized"] += 1
+
+    weekly_rows: list[dict[str, Any]] = []
+    for week_start in sorted(weekly.keys()):
+        total = int(weekly[week_start]["total"])
+        normalized = int(weekly[week_start]["normalized"])
+        coverage = (float(normalized) / float(total) * 100.0) if total > 0 else 0.0
+        weekly_rows.append(
+            {
+                "week_start": week_start,
+                "total_sales": total,
+                "normalized_sales": normalized,
+                "coverage_pct": round(coverage, 2),
+            }
+        )
+
+    consecutive_below = 0
+    for week_row in reversed(weekly_rows):
+        if float(week_row.get("coverage_pct") or 0.0) < float(threshold_percent):
+            consecutive_below += 1
+        else:
+            break
+    triggered = bool(consecutive_below >= max(1, int(min_consecutive_weeks)))
+    latest_week = weekly_rows[-1] if weekly_rows else {}
+    return {
+        "triggered": triggered,
+        "latest_week_start": str(latest_week.get("week_start") or ""),
+        "latest_week_coverage_pct": float(latest_week.get("coverage_pct") or 0.0),
+        "latest_week_total_sales": int(latest_week.get("total_sales") or 0),
+        "consecutive_below": int(consecutive_below),
+        "threshold_percent": float(threshold_percent),
+        "min_consecutive_weeks": int(min_consecutive_weeks),
+        "weekly_rows": weekly_rows,
+    }
 
 
 def _all_permission_options() -> list[str]:
@@ -236,6 +593,128 @@ def _normalize_comp_dealer_domains_csv(value: str) -> tuple[str, list[str]]:
     return ",".join(out), out
 
 
+def _parse_iso_naive(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _ebay_token_auto_refresh_diagnostics(repo: InventoryRepository) -> dict[str, Any]:
+    now = utcnow_naive().replace(microsecond=0)
+    interval_hours = max(
+        1,
+        min(72, int(get_runtime_int(repo, "ebay_user_token_auto_refresh_interval_hours", 12))),
+    )
+    min_ttl_minutes = max(
+        5,
+        min(240, int(get_runtime_int(repo, "ebay_user_token_auto_refresh_min_ttl_minutes", 45))),
+    )
+    failure_cooldown_minutes = max(
+        1,
+        min(
+            24 * 60,
+            int(get_runtime_int(repo, "ebay_user_token_auto_refresh_failure_cooldown_minutes", 30)),
+        ),
+    )
+    refreshed_at = _parse_iso_naive(get_runtime_str(repo, "ebay_user_access_token_refreshed_at", ""))
+    expires_at = _parse_iso_naive(get_runtime_str(repo, "ebay_user_access_token_expires_at", ""))
+    failed_at = _parse_iso_naive(get_runtime_str(repo, "ebay_user_access_token_refresh_failed_at", ""))
+    last_error = str(get_runtime_str(repo, "ebay_user_access_token_refresh_last_error", "") or "").strip()
+
+    expires_in_minutes: int | None = None
+    if expires_at is not None:
+        expires_in_minutes = int((expires_at - now).total_seconds() // 60)
+    next_refresh_due_at = (
+        (refreshed_at + timedelta(hours=int(interval_hours))).replace(microsecond=0)
+        if refreshed_at is not None
+        else None
+    )
+    failure_cooldown_until = (
+        (failed_at + timedelta(minutes=int(failure_cooldown_minutes))).replace(microsecond=0)
+        if failed_at is not None
+        else None
+    )
+    failure_cooldown_active = bool(
+        failure_cooldown_until is not None and now < failure_cooldown_until
+    )
+    return {
+        "now": now.isoformat(timespec="seconds"),
+        "interval_hours": int(interval_hours),
+        "min_ttl_minutes": int(min_ttl_minutes),
+        "failure_cooldown_minutes": int(failure_cooldown_minutes),
+        "refreshed_at": refreshed_at.isoformat(timespec="seconds") if refreshed_at else "",
+        "expires_at": expires_at.isoformat(timespec="seconds") if expires_at else "",
+        "expires_in_minutes": expires_in_minutes,
+        "next_refresh_due_at": next_refresh_due_at.isoformat(timespec="seconds") if next_refresh_due_at else "",
+        "failed_at": failed_at.isoformat(timespec="seconds") if failed_at else "",
+        "failure_cooldown_until": (
+            failure_cooldown_until.isoformat(timespec="seconds")
+            if failure_cooldown_until
+            else ""
+        ),
+        "failure_cooldown_active": bool(failure_cooldown_active),
+        "last_error": last_error,
+    }
+
+
+def _clear_ebay_token_refresh_failure_state(repo: InventoryRepository, *, actor: str) -> None:
+    repo.upsert_runtime_setting(
+        environment=settings.app_env,
+        key="ebay_user_access_token_refresh_failed_at",
+        value="",
+        value_type="str",
+        description="Timestamp when eBay user token auto-refresh most recently failed.",
+        actor=actor,
+    )
+    repo.upsert_runtime_setting(
+        environment=settings.app_env,
+        key="ebay_user_access_token_refresh_last_error",
+        value="",
+        value_type="str",
+        description="Last eBay user token auto-refresh error message.",
+        actor=actor,
+    )
+
+
+def _ebay_finding_recommended_runtime_settings() -> list[tuple[str, str, str, str]]:
+    return [
+        (
+            "comp_ebay_max_calls_per_run",
+            "3",
+            "int",
+            "Legacy Finding guardrail (inactive in primary comp path).",
+        ),
+        (
+            "comp_ebay_max_calls_per_10m",
+            "12",
+            "int",
+            "Legacy Finding rolling-window guardrail (inactive in primary comp path).",
+        ),
+        (
+            "ebay_finding_rate_limit_cooldown_seconds",
+            "600",
+            "int",
+            "Legacy Finding cooldown setting (inactive in primary comp path).",
+        ),
+        (
+            "ebay_finding_rate_limit_severe_cooldown_seconds",
+            "3600",
+            "int",
+            "Legacy Finding severe cooldown setting (inactive in primary comp path).",
+        ),
+        (
+            "ebay_finding_rate_limit_probe_interval_seconds",
+            "120",
+            "int",
+            "Legacy Finding cooldown probe interval (inactive in primary comp path).",
+        ),
+    ]
+
+
 def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
     return [
         {
@@ -261,6 +740,30 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "true" if settings.comp_web_fallback_enabled else "false",
             "value_type": "bool",
             "description": "Default web fallback behavior for Comp Tool when eBay comps are empty.",
+        },
+        {
+            "key": "comp_ebay_max_calls_per_run",
+            "value": "3",
+            "value_type": "int",
+            "description": "Legacy Finding guardrail (inactive in primary comp path).",
+        },
+        {
+            "key": "comp_ebay_max_calls_per_10m",
+            "value": "12",
+            "value_type": "int",
+            "description": "Legacy Finding rolling-window guardrail (inactive in primary comp path).",
+        },
+        {
+            "key": "ebay_finding_rate_limit_cooldown_seconds",
+            "value": str(int(getattr(settings, "ebay_finding_rate_limit_cooldown_seconds", 600))),
+            "value_type": "int",
+            "description": "Legacy Finding cooldown setting (inactive in primary comp path).",
+        },
+        {
+            "key": "ebay_finding_rate_limit_probe_interval_seconds",
+            "value": str(int(getattr(settings, "ebay_finding_rate_limit_probe_interval_seconds", 120))),
+            "value_type": "int",
+            "description": "Legacy Finding cooldown probe interval (inactive in primary comp path).",
         },
         {
             "key": "ebay_allow_sandbox_seller_ops",
@@ -393,6 +896,30 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": settings.ebay_user_refresh_token,
             "value_type": "str",
             "description": "Default eBay user refresh token used for access token renewal.",
+        },
+        {
+            "key": "ebay_user_token_auto_refresh_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Enable proactive eBay user token refresh in sync runner.",
+        },
+        {
+            "key": "ebay_user_token_auto_refresh_interval_hours",
+            "value": "12",
+            "value_type": "int",
+            "description": "Fallback max hours between proactive eBay user token refresh attempts.",
+        },
+        {
+            "key": "ebay_user_token_auto_refresh_min_ttl_minutes",
+            "value": "45",
+            "value_type": "int",
+            "description": "Refresh eBay user token when remaining TTL drops below this many minutes.",
+        },
+        {
+            "key": "ebay_user_token_auto_refresh_failure_cooldown_minutes",
+            "value": "30",
+            "value_type": "int",
+            "description": "Cooldown after eBay token auto-refresh failure before retrying again.",
         },
         {
             "key": "spot_price_provider",
@@ -541,6 +1068,24 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Enable scheduled backup policy reporting/tracking for this environment.",
         },
         {
+            "key": "backup_policy_runner_enabled",
+            "value": "false",
+            "value_type": "bool",
+            "description": "Enable scheduled backup execution by sync-runner.",
+        },
+        {
+            "key": "backup_policy_schedule_timezone",
+            "value": "America/Denver",
+            "value_type": "str",
+            "description": "IANA timezone used for scheduled backup execution.",
+        },
+        {
+            "key": "backup_policy_schedule_local_time",
+            "value": "02:00",
+            "value_type": "str",
+            "description": "Local-time HH:MM used for daily scheduled backup execution.",
+        },
+        {
             "key": "backup_policy_cadence_hours",
             "value": "24",
             "value_type": "int",
@@ -587,6 +1132,42 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": DEFAULT_COMP_INSTRUCTION,
             "value_type": "str",
             "description": "Instruction template for AI comp synthesis prompts.",
+        },
+        {
+            "key": "listing_wizard_ai_system_message",
+            "value": DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE,
+            "value_type": "str",
+            "description": "System message for Listing Wizard AI draft suggestions.",
+        },
+        {
+            "key": "listing_wizard_ai_instruction_template",
+            "value": DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE,
+            "value_type": "str",
+            "description": "Instruction template for Listing Wizard AI draft suggestions.",
+        },
+        {
+            "key": "listing_wizard_ai_seed_default",
+            "value": DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT,
+            "value_type": "str",
+            "description": "Default seed prompt pre-filled in Listing Wizard AI Draft Assist.",
+        },
+        {
+            "key": "listing_wizard_ai_include_quick_comp_context",
+            "value": "true",
+            "value_type": "bool",
+            "description": "When true, Listing Wizard AI tries to include quick eBay sold-comp and spot context.",
+        },
+        {
+            "key": "listing_wizard_ai_quick_comp_limit",
+            "value": "8",
+            "value_type": "int",
+            "description": "Max eBay sold-comp rows fetched for Listing Wizard AI quick pricing context.",
+        },
+        {
+            "key": "purchase_doc_auto_apply_linked_lot_fields",
+            "value": "false",
+            "value_type": "bool",
+            "description": "When true, inventory intake auto-applies extracted purchase-document fields to the linked lot accounting fields.",
         },
         {
             "key": "comp_reference_rules_context",
@@ -844,6 +1425,72 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Maximum number of active AI runtime profiles to attempt per request.",
         },
         {
+            "key": "ai_quality_title_min_words",
+            "value": "3",
+            "value_type": "int",
+            "description": "Minimum words required before applying AI-suggested listing title text.",
+        },
+        {
+            "key": "ai_quality_title_min_chars",
+            "value": "12",
+            "value_type": "int",
+            "description": "Minimum chars required before applying AI-suggested listing title text.",
+        },
+        {
+            "key": "ai_quality_listing_details_min_words",
+            "value": "28",
+            "value_type": "int",
+            "description": "Minimum words required before applying AI-suggested listing details.",
+        },
+        {
+            "key": "ai_quality_listing_details_min_chars",
+            "value": "180",
+            "value_type": "int",
+            "description": "Minimum chars required before applying AI-suggested listing details.",
+        },
+        {
+            "key": "ai_quality_intake_min_words",
+            "value": "8",
+            "value_type": "int",
+            "description": "Minimum words required before applying AI-suggested intake text.",
+        },
+        {
+            "key": "ai_quality_intake_min_chars",
+            "value": "40",
+            "value_type": "int",
+            "description": "Minimum chars required before applying AI-suggested intake text.",
+        },
+        {
+            "key": "ai_quality_forbidden_terms_csv",
+            "value": "guaranteed profit,guaranteed return,risk-free,no risk,investment advice,financial advice",
+            "value_type": "str",
+            "description": "Comma-separated blocked words/phrases that prevent AI suggestion auto-apply.",
+        },
+        {
+            "key": "ai_prompt_active_version_comp",
+            "value": "",
+            "value_type": "str",
+            "description": "Active prompt registry version id for comp workflow.",
+        },
+        {
+            "key": "ai_prompt_active_version_listing",
+            "value": "",
+            "value_type": "str",
+            "description": "Active prompt registry version id for listing workflow.",
+        },
+        {
+            "key": "ai_prompt_registry_comp_json",
+            "value": "[]",
+            "value_type": "json",
+            "description": "Prompt registry history rows for comp workflow.",
+        },
+        {
+            "key": "ai_prompt_registry_listing_json",
+            "value": "[]",
+            "value_type": "json",
+            "description": "Prompt registry history rows for listing workflow.",
+        },
+        {
             "key": "google_integration_enabled",
             "value": "false",
             "value_type": "bool",
@@ -908,6 +1555,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "America/Denver",
             "value_type": "str",
             "description": "Default timezone for Google Calendar event scheduling.",
+        },
+        {
+            "key": "app_default_timezone",
+            "value": "America/Denver",
+            "value_type": "str",
+            "description": "Default app timezone for local display/scheduling defaults.",
         },
         {
             "key": "google_http_timeout_seconds",
@@ -1055,9 +1708,9 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
         },
         {
             "key": "invoicing_tax_rate_percent_default",
-            "value": "8.81",
+            "value": "7.50",
             "value_type": "str",
-            "description": "Default sales-tax rate percent used by Documents tax calculator.",
+            "description": "Default local sales-tax rate percent used by Documents/Reports tax calculators (Golden, CO local profile).",
         },
         {
             "key": "invoicing_tax_shipping_taxable_default",
@@ -1070,6 +1723,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "bullion,coins",
             "value_type": "str",
             "description": "Comma-separated product categories treated as tax-exempt in auto tax mode.",
+        },
+        {
+            "key": "marketplace_facilitator_channels_csv",
+            "value": "ebay",
+            "value_type": "str",
+            "description": "Comma-separated marketplaces that collect/remit sales tax as facilitator channels (excluded by default in local tax-liability report scope).",
         },
         {
             "key": "slack_notifications_enabled",
@@ -1108,10 +1767,118 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Send Slack notifications for shipping exceptions.",
         },
         {
+            "key": "slack_notify_order_imports",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Send Slack notifications when new eBay orders are imported.",
+        },
+        {
             "key": "slack_notify_daily_summary",
             "value": "false",
             "value_type": "bool",
             "description": "Send one daily Slack operational summary message.",
+        },
+        {
+            "key": "slack_daily_report_enabled",
+            "value": "false",
+            "value_type": "bool",
+            "description": "Enable sync-runner scheduled daily operations report delivery.",
+        },
+        {
+            "key": "slack_daily_report_timezone",
+            "value": "America/Denver",
+            "value_type": "str",
+            "description": "IANA timezone used by daily ops report scheduler.",
+        },
+        {
+            "key": "slack_daily_report_local_time",
+            "value": "08:00",
+            "value_type": "str",
+            "description": "Local HH:MM trigger for daily ops report scheduler.",
+        },
+        {
+            "key": "slack_daily_report_channel",
+            "value": "",
+            "value_type": "str",
+            "description": "Optional channel override for scheduled daily ops report.",
+        },
+        {
+            "key": "slack_daily_report_normalized_fee_coverage_lookback_weeks",
+            "value": "8",
+            "value_type": "int",
+            "description": "Lookback window in weeks for normalized eBay fee-source coverage health in daily ops reports.",
+        },
+        {
+            "key": "slack_daily_report_normalized_fee_coverage_threshold_pct",
+            "value": "80",
+            "value_type": "float",
+            "description": "Minimum weekly normalized fee-source coverage percent before daily-report health alerting triggers.",
+        },
+        {
+            "key": "slack_daily_report_normalized_fee_coverage_consecutive_weeks",
+            "value": "2",
+            "value_type": "int",
+            "description": "Number of consecutive below-threshold weeks required before daily-report fee coverage alert is triggered.",
+        },
+        {
+            "key": "slack_notify_backup_success",
+            "value": "false",
+            "value_type": "bool",
+            "description": "Send Slack notification when scheduled backup succeeds.",
+        },
+        {
+            "key": "slack_notify_backup_failures",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Send Slack notification when scheduled backup fails.",
+        },
+        {
+            "key": "slack_channel_backup_events",
+            "value": "",
+            "value_type": "str",
+            "description": "Optional channel override for backup success/failure notifications.",
+        },
+        {
+            "key": "slack_channel_business_reports",
+            "value": "",
+            "value_type": "str",
+            "description": "Optional channel override for manual business status report notifications.",
+        },
+        {
+            "key": "slack_channel_order_imports",
+            "value": "",
+            "value_type": "str",
+            "description": "Optional channel override for new eBay order import notifications.",
+        },
+        {
+            "key": "slack_template_backup_success",
+            "value": ":white_check_mark: *GoldenStackers* scheduled DB backup completed\n- Env: `{env}`\n- File: `{file_name}`\n- Size: `{size_bytes}` bytes\n- Uploaded to S3: `{uploaded_to_s3}`\n- S3 Key: `{s3_key}`\n- Local Time: `{local_time}`",
+            "value_type": "str",
+            "description": "Template for successful scheduled backup notifications.",
+        },
+        {
+            "key": "slack_template_backup_failure",
+            "value": ":x: *GoldenStackers* scheduled DB backup failed\n- Env: `{env}`\n- Error: `{error}`\n- Local Time: `{local_time}`",
+            "value_type": "str",
+            "description": "Template for failed scheduled backup notifications.",
+        },
+        {
+            "key": "slack_template_business_status_report",
+            "value": ":bar_chart: *GoldenStackers Business Status* (`{env}`)\n- Window: `{window_days}` day(s)\n- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n- Orders: `{orders_window_count}`\n- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n- Low stock: `{low_stock_count}` | Unlisted: `{unlisted_count}`\n- As of UTC: `{as_of_utc}`",
+            "value_type": "str",
+            "description": "Template for manual business status report notifications.",
+        },
+        {
+            "key": "slack_template_inventory_risk_report",
+            "value": ":package: *GoldenStackers Inventory Risk* (`{env}`)\n- Low stock items: `{low_stock_count}`\n- Unlisted products: `{unlisted_count}`\n- Draft listings: `{draft_count}`\n- Active listings: `{active_count}`\n- Inventory cost basis: `${inventory_cost}`\n- As of UTC: `{as_of_utc}`",
+            "value_type": "str",
+            "description": "Template for manual inventory risk report notifications.",
+        },
+        {
+            "key": "slack_template_order_imported",
+            "value": ":package: *New eBay order imported*\n- Env: `{env}`\n- Order: `{order_id}`\n- Buyer: `{buyer}`\n- Status: `{status}`\n- Total: `${total}` (shipping `${shipping}`, tax `${tax}`)\n- Items: `{line_item_count}`\n- Shipping service: `{shipping_service}`\n- Ship to: `{shipping_address}`\n- Created: `{created_at}`",
+            "value_type": "str",
+            "description": "Template for new eBay order imported notifications.",
         },
         {
             "key": "slack_notify_google_queue_failures",
@@ -1124,6 +1891,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "true",
             "value_type": "bool",
             "description": "Send Slack notifications when any integration queue job hits terminal failure.",
+        },
+        {
+            "key": "slack_notify_ebay_oauth_refresh_failures",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Send Slack notifications when sync-runner eBay OAuth auto-refresh fails.",
         },
         {
             "key": "slack_notify_parity_decisions",
@@ -1148,6 +1921,48 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "0 16 * * *",
             "value_type": "str",
             "description": "Cron expression for daily summary schedule (UTC).",
+        },
+        {
+            "key": "notification_route_sync_failures",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for sync failure events (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
+            "key": "notification_route_daily_report",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for daily report events (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
+            "key": "notification_route_backup_events",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for backup success/failure events (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
+            "key": "notification_route_system_health_critical",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for system-health critical events (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
+            "key": "notification_route_business_reports",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for manual business status reports (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
+            "key": "notification_email_enabled",
+            "value": "false",
+            "value_type": "bool",
+            "description": "Enable notification email delivery pipeline (future Google/email integration).",
+        },
+        {
+            "key": "notification_email_recipients_csv",
+            "value": "",
+            "value_type": "str",
+            "description": "Default comma-separated notification email recipients (future email delivery).",
         },
         {
             "key": "slack_http_timeout_seconds",
@@ -1596,6 +2411,7 @@ def _apply_slack_channel_presets(repo: InventoryRepository, *, actor: str, env_n
     defaults = {
         "slack_default_channel": f"#gs-{env}-ops",
         "slack_channel_sync_failures": f"#gs-{env}-sync",
+        "slack_channel_order_imports": f"#gs-{env}-orders",
         "slack_channel_google_queue_failures": f"#gs-{env}-integrations",
         "slack_channel_warning": f"#gs-{env}-warn",
         "slack_channel_error": f"#gs-{env}-error",
@@ -3338,43 +4154,56 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         )
 
     cutoff = utcnow_naive() - timedelta(days=int(lookback_days))
-    nav_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.entity_type == "navigation",
-            AuditLog.action.in_(["workspace_handoff_applied", "workspace_handoff_cleared"]),
-            AuditLog.created_at >= cutoff,
-        )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(int(max_rows))
-    ).all()
-    feedback_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.entity_type == "workspace_feedback",
-            AuditLog.created_at >= cutoff,
-        )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(int(max_rows))
-    ).all()
-    parity_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.entity_type.in_(["workspace_parity", "workspace_parity_decision", "workspace_followup"]),
-            AuditLog.created_at >= cutoff,
-        )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(int(max_rows))
-    ).all()
-    comp_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.entity_type.in_(["comp_photo_retry", "comp_domain_recommendation"]),
-            AuditLog.created_at >= cutoff,
-        )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(int(max_rows))
-    ).all()
+    load_governance_event_exports = st.checkbox(
+        "Load Governance Event Exports (slower)",
+        value=False,
+        key="admin_governance_export_hub_load_events",
+        help="Defers handoff/feedback/parity/photo-comp audit-log export reads until requested.",
+    )
+    nav_logs: list[AuditLog] = []
+    feedback_logs: list[AuditLog] = []
+    parity_logs: list[AuditLog] = []
+    comp_logs: list[AuditLog] = []
+    if load_governance_event_exports:
+        nav_logs = repo.db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_type == "navigation",
+                AuditLog.action.in_(["workspace_handoff_applied", "workspace_handoff_cleared"]),
+                AuditLog.created_at >= cutoff,
+            )
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(int(max_rows))
+        ).all()
+        feedback_logs = repo.db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_type == "workspace_feedback",
+                AuditLog.created_at >= cutoff,
+            )
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(int(max_rows))
+        ).all()
+        parity_logs = repo.db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_type.in_(["workspace_parity", "workspace_parity_decision", "workspace_followup"]),
+                AuditLog.created_at >= cutoff,
+            )
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(int(max_rows))
+        ).all()
+        comp_logs = repo.db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_type.in_(["comp_photo_retry", "comp_domain_recommendation"]),
+                AuditLog.created_at >= cutoff,
+            )
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(int(max_rows))
+        ).all()
+    else:
+        st.caption("Governance event exports are skipped by default. Enable `Load Governance Event Exports (slower)` to fetch them.")
 
     def _rows(logs: list[AuditLog]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -3488,10 +4317,239 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
             key="admin_governance_export_hub_comp_csv_btn",
         )
 
+    st.markdown("#### Workflow State Governance")
+    st.caption(
+        "Review DB-backed workflow drafts/events and run retention cleanup for stale workflow state records."
+    )
+    wf1, wf2, wf3, wf4 = st.columns(4)
+    with wf1:
+        workflow_filter = st.text_input(
+            "Workflow Key Filter (optional)",
+            value="",
+            key="admin_workflow_state_filter_workflow_key",
+            placeholder="listing_wizard / ebay_workspace_setup",
+        ).strip().lower()
+    with wf2:
+        workflow_user_filter = st.text_input(
+            "Username Filter (optional)",
+            value="",
+            key="admin_workflow_state_filter_username",
+            placeholder="admin",
+        ).strip()
+    with wf3:
+        workflow_draft_limit = st.number_input(
+            "Draft/Event Row Limit",
+            min_value=50,
+            max_value=5000,
+            value=1000,
+            step=50,
+            key="admin_workflow_state_row_limit",
+        )
+    with wf4:
+        workflow_active_only = st.checkbox(
+            "Active Drafts Only",
+            value=False,
+            key="admin_workflow_state_active_only",
+        )
+    load_workflow_events = st.checkbox(
+        "Load Workflow Events (slower)",
+        value=False,
+        key="admin_workflow_state_load_events",
+        help="Defers workflow event-history queries until explicitly requested.",
+    )
+
+    workflow_drafts = repo.list_workflow_drafts(
+        environment=settings.app_env,
+        workflow_key=workflow_filter,
+        username=workflow_user_filter,
+        active_only=bool(workflow_active_only),
+        limit=int(workflow_draft_limit),
+    )
+    workflow_events = []
+    if load_workflow_events:
+        if workflow_filter:
+            workflow_events = repo.list_workflow_events(
+                environment=settings.app_env,
+                workflow_key=workflow_filter,
+                username=workflow_user_filter,
+                limit=int(workflow_draft_limit),
+            )
+        elif workflow_user_filter:
+            # If no workflow_key is supplied, pull common workflow streams for this user.
+            merged_events: list[WorkflowEvent] = []
+            for wf_key in [
+                "listing_wizard",
+                "listings_ebay_publish",
+                "ebay_workspace_setup",
+                "coin_intake_wizard",
+                "inventory_intake_wizard",
+            ]:
+                merged_events.extend(
+                    repo.list_workflow_events(
+                        environment=settings.app_env,
+                        workflow_key=wf_key,
+                        username=workflow_user_filter,
+                        limit=max(50, int(workflow_draft_limit) // 5),
+                    )
+                )
+            merged_events.sort(
+                key=lambda row: (getattr(row, "created_at", datetime.min), int(getattr(row, "id", 0))),
+                reverse=True,
+            )
+            workflow_events = merged_events[: int(workflow_draft_limit)]
+    else:
+        st.caption("Workflow events are skipped by default. Enable `Load Workflow Events (slower)` to fetch them.")
+
+    workflow_draft_rows: list[dict[str, Any]] = []
+    for row in workflow_drafts:
+        payload = {}
+        try:
+            payload = json.loads(str(getattr(row, "draft_json", "") or "{}"))
+        except Exception:
+            payload = {}
+        workflow_draft_rows.append(
+            {
+                "id": int(row.id),
+                "workflow_key": str(row.workflow_key or ""),
+                "username": str(row.username or ""),
+                "scope_key": str(row.scope_key or ""),
+                "status": str(row.status or ""),
+                "is_active": bool(row.is_active),
+                "autosave_count": int(row.autosave_count or 0),
+                "updated_at": row.updated_at.isoformat(timespec="seconds") if row.updated_at else "",
+                "resumed_at": row.resumed_at.isoformat(timespec="seconds") if row.resumed_at else "",
+                "expires_at": row.expires_at.isoformat(timespec="seconds") if row.expires_at else "",
+                "payload_preview": json.dumps(payload, ensure_ascii=True)[:500],
+            }
+        )
+    workflow_event_rows: list[dict[str, Any]] = []
+    for row in workflow_events:
+        payload = {}
+        try:
+            payload = json.loads(str(getattr(row, "payload_json", "") or "{}"))
+        except Exception:
+            payload = {}
+        workflow_event_rows.append(
+            {
+                "id": int(row.id),
+                "draft_id": int(row.draft_id) if row.draft_id is not None else "",
+                "workflow_key": str(row.workflow_key or ""),
+                "username": str(row.username or ""),
+                "scope_key": str(row.scope_key or ""),
+                "action": str(row.action or ""),
+                "status": str(row.status or ""),
+                "created_by": str(row.created_by or ""),
+                "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                "message": str(row.message or "")[:200],
+                "payload_preview": json.dumps(payload, ensure_ascii=True)[:500],
+            }
+        )
+
+    workflow_drafts_df = pd.DataFrame(workflow_draft_rows)
+    workflow_events_df = pd.DataFrame(workflow_event_rows)
+
+    wm1, wm2 = st.columns(2)
+    wm1.metric("Workflow Draft Rows", int(len(workflow_drafts_df)))
+    wm2.metric("Workflow Event Rows", int(len(workflow_events_df)))
+
+    with st.expander("Preview Workflow State Coverage", expanded=False):
+        pd1, pd2 = st.columns(2)
+        with pd1:
+            st.caption("Workflow Drafts")
+            st.dataframe(workflow_drafts_df.head(40), use_container_width=True, hide_index=True)
+        with pd2:
+            st.caption("Workflow Events")
+            st.dataframe(workflow_events_df.head(40), use_container_width=True, hide_index=True)
+
+    wd1, wd2 = st.columns(2)
+    with wd1:
+        st.download_button(
+            "Download Workflow Drafts CSV",
+            data=workflow_drafts_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"governance_workflow_drafts_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_governance_export_hub_workflow_drafts_csv_btn",
+        )
+    with wd2:
+        st.download_button(
+            "Download Workflow Events CSV",
+            data=workflow_events_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"governance_workflow_events_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_governance_export_hub_workflow_events_csv_btn",
+        )
+
+    st.markdown("##### Workflow State Retention Cleanup")
+    rc1, rc2, rc3 = st.columns(3)
+    with rc1:
+        cleanup_draft_days = st.number_input(
+            "Draft Retention Days",
+            min_value=1,
+            max_value=3650,
+            value=30,
+            step=1,
+            key="admin_workflow_state_cleanup_draft_days",
+        )
+    with rc2:
+        cleanup_event_days = st.number_input(
+            "Event Retention Days",
+            min_value=1,
+            max_value=3650,
+            value=90,
+            step=1,
+            key="admin_workflow_state_cleanup_event_days",
+        )
+    with rc3:
+        run_cleanup = st.button(
+            "Run Workflow Cleanup Now",
+            key="admin_workflow_state_cleanup_run_btn",
+            use_container_width=True,
+        )
+    if run_cleanup:
+        try:
+            cleanup_result = repo.cleanup_workflow_state(
+                environment=settings.app_env,
+                draft_retention_days=int(cleanup_draft_days),
+                event_retention_days=int(cleanup_event_days),
+                actor=user.username,
+            )
+            st.success(
+                "Workflow cleanup complete: "
+                f"deleted_stale_drafts={int(cleanup_result.get('deleted_stale_drafts', 0))}, "
+                f"deleted_events_for_stale_drafts={int(cleanup_result.get('deleted_events_for_stale_drafts', 0))}, "
+                f"deleted_old_events={int(cleanup_result.get('deleted_old_events', 0))}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Workflow cleanup failed: {exc}")
+
     st.markdown("#### Go-Live Evidence Pack")
     st.caption(
         "One-click bundle for release readiness review: governance exports, alert evidence, queue snapshot, and checklist snapshot."
     )
+    load_go_live_diagnostics = st.checkbox(
+        "Load Go-Live Diagnostics Tables (slower)",
+        value=False,
+        key="admin_go_live_load_diagnostics",
+        help="Defers heavy alert/validation/queue/history diagnostics reads until explicitly requested.",
+    )
+    load_go_live_full_history = st.checkbox(
+        "Load Full Go-Live Sign-Off History (slowest)",
+        value=False,
+        key="admin_go_live_load_full_history",
+        help="When disabled, history tables use a smaller recent window for faster default load.",
+    )
+    if not load_go_live_diagnostics:
+        st.caption(
+            "Diagnostics tables are deferred. Enable `Load Go-Live Diagnostics Tables (slower)` for full evidence counts/history."
+        )
+    if not load_go_live_full_history:
+        st.caption("Sign-off/history tables are using recent-window mode. Enable full-history toggle for deeper exports.")
+    signoff_history_limit = 500 if load_go_live_full_history else 50
+    restore_drill_history_limit = 1000 if load_go_live_full_history else 100
+    go_live_section_signoff_limit = 2000 if load_go_live_full_history else 200
+    legal_signoff_limit = 1200 if load_go_live_full_history else 120
+    dr_checklist_limit = 1000 if load_go_live_full_history else 120
     now_ts = utcnow_naive()
     try:
         alembic_version = str(repo.db.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar_one())
@@ -3515,19 +4573,29 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     ]
     untracked_env_keys = sorted([k for k in env_values.keys() if k not in env_defaults])
 
-    alert_rows_raw = repo.db.execute(
-        text(
-            """
-            SELECT created_at, actor, action, changes_json
-            FROM audit_logs
-            WHERE entity_type = 'integration_event'
-              AND created_at >= :since
-            ORDER BY created_at DESC
-            LIMIT 4000
-            """
-        ),
-        {"since": now_ts - timedelta(days=7)},
-    ).all()
+    integration_event_rows_30d = []
+    if load_go_live_diagnostics:
+        integration_event_rows_30d = repo.db.execute(
+            text(
+                """
+                SELECT created_at, actor, action, changes_json
+                FROM audit_logs
+                WHERE entity_type = 'integration_event'
+                  AND created_at >= :since
+                ORDER BY created_at DESC
+                LIMIT 4000
+                """
+            ),
+            {"since": now_ts - timedelta(days=30)},
+        ).all()
+    alert_window_start = now_ts - timedelta(days=7)
+    alert_rows_raw = [
+        row
+        for row in integration_event_rows_30d
+        if getattr(row, "__len__", lambda: 0)() >= 1
+        and row[0] is not None
+        and row[0] >= alert_window_start
+    ]
     critical_alert_evidence_rows: list[dict[str, Any]] = []
     for created_at, actor, action, changes_json in alert_rows_raw:
         try:
@@ -3571,19 +4639,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         )
     critical_alert_evidence_df = pd.DataFrame(critical_alert_evidence_rows)
 
-    provider_validation_rows_raw = repo.db.execute(
-        text(
-            """
-            SELECT created_at, actor, action, changes_json
-            FROM audit_logs
-            WHERE entity_type = 'integration_event'
-              AND created_at >= :since
-            ORDER BY created_at DESC
-            LIMIT 4000
-            """
-        ),
-        {"since": now_ts - timedelta(days=30)},
-    ).all()
+    provider_validation_rows_raw = list(integration_event_rows_30d)
     provider_validation_rows: list[dict[str, Any]] = []
     for created_at, actor, action, changes_json in provider_validation_rows_raw:
         try:
@@ -3619,7 +4675,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "shipping_provider_validation_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(500)
+        .limit(signoff_history_limit)
     ).all()
     provider_signoff_rows: list[dict[str, Any]] = []
     latest_signoff_by_env: dict[str, dict[str, Any]] = {}
@@ -3649,7 +4705,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "system_health_calibration_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(500)
+        .limit(signoff_history_limit)
     ).all()
     health_calibration_rows: list[dict[str, Any]] = []
     latest_health_calibration_by_env: dict[str, dict[str, Any]] = {}
@@ -3679,7 +4735,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "system_health_alert_routing_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(500)
+        .limit(signoff_history_limit)
     ).all()
     health_alert_routing_rows: list[dict[str, Any]] = []
     latest_health_alert_routing_by_env: dict[str, dict[str, Any]] = {}
@@ -3713,7 +4769,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "integration_automation_hardening_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(500)
+        .limit(signoff_history_limit)
     ).all()
     automation_hardening_rows: list[dict[str, Any]] = []
     latest_automation_hardening_by_env: dict[str, dict[str, Any]] = {}
@@ -3742,11 +4798,118 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     automation_hardening_dev_ready = automation_hardening_dev_status == "approved"
     automation_hardening_prod_ready = automation_hardening_prod_status == "approved"
 
+    fee_calibration_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "ebay_fee_calibration_signoff")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    fee_calibration_rows: list[dict[str, Any]] = []
+    latest_fee_calibration_by_env: dict[str, dict[str, Any]] = {}
+    for row in fee_calibration_logs:
+        payload = _audit_changes(row)
+        target_env = str(payload.get("target_env") or "").strip().lower()
+        entry = {
+            "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+            "actor": str(row.actor or ""),
+            "target_env": target_env,
+            "signoff_date": str(payload.get("signoff_date") or ""),
+            "owner": str(payload.get("owner") or ""),
+            "status": str(payload.get("status") or "").strip().lower(),
+            "sample_order_count": int(payload.get("sample_order_count") or 0),
+            "assumption_snapshot": str(payload.get("assumption_snapshot") or ""),
+            "evidence_link": str(payload.get("evidence_link") or ""),
+            "notes": str(payload.get("notes") or "")[:220],
+        }
+        fee_calibration_rows.append(entry)
+        if target_env and target_env not in latest_fee_calibration_by_env:
+            latest_fee_calibration_by_env[target_env] = entry
+    fee_calibration_df = pd.DataFrame(fee_calibration_rows)
+    fee_calibration_dev_status = str((latest_fee_calibration_by_env.get("dev") or {}).get("status") or "")
+    fee_calibration_prod_status = str((latest_fee_calibration_by_env.get("prod") or {}).get("status") or "")
+    fee_calibration_dev_ready = fee_calibration_dev_status == "approved"
+    fee_calibration_prod_ready = fee_calibration_prod_status == "approved"
+
+    economics_threshold_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "economics_threshold_signoff")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    economics_threshold_rows: list[dict[str, Any]] = []
+    latest_economics_threshold_by_env: dict[str, dict[str, Any]] = {}
+    for row in economics_threshold_logs:
+        payload = _audit_changes(row)
+        target_env = str(payload.get("target_env") or "").strip().lower()
+        entry = {
+            "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+            "actor": str(row.actor or ""),
+            "target_env": target_env,
+            "signoff_date": str(payload.get("signoff_date") or ""),
+            "owner": str(payload.get("owner") or ""),
+            "status": str(payload.get("status") or "").strip().lower(),
+            "min_actual_margin_alert_pct": float(payload.get("min_actual_margin_alert_pct") or 0.0),
+            "max_avg_fee_variance_alert_usd": float(payload.get("max_avg_fee_variance_alert_usd") or 0.0),
+            "min_group_sales_for_alert": int(payload.get("min_group_sales_for_alert") or 0),
+            "assumption_snapshot": str(payload.get("assumption_snapshot") or ""),
+            "evidence_link": str(payload.get("evidence_link") or ""),
+            "notes": str(payload.get("notes") or "")[:220],
+        }
+        economics_threshold_rows.append(entry)
+        if target_env and target_env not in latest_economics_threshold_by_env:
+            latest_economics_threshold_by_env[target_env] = entry
+    economics_threshold_df = pd.DataFrame(economics_threshold_rows)
+    economics_threshold_dev_status = str((latest_economics_threshold_by_env.get("dev") or {}).get("status") or "")
+    economics_threshold_prod_status = str((latest_economics_threshold_by_env.get("prod") or {}).get("status") or "")
+    economics_threshold_dev_ready = economics_threshold_dev_status == "approved"
+    economics_threshold_prod_ready = economics_threshold_prod_status == "approved"
+
+    lifecycle_retention_signoff_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "lifecycle_retention_policy_signoff")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    lifecycle_retention_signoff_rows: list[dict[str, Any]] = []
+    latest_lifecycle_retention_signoff_by_env: dict[str, dict[str, Any]] = {}
+    for row in lifecycle_retention_signoff_logs:
+        payload = _audit_changes(row)
+        target_env = str(payload.get("target_env") or "").strip().lower()
+        entry = {
+            "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+            "actor": str(row.actor or ""),
+            "target_env": target_env,
+            "signoff_date": str(payload.get("signoff_date") or ""),
+            "owner": str(payload.get("owner") or ""),
+            "status": str(payload.get("status") or "").strip().lower(),
+            "cleanup_enabled": bool(payload.get("cleanup_enabled")),
+            "cleanup_timezone": str(payload.get("cleanup_timezone") or ""),
+            "cleanup_local_time": str(payload.get("cleanup_local_time") or ""),
+            "retain_days_media": int(payload.get("retain_days_media") or 0),
+            "retain_days_listing": int(payload.get("retain_days_listing") or 0),
+            "retain_days_lot": int(payload.get("retain_days_lot") or 0),
+            "retain_days_product": int(payload.get("retain_days_product") or 0),
+            "evidence_link": str(payload.get("evidence_link") or ""),
+            "notes": str(payload.get("notes") or "")[:220],
+        }
+        lifecycle_retention_signoff_rows.append(entry)
+        if target_env and target_env not in latest_lifecycle_retention_signoff_by_env:
+            latest_lifecycle_retention_signoff_by_env[target_env] = entry
+    lifecycle_retention_signoff_df = pd.DataFrame(lifecycle_retention_signoff_rows)
+    lifecycle_retention_signoff_dev_status = str(
+        (latest_lifecycle_retention_signoff_by_env.get("dev") or {}).get("status") or ""
+    )
+    lifecycle_retention_signoff_prod_status = str(
+        (latest_lifecycle_retention_signoff_by_env.get("prod") or {}).get("status") or ""
+    )
+    lifecycle_retention_signoff_dev_ready = lifecycle_retention_signoff_dev_status == "approved"
+    lifecycle_retention_signoff_prod_ready = lifecycle_retention_signoff_prod_status == "approved"
+
     restore_drill_logs = repo.db.scalars(
         select(AuditLog)
         .where(AuditLog.entity_type == "backup_restore_drill")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(1000)
+        .limit(restore_drill_history_limit)
     ).all()
     restore_drill_rows: list[dict[str, Any]] = []
     for row in restore_drill_logs:
@@ -3806,7 +4969,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "go_live_section_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(2000)
+        .limit(go_live_section_signoff_limit)
     ).all()
     go_live_signoff_rows: list[dict[str, Any]] = []
     latest_go_live_signoff_by_key: dict[str, dict[str, Any]] = {}
@@ -3846,7 +5009,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "commerce_legal_signoff")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(1200)
+        .limit(legal_signoff_limit)
     ).all()
     legal_signoff_rows: list[dict[str, Any]] = []
     latest_legal_signoff_by_key: dict[str, dict[str, Any]] = {}
@@ -3890,24 +5053,25 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         select(AuditLog)
         .where(AuditLog.entity_type == "backup_dr_checklist")
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(1000)
+        .limit(dr_checklist_limit)
     ).all()
-    dr_checklist_df = pd.DataFrame(
-        [
+    dr_checklist_rows: list[dict[str, Any]] = []
+    for row in dr_checklist_logs:
+        payload = _audit_changes(row)
+        dr_checklist_rows.append(
             {
                 "id": int(row.id),
                 "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
                 "actor": str(row.actor or ""),
-                "target_env": str((_audit_changes(row).get("target_env") or "")),
-                "owner": str((_audit_changes(row).get("owner") or "")),
-                "evidence_link": str((_audit_changes(row).get("evidence_link") or "")),
-                "completed_count": (_audit_changes(row).get("completed_count")),
-                "total_count": (_audit_changes(row).get("total_count")),
-                "completion_percent": (_audit_changes(row).get("completion_percent")),
+                "target_env": str(payload.get("target_env") or ""),
+                "owner": str(payload.get("owner") or ""),
+                "evidence_link": str(payload.get("evidence_link") or ""),
+                "completed_count": payload.get("completed_count"),
+                "total_count": payload.get("total_count"),
+                "completion_percent": payload.get("completion_percent"),
             }
-            for row in dr_checklist_logs
-        ]
-    )
+        )
+    dr_checklist_df = pd.DataFrame(dr_checklist_rows)
     dr_checklist_180d_count = 0
     dr_checklist_latest_completion_pct: float | None = None
     since_checklist_window = now_ts - timedelta(days=180)
@@ -3923,19 +5087,14 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         except Exception:
             dr_checklist_latest_completion_pct = None
 
-    integration_event_24h_rows = repo.db.execute(
-        text(
-            """
-            SELECT created_at, actor, action, changes_json
-            FROM audit_logs
-            WHERE entity_type = 'integration_event'
-              AND created_at >= :since
-            ORDER BY created_at DESC
-            LIMIT 4000
-            """
-        ),
-        {"since": now_ts - timedelta(hours=24)},
-    ).all()
+    window_24h_start = now_ts - timedelta(hours=24)
+    integration_event_24h_rows = [
+        row
+        for row in integration_event_rows_30d
+        if getattr(row, "__len__", lambda: 0)() >= 1
+        and row[0] is not None
+        and row[0] >= window_24h_start
+    ]
     signal_counts = {"queue_execute_exceptions": 0, "terminal_queue_failures": 0, "integration_warnings": 0}
     signal_samples: list[dict[str, Any]] = []
     for created_at, actor, action, changes_json in integration_event_24h_rows:
@@ -3974,12 +5133,14 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     )
     signal_samples_df = pd.DataFrame(signal_samples)
 
-    queue_rows = repo.db.scalars(
-        select(IntegrationQueueJob)
-        .where(IntegrationQueueJob.environment == settings.app_env)
-        .order_by(IntegrationQueueJob.next_attempt_at.asc(), IntegrationQueueJob.id.desc())
-        .limit(5000)
-    ).all()
+    queue_rows = []
+    if load_go_live_diagnostics:
+        queue_rows = repo.db.scalars(
+            select(IntegrationQueueJob)
+            .where(IntegrationQueueJob.environment == settings.app_env)
+            .order_by(IntegrationQueueJob.next_attempt_at.asc(), IntegrationQueueJob.id.desc())
+            .limit(5000)
+        ).all()
     queue_df = pd.DataFrame(
         [
             {
@@ -4024,6 +5185,31 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     checklist_completion_pct = (
         (float(checklist_done) / float(checklist_total) * 100.0) if checklist_total > 0 else 0.0
     )
+    fee_calibration_required_envs = {"dev", "prod"}
+    fee_calibration_approved_envs = {
+        env_name
+        for env_name in fee_calibration_required_envs
+        if str((latest_fee_calibration_by_env.get(env_name) or {}).get("status") or "").strip().lower() == "approved"
+    }
+    fee_calibration_missing_envs = sorted(list(fee_calibration_required_envs - fee_calibration_approved_envs))
+    economics_threshold_required_envs = {"dev", "prod"}
+    economics_threshold_approved_envs = {
+        env_name
+        for env_name in economics_threshold_required_envs
+        if str((latest_economics_threshold_by_env.get(env_name) or {}).get("status") or "").strip().lower()
+        == "approved"
+    }
+    economics_threshold_missing_envs = sorted(list(economics_threshold_required_envs - economics_threshold_approved_envs))
+    lifecycle_retention_required_envs = {"dev", "prod"}
+    lifecycle_retention_approved_envs = {
+        env_name
+        for env_name in lifecycle_retention_required_envs
+        if str((latest_lifecycle_retention_signoff_by_env.get(env_name) or {}).get("status") or "").strip().lower()
+        == "approved"
+    }
+    lifecycle_retention_missing_envs = sorted(
+        list(lifecycle_retention_required_envs - lifecycle_retention_approved_envs)
+    )
     checklist_status_df = pd.DataFrame(
         [
             {
@@ -4032,6 +5218,18 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "in_progress_items": int(checklist_in_progress),
                 "not_started_items": int(checklist_not_started),
                 "completion_percent": round(float(checklist_completion_pct), 2),
+                "fee_calibration_required_env_count": int(len(fee_calibration_required_envs)),
+                "fee_calibration_approved_env_count": int(len(fee_calibration_approved_envs)),
+                "fee_calibration_missing_env_count": int(len(fee_calibration_missing_envs)),
+                "fee_calibration_missing_envs": ",".join(fee_calibration_missing_envs),
+                "economics_threshold_signoff_required_env_count": int(len(economics_threshold_required_envs)),
+                "economics_threshold_signoff_approved_env_count": int(len(economics_threshold_approved_envs)),
+                "economics_threshold_signoff_missing_env_count": int(len(economics_threshold_missing_envs)),
+                "economics_threshold_signoff_missing_envs": ",".join(economics_threshold_missing_envs),
+                "lifecycle_retention_signoff_required_env_count": int(len(lifecycle_retention_required_envs)),
+                "lifecycle_retention_signoff_approved_env_count": int(len(lifecycle_retention_approved_envs)),
+                "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
+                "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
             }
         ]
     )
@@ -4066,6 +5264,33 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     pa1, pa2 = st.columns(2)
     pa1.metric("Automation Hardening Dev", automation_hardening_dev_status or "missing")
     pa2.metric("Automation Hardening Prod", automation_hardening_prod_status or "missing")
+    pf1, pf2 = st.columns(2)
+    pf1.metric("Fee Calibration Dev", fee_calibration_dev_status or "missing")
+    pf2.metric("Fee Calibration Prod", fee_calibration_prod_status or "missing")
+    pet1, pet2 = st.columns(2)
+    pet1.metric("Economics Thresholds Dev", economics_threshold_dev_status or "missing")
+    pet2.metric("Economics Thresholds Prod", economics_threshold_prod_status or "missing")
+    pl1, pl2 = st.columns(2)
+    pl1.metric("Lifecycle Retention Dev", lifecycle_retention_signoff_dev_status or "missing")
+    pl2.metric("Lifecycle Retention Prod", lifecycle_retention_signoff_prod_status or "missing")
+    if fee_calibration_missing_envs:
+        st.warning(
+            "Fee calibration sign-off missing for: "
+            + ", ".join(fee_calibration_missing_envs)
+            + ". This now reduces go-live readiness score."
+        )
+    if economics_threshold_missing_envs:
+        st.warning(
+            "Economics threshold sign-off missing for: "
+            + ", ".join(economics_threshold_missing_envs)
+            + ". This now reduces go-live readiness score."
+        )
+    if lifecycle_retention_missing_envs:
+        st.warning(
+            "Lifecycle retention policy sign-off missing for: "
+            + ", ".join(lifecycle_retention_missing_envs)
+            + ". This now reduces go-live readiness score."
+        )
     with st.expander("Readiness Scoring Config", expanded=False):
         sc1, sc2, sc3 = st.columns(3)
         with sc1:
@@ -4263,6 +5488,9 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         (100.0 - float(checklist_completion_pct)) * (float(readiness_weight_checklist_gap_pct) / 100.0),
     )
     readiness_score -= float(len(env_missing)) * float(readiness_weight_env_missing)
+    readiness_score -= float(len(fee_calibration_missing_envs)) * float(readiness_weight_env_missing)
+    readiness_score -= float(len(economics_threshold_missing_envs)) * float(readiness_weight_env_missing)
+    readiness_score -= float(len(lifecycle_retention_missing_envs)) * float(readiness_weight_env_missing)
     readiness_score -= float(len(runtime_missing)) * float(readiness_weight_runtime_missing)
     readiness_score -= min(
         float(readiness_penalty_terminal_queue_failure_max),
@@ -4296,6 +5524,12 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "generated_by": str(user.username or ""),
                 "alembic_version": alembic_version,
                 "required_env_missing_count": int(len(env_missing)),
+                "fee_calibration_signoff_missing_env_count": int(len(fee_calibration_missing_envs)),
+                "fee_calibration_signoff_missing_envs": ",".join(fee_calibration_missing_envs),
+                "economics_threshold_signoff_missing_env_count": int(len(economics_threshold_missing_envs)),
+                "economics_threshold_signoff_missing_envs": ",".join(economics_threshold_missing_envs),
+                "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
+                "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
                 "required_runtime_missing_count": int(len(runtime_missing)),
                 "env_untracked_count": int(len(untracked_env_keys)),
                 "queue_job_count": int(len(queue_df)),
@@ -4317,6 +5551,18 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "automation_hardening_signoff_prod_status": automation_hardening_prod_status,
                 "automation_hardening_signoff_dev_ready": bool(automation_hardening_dev_ready),
                 "automation_hardening_signoff_prod_ready": bool(automation_hardening_prod_ready),
+                "fee_calibration_signoff_dev_status": fee_calibration_dev_status,
+                "fee_calibration_signoff_prod_status": fee_calibration_prod_status,
+                "fee_calibration_signoff_dev_ready": bool(fee_calibration_dev_ready),
+                "fee_calibration_signoff_prod_ready": bool(fee_calibration_prod_ready),
+                "economics_threshold_signoff_dev_status": economics_threshold_dev_status,
+                "economics_threshold_signoff_prod_status": economics_threshold_prod_status,
+                "economics_threshold_signoff_dev_ready": bool(economics_threshold_dev_ready),
+                "economics_threshold_signoff_prod_ready": bool(economics_threshold_prod_ready),
+                "lifecycle_retention_signoff_dev_status": lifecycle_retention_signoff_dev_status,
+                "lifecycle_retention_signoff_prod_status": lifecycle_retention_signoff_prod_status,
+                "lifecycle_retention_signoff_dev_ready": bool(lifecycle_retention_signoff_dev_ready),
+                "lifecycle_retention_signoff_prod_ready": bool(lifecycle_retention_signoff_prod_ready),
                 "restore_drills_180d_count": int(restore_drill_180d_count),
                 "restore_drills_180d_pass_count": int(restore_drill_180d_pass_count),
                 "restore_drill_last_at_utc": restore_drill_last_at,
@@ -4345,47 +5591,76 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         ]
     )
 
-    go_live_pack_buffer = BytesIO()
-    with zipfile.ZipFile(go_live_pack_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as pack_zip:
-        pack_zip.writestr("go_live_summary.csv", go_live_summary_df.to_csv(index=False))
-        pack_zip.writestr("governance_metadata.csv", pd.DataFrame(
-            [{
-                "environment": settings.app_env,
-                "lookback_days": int(lookback_days),
-                "max_rows_per_scope": int(max_rows),
-                "generated_at_utc": now_ts.isoformat(),
-                "generated_by": str(user.username or ""),
-            }]
-        ).to_csv(index=False))
-        pack_zip.writestr("governance_handoff_events.csv", nav_df.to_csv(index=False))
-        pack_zip.writestr("governance_workspace_feedback.csv", feedback_df.to_csv(index=False))
-        pack_zip.writestr("governance_parity_followup.csv", parity_df.to_csv(index=False))
-        pack_zip.writestr("governance_photo_comp.csv", comp_df.to_csv(index=False))
-        pack_zip.writestr("critical_alert_evidence_7d.csv", critical_alert_evidence_df.to_csv(index=False))
-        pack_zip.writestr("shipping_provider_validation_30d.csv", provider_validation_df.to_csv(index=False))
-        pack_zip.writestr("shipping_provider_validation_signoffs.csv", provider_signoff_df.to_csv(index=False))
-        pack_zip.writestr("system_health_calibration_signoffs.csv", health_calibration_df.to_csv(index=False))
-        pack_zip.writestr("system_health_alert_routing_signoffs.csv", health_alert_routing_df.to_csv(index=False))
-        pack_zip.writestr("integration_automation_hardening_signoffs.csv", automation_hardening_df.to_csv(index=False))
-        pack_zip.writestr("backup_restore_drills.csv", restore_drill_df.to_csv(index=False))
-        pack_zip.writestr("backup_dr_checklist_snapshots.csv", dr_checklist_df.to_csv(index=False))
-        pack_zip.writestr("go_live_section_signoffs.csv", go_live_signoff_df.to_csv(index=False))
-        pack_zip.writestr("commerce_legal_signoffs.csv", legal_signoff_df.to_csv(index=False))
-        pack_zip.writestr("integration_error_signal_counts_24h.csv", signal_counts_df.to_csv(index=False))
-        pack_zip.writestr("integration_error_signal_samples_24h.csv", signal_samples_df.to_csv(index=False))
-        pack_zip.writestr("integration_queue_snapshot.csv", queue_df.to_csv(index=False))
-        pack_zip.writestr("config_missing_required.csv", missing_required_df.to_csv(index=False))
-        pack_zip.writestr("config_env_untracked_keys.csv", env_untracked_df.to_csv(index=False))
-        pack_zip.writestr("go_live_checklist_status.csv", checklist_status_df.to_csv(index=False))
-        pack_zip.writestr("GO_LIVE_CHECKLIST_snapshot.md", checklist_text)
-    go_live_pack_buffer.seek(0)
-    st.download_button(
-        "Download Go-Live Evidence Pack (ZIP)",
-        data=go_live_pack_buffer.getvalue(),
-        file_name=f"go_live_evidence_pack_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip",
-        key="admin_go_live_evidence_pack_zip_btn",
+    st.caption(
+        "Evidence pack generation is on-demand to reduce Admin rerun latency. "
+        "Generate when needed, then download."
     )
+    pack_state_key = "admin_go_live_evidence_pack_state"
+    if st.button(
+        "Prepare Go-Live Evidence Pack (ZIP)",
+        key="admin_go_live_evidence_pack_prepare_btn",
+        help="Build and cache a fresh evidence bundle for download.",
+    ):
+        go_live_pack_buffer = BytesIO()
+        with zipfile.ZipFile(go_live_pack_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as pack_zip:
+            pack_zip.writestr("go_live_summary.csv", go_live_summary_df.to_csv(index=False))
+            pack_zip.writestr("governance_metadata.csv", pd.DataFrame(
+                [{
+                    "environment": settings.app_env,
+                    "lookback_days": int(lookback_days),
+                    "max_rows_per_scope": int(max_rows),
+                    "generated_at_utc": now_ts.isoformat(),
+                    "generated_by": str(user.username or ""),
+                }]
+            ).to_csv(index=False))
+            pack_zip.writestr("governance_handoff_events.csv", nav_df.to_csv(index=False))
+            pack_zip.writestr("governance_workspace_feedback.csv", feedback_df.to_csv(index=False))
+            pack_zip.writestr("governance_parity_followup.csv", parity_df.to_csv(index=False))
+            pack_zip.writestr("governance_photo_comp.csv", comp_df.to_csv(index=False))
+            pack_zip.writestr("critical_alert_evidence_7d.csv", critical_alert_evidence_df.to_csv(index=False))
+            pack_zip.writestr("shipping_provider_validation_30d.csv", provider_validation_df.to_csv(index=False))
+            pack_zip.writestr("shipping_provider_validation_signoffs.csv", provider_signoff_df.to_csv(index=False))
+            pack_zip.writestr("system_health_calibration_signoffs.csv", health_calibration_df.to_csv(index=False))
+            pack_zip.writestr("system_health_alert_routing_signoffs.csv", health_alert_routing_df.to_csv(index=False))
+            pack_zip.writestr("integration_automation_hardening_signoffs.csv", automation_hardening_df.to_csv(index=False))
+            pack_zip.writestr("ebay_fee_calibration_signoffs.csv", fee_calibration_df.to_csv(index=False))
+            pack_zip.writestr("economics_threshold_signoffs.csv", economics_threshold_df.to_csv(index=False))
+            pack_zip.writestr(
+                "lifecycle_retention_policy_signoffs.csv",
+                lifecycle_retention_signoff_df.to_csv(index=False),
+            )
+            pack_zip.writestr("backup_restore_drills.csv", restore_drill_df.to_csv(index=False))
+            pack_zip.writestr("backup_dr_checklist_snapshots.csv", dr_checklist_df.to_csv(index=False))
+            pack_zip.writestr("go_live_section_signoffs.csv", go_live_signoff_df.to_csv(index=False))
+            pack_zip.writestr("commerce_legal_signoffs.csv", legal_signoff_df.to_csv(index=False))
+            pack_zip.writestr("integration_error_signal_counts_24h.csv", signal_counts_df.to_csv(index=False))
+            pack_zip.writestr("integration_error_signal_samples_24h.csv", signal_samples_df.to_csv(index=False))
+            pack_zip.writestr("integration_queue_snapshot.csv", queue_df.to_csv(index=False))
+            pack_zip.writestr("config_missing_required.csv", missing_required_df.to_csv(index=False))
+            pack_zip.writestr("config_env_untracked_keys.csv", env_untracked_df.to_csv(index=False))
+            pack_zip.writestr("go_live_checklist_status.csv", checklist_status_df.to_csv(index=False))
+            pack_zip.writestr("GO_LIVE_CHECKLIST_snapshot.md", checklist_text)
+        go_live_pack_buffer.seek(0)
+        st.session_state[pack_state_key] = {
+            "generated_at_utc": utcnow_naive().isoformat(timespec="seconds"),
+            "file_name": f"go_live_evidence_pack_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.zip",
+            "bytes": go_live_pack_buffer.getvalue(),
+        }
+        st.success("Go-live evidence pack prepared.")
+
+    pack_state = st.session_state.get(pack_state_key)
+    if isinstance(pack_state, dict) and pack_state.get("bytes"):
+        st.caption(
+            "Prepared at UTC: "
+            f"{str(pack_state.get('generated_at_utc') or '')}"
+        )
+        st.download_button(
+            "Download Go-Live Evidence Pack (ZIP)",
+            data=pack_state.get("bytes"),
+            file_name=str(pack_state.get("file_name") or f"go_live_evidence_pack_{settings.app_env}.zip"),
+            mime="application/zip",
+            key="admin_go_live_evidence_pack_zip_btn",
+        )
     if st.button(
         "Record Evidence Capture Event",
         key="admin_go_live_evidence_capture_event_btn",
@@ -4403,6 +5678,12 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "captured_by": str(user.username or ""),
                     "alembic_version": alembic_version,
                     "required_env_missing_count": int(len(env_missing)),
+                    "fee_calibration_signoff_missing_env_count": int(len(fee_calibration_missing_envs)),
+                    "fee_calibration_signoff_missing_envs": ",".join(fee_calibration_missing_envs),
+                    "economics_threshold_signoff_missing_env_count": int(len(economics_threshold_missing_envs)),
+                    "economics_threshold_signoff_missing_envs": ",".join(economics_threshold_missing_envs),
+                    "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
+                    "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
                     "required_runtime_missing_count": int(len(runtime_missing)),
                     "queue_job_count": int(len(queue_df)),
                     "critical_alert_evidence_7d_count": int(len(critical_alert_evidence_df)),
@@ -4423,6 +5704,18 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "automation_hardening_signoff_prod_status": automation_hardening_prod_status,
                     "automation_hardening_signoff_dev_ready": bool(automation_hardening_dev_ready),
                     "automation_hardening_signoff_prod_ready": bool(automation_hardening_prod_ready),
+                    "fee_calibration_signoff_dev_status": fee_calibration_dev_status,
+                    "fee_calibration_signoff_prod_status": fee_calibration_prod_status,
+                    "fee_calibration_signoff_dev_ready": bool(fee_calibration_dev_ready),
+                    "fee_calibration_signoff_prod_ready": bool(fee_calibration_prod_ready),
+                    "economics_threshold_signoff_dev_status": economics_threshold_dev_status,
+                    "economics_threshold_signoff_prod_status": economics_threshold_prod_status,
+                    "economics_threshold_signoff_dev_ready": bool(economics_threshold_dev_ready),
+                    "economics_threshold_signoff_prod_ready": bool(economics_threshold_prod_ready),
+                    "lifecycle_retention_signoff_dev_status": lifecycle_retention_signoff_dev_status,
+                    "lifecycle_retention_signoff_prod_status": lifecycle_retention_signoff_prod_status,
+                    "lifecycle_retention_signoff_dev_ready": bool(lifecycle_retention_signoff_dev_ready),
+                    "lifecycle_retention_signoff_prod_ready": bool(lifecycle_retention_signoff_prod_ready),
                     "restore_drills_180d_count": int(restore_drill_180d_count),
                     "restore_drills_180d_pass_count": int(restore_drill_180d_pass_count),
                     "restore_drill_last_at_utc": restore_drill_last_at,
@@ -4454,12 +5747,16 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         except Exception as exc:
             st.error(f"Unable to record go-live evidence capture event: {exc}")
 
-    recent_capture_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(AuditLog.entity_type == "go_live_evidence")
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(20)
-    ).all()
+    recent_capture_logs = []
+    if load_go_live_diagnostics:
+        recent_capture_logs = repo.db.scalars(
+            select(AuditLog)
+            .where(AuditLog.entity_type == "go_live_evidence")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(20)
+        ).all()
+    else:
+        st.caption("Recent evidence-capture history is deferred until diagnostics loading is enabled.")
     if recent_capture_logs:
         capture_rows: list[dict[str, Any]] = []
         for row in recent_capture_logs:
@@ -4475,6 +5772,20 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "go_live_readiness_score": payload.get("go_live_readiness_score"),
                     "go_live_readiness_state": payload.get("go_live_readiness_state"),
                     "required_env_missing_count": payload.get("required_env_missing_count"),
+                    "fee_calibration_signoff_missing_env_count": payload.get("fee_calibration_signoff_missing_env_count"),
+                    "fee_calibration_signoff_missing_envs": payload.get("fee_calibration_signoff_missing_envs"),
+                    "economics_threshold_signoff_missing_env_count": payload.get(
+                        "economics_threshold_signoff_missing_env_count"
+                    ),
+                    "economics_threshold_signoff_missing_envs": payload.get(
+                        "economics_threshold_signoff_missing_envs"
+                    ),
+                    "lifecycle_retention_signoff_missing_env_count": payload.get(
+                        "lifecycle_retention_signoff_missing_env_count"
+                    ),
+                    "lifecycle_retention_signoff_missing_envs": payload.get(
+                        "lifecycle_retention_signoff_missing_envs"
+                    ),
                     "required_runtime_missing_count": payload.get("required_runtime_missing_count"),
                     "provider_validation_signoff_dev_status": payload.get("provider_validation_signoff_dev_status"),
                     "provider_validation_signoff_prod_status": payload.get("provider_validation_signoff_prod_status"),
@@ -4484,6 +5795,12 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "health_alert_routing_signoff_prod_status": payload.get("health_alert_routing_signoff_prod_status"),
                     "automation_hardening_signoff_dev_status": payload.get("automation_hardening_signoff_dev_status"),
                     "automation_hardening_signoff_prod_status": payload.get("automation_hardening_signoff_prod_status"),
+                    "fee_calibration_signoff_dev_status": payload.get("fee_calibration_signoff_dev_status"),
+                    "fee_calibration_signoff_prod_status": payload.get("fee_calibration_signoff_prod_status"),
+                    "economics_threshold_signoff_dev_status": payload.get("economics_threshold_signoff_dev_status"),
+                    "economics_threshold_signoff_prod_status": payload.get("economics_threshold_signoff_prod_status"),
+                    "lifecycle_retention_signoff_dev_status": payload.get("lifecycle_retention_signoff_dev_status"),
+                    "lifecycle_retention_signoff_prod_status": payload.get("lifecycle_retention_signoff_prod_status"),
                     "restore_drills_180d_count": payload.get("restore_drills_180d_count"),
                     "restore_drill_last_result": payload.get("restore_drill_last_result"),
                     "go_live_signoff_items_total": payload.get("go_live_signoff_items_total"),
@@ -4501,6 +5818,657 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
             )
         st.caption("Recent Evidence Capture Events")
         st.dataframe(pd.DataFrame(capture_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### eBay Fee Calibration Sign-Off Tracker")
+    st.caption(
+        "Capture finance calibration acceptance for eBay fee assumptions (owner/date/evidence) per environment."
+    )
+    fee_coverage_rows: list[dict[str, Any]] = []
+    for target_env in ["dev", "prod"]:
+        latest = latest_fee_calibration_by_env.get(target_env) or {}
+        fee_coverage_rows.append(
+            {
+                "environment": target_env,
+                "status": str(latest.get("status") or "missing"),
+                "owner": str(latest.get("owner") or ""),
+                "signoff_date": str(latest.get("signoff_date") or ""),
+                "sample_order_count": int(latest.get("sample_order_count") or 0),
+                "assumption_snapshot": str(latest.get("assumption_snapshot") or ""),
+                "evidence_link": str(latest.get("evidence_link") or ""),
+            }
+        )
+    fee_coverage_df = pd.DataFrame(fee_coverage_rows)
+    st.dataframe(fee_coverage_df, use_container_width=True, hide_index=True)
+    fes1, fes2 = st.columns([2, 1])
+    with fes1:
+        seed_fee_target = st.selectbox(
+            "Seed Missing Fee Sign-Off Rows For",
+            options=["prod", "dev", "dev+prod"],
+            index=0,
+            key="admin_ebay_fee_calibration_signoff_seed_target",
+        )
+    with fes2:
+        if st.button("Seed Missing Fee Sign-Off Items", key="admin_ebay_fee_calibration_signoff_seed_btn"):
+            target_envs = ["dev", "prod"] if seed_fee_target == "dev+prod" else [seed_fee_target]
+            seeded_count = 0
+            try:
+                for target_env in target_envs:
+                    if target_env in latest_fee_calibration_by_env:
+                        continue
+                    repo.record_audit_event(
+                        entity_type="ebay_fee_calibration_signoff",
+                        entity_id=None,
+                        action="seed_missing",
+                        actor=user.username,
+                        changes={
+                            "target_env": str(target_env or "").strip().lower(),
+                            "signoff_date": str(utcnow_naive().date().isoformat()),
+                            "owner": str(user.username or "").strip(),
+                            "status": "needs_followup",
+                            "sample_order_count": 0,
+                            "assumption_snapshot": (
+                                f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
+                                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
+                                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+                            ),
+                            "evidence_link": "",
+                            "notes": "Auto-seeded missing fee calibration sign-off row from Admin tracker.",
+                            "seeded": True,
+                        },
+                    )
+                    seeded_count += 1
+                if seeded_count <= 0:
+                    st.info("No missing fee calibration sign-off rows to seed for the selected target.")
+                else:
+                    st.success(f"Seeded {seeded_count} missing fee calibration sign-off row(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to seed fee calibration sign-off rows: {exc}")
+    feq1, feq2 = st.columns(2)
+    with feq1:
+        quick_fee_env = st.selectbox(
+            "Quick Approve Env",
+            options=["prod", "dev"],
+            index=0,
+            key="admin_ebay_fee_calibration_signoff_quick_env",
+        )
+    with feq2:
+        if st.button("Quick Mark Approved", key="admin_ebay_fee_calibration_signoff_quick_approve_btn"):
+            try:
+                repo.record_audit_event(
+                    entity_type="ebay_fee_calibration_signoff",
+                    entity_id=None,
+                    action="quick_approve",
+                    actor=user.username,
+                    changes={
+                        "target_env": str(quick_fee_env or "").strip().lower(),
+                        "signoff_date": str(utcnow_naive().date().isoformat()),
+                        "owner": str(user.username or "").strip(),
+                        "status": "approved",
+                        "sample_order_count": 0,
+                        "assumption_snapshot": (
+                            f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
+                            f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
+                            f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+                        ),
+                        "evidence_link": "",
+                        "notes": "Quick approved from fee calibration tracker.",
+                        "quick_action": True,
+                    },
+                )
+                st.success("Fee calibration sign-off quick-approved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to quick-approve fee calibration sign-off: {exc}")
+    with st.form("admin_ebay_fee_calibration_signoff_form"):
+        ef1, ef2 = st.columns(2)
+        with ef1:
+            fee_signoff_target_env = st.selectbox(
+                "Environment",
+                options=["dev", "prod"],
+                index=1,
+                key="admin_ebay_fee_calibration_signoff_target_env",
+            )
+            fee_signoff_date = st.date_input(
+                "Sign-Off Date",
+                value=utcnow_naive().date(),
+                key="admin_ebay_fee_calibration_signoff_date",
+            )
+            fee_signoff_owner = st.text_input(
+                "Owner",
+                value=str(user.username or ""),
+                key="admin_ebay_fee_calibration_signoff_owner",
+            )
+        with ef2:
+            fee_signoff_status = st.selectbox(
+                "Status",
+                options=["approved", "blocked", "needs_followup"],
+                index=0,
+                key="admin_ebay_fee_calibration_signoff_status",
+            )
+            fee_signoff_sample_order_count = st.number_input(
+                "Sample Order Count",
+                min_value=0,
+                max_value=10000,
+                value=5,
+                step=1,
+                key="admin_ebay_fee_calibration_signoff_sample_order_count",
+                help="How many production orders were used for calibration evidence.",
+            )
+            fee_signoff_evidence_link = st.text_input(
+                "Evidence Link",
+                placeholder="report/export/ticket URL",
+                key="admin_ebay_fee_calibration_signoff_evidence_link",
+            )
+        fee_signoff_assumption_snapshot = st.text_input(
+            "Assumption Snapshot",
+            value=(
+                f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
+                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
+                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+            ),
+            key="admin_ebay_fee_calibration_signoff_assumption_snapshot",
+        )
+        fee_signoff_notes = st.text_area(
+            "Notes",
+            placeholder="Calibration rationale, confidence, and any residual risk.",
+            key="admin_ebay_fee_calibration_signoff_notes",
+        )
+        save_fee_signoff = st.form_submit_button("Record Fee Calibration Sign-Off")
+    if save_fee_signoff:
+        try:
+            repo.record_audit_event(
+                entity_type="ebay_fee_calibration_signoff",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "target_env": str(fee_signoff_target_env or "").strip().lower(),
+                    "signoff_date": str(fee_signoff_date.isoformat()),
+                    "owner": str(fee_signoff_owner or "").strip(),
+                    "status": str(fee_signoff_status or "").strip().lower(),
+                    "sample_order_count": int(fee_signoff_sample_order_count or 0),
+                    "assumption_snapshot": str(fee_signoff_assumption_snapshot or "").strip(),
+                    "evidence_link": str(fee_signoff_evidence_link or "").strip(),
+                    "notes": str(fee_signoff_notes or "").strip(),
+                },
+            )
+            st.success("Fee calibration sign-off recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record fee calibration sign-off: {exc}")
+
+    if not fee_calibration_df.empty:
+        st.dataframe(fee_calibration_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Fee Calibration Sign-Off CSV",
+            data=fee_calibration_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"ebay_fee_calibration_signoffs_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_ebay_fee_calibration_signoff_download_csv_btn",
+        )
+    else:
+        st.caption("No fee calibration sign-off records yet.")
+
+    st.markdown("#### Economics Threshold Sign-Off Tracker")
+    st.caption(
+        "Capture finance/operator acceptance of Economics Intelligence alert thresholds and assumptions per environment."
+    )
+    economics_coverage_rows: list[dict[str, Any]] = []
+    for target_env in ["dev", "prod"]:
+        latest = latest_economics_threshold_by_env.get(target_env) or {}
+        economics_coverage_rows.append(
+            {
+                "environment": target_env,
+                "status": str(latest.get("status") or "missing"),
+                "owner": str(latest.get("owner") or ""),
+                "signoff_date": str(latest.get("signoff_date") or ""),
+                "min_actual_margin_alert_pct": float(latest.get("min_actual_margin_alert_pct") or 0.0),
+                "max_avg_fee_variance_alert_usd": float(latest.get("max_avg_fee_variance_alert_usd") or 0.0),
+                "min_group_sales_for_alert": int(latest.get("min_group_sales_for_alert") or 0),
+                "assumption_snapshot": str(latest.get("assumption_snapshot") or ""),
+                "evidence_link": str(latest.get("evidence_link") or ""),
+            }
+        )
+    economics_coverage_df = pd.DataFrame(economics_coverage_rows)
+    st.dataframe(economics_coverage_df, use_container_width=True, hide_index=True)
+    ets1, ets2 = st.columns([2, 1])
+    with ets1:
+        economics_seed_target = st.selectbox(
+            "Seed Missing Economics Threshold Rows For",
+            options=["prod", "dev", "dev+prod"],
+            index=0,
+            key="admin_economics_threshold_signoff_seed_target",
+        )
+    with ets2:
+        if st.button("Seed Missing Economics Threshold Sign-Off Items", key="admin_economics_threshold_signoff_seed_btn"):
+            target_envs = ["dev", "prod"] if economics_seed_target == "dev+prod" else [economics_seed_target]
+            seeded_count = 0
+            try:
+                for target_env in target_envs:
+                    if target_env in latest_economics_threshold_by_env:
+                        continue
+                    repo.record_audit_event(
+                        entity_type="economics_threshold_signoff",
+                        entity_id=None,
+                        action="seed_missing",
+                        actor=user.username,
+                        changes={
+                            "target_env": str(target_env or "").strip().lower(),
+                            "signoff_date": str(utcnow_naive().date().isoformat()),
+                            "owner": str(user.username or "").strip(),
+                            "status": "needs_followup",
+                            "min_actual_margin_alert_pct": 5.0,
+                            "max_avg_fee_variance_alert_usd": 3.0,
+                            "min_group_sales_for_alert": 3,
+                            "assumption_snapshot": "defaults=min_margin_pct:5.0,max_avg_fee_var_usd:3.0,min_group_sales:3",
+                            "evidence_link": "",
+                            "notes": "Auto-seeded missing economics threshold sign-off row from Admin tracker.",
+                            "seeded": True,
+                        },
+                    )
+                    seeded_count += 1
+                if seeded_count <= 0:
+                    st.info("No missing economics threshold sign-off rows to seed for the selected target.")
+                else:
+                    st.success(f"Seeded {seeded_count} missing economics threshold sign-off row(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to seed economics threshold sign-off rows: {exc}")
+    etq1, etq2 = st.columns(2)
+    with etq1:
+        quick_economics_env = st.selectbox(
+            "Quick Approve Economics Env",
+            options=["prod", "dev"],
+            index=0,
+            key="admin_economics_threshold_signoff_quick_env",
+        )
+    with etq2:
+        if st.button("Quick Mark Economics Threshold Approved", key="admin_economics_threshold_signoff_quick_approve_btn"):
+            try:
+                repo.record_audit_event(
+                    entity_type="economics_threshold_signoff",
+                    entity_id=None,
+                    action="quick_approve",
+                    actor=user.username,
+                    changes={
+                        "target_env": str(quick_economics_env or "").strip().lower(),
+                        "signoff_date": str(utcnow_naive().date().isoformat()),
+                        "owner": str(user.username or "").strip(),
+                        "status": "approved",
+                        "min_actual_margin_alert_pct": 5.0,
+                        "max_avg_fee_variance_alert_usd": 3.0,
+                        "min_group_sales_for_alert": 3,
+                        "assumption_snapshot": "defaults=min_margin_pct:5.0,max_avg_fee_var_usd:3.0,min_group_sales:3",
+                        "evidence_link": "",
+                        "notes": "Quick approved from economics threshold sign-off tracker.",
+                        "quick_action": True,
+                    },
+                )
+                st.success("Economics threshold sign-off quick-approved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to quick-approve economics threshold sign-off: {exc}")
+    with st.form("admin_economics_threshold_signoff_form"):
+        etf1, etf2 = st.columns(2)
+        with etf1:
+            economics_signoff_target_env = st.selectbox(
+                "Environment",
+                options=["dev", "prod"],
+                index=1,
+                key="admin_economics_threshold_signoff_target_env",
+            )
+            economics_signoff_date = st.date_input(
+                "Sign-Off Date",
+                value=utcnow_naive().date(),
+                key="admin_economics_threshold_signoff_date",
+            )
+            economics_signoff_owner = st.text_input(
+                "Owner",
+                value=str(user.username or ""),
+                key="admin_economics_threshold_signoff_owner",
+            )
+            economics_signoff_status = st.selectbox(
+                "Status",
+                options=["approved", "blocked", "needs_followup"],
+                index=0,
+                key="admin_economics_threshold_signoff_status",
+            )
+            economics_signoff_evidence_link = st.text_input(
+                "Evidence Link",
+                placeholder="report/export/ticket URL",
+                key="admin_economics_threshold_signoff_evidence_link",
+            )
+        with etf2:
+            economics_signoff_min_margin_alert_pct = st.number_input(
+                "Min Actual Margin % Alert",
+                min_value=-100.0,
+                max_value=100.0,
+                value=5.0,
+                step=0.5,
+                key="admin_economics_threshold_signoff_min_margin_alert_pct",
+            )
+            economics_signoff_max_fee_variance_alert_usd = st.number_input(
+                "Max Avg Fee Variance Alert ($)",
+                min_value=0.0,
+                value=3.0,
+                step=0.25,
+                key="admin_economics_threshold_signoff_max_fee_variance_alert_usd",
+            )
+            economics_signoff_min_group_sales_for_alert = st.number_input(
+                "Min Sales per Group for Alert",
+                min_value=1,
+                max_value=10000,
+                value=3,
+                step=1,
+                key="admin_economics_threshold_signoff_min_group_sales_for_alert",
+            )
+        economics_signoff_assumption_snapshot = st.text_input(
+            "Assumption Snapshot",
+            value=(
+                f"min_margin_pct={float(economics_signoff_min_margin_alert_pct):.2f},"
+                f"max_avg_fee_var_usd={float(economics_signoff_max_fee_variance_alert_usd):.2f},"
+                f"min_group_sales={int(economics_signoff_min_group_sales_for_alert)}"
+            ),
+            key="admin_economics_threshold_signoff_assumption_snapshot",
+        )
+        economics_signoff_notes = st.text_area(
+            "Notes",
+            placeholder="Threshold rationale, confidence, and any residual risk.",
+            key="admin_economics_threshold_signoff_notes",
+        )
+        save_economics_signoff = st.form_submit_button("Record Economics Threshold Sign-Off")
+    if save_economics_signoff:
+        try:
+            repo.record_audit_event(
+                entity_type="economics_threshold_signoff",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "target_env": str(economics_signoff_target_env or "").strip().lower(),
+                    "signoff_date": str(economics_signoff_date.isoformat()),
+                    "owner": str(economics_signoff_owner or "").strip(),
+                    "status": str(economics_signoff_status or "").strip().lower(),
+                    "min_actual_margin_alert_pct": float(economics_signoff_min_margin_alert_pct or 0.0),
+                    "max_avg_fee_variance_alert_usd": float(economics_signoff_max_fee_variance_alert_usd or 0.0),
+                    "min_group_sales_for_alert": int(economics_signoff_min_group_sales_for_alert or 0),
+                    "assumption_snapshot": str(economics_signoff_assumption_snapshot or "").strip(),
+                    "evidence_link": str(economics_signoff_evidence_link or "").strip(),
+                    "notes": str(economics_signoff_notes or "").strip(),
+                },
+            )
+            st.success("Economics threshold sign-off recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record economics threshold sign-off: {exc}")
+    if not economics_threshold_df.empty:
+        st.dataframe(economics_threshold_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Economics Threshold Sign-Off CSV",
+            data=economics_threshold_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"economics_threshold_signoffs_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_economics_threshold_signoff_download_csv_btn",
+        )
+    else:
+        st.caption("No economics threshold sign-off records yet.")
+
+    st.markdown("#### Lifecycle Retention Policy Sign-Off Tracker")
+    st.caption(
+        "Capture retention-policy acceptance per environment (owner/date/evidence) using current cleanup scheduler and retain-day settings."
+    )
+    lifecycle_coverage_rows: list[dict[str, Any]] = []
+    for target_env in ["dev", "prod"]:
+        latest = latest_lifecycle_retention_signoff_by_env.get(target_env) or {}
+        lifecycle_coverage_rows.append(
+            {
+                "environment": target_env,
+                "status": str(latest.get("status") or "missing"),
+                "owner": str(latest.get("owner") or ""),
+                "signoff_date": str(latest.get("signoff_date") or ""),
+                "cleanup_enabled": bool(latest.get("cleanup_enabled")),
+                "cleanup_timezone": str(latest.get("cleanup_timezone") or ""),
+                "cleanup_local_time": str(latest.get("cleanup_local_time") or ""),
+                "retain_days_media": int(latest.get("retain_days_media") or 0),
+                "retain_days_listing": int(latest.get("retain_days_listing") or 0),
+                "retain_days_lot": int(latest.get("retain_days_lot") or 0),
+                "retain_days_product": int(latest.get("retain_days_product") or 0),
+                "evidence_link": str(latest.get("evidence_link") or ""),
+            }
+        )
+    st.dataframe(pd.DataFrame(lifecycle_coverage_rows), use_container_width=True, hide_index=True)
+    lcs1, lcs2 = st.columns([2, 1])
+    with lcs1:
+        lifecycle_seed_target = st.selectbox(
+            "Seed Missing Lifecycle Policy Rows For",
+            options=["prod", "dev", "dev+prod"],
+            index=0,
+            key="admin_lifecycle_retention_signoff_seed_target",
+        )
+    with lcs2:
+        if st.button("Seed Missing Lifecycle Policy Sign-Off Items", key="admin_lifecycle_retention_signoff_seed_btn"):
+            target_envs = ["dev", "prod"] if lifecycle_seed_target == "dev+prod" else [lifecycle_seed_target]
+            seeded_count = 0
+            try:
+                for target_env in target_envs:
+                    if target_env in latest_lifecycle_retention_signoff_by_env:
+                        continue
+                    repo.record_audit_event(
+                        entity_type="lifecycle_retention_policy_signoff",
+                        entity_id=None,
+                        action="seed_missing",
+                        actor=user.username,
+                        changes={
+                            "target_env": str(target_env or "").strip().lower(),
+                            "signoff_date": str(utcnow_naive().date().isoformat()),
+                            "owner": str(user.username or "").strip(),
+                            "status": "needs_followup",
+                            "cleanup_enabled": bool(get_runtime_bool(repo, "lifecycle_archive_cleanup_enabled", False)),
+                            "cleanup_timezone": str(
+                                get_runtime_value(
+                                    repo,
+                                    "lifecycle_archive_cleanup_timezone",
+                                    str(get_runtime_value(repo, "app_default_timezone", "America/Denver")),
+                                )
+                            ),
+                            "cleanup_local_time": str(
+                                get_runtime_value(repo, "lifecycle_archive_cleanup_local_time", "03:45")
+                            ),
+                            "retain_days_media": int(
+                                get_runtime_int(repo, "lifecycle_media_archive_retain_days", 180)
+                            ),
+                            "retain_days_listing": int(
+                                get_runtime_int(repo, "lifecycle_listing_archive_retain_days", 365)
+                            ),
+                            "retain_days_lot": int(get_runtime_int(repo, "lifecycle_lot_archive_retain_days", 365)),
+                            "retain_days_product": int(
+                                get_runtime_int(repo, "lifecycle_product_archive_retain_days", 365)
+                            ),
+                            "evidence_link": "",
+                            "notes": "Auto-seeded missing lifecycle retention policy sign-off row from Admin tracker.",
+                            "seeded": True,
+                        },
+                    )
+                    seeded_count += 1
+                if seeded_count <= 0:
+                    st.info("No missing lifecycle retention policy sign-off rows to seed for the selected target.")
+                else:
+                    st.success(f"Seeded {seeded_count} missing lifecycle retention policy sign-off row(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to seed lifecycle retention policy sign-off rows: {exc}")
+    lcq1, lcq2 = st.columns(2)
+    with lcq1:
+        quick_lifecycle_env = st.selectbox(
+            "Quick Approve Lifecycle Env",
+            options=["prod", "dev"],
+            index=0,
+            key="admin_lifecycle_retention_signoff_quick_env",
+        )
+    with lcq2:
+        if st.button("Quick Mark Lifecycle Policy Approved", key="admin_lifecycle_retention_signoff_quick_approve_btn"):
+            try:
+                repo.record_audit_event(
+                    entity_type="lifecycle_retention_policy_signoff",
+                    entity_id=None,
+                    action="quick_approve",
+                    actor=user.username,
+                    changes={
+                        "target_env": str(quick_lifecycle_env or "").strip().lower(),
+                        "signoff_date": str(utcnow_naive().date().isoformat()),
+                        "owner": str(user.username or "").strip(),
+                        "status": "approved",
+                        "cleanup_enabled": bool(get_runtime_bool(repo, "lifecycle_archive_cleanup_enabled", False)),
+                        "cleanup_timezone": str(
+                            get_runtime_value(
+                                repo,
+                                "lifecycle_archive_cleanup_timezone",
+                                str(get_runtime_value(repo, "app_default_timezone", "America/Denver")),
+                            )
+                        ),
+                        "cleanup_local_time": str(get_runtime_value(repo, "lifecycle_archive_cleanup_local_time", "03:45")),
+                        "retain_days_media": int(get_runtime_int(repo, "lifecycle_media_archive_retain_days", 180)),
+                        "retain_days_listing": int(get_runtime_int(repo, "lifecycle_listing_archive_retain_days", 365)),
+                        "retain_days_lot": int(get_runtime_int(repo, "lifecycle_lot_archive_retain_days", 365)),
+                        "retain_days_product": int(get_runtime_int(repo, "lifecycle_product_archive_retain_days", 365)),
+                        "evidence_link": "",
+                        "notes": "Quick approved from lifecycle retention policy sign-off tracker.",
+                        "quick_action": True,
+                    },
+                )
+                st.success("Lifecycle retention policy sign-off quick-approved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to quick-approve lifecycle retention policy sign-off: {exc}")
+    with st.form("admin_lifecycle_retention_signoff_form"):
+        lcf1, lcf2 = st.columns(2)
+        with lcf1:
+            lifecycle_signoff_target_env = st.selectbox(
+                "Environment",
+                options=["dev", "prod"],
+                index=1,
+                key="admin_lifecycle_retention_signoff_target_env",
+            )
+            lifecycle_signoff_date = st.date_input(
+                "Sign-Off Date",
+                value=utcnow_naive().date(),
+                key="admin_lifecycle_retention_signoff_date",
+            )
+            lifecycle_signoff_owner = st.text_input(
+                "Owner",
+                value=str(user.username or ""),
+                key="admin_lifecycle_retention_signoff_owner",
+            )
+            lifecycle_signoff_status = st.selectbox(
+                "Status",
+                options=["approved", "blocked", "needs_followup"],
+                index=0,
+                key="admin_lifecycle_retention_signoff_status",
+            )
+            lifecycle_signoff_evidence_link = st.text_input(
+                "Evidence Link",
+                placeholder="policy/runbook/export URL",
+                key="admin_lifecycle_retention_signoff_evidence_link",
+            )
+        with lcf2:
+            lifecycle_signoff_cleanup_enabled = st.checkbox(
+                "Cleanup Enabled",
+                value=bool(get_runtime_bool(repo, "lifecycle_archive_cleanup_enabled", False)),
+                key="admin_lifecycle_retention_signoff_cleanup_enabled",
+            )
+            lifecycle_signoff_cleanup_timezone = st.text_input(
+                "Cleanup Timezone",
+                value=str(
+                    get_runtime_value(
+                        repo,
+                        "lifecycle_archive_cleanup_timezone",
+                        str(get_runtime_value(repo, "app_default_timezone", "America/Denver")),
+                    )
+                ),
+                key="admin_lifecycle_retention_signoff_cleanup_timezone",
+            )
+            lifecycle_signoff_cleanup_local_time = st.text_input(
+                "Cleanup Local Time (HH:MM)",
+                value=str(get_runtime_value(repo, "lifecycle_archive_cleanup_local_time", "03:45")),
+                key="admin_lifecycle_retention_signoff_cleanup_local_time",
+            )
+            lifecycle_signoff_retain_days_media = st.number_input(
+                "Retain Days Media",
+                min_value=1,
+                max_value=3650,
+                value=max(1, min(3650, int(get_runtime_int(repo, "lifecycle_media_archive_retain_days", 180)))),
+                step=1,
+                key="admin_lifecycle_retention_signoff_retain_days_media",
+            )
+            lifecycle_signoff_retain_days_listing = st.number_input(
+                "Retain Days Listings",
+                min_value=1,
+                max_value=3650,
+                value=max(1, min(3650, int(get_runtime_int(repo, "lifecycle_listing_archive_retain_days", 365)))),
+                step=1,
+                key="admin_lifecycle_retention_signoff_retain_days_listing",
+            )
+            lifecycle_signoff_retain_days_lot = st.number_input(
+                "Retain Days Lots",
+                min_value=1,
+                max_value=3650,
+                value=max(1, min(3650, int(get_runtime_int(repo, "lifecycle_lot_archive_retain_days", 365)))),
+                step=1,
+                key="admin_lifecycle_retention_signoff_retain_days_lot",
+            )
+            lifecycle_signoff_retain_days_product = st.number_input(
+                "Retain Days Products",
+                min_value=1,
+                max_value=3650,
+                value=max(1, min(3650, int(get_runtime_int(repo, "lifecycle_product_archive_retain_days", 365)))),
+                step=1,
+                key="admin_lifecycle_retention_signoff_retain_days_product",
+            )
+        lifecycle_signoff_notes = st.text_area(
+            "Notes",
+            placeholder="Policy rationale, risk acceptance, and follow-up items.",
+            key="admin_lifecycle_retention_signoff_notes",
+        )
+        save_lifecycle_signoff = st.form_submit_button("Record Lifecycle Retention Policy Sign-Off")
+    if save_lifecycle_signoff:
+        try:
+            repo.record_audit_event(
+                entity_type="lifecycle_retention_policy_signoff",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "target_env": str(lifecycle_signoff_target_env or "").strip().lower(),
+                    "signoff_date": str(lifecycle_signoff_date.isoformat()),
+                    "owner": str(lifecycle_signoff_owner or "").strip(),
+                    "status": str(lifecycle_signoff_status or "").strip().lower(),
+                    "cleanup_enabled": bool(lifecycle_signoff_cleanup_enabled),
+                    "cleanup_timezone": str(lifecycle_signoff_cleanup_timezone or "").strip(),
+                    "cleanup_local_time": str(lifecycle_signoff_cleanup_local_time or "").strip(),
+                    "retain_days_media": int(lifecycle_signoff_retain_days_media or 0),
+                    "retain_days_listing": int(lifecycle_signoff_retain_days_listing or 0),
+                    "retain_days_lot": int(lifecycle_signoff_retain_days_lot or 0),
+                    "retain_days_product": int(lifecycle_signoff_retain_days_product or 0),
+                    "evidence_link": str(lifecycle_signoff_evidence_link or "").strip(),
+                    "notes": str(lifecycle_signoff_notes or "").strip(),
+                },
+            )
+            st.success("Lifecycle retention policy sign-off recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record lifecycle retention policy sign-off: {exc}")
+    if not lifecycle_retention_signoff_df.empty:
+        st.dataframe(lifecycle_retention_signoff_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Lifecycle Retention Policy Sign-Off CSV",
+            data=lifecycle_retention_signoff_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"lifecycle_retention_policy_signoffs_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_lifecycle_retention_signoff_download_csv_btn",
+        )
+    else:
+        st.caption("No lifecycle retention policy sign-off records yet.")
 
     st.markdown("#### Go-Live Section Sign-Off Tracker")
     st.caption(
@@ -4801,16 +6769,31 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 st.error(f"Unable to record governance snapshot: {exc}")
 
     st.markdown("#### Recent Governance Snapshots")
-    snapshot_logs = repo.db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.entity_type == "governance_export",
-            AuditLog.action == "snapshot",
-            AuditLog.created_at >= cutoff,
+    load_snapshot_history = st.checkbox(
+        "Load Governance Snapshot History (slower)",
+        value=False,
+        key="admin_governance_export_hub_load_snapshot_history",
+        help="Defers governance snapshot-history query unless explicitly requested.",
+    )
+    if not load_snapshot_history:
+        st.caption(
+            "Governance snapshot history is deferred. Enable "
+            "`Load Governance Snapshot History (slower)` to query it."
         )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-        .limit(int(max_rows))
-    ).all()
+    snapshot_logs = (
+        repo.db.scalars(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_type == "governance_export",
+                AuditLog.action == "snapshot",
+                AuditLog.created_at >= cutoff,
+            )
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(int(max_rows))
+        ).all()
+        if load_snapshot_history
+        else []
+    )
     snapshot_rows: list[dict[str, Any]] = []
     for row in snapshot_logs:
         payload = _audit_changes(row)
@@ -5455,6 +7438,9 @@ def render_admin(repo: InventoryRepository) -> None:
         policy_drill_interval_days = max(1, int(get_runtime_int(repo, "backup_restore_drill_interval_days", 30)))
         policy_rto_target_minutes = max(1, int(get_runtime_int(repo, "backup_restore_rto_target_minutes", 60)))
         policy_owner = get_runtime_str(repo, "backup_policy_owner", "").strip()
+        policy_runner_enabled = get_runtime_bool(repo, "backup_policy_runner_enabled", False)
+        policy_schedule_timezone = get_runtime_str(repo, "backup_policy_schedule_timezone", "America/Denver").strip()
+        policy_schedule_local_time = get_runtime_str(repo, "backup_policy_schedule_local_time", "02:00").strip()
 
         st.markdown("### Backup Policy")
         st.caption("Environment-scoped policy settings for cadence, retention, and restore-drill objectives.")
@@ -5476,6 +7462,12 @@ def render_admin(repo: InventoryRepository) -> None:
                     value=policy_owner,
                     placeholder="ops@goldenstackers.com or on-call team",
                     key="admin_backup_policy_owner",
+                )
+                backup_policy_runner_enabled = st.checkbox(
+                    "Enable Scheduled Backup Runner",
+                    value=bool(policy_runner_enabled),
+                    key="admin_backup_policy_runner_enabled",
+                    help="When enabled, sync-runner executes one scheduled backup per local day.",
                 )
             with bp2:
                 backup_policy_cadence_hours = st.number_input(
@@ -5510,6 +7502,18 @@ def render_admin(repo: InventoryRepository) -> None:
                     step=1,
                     key="admin_backup_restore_rto_target_minutes",
                 )
+                backup_policy_schedule_timezone = st.text_input(
+                    "Backup Schedule Timezone",
+                    value=policy_schedule_timezone or "America/Denver",
+                    key="admin_backup_policy_schedule_timezone",
+                    help="IANA timezone, for example America/Denver or UTC.",
+                )
+                backup_policy_schedule_local_time = st.text_input(
+                    "Backup Schedule Local Time (HH:MM)",
+                    value=policy_schedule_local_time or "02:00",
+                    key="admin_backup_policy_schedule_local_time",
+                    help="24-hour local time in the selected timezone.",
+                )
             save_backup_policy = st.form_submit_button("Save Backup Policy")
 
         if save_backup_policy:
@@ -5522,6 +7526,9 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("backup_policy_retention_days", str(int(backup_policy_retention_days)), "int"),
                     ("backup_restore_drill_interval_days", str(int(backup_restore_drill_interval_days)), "int"),
                     ("backup_restore_rto_target_minutes", str(int(backup_restore_rto_target_minutes)), "int"),
+                    ("backup_policy_runner_enabled", "true" if backup_policy_runner_enabled else "false", "bool"),
+                    ("backup_policy_schedule_timezone", str(backup_policy_schedule_timezone or "").strip() or "America/Denver", "str"),
+                    ("backup_policy_schedule_local_time", str(backup_policy_schedule_local_time or "").strip() or "02:00", "str"),
                 ]
                 descriptions = {
                     "backup_policy_enabled": "Enable scheduled backup policy reporting/tracking for this environment.",
@@ -5531,6 +7538,9 @@ def render_admin(repo: InventoryRepository) -> None:
                     "backup_policy_retention_days": "Expected backup retention window in days.",
                     "backup_restore_drill_interval_days": "Maximum target days between successful restore drills.",
                     "backup_restore_rto_target_minutes": "Target restore recovery-time objective (minutes) used for drill evidence.",
+                    "backup_policy_runner_enabled": "Enable scheduled backup execution by sync-runner.",
+                    "backup_policy_schedule_timezone": "IANA timezone used for scheduled backup execution.",
+                    "backup_policy_schedule_local_time": "Local-time HH:MM used for daily scheduled backup execution.",
                 }
                 for key, value, value_type in updates:
                     repo.upsert_runtime_setting(
@@ -5939,6 +7949,55 @@ def render_admin(repo: InventoryRepository) -> None:
         st.caption("Validate eBay credentials and confirm token/API calls succeed from this runtime.")
         st.markdown("### Connection Status")
         render_ebay_connection_status_card(repo)
+        token_diag = _ebay_token_auto_refresh_diagnostics(repo)
+        st.markdown("#### Token Auto-Refresh Diagnostics")
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.metric("Refresh Interval (h)", int(token_diag.get("interval_hours") or 0))
+        with d2:
+            st.metric("Min TTL Trigger (min)", int(token_diag.get("min_ttl_minutes") or 0))
+        with d3:
+            exp_val = token_diag.get("expires_in_minutes")
+            st.metric("Access Token Expires In (min)", exp_val if exp_val is not None else "(unknown)")
+        with d4:
+            st.metric(
+                "Failure Cooldown Active",
+                "yes" if bool(token_diag.get("failure_cooldown_active")) else "no",
+            )
+        if bool(token_diag.get("failure_cooldown_active")):
+            st.warning(
+                "Auto-refresh failure cooldown is active until "
+                f"`{str(token_diag.get('failure_cooldown_until') or '(unknown)')}`."
+            )
+        td1, td2 = st.columns([1, 3])
+        with td1:
+            clear_refresh_failure_state = st.button(
+                "Clear Refresh Failure State",
+                key="admin_ebay_clear_refresh_failure_state_btn",
+                use_container_width=True,
+            )
+        with td2:
+            st.caption(
+                "Use after fixing credentials/scopes to clear cooldown/error state and allow immediate retry."
+            )
+        if clear_refresh_failure_state:
+            if ensure_permission(user, "update", "Clear eBay OAuth Refresh Failure State"):
+                try:
+                    _clear_ebay_token_refresh_failure_state(repo, actor=user.username)
+                    st.success("Cleared eBay token refresh failure/cooldown state.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to clear refresh failure state: {exc}")
+        diag_rows = [
+            {"field": "Now", "value": str(token_diag.get("now") or "")},
+            {"field": "Refreshed At", "value": str(token_diag.get("refreshed_at") or "")},
+            {"field": "Next Refresh Due At", "value": str(token_diag.get("next_refresh_due_at") or "")},
+            {"field": "Access Token Expires At", "value": str(token_diag.get("expires_at") or "")},
+            {"field": "Last Refresh Failed At", "value": str(token_diag.get("failed_at") or "")},
+            {"field": "Failure Cooldown Until", "value": str(token_diag.get("failure_cooldown_until") or "")},
+            {"field": "Last Refresh Error", "value": str(token_diag.get("last_error") or "")},
+        ]
+        st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
         client = EbayClient()
         ebay_auth_accepted_url = get_runtime_str(
             repo,
@@ -6104,35 +8163,47 @@ def render_admin(repo: InventoryRepository) -> None:
         else:
             st.success("OAuth readiness checks passed.")
 
+        load_recent_verification_feedback = st.checkbox(
+            "Load Recent Verification Feedback (slower)",
+            value=False,
+            key="admin_ebay_verify_load_recent_feedback",
+            help="Defers eBay verification audit-history query unless explicitly requested.",
+        )
         recent_verify_feedback: list[dict[str, Any]] = []
-        try:
-            audit_rows = repo.list_audit_logs(limit=500)
-            for row in audit_rows:
-                if str(getattr(row, "entity_type", "") or "").strip().lower() != "ebay_verify":
-                    continue
-                payload = _audit_changes(row)
-                recent_verify_feedback.append(
-                    {
-                        "at": row.created_at,
-                        "actor": str(getattr(row, "actor", "") or "").strip(),
-                        "action": str(getattr(row, "action", "") or "").strip(),
-                        "status": str(payload.get("status") or "").strip(),
-                        "resolved_user": str(payload.get("resolved_user") or "").strip(),
-                        "seller_registered": bool(payload.get("seller_registered"))
-                        if payload.get("seller_registered") is not None
-                        else "",
-                        "message": str(payload.get("message") or "").strip(),
-                    }
-                )
-                if len(recent_verify_feedback) >= 50:
-                    break
-        except Exception:
-            recent_verify_feedback = []
-        if recent_verify_feedback:
-            st.caption("Recent Verification Feedback")
-            st.dataframe(pd.DataFrame(recent_verify_feedback), use_container_width=True, hide_index=True)
+        if not load_recent_verification_feedback:
+            st.caption(
+                "Recent verification feedback is deferred. Enable "
+                "`Load Recent Verification Feedback (slower)` to query audit history."
+            )
         else:
-            st.caption("Recent Verification Feedback: no verification events recorded yet.")
+            try:
+                audit_rows = repo.list_audit_logs(limit=500)
+                for row in audit_rows:
+                    if str(getattr(row, "entity_type", "") or "").strip().lower() != "ebay_verify":
+                        continue
+                    payload = _audit_changes(row)
+                    recent_verify_feedback.append(
+                        {
+                            "at": row.created_at,
+                            "actor": str(getattr(row, "actor", "") or "").strip(),
+                            "action": str(getattr(row, "action", "") or "").strip(),
+                            "status": str(payload.get("status") or "").strip(),
+                            "resolved_user": str(payload.get("resolved_user") or "").strip(),
+                            "seller_registered": bool(payload.get("seller_registered"))
+                            if payload.get("seller_registered") is not None
+                            else "",
+                            "message": str(payload.get("message") or "").strip(),
+                        }
+                    )
+                    if len(recent_verify_feedback) >= 50:
+                        break
+            except Exception:
+                recent_verify_feedback = []
+            if recent_verify_feedback:
+                st.caption("Recent Verification Feedback")
+                st.dataframe(pd.DataFrame(recent_verify_feedback), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Recent Verification Feedback: no verification events recorded yet.")
 
         if not client.is_configured():
             st.warning("Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET, and EBAY_RU_NAME before running verification.")
@@ -6191,26 +8262,34 @@ def render_admin(repo: InventoryRepository) -> None:
                         pass
 
             st.caption("Step 2: Optional user-token API check (Sell Account privileges endpoint).")
+            pending_access = str(st.session_state.pop("admin_ebay_verify_user_token_pending", "") or "").strip()
+            if pending_access:
+                st.session_state["admin_ebay_verify_user_token"] = pending_access
+            pending_refresh = str(st.session_state.pop("admin_ebay_verify_refresh_token_pending", "") or "").strip()
+            if pending_refresh:
+                st.session_state["admin_ebay_verify_refresh_token"] = pending_refresh
+            if "admin_ebay_verify_user_token" not in st.session_state:
+                st.session_state["admin_ebay_verify_user_token"] = get_runtime_str(
+                    repo,
+                    "ebay_user_access_token",
+                    settings.ebay_user_access_token,
+                )
+            if "admin_ebay_verify_refresh_token" not in st.session_state:
+                st.session_state["admin_ebay_verify_refresh_token"] = get_runtime_str(
+                    repo,
+                    "ebay_user_refresh_token",
+                    settings.ebay_user_refresh_token,
+                )
             verify_user_token = st.text_area(
                 "Access Token",
                 height=120,
                 key="admin_ebay_verify_user_token",
-                value=get_runtime_str(
-                    repo,
-                    "ebay_user_access_token",
-                    settings.ebay_user_access_token,
-                ),
                 help="Paste a user OAuth access token from eBay OAuth code exchange.",
             )
             verify_refresh_token = st.text_area(
                 "Refresh Token (optional but recommended)",
                 height=120,
                 key="admin_ebay_verify_refresh_token",
-                value=get_runtime_str(
-                    repo,
-                    "ebay_user_refresh_token",
-                    settings.ebay_user_refresh_token,
-                ),
                 help="Used to auto-renew short-lived access tokens when they expire.",
             )
             if st.button("Verify User Token API Access", key="admin_ebay_verify_user_token_button"):
@@ -6404,11 +8483,14 @@ def render_admin(repo: InventoryRepository) -> None:
                                             description="Best-effort expiry timestamp for current eBay user access token.",
                                             actor=user.username,
                                         )
-                                    st.session_state["admin_ebay_verify_user_token"] = refreshed_access
+                                    st.session_state["admin_ebay_verify_user_token_pending"] = refreshed_access
+                                    if rotated_refresh:
+                                        st.session_state["admin_ebay_verify_refresh_token_pending"] = rotated_refresh
                                     retry_privileges = client.get_account_privileges(refreshed_access)
                                     refreshed_retry_ok = True
                                     st.success("Token was expired; refreshed successfully and verification now passed.")
                                     st.json(retry_privileges)
+                                    st.rerun()
                             except Exception as refresh_exc:
                                 refresh_error = str(refresh_exc)
                         if not refreshed_retry_ok:
@@ -6476,6 +8558,87 @@ def render_admin(repo: InventoryRepository) -> None:
                 ),
                 use_container_width=True,
             )
+            st.markdown("### Bulk Max Output Tokens Upgrade")
+            st.caption(
+                "One-click helper to raise all AI runtime profiles below a target token limit. "
+                "Use Dry Run first to preview impacted profiles."
+            )
+            with st.form("admin_ai_bulk_token_upgrade_form", clear_on_submit=False):
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    bulk_target_tokens = st.number_input(
+                        "Target Max Output Tokens",
+                        min_value=1,
+                        max_value=16000,
+                        value=16000,
+                        step=100,
+                    )
+                with b2:
+                    bulk_include_inactive = st.checkbox("Include Inactive Profiles", value=True)
+                with b3:
+                    bulk_dry_run = st.checkbox("Dry Run (no writes)", value=True)
+                bulk_apply = st.form_submit_button("Apply To Profiles Below Target")
+            if bulk_apply:
+                try:
+                    scoped_rows = (
+                        ai_rows
+                        if bulk_include_inactive
+                        else [row for row in ai_rows if bool(getattr(row, "is_active", False))]
+                    )
+                    target_int = int(bulk_target_tokens)
+                    candidates = [
+                        row
+                        for row in scoped_rows
+                        if int(getattr(row, "max_output_tokens", 0) or 0) < target_int
+                    ]
+                    if not candidates:
+                        st.info("No profiles are below the selected target.")
+                    elif bulk_dry_run:
+                        st.info(
+                            f"Dry run: {len(candidates)} profile(s) would be updated to `{target_int}` max output tokens."
+                        )
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "id": int(row.id),
+                                        "name": str(row.name or ""),
+                                        "provider": str(row.provider or ""),
+                                        "is_active": bool(row.is_active),
+                                        "before_max_output_tokens": int(getattr(row, "max_output_tokens", 0) or 0),
+                                        "after_max_output_tokens": target_int,
+                                    }
+                                    for row in candidates
+                                ]
+                            ),
+                            use_container_width=True,
+                        )
+                    else:
+                        updated = 0
+                        failures: list[str] = []
+                        for row in candidates:
+                            try:
+                                repo.update_ai_provider_config(
+                                    int(row.id),
+                                    {"max_output_tokens": target_int},
+                                    actor=user.username,
+                                )
+                                updated += 1
+                            except Exception as row_exc:
+                                failures.append(
+                                    f"#{int(row.id)} {str(row.name or '')}: {str(row_exc)}"
+                                )
+                        if updated > 0:
+                            st.success(
+                                f"Updated {updated} profile(s) to `{target_int}` max output tokens."
+                            )
+                        if failures:
+                            st.warning(
+                                "Some profiles failed to update:\n" + "\n".join(f"- {msg}" for msg in failures[:20])
+                            )
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"Bulk token upgrade failed: {exc}")
         else:
             st.info("No AI runtime profiles found for this environment.")
 
@@ -6534,7 +8697,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 temperature = st.number_input("Temperature", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
             with e2:
                 max_output_tokens = st.number_input(
-                    "Max Output Tokens", min_value=1, max_value=4096, value=600, step=50
+                    "Max Output Tokens", min_value=1, max_value=16000, value=16000, step=100
                 )
             with e3:
                 timeout_seconds = st.number_input(
@@ -6726,7 +8889,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     edit_max_output_tokens = st.number_input(
                         "Max Output Tokens",
                         min_value=1,
-                        max_value=4096,
+                        max_value=16000,
                         step=50,
                         key="admin_ai_edit_max_tokens",
                     )
@@ -6944,6 +9107,734 @@ def render_admin(repo: InventoryRepository) -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"Unable to reset prompt templates: {exc}")
+
+        st.divider()
+        st.markdown("### Listing Wizard AI Prompt Templates")
+        st.caption(
+            "Edit the prompt instruction and system message used by Listing Wizard AI draft suggestions. "
+            "Changes apply immediately (runtime settings with env/default fallback)."
+        )
+        wizard_system_message_row = repo.get_runtime_setting(
+            environment=settings.app_env,
+            key="listing_wizard_ai_system_message",
+            active_only=False,
+        )
+        wizard_instruction_row = repo.get_runtime_setting(
+            environment=settings.app_env,
+            key="listing_wizard_ai_instruction_template",
+            active_only=False,
+        )
+        wizard_seed_default_row = repo.get_runtime_setting(
+            environment=settings.app_env,
+            key="listing_wizard_ai_seed_default",
+            active_only=False,
+        )
+        wizard_system_message = (
+            (wizard_system_message_row.value if wizard_system_message_row else DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE)
+            or ""
+        )
+        wizard_instruction = (
+            (wizard_instruction_row.value if wizard_instruction_row else DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE)
+            or ""
+        )
+        wizard_seed_default = (
+            (wizard_seed_default_row.value if wizard_seed_default_row else DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT)
+            or ""
+        )
+
+        with st.form("admin_listing_wizard_prompt_templates_form"):
+            edited_wizard_system_message = st.text_area(
+                "Listing Wizard System Message",
+                value=wizard_system_message,
+                height=130,
+            )
+            edited_wizard_seed_default = st.text_area(
+                "Listing Wizard Seed Prompt (Default)",
+                value=wizard_seed_default,
+                height=120,
+            )
+            edited_wizard_instruction = st.text_area(
+                "Listing Wizard Instruction Template",
+                value=wizard_instruction,
+                height=200,
+            )
+            wsave1, wsave2 = st.columns(2)
+            with wsave1:
+                save_wizard_prompt_templates = st.form_submit_button("Save Listing Wizard Prompts")
+            with wsave2:
+                reset_wizard_prompt_templates = st.form_submit_button("Reset Listing Wizard Prompts")
+
+        if save_wizard_prompt_templates:
+            try:
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_system_message",
+                    value=(edited_wizard_system_message or "").strip() or DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE,
+                    value_type="str",
+                    description="System message for Listing Wizard AI draft suggestions.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_instruction_template",
+                    value=(edited_wizard_instruction or "").strip() or DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE,
+                    value_type="str",
+                    description="Instruction template for Listing Wizard AI draft suggestions.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_seed_default",
+                    value=(edited_wizard_seed_default or "").strip() or DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT,
+                    value_type="str",
+                    description="Default seed prompt pre-filled in Listing Wizard AI Draft Assist.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                st.success("Listing Wizard AI prompt templates saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save Listing Wizard prompts: {exc}")
+
+        if reset_wizard_prompt_templates:
+            try:
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_system_message",
+                    value=DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE,
+                    value_type="str",
+                    description="System message for Listing Wizard AI draft suggestions.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_instruction_template",
+                    value=DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE,
+                    value_type="str",
+                    description="Instruction template for Listing Wizard AI draft suggestions.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="listing_wizard_ai_seed_default",
+                    value=DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT,
+                    value_type="str",
+                    description="Default seed prompt pre-filled in Listing Wizard AI Draft Assist.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                st.success("Listing Wizard AI prompt templates reset to defaults.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to reset Listing Wizard prompts: {exc}")
+
+        st.divider()
+        st.markdown("### AI Prompt Version Registry + Rollback")
+        st.caption(
+            "Capture versioned prompt snapshots for `comp` and `listing` workflows, restore prior versions, "
+            "and pin the active version id used for telemetry."
+        )
+        registry_workflow = st.selectbox(
+            "Prompt Workflow",
+            options=["listing", "comp"],
+            index=0,
+            key="admin_ai_prompt_registry_workflow",
+        )
+        try:
+            active_version_id = active_prompt_version(repo, registry_workflow)
+            version_rows = list_prompt_versions(repo, registry_workflow, limit=120)
+        except Exception:
+            active_version_id = ""
+            version_rows = []
+        st.caption(
+            f"Active version: `{active_version_id or 'none'}` | stored versions: `{len(version_rows)}`"
+        )
+        version_labels: list[str] = []
+        version_lookup: dict[str, str] = {}
+        for row in version_rows:
+            vid = str(row.get("version_id") or "").strip()
+            created_at = str(row.get("created_at") or "").strip()
+            created_by = str(row.get("created_by") or "").strip()
+            note = str(row.get("note") or "").strip()
+            label = f"{vid} | {created_at} | {created_by}" + (f" | {note[:60]}" if note else "")
+            version_labels.append(label)
+            version_lookup[label] = vid
+        selected_version_label = st.selectbox(
+            "Stored Versions",
+            options=["(none)", *version_labels],
+            index=0,
+            key="admin_ai_prompt_registry_selected_version",
+        )
+        selected_version_id = version_lookup.get(selected_version_label, "")
+        note_key = f"admin_ai_prompt_registry_note_{registry_workflow}"
+        version_note = st.text_input(
+            "Snapshot Note (optional)",
+            value=str(st.session_state.get(note_key) or "").strip(),
+            key=note_key,
+            placeholder="e.g. tuned for bullion listings before weekend batch",
+        )
+        pr1, pr2, pr3 = st.columns(3)
+        with pr1:
+            if st.button("Save Current as New Version", key="admin_ai_prompt_registry_save_btn"):
+                try:
+                    created = create_prompt_version(
+                        repo,
+                        registry_workflow,
+                        actor=user.username,
+                        note=version_note,
+                        set_active=True,
+                    )
+                    st.success(f"Saved prompt version `{created.get('version_id')}` and set active.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to save prompt version: {exc}")
+        with pr2:
+            if st.button("Restore Selected Version", key="admin_ai_prompt_registry_restore_btn"):
+                if not selected_version_id:
+                    st.warning("Select a stored version first.")
+                else:
+                    try:
+                        restored = restore_prompt_version(
+                            repo,
+                            registry_workflow,
+                            version_id=selected_version_id,
+                            actor=user.username,
+                            set_active=True,
+                        )
+                        if restored is None:
+                            st.warning("Selected prompt version was not found.")
+                        else:
+                            st.success(f"Restored prompt version `{selected_version_id}`.")
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to restore prompt version: {exc}")
+        with pr3:
+            if st.button("Set Selected Active (No Restore)", key="admin_ai_prompt_registry_set_active_btn"):
+                if not selected_version_id:
+                    st.warning("Select a stored version first.")
+                else:
+                    try:
+                        repo.upsert_runtime_setting(
+                            environment=settings.app_env,
+                            key=f"ai_prompt_active_version_{registry_workflow}",
+                            value=selected_version_id,
+                            value_type="str",
+                            description=f"Active prompt registry version id for `{registry_workflow}` workflow.",
+                            is_active=True,
+                            actor=user.username,
+                        )
+                        st.success(f"Active version set to `{selected_version_id}`.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to set active prompt version: {exc}")
+        if version_rows:
+            preview_rows: list[dict[str, str]] = []
+            for row in version_rows[:30]:
+                prompt_values = row.get("prompt_values") if isinstance(row.get("prompt_values"), dict) else {}
+                preview_rows.append(
+                    {
+                        "version_id": str(row.get("version_id") or ""),
+                        "created_at": str(row.get("created_at") or ""),
+                        "created_by": str(row.get("created_by") or ""),
+                        "note": str(row.get("note") or "")[:140],
+                        "keys": ", ".join(sorted(str(k) for k in prompt_values.keys()))[:180],
+                    }
+                )
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("### AI Quality Metrics")
+        st.caption(
+            "Operational telemetry for AI suggestion acceptance/edit outcomes. "
+            "Use this to monitor prompt quality and version effectiveness."
+        )
+        am1, am2 = st.columns(2)
+        with am1:
+            lookback_days = int(
+                st.number_input(
+                    "Lookback Days",
+                    min_value=1,
+                    max_value=180,
+                    value=14,
+                    step=1,
+                    key="admin_ai_metrics_lookback_days",
+                )
+            )
+        with am2:
+            workflow_filter = st.selectbox(
+                "Workflow Filter",
+                options=["all", "listing_wizard", "listing", "comp", "intake"],
+                index=0,
+                key="admin_ai_metrics_workflow_filter",
+            )
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=lookback_days)
+        ai_metric_rows: list[tuple] = []
+        try:
+            ai_metric_rows = repo.db.execute(
+                text(
+                    """
+                    SELECT created_at, actor, action, changes_json
+                    FROM audit_logs
+                    WHERE entity_type = 'ai_prompt_acceptance'
+                      AND created_at >= :since
+                    ORDER BY created_at DESC
+                    LIMIT 5000
+                    """
+                ),
+                {"since": since},
+            ).all()
+        except Exception as exc:
+            try:
+                repo.db.rollback()
+            except Exception:
+                pass
+            st.warning(f"AI quality metrics query failed; recovered DB session. {exc}")
+            ai_metric_rows = []
+
+        metrics_summary = _summarize_ai_quality_metrics(
+            ai_metric_rows,
+            workflow_filter=workflow_filter,
+        )
+        apply_events = int(metrics_summary.get("apply_events") or 0)
+        outcome_events = int(metrics_summary.get("outcome_events") or 0)
+        accepted_as_is_count = int(metrics_summary.get("accepted_as_is_count") or 0)
+        edited_count = int(metrics_summary.get("edited_count") or 0)
+        workflow_totals = metrics_summary.get("workflow_totals") or {}
+        version_totals = metrics_summary.get("version_totals") or {}
+        daily_rows = metrics_summary.get("daily_rows") or []
+        workflow_daily_rows = metrics_summary.get("workflow_daily_rows") or []
+        recent_rows = metrics_summary.get("recent_rows") or []
+        edited_fields_top_rows = metrics_summary.get("edited_fields_top_rows") or []
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("AI Apply Events", int(apply_events))
+        m2.metric("AI Outcome Events", int(outcome_events))
+        m3.metric("Accepted As-Is", int(accepted_as_is_count))
+        accept_rate = (accepted_as_is_count / outcome_events * 100.0) if outcome_events else 0.0
+        m4.metric("Acceptance Rate", f"{accept_rate:,.1f}%")
+        if outcome_events:
+            m3.caption(f"Edited: {int(edited_count)}")
+
+        if daily_rows:
+            daily_df = pd.DataFrame(daily_rows)
+            st.markdown("#### Acceptance Trend (Daily)")
+            st.line_chart(
+                daily_df.set_index("date")[["accept_rate_pct"]],
+                height=220,
+                use_container_width=True,
+            )
+            st.dataframe(daily_df, use_container_width=True, hide_index=True)
+
+        if workflow_totals:
+            wf_df = pd.DataFrame(
+                [
+                    {
+                        "workflow": key,
+                        "total": int(values["total"]),
+                        "accepted_as_is": int(values["accepted_as_is"]),
+                        "edited": int(values["edited"]),
+                        "accept_rate_pct": round(
+                            (float(values["accepted_as_is"]) / float(values["total"]) * 100.0)
+                            if values["total"]
+                            else 0.0,
+                            2,
+                        ),
+                    }
+                    for key, values in workflow_totals.items()
+                ]
+            ).sort_values(by=["total", "accept_rate_pct"], ascending=[False, False])
+            st.markdown("#### Outcome by Workflow")
+            st.dataframe(wf_df, use_container_width=True, hide_index=True)
+            if workflow_daily_rows:
+                st.markdown("#### Workflow Daily Drilldown")
+                workflow_daily_df = pd.DataFrame(workflow_daily_rows)
+                workflow_options = sorted(
+                    {
+                        str(row.get("workflow") or "").strip()
+                        for row in workflow_daily_rows
+                        if str(row.get("workflow") or "").strip()
+                    }
+                )
+                if workflow_options:
+                    drilldown_workflow = st.selectbox(
+                        "Workflow Drilldown",
+                        options=workflow_options,
+                        index=0,
+                        key="admin_ai_metrics_workflow_drilldown",
+                    )
+                    drilldown_df = workflow_daily_df[
+                        workflow_daily_df["workflow"] == str(drilldown_workflow or "").strip()
+                    ].sort_values(by=["date"], ascending=True, kind="stable")
+                    st.line_chart(
+                        drilldown_df.set_index("date")[["accept_rate_pct"]],
+                        height=220,
+                        use_container_width=True,
+                    )
+                    st.dataframe(drilldown_df, use_container_width=True, hide_index=True)
+
+                    if edited_fields_top_rows:
+                        edited_fields_df = pd.DataFrame(edited_fields_top_rows)
+                        edited_fields_df = edited_fields_df[
+                            edited_fields_df["workflow"] == str(drilldown_workflow or "").strip()
+                        ].sort_values(by=["edit_count", "field"], ascending=[False, True], kind="stable")
+                        if not edited_fields_df.empty:
+                            st.markdown("#### Top Edited Fields (Workflow)")
+                            st.dataframe(
+                                edited_fields_df.head(30),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+        if version_totals:
+            ver_df = pd.DataFrame(
+                [
+                    {
+                        "prompt_version_id": key,
+                        "total": int(values["total"]),
+                        "accepted_as_is": int(values["accepted_as_is"]),
+                        "edited": int(values["edited"]),
+                        "accept_rate_pct": round(
+                            (float(values["accepted_as_is"]) / float(values["total"]) * 100.0)
+                            if values["total"]
+                            else 0.0,
+                            2,
+                        ),
+                    }
+                    for key, values in version_totals.items()
+                ]
+            ).sort_values(by=["total", "accept_rate_pct"], ascending=[False, False])
+            st.markdown("#### Outcome by Prompt Version")
+            st.dataframe(ver_df.head(40), use_container_width=True, hide_index=True)
+
+        if recent_rows:
+            recent_df = pd.DataFrame(recent_rows[:80])
+            st.markdown("#### Recent AI Outcomes")
+            st.dataframe(recent_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download AI Quality Metrics CSV",
+                data=recent_df.to_csv(index=False),
+                file_name=f"ai_quality_metrics_{settings.app_env}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv",
+                mime="text/csv",
+                key="admin_ai_quality_metrics_csv_download",
+            )
+        else:
+            st.caption("No AI outcome telemetry rows found for current filters.")
+
+        st.divider()
+        st.markdown("### Workflow AI Profile Routing")
+        st.caption(
+            "Optionally pin specific workflows to a preferred AI Runtime profile. "
+            "Leave blank to use the default/fallback chain ordering."
+        )
+        profile_rows = repo.list_ai_provider_configs(environment=settings.app_env, active_only=True)
+        profile_choices = [{"label": "Default chain order (no workflow override)", "value": ""}]
+        for row in profile_rows:
+            profile_choices.append(
+                {
+                    "label": (
+                        f"#{int(row.id)} | {str(row.name or '').strip()} "
+                        f"({str(row.provider or '').strip().lower()} / {str(row.model or '').strip()})"
+                    ),
+                    "value": str(int(row.id)),
+                }
+            )
+
+        def _workflow_profile_current(key: str) -> str:
+            row = repo.get_runtime_setting(environment=settings.app_env, key=key, active_only=False)
+            return str(row.value if row is not None else "").strip()
+
+        def _workflow_profile_index(current: str) -> int:
+            for idx, choice in enumerate(profile_choices):
+                if str(choice.get("value") or "") == str(current or ""):
+                    return idx
+            return 0
+
+        current_listing_profile = _workflow_profile_current("ai_workflow_profile_listing")
+        current_intake_profile = _workflow_profile_current("ai_workflow_profile_intake")
+        current_comp_profile = _workflow_profile_current("ai_workflow_profile_comp")
+        current_risk_profile = _workflow_profile_current("ai_workflow_profile_risk")
+        profile_labels = [str(choice["label"]) for choice in profile_choices]
+
+        with st.form("admin_ai_workflow_profile_routing_form"):
+            wf1, wf2 = st.columns(2)
+            with wf1:
+                listing_label = st.selectbox(
+                    "Listing Workflow Profile",
+                    options=profile_labels,
+                    index=_workflow_profile_index(current_listing_profile),
+                    key="admin_ai_workflow_profile_listing",
+                )
+                comp_label = st.selectbox(
+                    "Comp Workflow Profile",
+                    options=profile_labels,
+                    index=_workflow_profile_index(current_comp_profile),
+                    key="admin_ai_workflow_profile_comp",
+                )
+            with wf2:
+                intake_label = st.selectbox(
+                    "Intake Workflow Profile",
+                    options=profile_labels,
+                    index=_workflow_profile_index(current_intake_profile),
+                    key="admin_ai_workflow_profile_intake",
+                )
+                risk_label = st.selectbox(
+                    "Risk Workflow Profile",
+                    options=profile_labels,
+                    index=_workflow_profile_index(current_risk_profile),
+                    key="admin_ai_workflow_profile_risk",
+                )
+            sr1, sr2 = st.columns(2)
+            with sr1:
+                save_workflow_routing = st.form_submit_button("Save Workflow Profile Routing")
+            with sr2:
+                clear_workflow_routing = st.form_submit_button("Clear Workflow Profile Routing")
+
+        if save_workflow_routing:
+            try:
+                label_to_value = {str(choice["label"]): str(choice["value"]) for choice in profile_choices}
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ai_workflow_profile_listing",
+                    value=label_to_value.get(str(listing_label), ""),
+                    value_type="str",
+                    description="Preferred AI runtime profile id for listing workflow calls (blank uses default chain order).",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ai_workflow_profile_intake",
+                    value=label_to_value.get(str(intake_label), ""),
+                    value_type="str",
+                    description="Preferred AI runtime profile id for intake workflow calls (blank uses default chain order).",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ai_workflow_profile_comp",
+                    value=label_to_value.get(str(comp_label), ""),
+                    value_type="str",
+                    description="Preferred AI runtime profile id for comp workflow calls (blank uses default chain order).",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ai_workflow_profile_risk",
+                    value=label_to_value.get(str(risk_label), ""),
+                    value_type="str",
+                    description="Preferred AI runtime profile id for risk workflow calls (blank uses default chain order).",
+                    is_active=True,
+                    actor=user.username,
+                )
+                st.success("Workflow AI profile routing saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save workflow AI profile routing: {exc}")
+
+        if clear_workflow_routing:
+            try:
+                for runtime_key, runtime_desc in [
+                    (
+                        "ai_workflow_profile_listing",
+                        "Preferred AI runtime profile id for listing workflow calls (blank uses default chain order).",
+                    ),
+                    (
+                        "ai_workflow_profile_intake",
+                        "Preferred AI runtime profile id for intake workflow calls (blank uses default chain order).",
+                    ),
+                    (
+                        "ai_workflow_profile_comp",
+                        "Preferred AI runtime profile id for comp workflow calls (blank uses default chain order).",
+                    ),
+                    (
+                        "ai_workflow_profile_risk",
+                        "Preferred AI runtime profile id for risk workflow calls (blank uses default chain order).",
+                    ),
+                ]:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=runtime_key,
+                        value="",
+                        value_type="str",
+                        description=runtime_desc,
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("Workflow AI profile routing cleared.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to clear workflow AI profile routing: {exc}")
+
+        st.divider()
+        st.markdown("### AI Apply-Time Quality Gates")
+        st.caption(
+            "Control minimum AI output quality thresholds and policy-blocked phrases used before applying "
+            "AI suggestions in listing and intake workflows."
+        )
+        ai_quality_defaults = {
+            "title_min_words": 3,
+            "title_min_chars": 12,
+            "details_min_words": 28,
+            "details_min_chars": 180,
+            "intake_min_words": 8,
+            "intake_min_chars": 40,
+            "forbidden_terms_csv": "guaranteed profit,guaranteed return,risk-free,no risk,investment advice,financial advice",
+        }
+        quality_title_min_words = int(
+            get_runtime_int(repo, "ai_quality_title_min_words", ai_quality_defaults["title_min_words"])
+        )
+        quality_title_min_chars = int(
+            get_runtime_int(repo, "ai_quality_title_min_chars", ai_quality_defaults["title_min_chars"])
+        )
+        quality_details_min_words = int(
+            get_runtime_int(
+                repo,
+                "ai_quality_listing_details_min_words",
+                ai_quality_defaults["details_min_words"],
+            )
+        )
+        quality_details_min_chars = int(
+            get_runtime_int(
+                repo,
+                "ai_quality_listing_details_min_chars",
+                ai_quality_defaults["details_min_chars"],
+            )
+        )
+        quality_intake_min_words = int(
+            get_runtime_int(repo, "ai_quality_intake_min_words", ai_quality_defaults["intake_min_words"])
+        )
+        quality_intake_min_chars = int(
+            get_runtime_int(repo, "ai_quality_intake_min_chars", ai_quality_defaults["intake_min_chars"])
+        )
+        quality_forbidden_terms = str(
+            get_runtime_str(
+                repo,
+                "ai_quality_forbidden_terms_csv",
+                ai_quality_defaults["forbidden_terms_csv"],
+            )
+            or ""
+        ).strip()
+        with st.form("admin_ai_quality_gate_form"):
+            q1, q2 = st.columns(2)
+            with q1:
+                input_title_min_words = st.number_input(
+                    "Listing title min words",
+                    min_value=1,
+                    max_value=20,
+                    step=1,
+                    value=quality_title_min_words,
+                    key="admin_ai_quality_title_min_words",
+                )
+                input_title_min_chars = st.number_input(
+                    "Listing title min chars",
+                    min_value=5,
+                    max_value=120,
+                    step=1,
+                    value=quality_title_min_chars,
+                    key="admin_ai_quality_title_min_chars",
+                )
+                input_details_min_words = st.number_input(
+                    "Listing details min words",
+                    min_value=10,
+                    max_value=400,
+                    step=1,
+                    value=quality_details_min_words,
+                    key="admin_ai_quality_details_min_words",
+                )
+            with q2:
+                input_details_min_chars = st.number_input(
+                    "Listing details min chars",
+                    min_value=50,
+                    max_value=8000,
+                    step=10,
+                    value=quality_details_min_chars,
+                    key="admin_ai_quality_details_min_chars",
+                )
+                input_intake_min_words = st.number_input(
+                    "Intake text min words",
+                    min_value=3,
+                    max_value=200,
+                    step=1,
+                    value=quality_intake_min_words,
+                    key="admin_ai_quality_intake_min_words",
+                )
+                input_intake_min_chars = st.number_input(
+                    "Intake text min chars",
+                    min_value=20,
+                    max_value=4000,
+                    step=10,
+                    value=quality_intake_min_chars,
+                    key="admin_ai_quality_intake_min_chars",
+                )
+            input_forbidden_terms = st.text_area(
+                "Policy blocked terms/phrases (comma/newline separated)",
+                value=quality_forbidden_terms,
+                key="admin_ai_quality_forbidden_terms",
+                help="If AI suggestions contain these terms, they are blocked from auto-apply.",
+            )
+            qsave1, qsave2 = st.columns(2)
+            with qsave1:
+                save_quality_gates = st.form_submit_button("Save AI Quality Gates")
+            with qsave2:
+                reset_quality_gates = st.form_submit_button("Reset AI Quality Gates to Defaults")
+
+        if save_quality_gates:
+            try:
+                quality_rows = [
+                    ("ai_quality_title_min_words", str(int(input_title_min_words or 3)), "int"),
+                    ("ai_quality_title_min_chars", str(int(input_title_min_chars or 12)), "int"),
+                    ("ai_quality_listing_details_min_words", str(int(input_details_min_words or 28)), "int"),
+                    ("ai_quality_listing_details_min_chars", str(int(input_details_min_chars or 180)), "int"),
+                    ("ai_quality_intake_min_words", str(int(input_intake_min_words or 8)), "int"),
+                    ("ai_quality_intake_min_chars", str(int(input_intake_min_chars or 40)), "int"),
+                    ("ai_quality_forbidden_terms_csv", str(input_forbidden_terms or "").strip(), "str"),
+                ]
+                for key, value, value_type in quality_rows:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=key,
+                        value=value,
+                        value_type=value_type,
+                        description="AI apply-time quality gate setting.",
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("AI quality gates saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save AI quality gates: {exc}")
+
+        if reset_quality_gates:
+            try:
+                default_rows = [
+                    ("ai_quality_title_min_words", str(ai_quality_defaults["title_min_words"]), "int"),
+                    ("ai_quality_title_min_chars", str(ai_quality_defaults["title_min_chars"]), "int"),
+                    ("ai_quality_listing_details_min_words", str(ai_quality_defaults["details_min_words"]), "int"),
+                    ("ai_quality_listing_details_min_chars", str(ai_quality_defaults["details_min_chars"]), "int"),
+                    ("ai_quality_intake_min_words", str(ai_quality_defaults["intake_min_words"]), "int"),
+                    ("ai_quality_intake_min_chars", str(ai_quality_defaults["intake_min_chars"]), "int"),
+                    ("ai_quality_forbidden_terms_csv", str(ai_quality_defaults["forbidden_terms_csv"]), "str"),
+                ]
+                for key, value, value_type in default_rows:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=key,
+                        value=value,
+                        value_type=value_type,
+                        description="AI apply-time quality gate setting.",
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("AI quality gates reset to defaults.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to reset AI quality gates: {exc}")
 
         st.divider()
         st.markdown("### Ask GoldenStackers AI Refinement")
@@ -8801,7 +11692,21 @@ def render_admin(repo: InventoryRepository) -> None:
             invalid_preset_audit_range = preset_audit_from_date > preset_audit_to_date
         if invalid_preset_audit_range:
             st.error("Preset audit From Date must be on or before To Date.")
-        preset_audit_logs = repo.list_audit_logs(limit=int(preset_audit_limit))
+        load_preset_audit_summary = st.checkbox(
+            "Load Preset Audit Summary (slower)",
+            value=False,
+            key="admin_documents_handoff_load_preset_audit_summary",
+            help="Defers preset-governance audit-history query unless explicitly requested.",
+        )
+        if not load_preset_audit_summary:
+            st.caption(
+                "Preset audit summary is deferred. Enable `Load Preset Audit Summary (slower)` to query audit history."
+            )
+        preset_audit_logs = (
+            repo.list_audit_logs(limit=int(preset_audit_limit))
+            if load_preset_audit_summary
+            else []
+        )
         preset_event_rows: list[dict] = []
         for row in preset_audit_logs:
             if str(row.entity_type or "").strip().lower() != "documents_handoff_governance_preset":
@@ -8919,7 +11824,17 @@ def render_admin(repo: InventoryRepository) -> None:
             invalid_clear_audit_range = clear_audit_from_date > clear_audit_to_date
         if invalid_clear_audit_range:
             st.error("From Date must be on or before To Date.")
-        audit_rows = repo.list_audit_logs(limit=int(clear_audit_limit))
+        load_clear_audit_summary = st.checkbox(
+            "Load Clear Audit Summary (slower)",
+            value=False,
+            key="admin_documents_handoff_load_clear_audit_summary",
+            help="Defers clear-history audit query unless explicitly requested.",
+        )
+        if not load_clear_audit_summary:
+            st.caption(
+                "Clear audit summary is deferred. Enable `Load Clear Audit Summary (slower)` to query audit history."
+            )
+        audit_rows = repo.list_audit_logs(limit=int(clear_audit_limit)) if load_clear_audit_summary else []
         clear_rows: list[dict] = []
         for row in audit_rows:
             if str(row.entity_type or "").strip().lower() != "documents_handoff_history":
@@ -9073,6 +11988,105 @@ def render_admin(repo: InventoryRepository) -> None:
                     key="admin_documents_handoff_governance_bundle_download",
                 )
 
+        st.markdown("### Purchase Document -> Lot Apply Audit")
+        pdla1, pdla2 = st.columns(2)
+        with pdla1:
+            purchase_doc_apply_from = st.date_input(
+                "From Date",
+                value=(utcnow_naive().date() - timedelta(days=29)),
+                key="admin_purchase_doc_lot_apply_from_date",
+            )
+        with pdla2:
+            purchase_doc_apply_to = st.date_input(
+                "To Date",
+                value=utcnow_naive().date(),
+                key="admin_purchase_doc_lot_apply_to_date",
+            )
+        if purchase_doc_apply_from > purchase_doc_apply_to:
+            st.error("Purchase-document lot-apply audit From Date must be on or before To Date.")
+        purchase_doc_apply_limit = st.number_input(
+            "Purchase-Document Audit Lookback Rows",
+            min_value=100,
+            max_value=5000,
+            value=1000,
+            step=100,
+            key="admin_purchase_doc_lot_apply_audit_limit",
+        )
+        load_purchase_doc_apply_audit = st.checkbox(
+            "Load Purchase-Document Lot-Apply Audit (slower)",
+            value=False,
+            key="admin_load_purchase_doc_lot_apply_audit",
+            help="Defers audit-log query unless explicitly requested.",
+        )
+        if not load_purchase_doc_apply_audit:
+            st.caption(
+                "Purchase-document lot-apply audit is deferred. Enable "
+                "`Load Purchase-Document Lot-Apply Audit (slower)` to query events."
+            )
+        else:
+            audit_rows = repo.list_audit_logs(limit=int(purchase_doc_apply_limit))
+            event_rows: list[dict] = []
+            for row in audit_rows:
+                if str(getattr(row, "entity_type", "") or "").strip().lower() != "purchase_document":
+                    continue
+                action = str(getattr(row, "action", "") or "").strip().lower()
+                if action not in {"auto_apply_extracted_fields_to_lot", "manual_apply_extracted_fields_to_lot"}:
+                    continue
+                created_dt = getattr(row, "created_at", None)
+                if created_dt is None:
+                    continue
+                created_date = created_dt.date()
+                if created_date < purchase_doc_apply_from or created_date > purchase_doc_apply_to:
+                    continue
+                payload: dict = {}
+                try:
+                    parsed = json.loads(str(getattr(row, "changes_json", "") or "{}"))
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = {}
+                applied_fields_raw = payload.get("applied_fields")
+                if isinstance(applied_fields_raw, list):
+                    applied_fields = [str(v).strip() for v in applied_fields_raw if str(v).strip()]
+                else:
+                    applied_fields = []
+                event_rows.append(
+                    {
+                        "created_at": created_dt.isoformat(),
+                        "actor": str(getattr(row, "actor", "") or "").strip().lower(),
+                        "action": action,
+                        "mode": str(payload.get("mode") or "").strip().lower(),
+                        "workflow": str(payload.get("workflow") or "").strip(),
+                        "purchase_document_id": int(getattr(row, "entity_id", 0) or 0),
+                        "lot_id": int(payload.get("lot_id") or 0) if payload.get("lot_id") is not None else 0,
+                        "applied_field_count": int(len(applied_fields)),
+                        "applied_fields": ", ".join(applied_fields),
+                    }
+                )
+            if not event_rows:
+                st.caption("No purchase-document lot-apply audit events found in selected lookback.")
+            else:
+                events_df = pd.DataFrame(event_rows).sort_values("created_at", ascending=False)
+                auto_count = int(
+                    (events_df["action"].astype(str) == "auto_apply_extracted_fields_to_lot").sum()
+                )
+                manual_count = int(
+                    (events_df["action"].astype(str) == "manual_apply_extracted_fields_to_lot").sum()
+                )
+                qa1, qa2, qa3, qa4 = st.columns(4)
+                qa1.metric("Events", int(len(events_df)))
+                qa2.metric("Auto", auto_count)
+                qa3.metric("Manual", manual_count)
+                qa4.metric("Distinct Lots", int(events_df["lot_id"].replace(0, pd.NA).dropna().nunique()))
+                st.dataframe(events_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download Purchase-Document Lot-Apply Audit CSV",
+                    data=events_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"purchase_document_lot_apply_audit_admin_{settings.app_env}.csv",
+                    mime="text/csv",
+                    key="admin_purchase_doc_lot_apply_audit_download",
+                )
+
         st.markdown("### Seed Recommended Runtime Keys")
         if st.button("Seed Defaults From Current Env", key="admin_runtime_seed_btn"):
             seeded = _seed_missing_runtime_defaults(
@@ -9188,6 +12202,70 @@ def render_admin(repo: InventoryRepository) -> None:
 
         def _rb(key: str, default: bool = False) -> bool:
             return _rv(key, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
+
+        st.markdown("#### Integrations Performance Controls")
+        ic1, ic2, ic3, ic4 = st.columns(4)
+        with ic1:
+            load_shipping_validation_events = st.checkbox(
+                "Load Shipping Validation Events",
+                value=False,
+                key="admin_integrations_load_shipping_validation_events",
+            )
+        with ic2:
+            load_shipping_adapter_events = st.checkbox(
+                "Load Shipping Adapter Events",
+                value=False,
+                key="admin_integrations_load_shipping_adapter_events",
+            )
+        with ic3:
+            load_automation_engine_events = st.checkbox(
+                "Load Automation Engine Events",
+                value=False,
+                key="admin_integrations_load_automation_engine_events",
+            )
+        with ic4:
+            load_slack_delivery_events = st.checkbox(
+                "Load Slack Delivery Events",
+                value=False,
+                key="admin_integrations_load_slack_delivery_events",
+            )
+        ic5, ic6 = st.columns(2)
+        with ic5:
+            load_slack_queue_jobs = st.checkbox(
+                "Load Slack Queue Jobs",
+                value=False,
+                key="admin_integrations_load_slack_queue_jobs",
+            )
+        with ic6:
+            load_google_queue_jobs = st.checkbox(
+                "Load Google Queue Jobs",
+                value=False,
+                key="admin_integrations_load_google_queue_jobs",
+            )
+        load_integrations_signoff_history = st.checkbox(
+            "Load Integrations Sign-Off History",
+            value=False,
+            key="admin_integrations_load_signoff_history",
+            help="Defers sign-off history audit-log reads until explicitly requested.",
+        )
+        _integration_event_cache: dict[tuple[int, int], list[Any]] = {}
+
+        def _integration_event_rows(lookback_days: int, limit: int) -> list[Any]:
+            key = (int(lookback_days), int(limit))
+            cached = _integration_event_cache.get(key)
+            if cached is not None:
+                return cached
+            rows = repo.db.scalars(
+                select(AuditLog)
+                .where(
+                    AuditLog.entity_type == "integration_event",
+                    AuditLog.created_at >= (utcnow_naive() - timedelta(days=int(lookback_days))),
+                )
+                .order_by(AuditLog.created_at.desc())
+                .limit(int(limit))
+            ).all()
+            _integration_event_cache[key] = rows
+            return rows
 
         st.markdown("#### Google Workspace")
         with st.form("admin_google_integration_form"):
@@ -9675,56 +12753,51 @@ def render_admin(repo: InventoryRepository) -> None:
                     pass
 
         st.markdown("#### Recent Live Provider Validation Runs")
-        validation_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "integration_event",
-                AuditLog.created_at >= (utcnow_naive() - timedelta(days=30)),
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(1000)
-        ).all()
-        validation_events: list[dict[str, Any]] = []
-        for row in validation_rows:
-            try:
-                payload = json.loads(row.changes_json or "{}")
-            except Exception:
-                payload = {}
-            after = payload.get("after") if isinstance(payload, dict) else {}
-            if not isinstance(after, dict):
-                after = {}
-            if str(after.get("integration") or "").strip().lower() != "shipping_provider_validation":
-                continue
-            details = after.get("details") if isinstance(after.get("details"), dict) else {}
-            validation_events.append(
-                {
-                    "created_at": row.created_at.isoformat() if row.created_at else "",
-                    "actor": str(row.actor or ""),
-                    "status": str(after.get("status") or ""),
-                    "target_env": str(details.get("target_env") or ""),
-                    "provider": str(details.get("provider") or ""),
-                    "sale_id": details.get("sale_id"),
-                    "queue_job_id": details.get("queue_job_id"),
-                    "queue_status": str(details.get("queue_status") or ""),
-                    "label_id": str(details.get("label_id") or ""),
-                    "tracking_number": str(details.get("tracking_number") or ""),
-                    "message": str(details.get("message") or ""),
-                    "notes": str(details.get("validation_notes") or ""),
-                    "error": str(details.get("error") or "")[:220],
-                }
-            )
-        if validation_events:
-            validation_df = pd.DataFrame(validation_events)
-            st.dataframe(validation_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download Live Provider Validation CSV",
-                data=validation_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"shipping_provider_validation_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="admin_shipping_provider_validation_download_csv_btn",
-            )
+        if not load_shipping_validation_events:
+            st.caption("Live provider validation events are deferred. Enable above to load.")
         else:
-            st.caption("No live provider validation runs in last 30 days.")
+            validation_rows = _integration_event_rows(lookback_days=30, limit=1000)
+            validation_events: list[dict[str, Any]] = []
+            for row in validation_rows:
+                try:
+                    payload = json.loads(row.changes_json or "{}")
+                except Exception:
+                    payload = {}
+                after = payload.get("after") if isinstance(payload, dict) else {}
+                if not isinstance(after, dict):
+                    after = {}
+                if str(after.get("integration") or "").strip().lower() != "shipping_provider_validation":
+                    continue
+                details = after.get("details") if isinstance(after.get("details"), dict) else {}
+                validation_events.append(
+                    {
+                        "created_at": row.created_at.isoformat() if row.created_at else "",
+                        "actor": str(row.actor or ""),
+                        "status": str(after.get("status") or ""),
+                        "target_env": str(details.get("target_env") or ""),
+                        "provider": str(details.get("provider") or ""),
+                        "sale_id": details.get("sale_id"),
+                        "queue_job_id": details.get("queue_job_id"),
+                        "queue_status": str(details.get("queue_status") or ""),
+                        "label_id": str(details.get("label_id") or ""),
+                        "tracking_number": str(details.get("tracking_number") or ""),
+                        "message": str(details.get("message") or ""),
+                        "notes": str(details.get("validation_notes") or ""),
+                        "error": str(details.get("error") or "")[:220],
+                    }
+                )
+            if validation_events:
+                validation_df = pd.DataFrame(validation_events)
+                st.dataframe(validation_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download Live Provider Validation CSV",
+                    data=validation_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"shipping_provider_validation_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="admin_shipping_provider_validation_download_csv_btn",
+                )
+            else:
+                st.caption("No live provider validation runs in last 30 days.")
 
         st.markdown("#### Validation Sign-Off (Dev/Prod)")
         st.caption(
@@ -9788,12 +12861,16 @@ def render_admin(repo: InventoryRepository) -> None:
             except Exception as exc:
                 st.error(f"Unable to record validation sign-off: {exc}")
 
-        signoff_logs = repo.db.scalars(
-            select(AuditLog)
-            .where(AuditLog.entity_type == "shipping_provider_validation_signoff")
-            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-            .limit(200)
-        ).all()
+        signoff_logs: list[Any] = []
+        if not load_integrations_signoff_history:
+            st.caption("Validation sign-off history is deferred. Enable `Load Integrations Sign-Off History` to load.")
+        else:
+            signoff_logs = repo.db.scalars(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "shipping_provider_validation_signoff")
+                .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                .limit(200)
+            ).all()
         signoff_rows: list[dict[str, Any]] = []
         for row in signoff_logs:
             payload = _audit_changes(row)
@@ -9833,48 +12910,43 @@ def render_admin(repo: InventoryRepository) -> None:
                 mime="text/csv",
                 key="admin_shipping_provider_validation_signoff_download_csv_btn",
             )
-        else:
+        elif load_integrations_signoff_history:
             st.caption("No validation sign-off records yet.")
 
         st.markdown("#### Recent Shipping Adapter Test Events")
-        shipping_adapter_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "integration_event",
-                AuditLog.created_at >= (utcnow_naive() - timedelta(days=14)),
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(500)
-        ).all()
-        shipping_adapter_events: list[dict[str, str]] = []
-        for row in shipping_adapter_rows:
-            try:
-                payload = json.loads(row.changes_json or "{}")
-            except Exception:
-                payload = {}
-            after = payload.get("after") if isinstance(payload, dict) else {}
-            if not isinstance(after, dict):
-                after = {}
-            integration_name = str(after.get("integration") or "").strip().lower()
-            if integration_name != "shipping_label_adapter":
-                continue
-            details = after.get("details") if isinstance(after.get("details"), dict) else {}
-            shipping_adapter_events.append(
-                {
-                    "created_at": row.created_at.isoformat() if row.created_at else "",
-                    "actor": row.actor,
-                    "action": str(after.get("action") or row.action or ""),
-                    "status": str(after.get("status") or ""),
-                    "mode": str(details.get("mode") or ""),
-                    "sale_id": str(details.get("sale_id") or ""),
-                    "label_id": str(details.get("label_id") or ""),
-                    "error": str(details.get("error") or "")[:220],
-                }
-            )
-        if shipping_adapter_events:
-            st.dataframe(pd.DataFrame(shipping_adapter_events), use_container_width=True, hide_index=True)
+        if not load_shipping_adapter_events:
+            st.caption("Shipping adapter event history is deferred. Enable above to load.")
         else:
-            st.caption("No shipping adapter test events in last 14 days.")
+            shipping_adapter_rows = _integration_event_rows(lookback_days=14, limit=500)
+            shipping_adapter_events: list[dict[str, str]] = []
+            for row in shipping_adapter_rows:
+                try:
+                    payload = json.loads(row.changes_json or "{}")
+                except Exception:
+                    payload = {}
+                after = payload.get("after") if isinstance(payload, dict) else {}
+                if not isinstance(after, dict):
+                    after = {}
+                integration_name = str(after.get("integration") or "").strip().lower()
+                if integration_name != "shipping_label_adapter":
+                    continue
+                details = after.get("details") if isinstance(after.get("details"), dict) else {}
+                shipping_adapter_events.append(
+                    {
+                        "created_at": row.created_at.isoformat() if row.created_at else "",
+                        "actor": row.actor,
+                        "action": str(after.get("action") or row.action or ""),
+                        "status": str(after.get("status") or ""),
+                        "mode": str(details.get("mode") or ""),
+                        "sale_id": str(details.get("sale_id") or ""),
+                        "label_id": str(details.get("label_id") or ""),
+                        "error": str(details.get("error") or "")[:220],
+                    }
+                )
+            if shipping_adapter_events:
+                st.dataframe(pd.DataFrame(shipping_adapter_events), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No shipping adapter test events in last 14 days.")
 
         st.markdown("#### Integration Automation Rules (Preview)")
         st.caption(
@@ -10257,53 +13329,48 @@ def render_admin(repo: InventoryRepository) -> None:
             st.caption("No automation approvals yet.")
 
         st.markdown("#### Recent Automation Engine Events")
-        automation_audit_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "integration_event",
-                AuditLog.created_at >= (utcnow_naive() - timedelta(days=14)),
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(500)
-        ).all()
         automation_events: list[dict[str, Any]] = []
-        for row in automation_audit_rows:
-            try:
-                payload = json.loads(row.changes_json or "{}")
-            except Exception:
-                payload = {}
-            after = payload.get("after") if isinstance(payload, dict) else {}
-            if not isinstance(after, dict):
-                after = {}
-            integration_name = str(after.get("integration") or "").strip().lower()
-            if integration_name != "integration_automation":
-                continue
-            details = after.get("details") if isinstance(after.get("details"), dict) else {}
-            automation_events.append(
-                {
-                    "created_at": row.created_at.isoformat() if row.created_at else "",
-                    "actor": row.actor,
-                    "action": str(after.get("action") or row.action or ""),
-                    "status": str(after.get("status") or ""),
-                    "job_id": details.get("job_id"),
-                    "integration": details.get("integration"),
-                    "action_name": details.get("action_name"),
-                    "trigger_status": details.get("trigger_status"),
-                    "dry_run": details.get("dry_run"),
-                    "blocked": details.get("blocked"),
-                    "matched_rules": len(details.get("matched_rule_ids") or []),
-                    "applied_rules": len(details.get("applied_rule_ids") or []),
-                    "approval_gated_rules": len(details.get("approval_gated_rule_ids") or []),
-                    "blocked_reason": str(details.get("blocked_reason") or "")[:160],
-                    "matched_rule_ids": details.get("matched_rule_ids") or [],
-                    "approval_gated_rule_ids": details.get("approval_gated_rule_ids") or [],
-                    "details_raw": details,
-                }
-            )
-        if automation_events:
-            st.dataframe(pd.DataFrame(automation_events), use_container_width=True, hide_index=True)
+        if not load_automation_engine_events:
+            st.caption("Automation engine event history is deferred. Enable above to load.")
         else:
-            st.caption("No automation engine events in last 14 days.")
+            automation_audit_rows = _integration_event_rows(lookback_days=14, limit=500)
+            for row in automation_audit_rows:
+                try:
+                    payload = json.loads(row.changes_json or "{}")
+                except Exception:
+                    payload = {}
+                after = payload.get("after") if isinstance(payload, dict) else {}
+                if not isinstance(after, dict):
+                    after = {}
+                integration_name = str(after.get("integration") or "").strip().lower()
+                if integration_name != "integration_automation":
+                    continue
+                details = after.get("details") if isinstance(after.get("details"), dict) else {}
+                automation_events.append(
+                    {
+                        "created_at": row.created_at.isoformat() if row.created_at else "",
+                        "actor": row.actor,
+                        "action": str(after.get("action") or row.action or ""),
+                        "status": str(after.get("status") or ""),
+                        "job_id": details.get("job_id"),
+                        "integration": details.get("integration"),
+                        "action_name": details.get("action_name"),
+                        "trigger_status": details.get("trigger_status"),
+                        "dry_run": details.get("dry_run"),
+                        "blocked": details.get("blocked"),
+                        "matched_rules": len(details.get("matched_rule_ids") or []),
+                        "applied_rules": len(details.get("applied_rule_ids") or []),
+                        "approval_gated_rules": len(details.get("approval_gated_rule_ids") or []),
+                        "blocked_reason": str(details.get("blocked_reason") or "")[:160],
+                        "matched_rule_ids": details.get("matched_rule_ids") or [],
+                        "approval_gated_rule_ids": details.get("approval_gated_rule_ids") or [],
+                        "details_raw": details,
+                    }
+                )
+            if automation_events:
+                st.dataframe(pd.DataFrame(automation_events), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No automation engine events in last 14 days.")
 
         triage_candidates = [
             row
@@ -10659,12 +13726,16 @@ def render_admin(repo: InventoryRepository) -> None:
             except Exception as exc:
                 st.error(f"Unable to record automation hardening sign-off: {exc}")
 
-        hardening_logs = repo.db.scalars(
-            select(AuditLog)
-            .where(AuditLog.entity_type == "integration_automation_hardening_signoff")
-            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-            .limit(200)
-        ).all()
+        hardening_logs: list[Any] = []
+        if not load_integrations_signoff_history:
+            st.caption("Automation hardening sign-off history is deferred. Enable `Load Integrations Sign-Off History` to load.")
+        else:
+            hardening_logs = repo.db.scalars(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "integration_automation_hardening_signoff")
+                .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                .limit(200)
+            ).all()
         hardening_rows: list[dict[str, Any]] = []
         latest_hardening_by_env: dict[str, str] = {}
         for row in hardening_logs:
@@ -10701,7 +13772,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 mime="text/csv",
                 key="admin_automation_hardening_signoff_download_csv_btn",
             )
-        else:
+        elif load_integrations_signoff_history:
             st.caption("No automation hardening sign-off records yet.")
 
         st.divider()
@@ -10741,9 +13812,32 @@ def render_admin(repo: InventoryRepository) -> None:
                     "Notify Shipping Exceptions",
                     value=_rb("slack_notify_shipping_exceptions", True),
                 )
+                slack_notify_order_imports = st.checkbox(
+                    "Notify eBay Order Imports",
+                    value=_rb("slack_notify_order_imports", True),
+                    help="Send a Slack message when a new eBay order is imported into local Orders/Sales.",
+                )
                 slack_notify_daily = st.checkbox(
                     "Send Daily Summary",
                     value=_rb("slack_notify_daily_summary", False),
+                )
+                app_default_timezone = st.text_input(
+                    "App Default Timezone",
+                    value=_rv("app_default_timezone", settings.app_default_timezone or "America/Denver"),
+                    help="Global default timezone for app display/scheduling defaults.",
+                )
+                slack_daily_report_enabled = st.checkbox(
+                    "Enable Daily Ops Report Scheduler",
+                    value=_rb("slack_daily_report_enabled", _rb("slack_notify_daily_summary", False)),
+                    help="Runs once per local day in sync-runner and sends inventory/sales/listing/order summary to Slack.",
+                )
+                slack_notify_backup_success = st.checkbox(
+                    "Notify Backup Success",
+                    value=_rb("slack_notify_backup_success", False),
+                )
+                slack_notify_backup_failures = st.checkbox(
+                    "Notify Backup Failures",
+                    value=_rb("slack_notify_backup_failures", True),
                 )
                 slack_notify_queue_failures = st.checkbox(
                     "Notify Google Queue Failures",
@@ -10752,6 +13846,11 @@ def render_admin(repo: InventoryRepository) -> None:
                 slack_notify_integration_queue_failures = st.checkbox(
                     "Notify Integration Queue Failures",
                     value=_rb("slack_notify_integration_queue_failures", True),
+                )
+                slack_notify_ebay_oauth_refresh_failures = st.checkbox(
+                    "Notify eBay OAuth Refresh Failures",
+                    value=_rb("slack_notify_ebay_oauth_refresh_failures", True),
+                    help="Send Slack alerts when sync-runner eBay token auto-refresh fails.",
                 )
                 slack_notify_parity_decisions = st.checkbox(
                     "Notify Parity Decisions",
@@ -10768,6 +13867,64 @@ def render_admin(repo: InventoryRepository) -> None:
                 slack_daily_cron = st.text_input(
                     "Daily Summary Cron (UTC)",
                     value=_rv("slack_daily_summary_cron", "0 16 * * *"),
+                )
+                slack_daily_report_timezone = st.text_input(
+                    "Daily Ops Report Timezone",
+                    value=_rv("slack_daily_report_timezone", "America/Denver"),
+                    help="IANA timezone for daily ops report schedule.",
+                )
+                slack_daily_report_local_time = st.text_input(
+                    "Daily Ops Report Local Time (HH:MM)",
+                    value=_rv("slack_daily_report_local_time", "08:00"),
+                    help="24-hour local time for daily ops report in selected timezone.",
+                )
+                slack_daily_report_fee_lookback_weeks = st.number_input(
+                    "Daily Report Fee Coverage Lookback (weeks)",
+                    min_value=2,
+                    max_value=52,
+                    value=max(
+                        2,
+                        min(
+                            52,
+                            int(_rv("slack_daily_report_normalized_fee_coverage_lookback_weeks", "8") or "8"),
+                        ),
+                    ),
+                    step=1,
+                    help="Weeks of reconciliation data used for normalized fee-source coverage health checks.",
+                )
+                try:
+                    _fee_threshold_default = float(
+                        _rv("slack_daily_report_normalized_fee_coverage_threshold_pct", "80") or "80"
+                    )
+                except Exception:
+                    _fee_threshold_default = 80.0
+                slack_daily_report_fee_threshold_pct = st.number_input(
+                    "Daily Report Fee Coverage Threshold (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=max(0.0, min(100.0, float(_fee_threshold_default))),
+                    step=0.5,
+                    help="Alert threshold for weekly normalized fee-source coverage percentage.",
+                )
+                slack_daily_report_fee_consecutive_weeks = st.number_input(
+                    "Daily Report Fee Coverage Consecutive Weeks",
+                    min_value=1,
+                    max_value=12,
+                    value=max(
+                        1,
+                        min(
+                            12,
+                            int(
+                                _rv(
+                                    "slack_daily_report_normalized_fee_coverage_consecutive_weeks",
+                                    "2",
+                                )
+                                or "2"
+                            ),
+                        ),
+                    ),
+                    step=1,
+                    help="Consecutive below-threshold weeks required before posting a coverage alert line.",
                 )
                 slack_timeout = st.number_input(
                     "Slack HTTP Timeout Seconds",
@@ -10813,16 +13970,100 @@ def render_admin(repo: InventoryRepository) -> None:
                     value=max(5, min(24 * 60, int(_rv("health_auto_alert_cooldown_minutes", "60") or "60"))),
                     step=5,
                 )
+                slack_ops_runner_enabled = st.checkbox(
+                    "Enable Slack Ops Socket Mode Runner",
+                    value=_rb("slack_ops_runner_enabled", False),
+                    help="Runs dedicated Slack Socket Mode worker for app mentions/commands.",
+                )
+                slack_ops_enabled = st.checkbox(
+                    "Enable Slack Ops Command Ingest",
+                    value=_rb("slack_ops_enabled", True),
+                    help="Global kill switch for Slack command ingestion.",
+                )
+                slack_ops_write_actions_require_approval = st.checkbox(
+                    "Slack Ops: Require Approval For Write Actions",
+                    value=_rb("slack_ops_write_actions_require_approval", True),
+                )
+                slack_ops_ai_assist_enabled = st.checkbox(
+                    "Slack Ops: Enable AI Assist",
+                    value=_rb("slack_ops_ai_assist_enabled", True),
+                )
+                slack_ops_ai_auto_reply_enabled = st.checkbox(
+                    "Slack Ops: Enable AI Auto-Reply",
+                    value=_rb("slack_ops_ai_auto_reply_enabled", False),
+                    help="Posts AI summary responses back to Slack thread/channel after queue execution.",
+                )
+                slack_ops_process_queue_enabled = st.checkbox(
+                    "Auto-Process Slack Ops Queue",
+                    value=_rb("slack_ops_process_queue_enabled", True),
+                    help="Allows Slack Ops runner to execute due slack_ops queue jobs automatically.",
+                )
+                slack_ops_process_queue_limit = st.number_input(
+                    "Slack Ops Queue Process Limit",
+                    min_value=1,
+                    max_value=200,
+                    value=max(1, min(200, int(_rv("slack_ops_process_queue_limit", "25") or "25"))),
+                    step=1,
+                )
+                slack_ops_poll_interval_seconds = st.number_input(
+                    "Slack Ops Poll Interval Seconds",
+                    min_value=2,
+                    max_value=300,
+                    value=max(2, min(300, int(_rv("slack_ops_poll_interval_seconds", "5") or "5"))),
+                    step=1,
+                )
+                slack_ops_default_role = st.selectbox(
+                    "Slack Ops Default Role",
+                    options=["viewer", "ops", "admin"],
+                    index=["viewer", "ops", "admin"].index(
+                        str(_rv("slack_ops_default_role", "ops") or "ops").strip().lower()
+                        if str(_rv("slack_ops_default_role", "ops") or "ops").strip().lower() in {"viewer", "ops", "admin"}
+                        else "ops"
+                    ),
+                    help="Fallback app role for Slack users not mapped explicitly.",
+                )
             with s2:
                 slack_bot_token = st.text_input(
                     "Slack Bot Token",
                     value=_rv("slack_bot_token", ""),
                     type="password",
                 )
+                slack_app_token = st.text_input(
+                    "Slack App Token (Socket Mode)",
+                    value=_rv("slack_app_token", ""),
+                    type="password",
+                    help="Starts with `xapp-`; required for inbound Slack bot conversation via Socket Mode.",
+                )
+                slack_bot_user_id = st.text_input(
+                    "Slack Bot User ID (optional)",
+                    value=_rv("slack_bot_user_id", ""),
+                    help="Optional `U...` bot ID for mention stripping; auto-detected if empty.",
+                )
                 slack_signing_secret = st.text_input(
                     "Slack Signing Secret",
                     value=_rv("slack_signing_secret", ""),
                     type="password",
+                )
+                slack_ops_command_prefix = st.text_input(
+                    "Slack Ops Command Prefix (optional)",
+                    value=_rv("slack_ops_command_prefix", ""),
+                    help="Optional prefix after mention, e.g. `gs` so `@bot gs comp ...`.",
+                )
+                slack_ops_user_role_map = st.text_area(
+                    "Slack Ops User Role Map",
+                    value=_rv("slack_ops_user_role_map", ""),
+                    height=90,
+                    help="Comma-separated `slackUserOrName:role` entries, e.g. `U123:admin,keith:ops`.",
+                )
+                slack_ops_allowed_channels = st.text_input(
+                    "Slack Ops Allowed Channels (CSV)",
+                    value=_rv("slack_ops_allowed_channels", ""),
+                    help="Comma-separated channel IDs or names allowed to use Slack Ops (empty = unrestricted).",
+                )
+                slack_ops_allowed_users = st.text_input(
+                    "Slack Ops Allowed Users (CSV)",
+                    value=_rv("slack_ops_allowed_users", ""),
+                    help="Comma-separated Slack user IDs/usernames allowed to use Slack Ops (empty = unrestricted).",
                 )
                 slack_channel_sync_failures = st.text_input(
                     "Channel Override: Sync Failures",
@@ -10860,6 +14101,26 @@ def render_admin(repo: InventoryRepository) -> None:
                 slack_channel_system_health_critical = st.text_input(
                     "Channel Override: System Health Critical",
                     value=_rv("slack_channel_system_health_critical", ""),
+                )
+                slack_daily_report_channel = st.text_input(
+                    "Channel Override: Daily Ops Report",
+                    value=_rv("slack_daily_report_channel", ""),
+                    help="Optional dedicated channel for scheduled daily ops report.",
+                )
+                slack_channel_backup_events = st.text_input(
+                    "Channel Override: Backup Events",
+                    value=_rv("slack_channel_backup_events", ""),
+                    help="Optional dedicated channel for scheduled backup success/failure notifications.",
+                )
+                slack_channel_business_reports = st.text_input(
+                    "Channel Override: Business Reports",
+                    value=_rv("slack_channel_business_reports", ""),
+                    help="Optional dedicated channel for manual business status report sends.",
+                )
+                slack_channel_order_imports = st.text_input(
+                    "Channel Override: eBay Order Imports",
+                    value=_rv("slack_channel_order_imports", ""),
+                    help="Optional dedicated channel for new eBay order import notifications.",
                 )
                 slack_template_sync_failures = st.text_area(
                     "Template: Sync Failures",
@@ -10950,6 +14211,123 @@ def render_admin(repo: InventoryRepository) -> None:
                     ),
                     height=130,
                 )
+                slack_template_backup_success = st.text_area(
+                    "Template: Backup Success",
+                    value=_rv(
+                        "slack_template_backup_success",
+                        (
+                            ":white_check_mark: *GoldenStackers* scheduled DB backup completed\n"
+                            "- Env: `{env}`\n"
+                            "- File: `{file_name}`\n"
+                            "- Size: `{size_bytes}` bytes\n"
+                            "- Uploaded to S3: `{uploaded_to_s3}`\n"
+                            "- S3 Key: `{s3_key}`\n"
+                            "- Local Time: `{local_time}`"
+                        ),
+                    ),
+                    height=120,
+                )
+                slack_template_backup_failure = st.text_area(
+                    "Template: Backup Failure",
+                    value=_rv(
+                        "slack_template_backup_failure",
+                        (
+                            ":x: *GoldenStackers* scheduled DB backup failed\n"
+                            "- Env: `{env}`\n"
+                            "- Error: `{error}`\n"
+                            "- Local Time: `{local_time}`"
+                        ),
+                    ),
+                    height=120,
+                )
+                slack_template_business_status_report = st.text_area(
+                    "Template: Business Status Report",
+                    value=_rv(
+                        "slack_template_business_status_report",
+                        (
+                            ":bar_chart: *GoldenStackers Business Status* (`{env}`)\n"
+                            "- Window: `{window_days}` day(s)\n"
+                            "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Orders: `{orders_window_count}`\n"
+                            "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
+                            "- Low stock: `{low_stock_count}` | Unlisted: `{unlisted_count}`\n"
+                            "- As of UTC: `{as_of_utc}`"
+                        ),
+                    ),
+                    height=120,
+                )
+                slack_template_inventory_risk_report = st.text_area(
+                    "Template: Inventory Risk Report",
+                    value=_rv(
+                        "slack_template_inventory_risk_report",
+                        (
+                            ":package: *GoldenStackers Inventory Risk* (`{env}`)\n"
+                            "- Low stock items: `{low_stock_count}`\n"
+                            "- Unlisted products: `{unlisted_count}`\n"
+                            "- Draft listings: `{draft_count}`\n"
+                            "- Active listings: `{active_count}`\n"
+                            "- Inventory cost basis: `${inventory_cost}`\n"
+                            "- As of UTC: `{as_of_utc}`"
+                        ),
+                    ),
+                    height=120,
+                )
+                slack_template_order_imported = st.text_area(
+                    "Template: eBay Order Imported",
+                    value=_rv(
+                        "slack_template_order_imported",
+                        (
+                            ":package: *New eBay order imported*\n"
+                            "- Env: `{env}`\n"
+                            "- Order: `{order_id}`\n"
+                            "- Buyer: `{buyer}`\n"
+                            "- Status: `{status}`\n"
+                            "- Total: `${total}` (shipping `${shipping}`, tax `${tax}`)\n"
+                            "- Items: `{line_item_count}`\n"
+                            "- Shipping service: `{shipping_service}`\n"
+                            "- Ship to: `{shipping_address}`\n"
+                            "- Created: `{created_at}`"
+                        ),
+                    ),
+                    height=140,
+                )
+            st.markdown("##### Fee Coverage Health (Daily Report Input)")
+            st.caption(
+                "Live view of normalized eBay fee-source coverage that feeds daily-report alerting thresholds."
+            )
+            try:
+                fee_health = _build_normalized_fee_coverage_admin_summary(
+                    repo,
+                    lookback_weeks=int(slack_daily_report_fee_lookback_weeks),
+                    threshold_percent=float(slack_daily_report_fee_threshold_pct),
+                    min_consecutive_weeks=int(slack_daily_report_fee_consecutive_weeks),
+                )
+                f1, f2, f3 = st.columns(3)
+                f1.metric(
+                    "Latest Week Coverage",
+                    f"{float(fee_health.get('latest_week_coverage_pct') or 0.0):.2f}%",
+                )
+                f2.metric(
+                    "Consecutive Below Threshold",
+                    int(fee_health.get("consecutive_below") or 0),
+                )
+                f3.metric(
+                    "Alert Triggered",
+                    "yes" if bool(fee_health.get("triggered")) else "no",
+                )
+                if bool(fee_health.get("triggered")):
+                    st.warning(
+                        "Coverage alert would trigger under current settings."
+                        f" Threshold={float(fee_health.get('threshold_percent') or 0.0):.2f}%"
+                        f", required_weeks={int(fee_health.get('min_consecutive_weeks') or 0)}."
+                    )
+                weekly_rows = fee_health.get("weekly_rows") or []
+                if weekly_rows:
+                    st.dataframe(pd.DataFrame(weekly_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No reconciliation rows found in lookback window.")
+            except Exception as exc:
+                st.warning(f"Unable to compute fee coverage health preview: {exc}")
             save_slack = st.form_submit_button("Save Slack Notification Settings")
         if save_slack:
             try:
@@ -10958,9 +14336,39 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("slack_default_channel", slack_default_channel.strip(), "str", "Default Slack channel for operational notifications (for example #ops-alerts)."),
                     ("slack_notify_sync_failures", "true" if slack_notify_sync else "false", "bool", "Send Slack notifications for sync failures/partial runs."),
                     ("slack_notify_shipping_exceptions", "true" if slack_notify_shipping else "false", "bool", "Send Slack notifications for shipping exceptions."),
+                    ("slack_notify_order_imports", "true" if slack_notify_order_imports else "false", "bool", "Send Slack notifications when new eBay orders are imported."),
                     ("slack_notify_daily_summary", "true" if slack_notify_daily else "false", "bool", "Send one daily Slack operational summary message."),
+                    ("app_default_timezone", app_default_timezone.strip() or "America/Denver", "str", "Global default timezone for app display/scheduling defaults."),
+                    ("slack_daily_report_enabled", "true" if slack_daily_report_enabled else "false", "bool", "Enable sync-runner scheduled daily operations report delivery."),
+                    ("slack_daily_report_timezone", slack_daily_report_timezone.strip() or "America/Denver", "str", "IANA timezone used by daily ops report scheduler."),
+                    ("slack_daily_report_local_time", slack_daily_report_local_time.strip() or "08:00", "str", "Local HH:MM trigger for daily ops report scheduler."),
+                    ("slack_daily_report_channel", slack_daily_report_channel.strip(), "str", "Optional channel override for scheduled daily ops report."),
+                    (
+                        "slack_daily_report_normalized_fee_coverage_lookback_weeks",
+                        str(int(slack_daily_report_fee_lookback_weeks)),
+                        "int",
+                        "Lookback window in weeks for normalized eBay fee-source coverage health in daily ops reports.",
+                    ),
+                    (
+                        "slack_daily_report_normalized_fee_coverage_threshold_pct",
+                        str(float(slack_daily_report_fee_threshold_pct)),
+                        "float",
+                        "Minimum weekly normalized fee-source coverage percent before daily-report health alerting triggers.",
+                    ),
+                    (
+                        "slack_daily_report_normalized_fee_coverage_consecutive_weeks",
+                        str(int(slack_daily_report_fee_consecutive_weeks)),
+                        "int",
+                        "Number of consecutive below-threshold weeks required before daily-report fee coverage alert is triggered.",
+                    ),
+                    ("slack_notify_backup_success", "true" if slack_notify_backup_success else "false", "bool", "Send Slack notification on scheduled backup success."),
+                    ("slack_notify_backup_failures", "true" if slack_notify_backup_failures else "false", "bool", "Send Slack notification on scheduled backup failure."),
+                    ("slack_channel_backup_events", slack_channel_backup_events.strip(), "str", "Optional channel override for backup success/failure notifications."),
+                    ("slack_channel_business_reports", slack_channel_business_reports.strip(), "str", "Optional channel override for manual business status report notifications."),
+                    ("slack_channel_order_imports", slack_channel_order_imports.strip(), "str", "Optional channel override for new eBay order import notifications."),
                     ("slack_notify_google_queue_failures", "true" if slack_notify_queue_failures else "false", "bool", "Send Slack notifications when Google integration queue jobs hit terminal failure."),
                     ("slack_notify_integration_queue_failures", "true" if slack_notify_integration_queue_failures else "false", "bool", "Send Slack notifications when any integration queue job hits terminal failure."),
+                    ("slack_notify_ebay_oauth_refresh_failures", "true" if slack_notify_ebay_oauth_refresh_failures else "false", "bool", "Send Slack notifications when sync-runner eBay OAuth auto-refresh fails."),
                     ("slack_notify_parity_decisions", "true" if slack_notify_parity_decisions else "false", "bool", "Send Slack notifications when workspace parity release decisions are recorded."),
                     ("slack_notify_followup_overdue", "true" if slack_notify_followup_overdue else "false", "bool", "Allow sending Slack notifications for overdue workspace rollout follow-up tasks."),
                     ("slack_notify_system_health_critical", "true" if slack_notify_system_health_critical else "false", "bool", "Send Slack notifications when System Health critical-signal thresholds are breached."),
@@ -10972,8 +14380,23 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("slack_queue_backoff_max_seconds", str(int(slack_queue_backoff_max)), "int", "Maximum backoff seconds for Slack retry queue scheduling."),
                     ("health_auto_alert_critical_enabled", "true" if health_auto_alert_critical_enabled else "false", "bool", "Enable automatic System Health critical-signal alert dispatch."),
                     ("health_auto_alert_cooldown_minutes", str(int(health_auto_alert_cooldown_minutes)), "int", "Cooldown minutes before repeating identical System Health critical alerts."),
+                    ("slack_ops_runner_enabled", "true" if slack_ops_runner_enabled else "false", "bool", "Enable Slack Socket Mode inbound command runner."),
+                    ("slack_ops_enabled", "true" if slack_ops_enabled else "false", "bool", "Global enable/disable for Slack ops command ingestion."),
+                    ("slack_ops_write_actions_require_approval", "true" if slack_ops_write_actions_require_approval else "false", "bool", "Require in-app approval for write-intent Slack ops actions."),
+                    ("slack_ops_ai_assist_enabled", "true" if slack_ops_ai_assist_enabled else "false", "bool", "Enable AI assist for Slack ops intake/comp intents."),
+                    ("slack_ops_ai_auto_reply_enabled", "true" if slack_ops_ai_auto_reply_enabled else "false", "bool", "Post AI summaries back to Slack thread/channel for supported intents."),
+                    ("slack_ops_process_queue_enabled", "true" if slack_ops_process_queue_enabled else "false", "bool", "Allow Slack Ops runner to auto-process due slack_ops queue jobs."),
+                    ("slack_ops_process_queue_limit", str(int(slack_ops_process_queue_limit)), "int", "Max due slack_ops queue jobs to process per runner tick."),
+                    ("slack_ops_poll_interval_seconds", str(int(slack_ops_poll_interval_seconds)), "int", "Slack Ops runner tick interval in seconds."),
+                    ("slack_ops_default_role", str(slack_ops_default_role).strip().lower(), "str", "Fallback app role for Slack users not explicitly mapped."),
                     ("slack_bot_token", slack_bot_token.strip(), "str", "Slack Bot OAuth token used for posting notifications."),
+                    ("slack_app_token", slack_app_token.strip(), "str", "Slack App-level token for Socket Mode inbound event handling."),
+                    ("slack_bot_user_id", slack_bot_user_id.strip(), "str", "Optional Slack bot user ID (`U...`) for mention stripping."),
                     ("slack_signing_secret", slack_signing_secret.strip(), "str", "Slack signing secret for future interactive/event verification."),
+                    ("slack_ops_command_prefix", slack_ops_command_prefix.strip(), "str", "Optional command prefix required after mention in Slack ops requests."),
+                    ("slack_ops_user_role_map", slack_ops_user_role_map.strip(), "str", "Comma-separated Slack user-role map (`user_or_id:role`)."),
+                    ("slack_ops_allowed_channels", slack_ops_allowed_channels.strip(), "str", "Comma-separated Slack channels allowed for Slack Ops requests."),
+                    ("slack_ops_allowed_users", slack_ops_allowed_users.strip(), "str", "Comma-separated Slack users allowed for Slack Ops requests."),
                     ("slack_channel_sync_failures", slack_channel_sync_failures.strip(), "str", "Optional channel override for sync failure alerts."),
                     ("slack_channel_google_queue_failures", slack_channel_google_queue_failures.strip(), "str", "Optional channel override for Google queue failure alerts."),
                     ("slack_channel_integration_queue_failures", slack_channel_integration_queue_failures.strip(), "str", "Optional channel override for integration queue failure alerts."),
@@ -10989,6 +14412,11 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("slack_template_parity_decision", slack_template_parity_decision.strip(), "str", "Template for workspace parity release decision alerts."),
                     ("slack_template_followup_overdue", slack_template_followup_overdue.strip(), "str", "Template for overdue workspace rollout follow-up alerts."),
                     ("slack_template_system_health_critical", slack_template_system_health_critical.strip(), "str", "Template for System Health critical threshold alerts."),
+                    ("slack_template_backup_success", slack_template_backup_success.strip(), "str", "Template for successful scheduled backup notifications."),
+                    ("slack_template_backup_failure", slack_template_backup_failure.strip(), "str", "Template for failed scheduled backup notifications."),
+                    ("slack_template_business_status_report", slack_template_business_status_report.strip(), "str", "Template for manual business status report notifications."),
+                    ("slack_template_inventory_risk_report", slack_template_inventory_risk_report.strip(), "str", "Template for manual inventory risk report notifications."),
+                    ("slack_template_order_imported", slack_template_order_imported.strip(), "str", "Template for new eBay order imported notifications."),
                 ]
                 for key, value, value_type, description in updates:
                     repo.upsert_runtime_setting(
@@ -11004,6 +14432,656 @@ def render_admin(repo: InventoryRepository) -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"Unable to save Slack notification settings: {exc}")
+
+        st.markdown("#### Notification Routing")
+        st.caption("Choose delivery route per event type. Email routing is scoped and stored now; send pipeline will be enabled in a future milestone.")
+        route_options = ["slack", "email", "both", "disabled"]
+
+        def _route_index(value: str) -> int:
+            raw = str(value or "").strip().lower()
+            if raw in route_options:
+                return route_options.index(raw)
+            return 0
+
+        with st.form("admin_notification_routing_form"):
+            r1, r2 = st.columns(2)
+            with r1:
+                route_sync_failures = st.selectbox(
+                    "Route: Sync Failures",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_sync_failures", "slack")),
+                )
+                route_daily_report = st.selectbox(
+                    "Route: Daily Report",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_daily_report", "slack")),
+                )
+                route_backup_events = st.selectbox(
+                    "Route: Backup Events",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_backup_events", "slack")),
+                )
+            with r2:
+                route_system_health_critical = st.selectbox(
+                    "Route: System Health Critical",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_system_health_critical", "slack")),
+                )
+                route_business_reports = st.selectbox(
+                    "Route: Business Reports",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_business_reports", "slack")),
+                )
+                notification_email_enabled = st.checkbox(
+                    "Enable Notification Email Pipeline (future)",
+                    value=_rb("notification_email_enabled", False),
+                )
+                notification_email_recipients_csv = st.text_input(
+                    "Notification Email Recipients (CSV, future)",
+                    value=_rv("notification_email_recipients_csv", ""),
+                    placeholder="ops@goldenstackers.com, owner@goldenstackers.com",
+                )
+            save_notification_routing = st.form_submit_button("Save Notification Routing")
+        if save_notification_routing:
+            try:
+                route_updates = [
+                    ("notification_route_sync_failures", route_sync_failures, "str", "Notification route for sync failure events."),
+                    ("notification_route_daily_report", route_daily_report, "str", "Notification route for daily report events."),
+                    ("notification_route_backup_events", route_backup_events, "str", "Notification route for backup events."),
+                    ("notification_route_system_health_critical", route_system_health_critical, "str", "Notification route for system-health critical events."),
+                    ("notification_route_business_reports", route_business_reports, "str", "Notification route for manual business reports."),
+                    ("notification_email_enabled", "true" if notification_email_enabled else "false", "bool", "Enable notification email pipeline."),
+                    ("notification_email_recipients_csv", notification_email_recipients_csv.strip(), "str", "Default notification email recipients (CSV)."),
+                ]
+                for key, value, value_type, description in route_updates:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=key,
+                        value=str(value or "").strip(),
+                        value_type=value_type,
+                        description=description,
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("Notification routing settings saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save notification routing settings: {exc}")
+
+        st.markdown("#### Notification Outbox Controls")
+        st.caption(
+            "Configure retry/backoff/retention behavior for queued notifications and run manual outbox processing/cleanup."
+        )
+        with st.form("admin_notification_outbox_controls_form"):
+            o1, o2, o3 = st.columns(3)
+            with o1:
+                outbox_runner_enabled = st.checkbox(
+                    "Enable Outbox Runner",
+                    value=_rb("notification_outbox_runner_enabled", False),
+                )
+                outbox_runner_limit = st.number_input(
+                    "Runner Batch Limit",
+                    min_value=1,
+                    max_value=500,
+                    value=max(1, min(500, int(_rv("notification_outbox_runner_limit", "50") or "50"))),
+                    step=1,
+                )
+                outbox_backoff_base = st.number_input(
+                    "Backoff Base Seconds",
+                    min_value=10,
+                    max_value=3600,
+                    value=max(
+                        10,
+                        min(3600, int(_rv("notification_outbox_backoff_base_seconds", "60") or "60")),
+                    ),
+                    step=10,
+                )
+                outbox_backoff_max = st.number_input(
+                    "Backoff Max Seconds",
+                    min_value=10,
+                    max_value=86400,
+                    value=max(
+                        10,
+                        min(86400, int(_rv("notification_outbox_backoff_max_seconds", "3600") or "3600")),
+                    ),
+                    step=30,
+                )
+            with o2:
+                outbox_retain_sent_days = st.number_input(
+                    "Retention (Sent Days)",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(
+                        1,
+                        min(3650, int(_rv("notification_outbox_retain_sent_days", "14") or "14")),
+                    ),
+                    step=1,
+                )
+                outbox_retain_failed_days = st.number_input(
+                    "Retention (Failed Days)",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(
+                        1,
+                        min(3650, int(_rv("notification_outbox_retain_failed_days", "30") or "30")),
+                    ),
+                    step=1,
+                )
+                outbox_cleanup_enabled = st.checkbox(
+                    "Enable Daily Cleanup",
+                    value=_rb("notification_outbox_cleanup_enabled", True),
+                )
+                outbox_cleanup_timezone = st.text_input(
+                    "Cleanup Timezone",
+                    value=_rv("notification_outbox_cleanup_timezone", _rv("app_default_timezone", "America/Denver")),
+                )
+                outbox_cleanup_local_time = st.text_input(
+                    "Cleanup Local Time (HH:MM)",
+                    value=_rv("notification_outbox_cleanup_local_time", "03:15"),
+                )
+            with o3:
+                st.caption("Manual Actions")
+                run_now_limit = st.number_input(
+                    "Run-Now Limit",
+                    min_value=1,
+                    max_value=500,
+                    value=max(1, min(500, int(_rv("notification_outbox_runner_limit", "50") or "50"))),
+                    step=1,
+                    key="admin_notification_outbox_run_now_limit",
+                )
+                run_now = st.form_submit_button("Run Outbox Now")
+                cleanup_now = st.form_submit_button("Run Cleanup Now")
+                save_outbox_controls = st.form_submit_button("Save Outbox Controls")
+        if save_outbox_controls:
+            try:
+                outbox_updates = [
+                    ("notification_outbox_runner_enabled", "true" if outbox_runner_enabled else "false", "bool", "Enable sync-runner outbox processor."),
+                    ("notification_outbox_runner_limit", str(int(outbox_runner_limit)), "int", "Max queued outbox rows to process per sync-runner pass."),
+                    ("notification_outbox_backoff_base_seconds", str(int(outbox_backoff_base)), "int", "Base retry backoff seconds for notification outbox."),
+                    ("notification_outbox_backoff_max_seconds", str(int(outbox_backoff_max)), "int", "Max retry backoff seconds for notification outbox."),
+                    ("notification_outbox_retain_sent_days", str(int(outbox_retain_sent_days)), "int", "Retention window for sent outbox rows."),
+                    ("notification_outbox_retain_failed_days", str(int(outbox_retain_failed_days)), "int", "Retention window for failed outbox rows."),
+                    ("notification_outbox_cleanup_enabled", "true" if outbox_cleanup_enabled else "false", "bool", "Enable daily outbox retention cleanup."),
+                    ("notification_outbox_cleanup_timezone", str(outbox_cleanup_timezone or "").strip() or "America/Denver", "str", "IANA timezone for outbox cleanup schedule."),
+                    ("notification_outbox_cleanup_local_time", str(outbox_cleanup_local_time or "").strip() or "03:15", "str", "Local HH:MM time for outbox cleanup schedule."),
+                ]
+                for key, value, value_type, description in outbox_updates:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=key,
+                        value=value,
+                        value_type=value_type,
+                        description=description,
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("Notification outbox controls saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save outbox controls: {exc}")
+        if run_now:
+            try:
+                result = process_due_notification_outbox(
+                    repo,
+                    environment=settings.app_env,
+                    actor=user.username,
+                    limit=int(run_now_limit),
+                )
+                repo.log_integration_event(
+                    actor=user.username,
+                    integration="notification_outbox",
+                    action="manual_process_due",
+                    status="success",
+                    details={
+                        "due": int(result.get("due") or 0),
+                        "sent": int(result.get("sent") or 0),
+                        "failed": int(result.get("failed") or 0),
+                        "limit": int(run_now_limit),
+                    },
+                )
+                st.success(
+                    f"Outbox run completed: due={int(result.get('due') or 0)} "
+                    f"sent={int(result.get('sent') or 0)} failed={int(result.get('failed') or 0)}"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to run outbox now: {exc}")
+        if cleanup_now:
+            try:
+                result = cleanup_notification_outbox_retention(
+                    repo,
+                    environment=settings.app_env,
+                )
+                repo.log_integration_event(
+                    actor=user.username,
+                    integration="notification_outbox",
+                    action="manual_cleanup",
+                    status="success",
+                    details={
+                        "deleted_total": int(result.get("deleted_total") or 0),
+                        "deleted_sent": int(result.get("deleted_sent") or 0),
+                        "deleted_failed": int(result.get("deleted_failed") or 0),
+                    },
+                )
+                st.success(
+                    f"Cleanup completed: deleted_total={int(result.get('deleted_total') or 0)} "
+                    f"(sent={int(result.get('deleted_sent') or 0)}, failed={int(result.get('deleted_failed') or 0)})"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to run outbox cleanup now: {exc}")
+
+        try:
+            outbox_preview_rows = repo.list_notification_outbox(
+                environment=settings.app_env,
+                statuses={"queued", "retrying", "processing", "failed", "sent"},
+                limit=100,
+            )
+        except Exception:
+            outbox_preview_rows = []
+        if outbox_preview_rows:
+            status_counts = Counter(str(getattr(row, "status", "") or "").strip().lower() for row in outbox_preview_rows)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Outbox Queued", int(status_counts.get("queued", 0)))
+            m2.metric("Outbox Retrying", int(status_counts.get("retrying", 0)))
+            m3.metric("Outbox Failed", int(status_counts.get("failed", 0)))
+            m4.metric("Outbox Sent", int(status_counts.get("sent", 0)))
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": int(getattr(row, "id", 0) or 0),
+                            "status": str(getattr(row, "status", "") or ""),
+                            "channel": str(getattr(row, "channel", "") or ""),
+                            "event_type": str(getattr(row, "event_type", "") or ""),
+                            "attempt_count": int(getattr(row, "attempt_count", 0) or 0),
+                            "max_attempts": int(getattr(row, "max_attempts", 0) or 0),
+                            "next_attempt_at": getattr(row, "next_attempt_at", None),
+                            "last_error": str(getattr(row, "last_error", "") or "")[:220],
+                        }
+                        for row in outbox_preview_rows[:50]
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No notification outbox rows found.")
+
+        st.markdown("#### Lifecycle Archive Retention Controls")
+        st.caption(
+            "Configure archived-record retention windows for media/listings/lots/products and run manual cleanup."
+        )
+        if "admin_lifecycle_cleanup_last_result" not in st.session_state:
+            st.session_state["admin_lifecycle_cleanup_last_result"] = None
+        if "admin_lifecycle_cleanup_last_error" not in st.session_state:
+            st.session_state["admin_lifecycle_cleanup_last_error"] = ""
+        if "admin_lifecycle_cleanup_last_ran_at" not in st.session_state:
+            st.session_state["admin_lifecycle_cleanup_last_ran_at"] = ""
+        with st.form("admin_lifecycle_retention_controls_form"):
+            lc1, lc2, lc3 = st.columns(3)
+            with lc1:
+                lifecycle_cleanup_enabled = st.checkbox(
+                    "Enable Daily Lifecycle Cleanup",
+                    value=_rb("lifecycle_archive_cleanup_enabled", False),
+                )
+                lifecycle_cleanup_timezone = st.text_input(
+                    "Lifecycle Cleanup Timezone",
+                    value=_rv("lifecycle_archive_cleanup_timezone", _rv("app_default_timezone", "America/Denver")),
+                )
+                lifecycle_cleanup_local_time = st.text_input(
+                    "Lifecycle Cleanup Local Time (HH:MM)",
+                    value=_rv("lifecycle_archive_cleanup_local_time", "03:45"),
+                )
+            with lc2:
+                lifecycle_media_retain_days = st.number_input(
+                    "Media Archive Retain Days",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(1, min(3650, int(_rv("lifecycle_media_archive_retain_days", "180") or "180"))),
+                    step=1,
+                )
+                lifecycle_listing_retain_days = st.number_input(
+                    "Listing Archive Retain Days",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(1, min(3650, int(_rv("lifecycle_listing_archive_retain_days", "365") or "365"))),
+                    step=1,
+                )
+            with lc3:
+                lifecycle_lot_retain_days = st.number_input(
+                    "Lot Archive Retain Days",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(1, min(3650, int(_rv("lifecycle_lot_archive_retain_days", "365") or "365"))),
+                    step=1,
+                )
+                lifecycle_product_retain_days = st.number_input(
+                    "Product Archive Retain Days",
+                    min_value=1,
+                    max_value=3650,
+                    value=max(1, min(3650, int(_rv("lifecycle_product_archive_retain_days", "365") or "365"))),
+                    step=1,
+                )
+                st.caption("Manual Actions")
+                lifecycle_run_now = st.form_submit_button("Run Lifecycle Cleanup Now")
+                lifecycle_save_controls = st.form_submit_button("Save Lifecycle Controls")
+        if lifecycle_save_controls:
+            try:
+                lifecycle_updates = [
+                    (
+                        "lifecycle_archive_cleanup_enabled",
+                        "true" if lifecycle_cleanup_enabled else "false",
+                        "bool",
+                        "Enable daily archived-record lifecycle cleanup.",
+                    ),
+                    (
+                        "lifecycle_archive_cleanup_timezone",
+                        str(lifecycle_cleanup_timezone or "").strip() or "America/Denver",
+                        "str",
+                        "IANA timezone for lifecycle cleanup schedule.",
+                    ),
+                    (
+                        "lifecycle_archive_cleanup_local_time",
+                        str(lifecycle_cleanup_local_time or "").strip() or "03:45",
+                        "str",
+                        "Local HH:MM time for lifecycle cleanup schedule.",
+                    ),
+                    (
+                        "lifecycle_media_archive_retain_days",
+                        str(int(lifecycle_media_retain_days)),
+                        "int",
+                        "Retention window for archived media assets.",
+                    ),
+                    (
+                        "lifecycle_listing_archive_retain_days",
+                        str(int(lifecycle_listing_retain_days)),
+                        "int",
+                        "Retention window for archived marketplace listings.",
+                    ),
+                    (
+                        "lifecycle_lot_archive_retain_days",
+                        str(int(lifecycle_lot_retain_days)),
+                        "int",
+                        "Retention window for archived purchase lots.",
+                    ),
+                    (
+                        "lifecycle_product_archive_retain_days",
+                        str(int(lifecycle_product_retain_days)),
+                        "int",
+                        "Retention window for archived products.",
+                    ),
+                ]
+                for key, value, value_type, description in lifecycle_updates:
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key=key,
+                        value=value,
+                        value_type=value_type,
+                        description=description,
+                        is_active=True,
+                        actor=user.username,
+                    )
+                st.success("Lifecycle retention controls saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save lifecycle retention controls: {exc}")
+        if lifecycle_run_now:
+            try:
+                result = cleanup_lifecycle_retention(
+                    repo,
+                    actor=user.username,
+                )
+                repo.log_integration_event(
+                    actor=user.username,
+                    integration="lifecycle_retention",
+                    action="manual_cleanup",
+                    status="success",
+                    details={
+                        "retain_days_media": int(result.get("retain_days_media") or 0),
+                        "retain_days_listing": int(result.get("retain_days_listing") or 0),
+                        "retain_days_lot": int(result.get("retain_days_lot") or 0),
+                        "retain_days_product": int(result.get("retain_days_product") or 0),
+                        "deleted_archived_media": int(result.get("deleted_archived_media") or 0),
+                        "deleted_archived_listings": int(result.get("deleted_archived_listings") or 0),
+                        "deleted_archived_lots": int(result.get("deleted_archived_lots") or 0),
+                        "deleted_archived_products": int(result.get("deleted_archived_products") or 0),
+                        "skipped_listings_with_dependencies": int(
+                            result.get("skipped_listings_with_dependencies") or 0
+                        ),
+                        "skipped_lots_with_dependencies": int(
+                            result.get("skipped_lots_with_dependencies") or 0
+                        ),
+                        "skipped_products_with_dependencies": int(
+                            result.get("skipped_products_with_dependencies") or 0
+                        ),
+                    },
+                )
+                st.session_state["admin_lifecycle_cleanup_last_result"] = {
+                    **result,
+                    "status": "success",
+                    "actor": user.username,
+                    "env": settings.app_env,
+                }
+                st.session_state["admin_lifecycle_cleanup_last_error"] = ""
+                st.session_state["admin_lifecycle_cleanup_last_ran_at"] = utcnow_naive().isoformat(timespec="seconds")
+                st.success(
+                    "Lifecycle cleanup complete: "
+                    f"deleted_media={int(result.get('deleted_archived_media') or 0)}, "
+                    f"deleted_listings={int(result.get('deleted_archived_listings') or 0)}, "
+                    f"deleted_lots={int(result.get('deleted_archived_lots') or 0)}, "
+                    f"deleted_products={int(result.get('deleted_archived_products') or 0)}, "
+                    f"skipped_with_dependencies="
+                    f"{int(result.get('skipped_listings_with_dependencies') or 0) + int(result.get('skipped_lots_with_dependencies') or 0) + int(result.get('skipped_products_with_dependencies') or 0)}"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.session_state["admin_lifecycle_cleanup_last_result"] = None
+                st.session_state["admin_lifecycle_cleanup_last_error"] = str(exc)
+                st.session_state["admin_lifecycle_cleanup_last_ran_at"] = utcnow_naive().isoformat(timespec="seconds")
+                st.error(f"Unable to run lifecycle cleanup now: {exc}")
+        last_cleanup_result = st.session_state.get("admin_lifecycle_cleanup_last_result")
+        last_cleanup_error = str(st.session_state.get("admin_lifecycle_cleanup_last_error") or "").strip()
+        last_cleanup_ran_at = str(st.session_state.get("admin_lifecycle_cleanup_last_ran_at") or "").strip()
+        if last_cleanup_result or last_cleanup_error:
+            st.markdown("##### Last Lifecycle Cleanup Run")
+            if last_cleanup_ran_at:
+                st.caption(f"Last run at (UTC): {last_cleanup_ran_at}")
+            if last_cleanup_result:
+                st.code(
+                    json.dumps(last_cleanup_result, indent=2),
+                    language="json",
+                )
+            elif last_cleanup_error:
+                st.error(f"Last cleanup error: {last_cleanup_error}")
+
+        st.markdown("#### Business Status Reports")
+        st.caption("Send operational status snapshots to Slack on demand.")
+        route_business_reports_now = str(_rv("notification_route_business_reports", "slack") or "slack").strip().lower()
+        if route_business_reports_now in {"disabled", "email"}:
+            st.info(
+                "Business report route is set to "
+                f"`{route_business_reports_now}`. Switch route to `slack` or `both` to send Slack reports."
+            )
+        br1, br2, br3 = st.columns(3)
+        send_daily_business_report = br1.button("Send Daily Business Snapshot", key="admin_send_daily_business_snapshot_btn")
+        send_weekly_business_report = br2.button("Send Weekly Business Summary", key="admin_send_weekly_business_summary_btn")
+        send_inventory_risk_report = br3.button("Send Inventory Risk Snapshot", key="admin_send_inventory_risk_snapshot_btn")
+
+        if send_daily_business_report or send_weekly_business_report or send_inventory_risk_report:
+            if route_business_reports_now not in {"slack", "both"}:
+                st.error("Slack delivery is disabled by routing for business reports.")
+            else:
+                try:
+                    if send_weekly_business_report:
+                        context = _build_business_status_context(repo, days=7)
+                        event_type = "business_status_report"
+                        default_template = (
+                            ":bar_chart: *GoldenStackers Weekly Business Summary* (`{env}`)\n"
+                            "- Window: `{window_days}` day(s)\n"
+                            "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Orders: `{orders_window_count}`\n"
+                            "- Inventory cost basis: `${inventory_cost}`\n"
+                            "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
+                            "- Low stock items: `{low_stock_count}` | Unlisted products: `{unlisted_count}`\n"
+                            "- As of UTC: `{as_of_utc}`"
+                        )
+                    elif send_inventory_risk_report:
+                        context = _build_business_status_context(repo, days=7)
+                        event_type = "inventory_risk_report"
+                        default_template = (
+                            ":package: *GoldenStackers Inventory Risk Snapshot* (`{env}`)\n"
+                            "- Low stock items: `{low_stock_count}`\n"
+                            "- Unlisted products: `{unlisted_count}`\n"
+                            "- Draft listings: `{draft_count}`\n"
+                            "- Active listings: `{active_count}`\n"
+                            "- Inventory cost basis: `${inventory_cost}`\n"
+                            "- Sales (last `{window_days}`d): `{sales_window_count}` (net `${net_window}`)\n"
+                            "- As of UTC: `{as_of_utc}`"
+                        )
+                    else:
+                        context = _build_business_status_context(repo, days=1)
+                        event_type = "business_status_report"
+                        default_template = (
+                            ":clipboard: *GoldenStackers Daily Business Snapshot* (`{env}`)\n"
+                            "- Sales 24h: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Orders 24h: `{orders_window_count}`\n"
+                            "- Products: `{product_count}` | Listings: `{listing_count}`\n"
+                            "- Draft listings: `{draft_count}` | Low stock: `{low_stock_count}`\n"
+                            "- Inventory cost basis: `${inventory_cost}`\n"
+                            "- As of UTC: `{as_of_utc}`"
+                        )
+                    text = build_slack_alert_text(
+                        repo,
+                        event_type=event_type,
+                        default_template=default_template,
+                        context=context,
+                    )
+                    dispatch_result = dispatch_slack_alert(
+                        repo,
+                        actor=user.username,
+                        text=text,
+                        event_type=event_type,
+                        severity="info",
+                        override_channel=str(_rv("slack_channel_business_reports", "") or "").strip(),
+                    )
+                    st.success(
+                        f"Business status report dispatch result: `{dispatch_result.get('status', 'unknown')}` "
+                        f"(channel: `{dispatch_result.get('channel', '')}`)"
+                    )
+                except Exception as exc:
+                    st.error(f"Unable to send business status report: {exc}")
+
+        st.markdown("#### Notification Dry-Run Preview")
+        st.caption("Preview resolved Slack payload text and target channel before send.")
+        preview_options = [
+            "Daily Business Snapshot",
+            "Weekly Business Summary",
+            "Inventory Risk Snapshot",
+        ]
+        preview_choice = st.selectbox(
+            "Preview Report Type",
+            options=preview_options,
+            index=0,
+            key="admin_business_report_preview_choice",
+        )
+        preview_days = 1
+        preview_event_type = "business_status_report"
+        preview_default_template = (
+            ":clipboard: *GoldenStackers Daily Business Snapshot* (`{env}`)\n"
+            "- Sales 24h: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+            "- Orders 24h: `{orders_window_count}`\n"
+            "- Products: `{product_count}` | Listings: `{listing_count}`\n"
+            "- Draft listings: `{draft_count}` | Low stock: `{low_stock_count}`\n"
+            "- Inventory cost basis: `${inventory_cost}`\n"
+            "- As of UTC: `{as_of_utc}`"
+        )
+        if preview_choice == "Weekly Business Summary":
+            preview_days = 7
+            preview_default_template = (
+                ":bar_chart: *GoldenStackers Weekly Business Summary* (`{env}`)\n"
+                "- Window: `{window_days}` day(s)\n"
+                "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                "- Orders: `{orders_window_count}`\n"
+                "- Inventory cost basis: `${inventory_cost}`\n"
+                "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
+                "- Low stock items: `{low_stock_count}` | Unlisted products: `{unlisted_count}`\n"
+                "- As of UTC: `{as_of_utc}`"
+            )
+        elif preview_choice == "Inventory Risk Snapshot":
+            preview_days = 7
+            preview_event_type = "inventory_risk_report"
+            preview_default_template = (
+                ":package: *GoldenStackers Inventory Risk Snapshot* (`{env}`)\n"
+                "- Low stock items: `{low_stock_count}`\n"
+                "- Unlisted products: `{unlisted_count}`\n"
+                "- Draft listings: `{draft_count}`\n"
+                "- Active listings: `{active_count}`\n"
+                "- Inventory cost basis: `${inventory_cost}`\n"
+                "- Sales (last `{window_days}`d): `{sales_window_count}` (net `${net_window}`)\n"
+                "- As of UTC: `{as_of_utc}`"
+            )
+        preview_context = _build_business_status_context(repo, days=preview_days)
+        preview_text = build_slack_alert_text(
+            repo,
+            event_type=preview_event_type,
+            default_template=preview_default_template,
+            context=preview_context,
+        )
+        preview_channel = str(_rv("slack_channel_business_reports", "") or "").strip()
+        if not preview_channel:
+            preview_channel = str(_rv("slack_default_channel", "") or "").strip()
+        st.code(
+            (
+                f"route={route_business_reports_now or 'slack'}\n"
+                f"event_type={preview_event_type}\n"
+                f"channel={preview_channel or '(unresolved)'}\n\n"
+                f"{preview_text}"
+            ),
+            language="text",
+        )
+        st.text_area(
+            "Payload Text (copy)",
+            value=preview_text,
+            height=180,
+            key="admin_business_report_preview_payload_text",
+            help="Copy this rendered payload text directly for review or external notes.",
+        )
+        pv1, pv2 = st.columns(2)
+        send_preview_now = pv1.button(
+            "Send This Preview Now",
+            key="admin_send_business_report_preview_now_btn",
+        )
+        pv2.download_button(
+            "Copy/Download Payload (.txt)",
+            data=preview_text.encode("utf-8"),
+            file_name=f"business_report_preview_{preview_event_type}_{settings.app_env}.txt",
+            mime="text/plain",
+            key="admin_download_business_report_preview_payload_btn",
+        )
+        if send_preview_now:
+            if route_business_reports_now not in {"slack", "both"}:
+                st.error("Slack delivery is disabled by routing for business reports.")
+            elif not preview_channel:
+                st.error("No Slack channel resolved for preview send.")
+            else:
+                try:
+                    dispatch_result = dispatch_slack_alert(
+                        repo,
+                        actor=user.username,
+                        text=preview_text,
+                        event_type=preview_event_type,
+                        severity="info",
+                        override_channel=preview_channel,
+                    )
+                    st.success(
+                        f"Preview dispatch result: `{dispatch_result.get('status', 'unknown')}` "
+                        f"(channel: `{dispatch_result.get('channel', '')}`)"
+                    )
+                except Exception as exc:
+                    st.error(f"Unable to send preview payload: {exc}")
+        if not preview_channel:
+            st.warning("No Slack channel resolved. Set `slack_channel_business_reports` or `slack_default_channel`.")
 
         with st.form("admin_slack_test_send_form"):
             test_channel = st.text_input("Test Channel (optional, default uses slack_default_channel)", value="")
@@ -11045,62 +15123,122 @@ def render_admin(repo: InventoryRepository) -> None:
                     pass
                 st.error(f"Slack test send failed: {exc}")
 
+        st.markdown("#### Test eBay Order Import Alert")
+        test_order_channel = str(_rv("slack_channel_order_imports", "") or "").strip()
+        if not test_order_channel:
+            test_order_channel = str(_rv("slack_default_channel", "") or "").strip()
+        sample_order_context = {
+            "env": settings.app_env,
+            "order_id": "TEST-EBAY-ORDER-001",
+            "buyer": "sample-buyer",
+            "status": "not_shipped",
+            "total": "149.99",
+            "shipping": "9.99",
+            "tax": "5.21",
+            "line_item_count": 2,
+            "shipping_service": "USPS Ground Advantage",
+            "shipping_address": "Golden, CO, US",
+            "created_at": utcnow_naive().isoformat(timespec="seconds"),
+        }
+        sample_order_text = build_slack_alert_text(
+            repo,
+            event_type="order_imported",
+            default_template=(
+                ":package: *New eBay order imported*\n"
+                "- Env: `{env}`\n"
+                "- Order: `{order_id}`\n"
+                "- Buyer: `{buyer}`\n"
+                "- Status: `{status}`\n"
+                "- Total: `${total}` (shipping `${shipping}`, tax `${tax}`)\n"
+                "- Items: `{line_item_count}`\n"
+                "- Shipping service: `{shipping_service}`\n"
+                "- Ship to: `{shipping_address}`\n"
+                "- Created: `{created_at}`"
+            ),
+            context=sample_order_context,
+        )
+        st.code(
+            (
+                f"event_type=order_imported\n"
+                f"channel={test_order_channel or '(unresolved)'}\n\n"
+                f"{sample_order_text}"
+            ),
+            language="text",
+        )
+        if st.button("Send Test eBay Order Import Alert", key="admin_send_test_order_import_alert_btn"):
+            if not test_order_channel:
+                st.error("No Slack channel resolved. Set `slack_channel_order_imports` or `slack_default_channel`.")
+            else:
+                try:
+                    dispatch_result = dispatch_slack_alert(
+                        repo,
+                        actor=user.username,
+                        event_type="order_imported",
+                        severity="info",
+                        text=sample_order_text,
+                        override_channel=test_order_channel,
+                    )
+                    st.success(
+                        f"Test order-import alert dispatched: `{dispatch_result.get('status', 'unknown')}` "
+                        f"(channel: `{dispatch_result.get('channel', '')}`)"
+                    )
+                except Exception as exc:
+                    st.error(f"Unable to send test order-import alert: {exc}")
+
         st.markdown("#### Recent Slack Delivery Events")
-        slack_audit_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "integration_event",
-                AuditLog.created_at >= (utcnow_naive() - timedelta(days=14)),
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(500)
-        ).all()
-        slack_events: list[dict[str, str]] = []
-        for row in slack_audit_rows:
-            try:
-                payload = json.loads(row.changes_json or "{}")
-            except Exception:
-                payload = {}
-            after = payload.get("after") if isinstance(payload, dict) else {}
-            if not isinstance(after, dict):
-                after = {}
-            integration_name = str(after.get("integration") or "").strip().lower()
-            if not integration_name.startswith("slack"):
-                continue
-            details = after.get("details") if isinstance(after.get("details"), dict) else {}
-            slack_events.append(
-                {
-                    "created_at": row.created_at.isoformat() if row.created_at else "",
-                    "actor": row.actor,
-                    "integration": integration_name,
-                    "action": str(after.get("action") or row.action or ""),
-                    "status": str(after.get("status") or ""),
-                    "channel": str(details.get("channel") or ""),
-                    "ts": str(details.get("ts") or ""),
-                    "error": str(details.get("error") or "")[:220],
-                }
-            )
-        if slack_events:
-            st.dataframe(pd.DataFrame(slack_events), use_container_width=True)
+        if not load_slack_delivery_events:
+            st.caption("Slack delivery event history is deferred. Enable above to load.")
         else:
-            st.info("No Slack integration events in last 14 days.")
+            slack_audit_rows = _integration_event_rows(lookback_days=14, limit=500)
+            slack_events: list[dict[str, str]] = []
+            for row in slack_audit_rows:
+                try:
+                    payload = json.loads(row.changes_json or "{}")
+                except Exception:
+                    payload = {}
+                after = payload.get("after") if isinstance(payload, dict) else {}
+                if not isinstance(after, dict):
+                    after = {}
+                integration_name = str(after.get("integration") or "").strip().lower()
+                if not integration_name.startswith("slack"):
+                    continue
+                details = after.get("details") if isinstance(after.get("details"), dict) else {}
+                slack_events.append(
+                    {
+                        "created_at": row.created_at.isoformat() if row.created_at else "",
+                        "actor": row.actor,
+                        "integration": integration_name,
+                        "action": str(after.get("action") or row.action or ""),
+                        "status": str(after.get("status") or ""),
+                        "channel": str(details.get("channel") or ""),
+                        "ts": str(details.get("ts") or ""),
+                        "error": str(details.get("error") or "")[:220],
+                    }
+                )
+            if slack_events:
+                st.dataframe(pd.DataFrame(slack_events), use_container_width=True)
+            else:
+                st.info("No Slack integration events in last 14 days.")
 
         st.markdown("#### Slack Retry Queue")
-        try:
-            slack_queue_rows = repo.list_integration_queue_jobs(
-                environment=settings.app_env,
-                integration="slack",
-                statuses={"queued", "running", "failed", "success"},
-                limit=500,
-            )
-        except Exception as exc:
-            st.error(
-                "Integration queue table is not available yet. "
-                "Run database migrations first (`docker compose run --rm migrate`)."
-            )
-            st.caption(f"Details: {exc}")
+        if not load_slack_queue_jobs:
             slack_queue_rows = []
-
+            st.caption("Slack queue table hydration is deferred. Enable above to load.")
+        else:
+            try:
+                slack_queue_rows = repo.list_integration_queue_jobs(
+                    environment=settings.app_env,
+                    integration="slack",
+                    statuses={"queued", "running", "failed", "success"},
+                    limit=500,
+                )
+            except Exception as exc:
+                st.error(
+                    "Integration queue table is not available yet. "
+                    "Run database migrations first (`docker compose run --rm migrate`)."
+                )
+                st.caption(f"Details: {exc}")
+                slack_queue_rows = []
         if slack_queue_rows:
             slack_queue_df = pd.DataFrame(
                 [
@@ -11172,27 +15310,184 @@ def render_admin(repo: InventoryRepository) -> None:
                             st.error(f"Unable to retry selected Slack queue job: {exc}")
                 else:
                     st.info("No failed Slack queue jobs available.")
-        else:
+        elif load_slack_queue_jobs:
             st.info("No Slack queue jobs found for this environment.")
+
+        st.markdown("#### Slack Ops Queue (Bot)")
+        st.caption(
+            "Slack AI Ops command queue status with pending-approval visibility and direct triage controls."
+        )
+        if not load_slack_queue_jobs:
+            slack_ops_queue_rows = []
+            st.caption("Slack Ops queue hydration is deferred. Enable above to load.")
+        else:
+            try:
+                slack_ops_queue_rows = repo.list_integration_queue_jobs(
+                    environment=settings.app_env,
+                    integration="slack_ops",
+                    statuses={"queued", "running", "blocked", "failed", "success"},
+                    limit=500,
+                )
+            except Exception as exc:
+                st.error(
+                    "Slack Ops queue table is not available yet. "
+                    "Run database migrations first (`docker compose run --rm migrate`)."
+                )
+                st.caption(f"Details: {exc}")
+                slack_ops_queue_rows = []
+        if slack_ops_queue_rows:
+            snapshot = _slack_ops_queue_snapshot(slack_ops_queue_rows, now=utcnow_naive())
+            so1, so2, so3, so4, so5, so6 = st.columns(6)
+            so1.metric("Total", int(snapshot["total_count"]))
+            so2.metric("Queued", int(snapshot["queued_count"]))
+            so3.metric("Running", int(snapshot["running_count"]))
+            so4.metric("Blocked", int(snapshot["blocked_count"]))
+            so5.metric("Success", int(snapshot["success_count"]))
+            so6.metric("Failed", int(snapshot["failed_count"]))
+            so7, so8, so9 = st.columns(3)
+            so7.metric("Pending Approvals", int(snapshot["pending_approval_count"]))
+            so8.metric("Approval SLA Avg (h)", f"{float(snapshot['pending_approval_avg_hours']):.2f}")
+            so9.metric("Approval SLA Max (h)", f"{float(snapshot['pending_approval_max_hours']):.2f}")
+
+            slack_ops_df = pd.DataFrame(
+                [
+                    {
+                        "id": row["id"],
+                        "intent": row["intent"],
+                        "action": row["action"],
+                        "status": row["status"],
+                        "retry_count": row["retry_count"],
+                        "max_retries": row["max_retries"],
+                        "requested_by": row["requested_by"],
+                        "approval_required": row["approval_required"],
+                        "approval_status": row["approval_status"],
+                        "approval_requested_at": row["approval_requested_at"],
+                        "approval_requested_by": row["approval_requested_by"],
+                        "approval_approved_at": row["approval_approved_at"],
+                        "approval_approved_by": row["approval_approved_by"],
+                        "pending_approval_age_hours": row["pending_approval_age_hours"],
+                        "next_attempt_at": row["next_attempt_at"].isoformat() if row["next_attempt_at"] else "",
+                        "created_at": row["created_at"].isoformat() if row["created_at"] else "",
+                        "last_error": str(row["last_error"] or "")[:250],
+                    }
+                    for row in snapshot["rows"]
+                ]
+            )
+            st.dataframe(slack_ops_df, use_container_width=True)
+            soq1, soq2, soq3 = st.columns(3)
+            with soq1:
+                if st.button("Run Due Slack Ops Jobs Now", key="admin_slack_ops_queue_run_due_btn"):
+                    try:
+                        summary = process_due_integration_queue_jobs(
+                            repo,
+                            integration="slack_ops",
+                            actor=user.username,
+                            limit=20,
+                        )
+                        st.success(
+                            f"Processed {summary['processed']} Slack Ops job(s): "
+                            f"{summary['success']} success, {summary['queued']} re-queued, {summary['failed']} failed."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to run due Slack Ops queue jobs: {exc}")
+            with soq2:
+                slack_ops_failed_only = [row for row in snapshot["rows"] if str(row["status"] or "").lower() == "failed"]
+                if slack_ops_failed_only:
+                    row_map = {
+                        f"#{row['id']} | {row['intent']} | retry {row['retry_count']}/{row['max_retries']}": row
+                        for row in slack_ops_failed_only
+                    }
+                    selected_key = st.selectbox(
+                        "Retry Failed Slack Ops Job",
+                        options=list(row_map.keys()),
+                        key="admin_slack_ops_queue_retry_failed_select",
+                    )
+                    if st.button("Retry Selected Slack Ops Job", key="admin_slack_ops_queue_retry_failed_btn"):
+                        selected_row = row_map[selected_key]
+                        try:
+                            repo.update_integration_queue_job(
+                                int(selected_row["id"]),
+                                {"status": "queued", "next_attempt_at": utcnow_naive()},
+                                actor=user.username,
+                            )
+                            ok, msg = process_integration_queue_job(
+                                repo,
+                                job_id=int(selected_row["id"]),
+                                actor=user.username,
+                            )
+                            if ok:
+                                st.success(f"Retry succeeded for Slack Ops queue job #{selected_row['id']}. {msg}")
+                            else:
+                                st.warning(
+                                    f"Retry did not complete successfully for Slack Ops queue job #{selected_row['id']}. {msg}"
+                                )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Unable to retry selected Slack Ops queue job: {exc}")
+                else:
+                    st.info("No failed Slack Ops queue jobs available.")
+            with soq3:
+                slack_ops_pending = [
+                    row
+                    for row in snapshot["rows"]
+                    if str(row["status"] or "").lower() == "blocked"
+                    and bool(row["approval_required"])
+                    and str(row["approval_status"] or "").lower() == "pending"
+                ]
+                if slack_ops_pending:
+                    pending_map = {
+                        f"#{row['id']} | {row['intent']} | requested_by={row['approval_requested_by'] or row['requested_by']}": row
+                        for row in slack_ops_pending
+                    }
+                    selected_pending_key = st.selectbox(
+                        "Approve Pending Slack Ops Job",
+                        options=list(pending_map.keys()),
+                        key="admin_slack_ops_queue_approve_select",
+                    )
+                    if st.button("Approve Selected Slack Ops Job", key="admin_slack_ops_queue_approve_btn"):
+                        selected_row = pending_map[selected_pending_key]
+                        try:
+                            outcome = approve_slack_ops_queue_job(
+                                repo,
+                                queue_job_id=int(selected_row["id"]),
+                                approver_username=user.username,
+                                approver_role=str(getattr(user, "role", "") or ""),
+                                actor=user.username,
+                            )
+                            if str(outcome.get("status") or "").lower() == "approved":
+                                st.success(f"Approved Slack Ops queue job #{selected_row['id']}.")
+                            else:
+                                st.warning(f"Approval not applied: {outcome}")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Unable to approve selected Slack Ops queue job: {exc}")
+                else:
+                    st.info("No pending Slack Ops approvals.")
+        elif load_slack_queue_jobs:
+            st.info("No Slack Ops queue jobs found for this environment.")
 
         st.divider()
         st.markdown("#### Google Retry Queue")
         st.caption("Durable retry queue for failed Google Gmail/Calendar/Drive actions with backoff scheduling.")
-        try:
-            queue_rows = repo.list_integration_queue_jobs(
-                environment=settings.app_env,
-                integration="google",
-                statuses={"queued", "running", "failed", "success"},
-                limit=500,
-            )
-        except Exception as exc:
-            st.error(
-                "Integration queue table is not available yet. "
-                "Run database migrations first (`docker compose run --rm migrate`)."
-            )
-            st.caption(f"Details: {exc}")
+        if not load_google_queue_jobs:
             queue_rows = []
-
+            st.caption("Google queue table hydration is deferred. Enable above to load.")
+        else:
+            try:
+                queue_rows = repo.list_integration_queue_jobs(
+                    environment=settings.app_env,
+                    integration="google",
+                    statuses={"queued", "running", "failed", "success"},
+                    limit=500,
+                )
+            except Exception as exc:
+                st.error(
+                    "Integration queue table is not available yet. "
+                    "Run database migrations first (`docker compose run --rm migrate`)."
+                )
+                st.caption(f"Details: {exc}")
+                queue_rows = []
         if queue_rows:
             queue_df = pd.DataFrame(
                 [
@@ -11260,7 +15555,7 @@ def render_admin(repo: InventoryRepository) -> None:
                             st.error(f"Unable to retry selected job: {exc}")
                 else:
                     st.info("No failed queue jobs available.")
-        else:
+        elif load_google_queue_jobs:
             st.info("No Google queue jobs found for this environment.")
 
     with tab_comp_config:
@@ -11765,6 +16060,11 @@ def render_admin(repo: InventoryRepository) -> None:
             )
             st.code(snippet, language="bash")
 
+        st.caption(
+            "Legacy eBay Finding controls have been removed from this Admin view. "
+            "Comp workflows use sold-results HTML and web fallback sources."
+        )
+
         st.markdown("### Governance Snapshot Scheduler Status")
         worker_snapshots = repo.db.scalars(
             select(AuditLog)
@@ -12216,652 +16516,677 @@ def render_admin(repo: InventoryRepository) -> None:
 
         st.markdown("### Navigation Telemetry")
         st.caption("Derived from audit events (`entity_type=navigation`) to tune IA and workflow grouping.")
-        nav_query = select(AuditLog).where(AuditLog.entity_type == "navigation")
+        load_navigation_telemetry = st.checkbox(
+            "Load Navigation Telemetry (slower)",
+            value=False,
+            key="admin_load_navigation_telemetry",
+        )
         window_start_dt = None
         if current_window_start_raw:
             try:
                 window_start_dt = datetime.fromisoformat(current_window_start_raw)
             except Exception:
                 window_start_dt = None
-        if window_start_dt is not None:
-            nav_query = nav_query.where(AuditLog.created_at >= window_start_dt)
-            st.caption(f"Telemetry window start: `{window_start_dt.isoformat(timespec='seconds')}`")
-        nav_events = repo.db.scalars(nav_query.order_by(AuditLog.created_at.desc()).limit(1500)).all()
-        if not nav_events:
-            st.info("No navigation telemetry events recorded yet.")
+        if not load_navigation_telemetry:
+            st.caption("Navigation telemetry is skipped by default. Enable `Load Navigation Telemetry (slower)` to fetch it.")
         else:
-            page_view_counter: Counter[str] = Counter()
-            switch_counter: Counter[str] = Counter()
-            bounce_counter: Counter[str] = Counter()
-            handoff_applied_counter: Counter[str] = Counter()
-            handoff_cleared_counter: Counter[str] = Counter()
-            event_rows: list[dict] = []
-            for row in nav_events:
-                payload = _audit_changes(row)
-                action = str(row.action or "").strip().lower()
-                if action == "page_view":
-                    page_key = str(payload.get("page") or payload.get("page_title") or "unknown")
-                    page_view_counter[page_key] += 1
-                elif action == "page_switch":
-                    from_page = str(payload.get("from_page") or "").strip()
-                    to_page = str(payload.get("to_page") or "").strip()
-                    if from_page or to_page:
-                        edge = f"{from_page or '?'} -> {to_page or '?'}"
-                        switch_counter[edge] += 1
-                        try:
-                            delta = float(payload.get("seconds_since_last_page") or 0.0)
-                        except Exception:
-                            delta = 0.0
-                        if delta > 0.0 and delta < 10.0:
-                            bounce_counter[edge] += 1
-                elif action == "workspace_handoff_applied":
-                    target = str(payload.get("to") or payload.get("target") or "unknown").strip().lower() or "unknown"
-                    handoff_applied_counter[target] += 1
-                elif action == "workspace_handoff_cleared":
-                    target = str(payload.get("target") or payload.get("to") or "unknown").strip().lower() or "unknown"
-                    handoff_cleared_counter[target] += 1
-                event_rows.append(
-                    {
-                        "id": row.id,
-                        "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
-                        "actor": row.actor,
-                        "action": row.action,
-                        "changes": json.dumps(payload)[:400],
-                    }
-                )
-
-            n1, n2, n3 = st.columns(3)
-            n1.metric("Total Nav Events", len(nav_events))
-            n2.metric("Unique Page Views", len(page_view_counter))
-            n3.metric("Unique Switch Paths", len(switch_counter))
-
-            top_pages_df = pd.DataFrame(
-                [{"page": page, "views": count} for page, count in page_view_counter.most_common(20)]
-            )
-            top_switch_df = pd.DataFrame(
-                [
-                    {"switch_path": path, "count": count, "bounce_lt_10s": int(bounce_counter.get(path, 0))}
-                    for path, count in switch_counter.most_common(20)
-                ]
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("#### Most Visited Pages")
-                if top_pages_df.empty:
-                    st.caption("No page-view telemetry yet.")
-                else:
-                    st.dataframe(top_pages_df, use_container_width=True, hide_index=True)
-            with c2:
-                st.markdown("#### Most Common Switch Paths")
-                if top_switch_df.empty:
-                    st.caption("No page-switch telemetry yet.")
-                else:
-                    st.dataframe(top_switch_df, use_container_width=True, hide_index=True)
-
-            st.markdown("#### Handoff Telemetry")
-            total_handoff_applied = int(sum(handoff_applied_counter.values()))
-            total_handoff_cleared = int(sum(handoff_cleared_counter.values()))
-            clear_rate = (float(total_handoff_cleared) / float(total_handoff_applied)) if total_handoff_applied else 0.0
-            handoff_df_for_export = pd.DataFrame()
-            h1, h2, h3 = st.columns(3)
-            h1.metric("Handoff Applied", total_handoff_applied)
-            h2.metric("Handoff Cleared", total_handoff_cleared)
-            h3.metric("Handoff Clear Rate", f"{clear_rate * 100:.1f}%")
-            handoff_targets = sorted(set(handoff_applied_counter.keys()) | set(handoff_cleared_counter.keys()))
-            if handoff_targets:
-                handoff_df = pd.DataFrame(
-                    [
-                        {
-                            "target": target,
-                            "applied_count": int(handoff_applied_counter.get(target, 0)),
-                            "cleared_count": int(handoff_cleared_counter.get(target, 0)),
-                            "clear_rate": round(
-                                (
-                                    float(handoff_cleared_counter.get(target, 0))
-                                    / float(handoff_applied_counter.get(target, 0))
-                                )
-                                if int(handoff_applied_counter.get(target, 0)) > 0
-                                else 0.0,
-                                4,
-                            ),
-                        }
-                        for target in handoff_targets
-                    ]
-                ).sort_values(by=["applied_count", "target"], ascending=[False, True])
-                handoff_df_for_export = handoff_df.copy()
-                st.dataframe(handoff_df, use_container_width=True, hide_index=True)
+            nav_query = select(AuditLog).where(AuditLog.entity_type == "navigation")
+            if window_start_dt is not None:
+                nav_query = nav_query.where(AuditLog.created_at >= window_start_dt)
+                st.caption(f"Telemetry window start: `{window_start_dt.isoformat(timespec='seconds')}`")
+            nav_events = repo.db.scalars(nav_query.order_by(AuditLog.created_at.desc()).limit(1500)).all()
+            if not nav_events:
+                st.info("No navigation telemetry events recorded yet.")
             else:
-                st.caption("No workspace handoff telemetry recorded yet.")
-            handoff_event_rows = [
-                {
-                    "id": row.id,
-                    "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
-                    "actor": str(row.actor or ""),
-                    "action": str(row.action or ""),
-                    "target": str(
-                        _audit_changes(row).get("target", "")
-                        or _audit_changes(row).get("to", "")
-                        or "unknown"
-                    ).strip().lower(),
-                    "summary": json.dumps(_audit_changes(row))[:220],
-                }
-                for row in nav_events
-                if str(row.action or "").strip().lower() in {"workspace_handoff_applied", "workspace_handoff_cleared"}
-            ]
-            with st.expander("Recent Handoff Events", expanded=False):
-                if not handoff_event_rows:
-                    st.caption("No handoff events recorded in this telemetry window.")
+                page_view_counter: Counter[str] = Counter()
+                switch_counter: Counter[str] = Counter()
+                bounce_counter: Counter[str] = Counter()
+                handoff_applied_counter: Counter[str] = Counter()
+                handoff_cleared_counter: Counter[str] = Counter()
+                nav_payload_by_id: dict[int, dict[str, Any]] = {}
+                event_rows: list[dict] = []
+                for row in nav_events:
+                    payload = _audit_changes(row)
+                    nav_payload_by_id[int(row.id)] = payload if isinstance(payload, dict) else {}
+                    action = str(row.action or "").strip().lower()
+                    if action == "page_view":
+                        page_key = str(payload.get("page") or payload.get("page_title") or "unknown")
+                        page_view_counter[page_key] += 1
+                    elif action == "page_switch":
+                        from_page = str(payload.get("from_page") or "").strip()
+                        to_page = str(payload.get("to_page") or "").strip()
+                        if from_page or to_page:
+                            edge = f"{from_page or '?'} -> {to_page or '?'}"
+                            switch_counter[edge] += 1
+                            try:
+                                delta = float(payload.get("seconds_since_last_page") or 0.0)
+                            except Exception:
+                                delta = 0.0
+                            if delta > 0.0 and delta < 10.0:
+                                bounce_counter[edge] += 1
+                    elif action == "workspace_handoff_applied":
+                        target = str(payload.get("to") or payload.get("target") or "unknown").strip().lower() or "unknown"
+                        handoff_applied_counter[target] += 1
+                    elif action == "workspace_handoff_cleared":
+                        target = str(payload.get("target") or payload.get("to") or "unknown").strip().lower() or "unknown"
+                        handoff_cleared_counter[target] += 1
+                    event_rows.append(
+                        {
+                            "id": row.id,
+                            "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                            "actor": row.actor,
+                            "action": row.action,
+                            "changes": json.dumps(payload)[:400],
+                        }
+                    )
+    
+                n1, n2, n3 = st.columns(3)
+                n1.metric("Total Nav Events", len(nav_events))
+                n2.metric("Unique Page Views", len(page_view_counter))
+                n3.metric("Unique Switch Paths", len(switch_counter))
+    
+                top_pages_df = pd.DataFrame(
+                    [{"page": page, "views": count} for page, count in page_view_counter.most_common(20)]
+                )
+                top_switch_df = pd.DataFrame(
+                    [
+                        {"switch_path": path, "count": count, "bounce_lt_10s": int(bounce_counter.get(path, 0))}
+                        for path, count in switch_counter.most_common(20)
+                    ]
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("#### Most Visited Pages")
+                    if top_pages_df.empty:
+                        st.caption("No page-view telemetry yet.")
+                    else:
+                        st.dataframe(top_pages_df, use_container_width=True, hide_index=True)
+                with c2:
+                    st.markdown("#### Most Common Switch Paths")
+                    if top_switch_df.empty:
+                        st.caption("No page-switch telemetry yet.")
+                    else:
+                        st.dataframe(top_switch_df, use_container_width=True, hide_index=True)
+    
+                st.markdown("#### Handoff Telemetry")
+                total_handoff_applied = int(sum(handoff_applied_counter.values()))
+                total_handoff_cleared = int(sum(handoff_cleared_counter.values()))
+                clear_rate = (float(total_handoff_cleared) / float(total_handoff_applied)) if total_handoff_applied else 0.0
+                handoff_df_for_export = pd.DataFrame()
+                h1, h2, h3 = st.columns(3)
+                h1.metric("Handoff Applied", total_handoff_applied)
+                h2.metric("Handoff Cleared", total_handoff_cleared)
+                h3.metric("Handoff Clear Rate", f"{clear_rate * 100:.1f}%")
+                handoff_targets = sorted(set(handoff_applied_counter.keys()) | set(handoff_cleared_counter.keys()))
+                if handoff_targets:
+                    handoff_df = pd.DataFrame(
+                        [
+                            {
+                                "target": target,
+                                "applied_count": int(handoff_applied_counter.get(target, 0)),
+                                "cleared_count": int(handoff_cleared_counter.get(target, 0)),
+                                "clear_rate": round(
+                                    (
+                                        float(handoff_cleared_counter.get(target, 0))
+                                        / float(handoff_applied_counter.get(target, 0))
+                                    )
+                                    if int(handoff_applied_counter.get(target, 0)) > 0
+                                    else 0.0,
+                                    4,
+                                ),
+                            }
+                            for target in handoff_targets
+                        ]
+                    ).sort_values(by=["applied_count", "target"], ascending=[False, True])
+                    handoff_df_for_export = handoff_df.copy()
+                    st.dataframe(handoff_df, use_container_width=True, hide_index=True)
                 else:
-                    handoff_events_df = pd.DataFrame(handoff_event_rows)
-                    hf1, hf2, hf3 = st.columns(3)
-                    with hf1:
-                        action_filter = st.multiselect(
-                            "Action",
-                            options=sorted(handoff_events_df["action"].dropna().unique().tolist()),
-                            default=[],
-                            key="admin_handoff_events_action_filter",
-                        )
-                    with hf2:
-                        target_filter = st.multiselect(
-                            "Target",
-                            options=sorted(handoff_events_df["target"].dropna().unique().tolist()),
-                            default=[],
-                            key="admin_handoff_events_target_filter",
-                        )
-                    with hf3:
-                        actor_filter = st.multiselect(
-                            "Actor",
-                            options=sorted(handoff_events_df["actor"].dropna().unique().tolist()),
-                            default=[],
-                            key="admin_handoff_events_actor_filter",
-                        )
-                    filtered_handoff_df = handoff_events_df
-                    if action_filter:
-                        filtered_handoff_df = filtered_handoff_df[
-                            filtered_handoff_df["action"].isin(action_filter)
-                        ]
-                    if target_filter:
-                        filtered_handoff_df = filtered_handoff_df[
-                            filtered_handoff_df["target"].isin(target_filter)
-                        ]
-                    if actor_filter:
-                        filtered_handoff_df = filtered_handoff_df[
-                            filtered_handoff_df["actor"].isin(actor_filter)
-                        ]
-                    top_actor = ""
-                    top_target = ""
-                    most_cleared_target = ""
-                    if not filtered_handoff_df.empty:
-                        actor_counts = (
-                            filtered_handoff_df["actor"]
-                            .fillna("")
-                            .astype(str)
-                            .str.strip()
-                            .loc[lambda s: s != ""]
-                            .value_counts()
-                        )
-                        if not actor_counts.empty:
-                            top_actor = str(actor_counts.index[0])
-                        target_counts = (
-                            filtered_handoff_df["target"]
-                            .fillna("")
-                            .astype(str)
-                            .str.strip()
-                            .loc[lambda s: s != ""]
-                            .value_counts()
-                        )
-                        if not target_counts.empty:
-                            top_target = str(target_counts.index[0])
-                        cleared_df = filtered_handoff_df[
-                            filtered_handoff_df["action"].astype(str).str.lower() == "workspace_handoff_cleared"
-                        ]
-                        if not cleared_df.empty:
-                            cleared_counts = (
-                                cleared_df["target"]
+                    st.caption("No workspace handoff telemetry recorded yet.")
+                handoff_event_rows: list[dict[str, Any]] = []
+                for row in nav_events:
+                    if str(row.action or "").strip().lower() not in {
+                        "workspace_handoff_applied",
+                        "workspace_handoff_cleared",
+                    }:
+                        continue
+                    payload = nav_payload_by_id.get(int(row.id), {})
+                    handoff_event_rows.append(
+                        {
+                            "id": row.id,
+                            "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                            "actor": str(row.actor or ""),
+                            "action": str(row.action or ""),
+                            "target": str(payload.get("target", "") or payload.get("to", "") or "unknown")
+                            .strip()
+                            .lower(),
+                            "summary": json.dumps(payload)[:220],
+                        }
+                    )
+                with st.expander("Recent Handoff Events", expanded=False):
+                    if not handoff_event_rows:
+                        st.caption("No handoff events recorded in this telemetry window.")
+                    else:
+                        handoff_events_df = pd.DataFrame(handoff_event_rows)
+                        hf1, hf2, hf3 = st.columns(3)
+                        with hf1:
+                            action_filter = st.multiselect(
+                                "Action",
+                                options=sorted(handoff_events_df["action"].dropna().unique().tolist()),
+                                default=[],
+                                key="admin_handoff_events_action_filter",
+                            )
+                        with hf2:
+                            target_filter = st.multiselect(
+                                "Target",
+                                options=sorted(handoff_events_df["target"].dropna().unique().tolist()),
+                                default=[],
+                                key="admin_handoff_events_target_filter",
+                            )
+                        with hf3:
+                            actor_filter = st.multiselect(
+                                "Actor",
+                                options=sorted(handoff_events_df["actor"].dropna().unique().tolist()),
+                                default=[],
+                                key="admin_handoff_events_actor_filter",
+                            )
+                        filtered_handoff_df = handoff_events_df
+                        if action_filter:
+                            filtered_handoff_df = filtered_handoff_df[
+                                filtered_handoff_df["action"].isin(action_filter)
+                            ]
+                        if target_filter:
+                            filtered_handoff_df = filtered_handoff_df[
+                                filtered_handoff_df["target"].isin(target_filter)
+                            ]
+                        if actor_filter:
+                            filtered_handoff_df = filtered_handoff_df[
+                                filtered_handoff_df["actor"].isin(actor_filter)
+                            ]
+                        top_actor = ""
+                        top_target = ""
+                        most_cleared_target = ""
+                        if not filtered_handoff_df.empty:
+                            actor_counts = (
+                                filtered_handoff_df["actor"]
                                 .fillna("")
                                 .astype(str)
                                 .str.strip()
                                 .loc[lambda s: s != ""]
                                 .value_counts()
                             )
-                            if not cleared_counts.empty:
-                                most_cleared_target = str(cleared_counts.index[0])
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Top Actor", top_actor or "n/a")
-                    k2.metric("Top Target", top_target or "n/a")
-                    k3.metric("Most Cleared Target", most_cleared_target or "n/a")
-                    st.download_button(
-                        "Download Handoff Events CSV",
-                        data=filtered_handoff_df.to_csv(index=False).encode("utf-8"),
-                        file_name=f"handoff_events_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        key="admin_handoff_events_csv_btn",
-                    )
-                    bundle_buffer = BytesIO()
-                    with zipfile.ZipFile(bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
-                        handoff_kpis_df = pd.DataFrame(
-                            [
-                                {
-                                    "environment": settings.app_env,
-                                    "total_handoff_applied": int(total_handoff_applied),
-                                    "total_handoff_cleared": int(total_handoff_cleared),
-                                    "handoff_clear_rate_pct": round(float(clear_rate) * 100.0, 2),
-                                    "top_actor": top_actor or "",
-                                    "top_target": top_target or "",
-                                    "most_cleared_target": most_cleared_target or "",
-                                    "generated_at_utc": utcnow_naive().isoformat(),
-                                }
+                            if not actor_counts.empty:
+                                top_actor = str(actor_counts.index[0])
+                            target_counts = (
+                                filtered_handoff_df["target"]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .loc[lambda s: s != ""]
+                                .value_counts()
+                            )
+                            if not target_counts.empty:
+                                top_target = str(target_counts.index[0])
+                            cleared_df = filtered_handoff_df[
+                                filtered_handoff_df["action"].astype(str).str.lower() == "workspace_handoff_cleared"
                             ]
+                            if not cleared_df.empty:
+                                cleared_counts = (
+                                    cleared_df["target"]
+                                    .fillna("")
+                                    .astype(str)
+                                    .str.strip()
+                                    .loc[lambda s: s != ""]
+                                    .value_counts()
+                                )
+                                if not cleared_counts.empty:
+                                    most_cleared_target = str(cleared_counts.index[0])
+                        k1, k2, k3 = st.columns(3)
+                        k1.metric("Top Actor", top_actor or "n/a")
+                        k2.metric("Top Target", top_target or "n/a")
+                        k3.metric("Most Cleared Target", most_cleared_target or "n/a")
+                        st.download_button(
+                            "Download Handoff Events CSV",
+                            data=filtered_handoff_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"handoff_events_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="admin_handoff_events_csv_btn",
                         )
-                        bundle_zip.writestr("handoff_kpis.csv", handoff_kpis_df.to_csv(index=False))
-                        if not handoff_df_for_export.empty:
-                            agg_df = handoff_df_for_export.copy()
-                            agg_df.insert(0, "environment", settings.app_env)
-                            bundle_zip.writestr(
-                                "handoff_target_aggregate.csv",
-                                agg_df.to_csv(index=False),
-                            )
-                        bundle_zip.writestr(
-                            "handoff_events_filtered.csv",
-                            filtered_handoff_df.to_csv(index=False),
-                        )
-                        full_events_df = handoff_events_df.copy()
-                        full_events_df.insert(0, "environment", settings.app_env)
-                        bundle_zip.writestr(
-                            "handoff_events_full_window.csv",
-                            full_events_df.to_csv(index=False),
-                        )
-                    bundle_buffer.seek(0)
-                    st.download_button(
-                        "Export Handoff Governance Bundle (ZIP)",
-                        data=bundle_buffer.getvalue(),
-                        file_name=f"handoff_governance_bundle_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.zip",
-                        mime="application/zip",
-                        key="admin_handoff_events_bundle_zip_btn",
-                    )
-                    st.dataframe(
-                        filtered_handoff_df.head(200),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-            with st.expander("Recent Navigation Events", expanded=False):
-                st.dataframe(pd.DataFrame(event_rows[:200]), use_container_width=True, hide_index=True)
-
-            st.markdown("#### Workflow Baseline Metrics")
-            switch_events: list[dict] = []
-            for row in nav_events:
-                payload = _audit_changes(row)
-                if str(row.action or "").strip().lower() != "page_switch":
-                    continue
-                try:
-                    delta = float(payload.get("seconds_since_last_page") or 0.0)
-                except Exception:
-                    delta = 0.0
-                switch_events.append(
-                    {
-                        "actor": str(row.actor or "unknown"),
-                        "created_at": row.created_at,
-                        "from_page": str(payload.get("from_page") or "").strip().lower(),
-                        "to_page": str(payload.get("to_page") or "").strip().lower(),
-                        "delta_s": delta,
-                    }
-                )
-
-            if not switch_events:
-                st.caption("No page-switch telemetry yet for baseline metrics.")
-            else:
-                def _median(values: list[float]) -> float:
-                    vals = sorted(v for v in values if v >= 0)
-                    if not vals:
-                        return 0.0
-                    n = len(vals)
-                    mid = n // 2
-                    if n % 2 == 1:
-                        return float(vals[mid])
-                    return float((vals[mid - 1] + vals[mid]) / 2.0)
-
-                all_deltas = [float(r["delta_s"]) for r in switch_events if float(r["delta_s"]) > 0]
-                bounce_count = len([v for v in all_deltas if v < 10.0])
-                bounce_rate = (bounce_count / len(all_deltas)) if all_deltas else 0.0
-
-                # Session click-depth: per actor, new session starts after 30m inactivity.
-                sessions: list[int] = []
-                by_actor: dict[str, list[dict]] = {}
-                for row in switch_events:
-                    by_actor.setdefault(str(row["actor"]), []).append(row)
-                for actor_rows in by_actor.values():
-                    actor_rows_sorted = sorted(actor_rows, key=lambda r: r["created_at"] or utcnow_naive())
-                    session_count = 0
-                    prev_ts = None
-                    for ev in actor_rows_sorted:
-                        ts = ev["created_at"]
-                        if ts is None:
-                            continue
-                        if prev_ts is None or (ts - prev_ts).total_seconds() > 1800:
-                            if session_count > 0:
-                                sessions.append(session_count)
-                            session_count = 1
-                        else:
-                            session_count += 1
-                        prev_ts = ts
-                    if session_count > 0:
-                        sessions.append(session_count)
-
-                def _workflow_median(pairs: set[tuple[str, str]]) -> float:
-                    vals = [
-                        float(r["delta_s"])
-                        for r in switch_events
-                        if (str(r["from_page"]), str(r["to_page"])) in pairs and float(r["delta_s"]) > 0
-                    ]
-                    return _median(vals)
-
-                listing_pairs = {
-                    ("operations_home", "listings"),
-                    ("products", "listings"),
-                    ("inventory_intake_wizard", "listings"),
-                    ("listings", "ebay_workspace"),
-                }
-                fulfillment_pairs = {
-                    ("operations_home", "shipping"),
-                    ("orders", "shipping"),
-                    ("sales", "shipping"),
-                    ("shipping", "orders"),
-                }
-                reconcile_pairs = {
-                    ("shipping", "sync"),
-                    ("sales", "reports"),
-                    ("sync", "reports"),
-                    ("reports", "documents"),
-                }
-
-                b1, b2, b3, b4 = st.columns(4)
-                b1.metric("Median Switch Latency (s)", f"{_median(all_deltas):.1f}")
-                b2.metric("Bounce Rate (<10s)", f"{bounce_rate * 100:.1f}%")
-                b3.metric("Median Click-Depth / Session", f"{_median([float(v) for v in sessions]):.1f}")
-                b4.metric("Switch Events (window)", len(switch_events))
-
-                wf_df = pd.DataFrame(
-                    [
-                        {
-                            "workflow": "Listing handoff",
-                            "median_transition_seconds": round(_workflow_median(listing_pairs), 2),
-                        },
-                        {
-                            "workflow": "Fulfillment handoff",
-                            "median_transition_seconds": round(_workflow_median(fulfillment_pairs), 2),
-                        },
-                        {
-                            "workflow": "Reconcile handoff",
-                            "median_transition_seconds": round(_workflow_median(reconcile_pairs), 2),
-                        },
-                    ]
-                )
-                st.dataframe(wf_df, use_container_width=True, hide_index=True)
-                baseline_summary_df = pd.DataFrame(
-                    [
-                        {"metric": "median_switch_latency_seconds", "value": round(_median(all_deltas), 4)},
-                        {"metric": "bounce_rate_lt_10s", "value": round(bounce_rate, 6)},
-                        {"metric": "median_click_depth_per_session", "value": round(_median([float(v) for v in sessions]), 4)},
-                        {"metric": "switch_event_count", "value": int(len(switch_events))},
-                        {"metric": "window_start", "value": window_start_dt.isoformat(timespec="seconds") if window_start_dt else ""},
-                        {"metric": "window_end", "value": utcnow_naive().isoformat(timespec="seconds")},
-                    ]
-                )
-                combined_baseline_export = pd.concat(
-                    [
-                        baseline_summary_df.assign(section="summary"),
-                        wf_df.rename(columns={"median_transition_seconds": "value"}).assign(section="workflow"),
-                    ],
-                    ignore_index=True,
-                )
-                ex1, ex2 = st.columns(2)
-                with ex1:
-                    st.download_button(
-                        "Download Baseline Metrics CSV",
-                        data=combined_baseline_export.to_csv(index=False).encode("utf-8"),
-                        file_name=f"ux_baseline_metrics_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        key="admin_nav_baseline_metrics_csv_btn",
-                    )
-                with ex2:
-                    if st.button("Record Baseline Snapshot Event", key="admin_nav_baseline_snapshot_btn"):
-                        try:
-                            repo.record_audit_event(
-                                entity_type="navigation_baseline",
-                                entity_id=None,
-                                action="snapshot",
-                                actor=user.username,
-                                changes={
-                                    "environment": settings.app_env,
-                                    "recorded_at": utcnow_naive().isoformat(timespec="seconds"),
-                                    "summary": baseline_summary_df.to_dict(orient="records"),
-                                    "workflow_handoffs": wf_df.to_dict(orient="records"),
-                                },
-                            )
-                            st.success("Baseline metrics snapshot recorded.")
-                        except Exception as exc:
-                            st.error(f"Unable to record baseline snapshot: {exc}")
-
-        st.markdown("### Workspace Feedback Insights")
-        st.caption("Aggregated from audit events (`entity_type=workspace_feedback`) to prioritize UX fixes.")
-        feedback_lookback_days = st.number_input(
-            "Feedback Lookback Window (days)",
-            min_value=1,
-            max_value=365,
-            value=30,
-            step=1,
-            key="admin_workspace_feedback_lookback_days",
-        )
-        feedback_since_dt = utcnow_naive() - timedelta(days=int(feedback_lookback_days))
-        if window_start_dt is not None and window_start_dt > feedback_since_dt:
-            feedback_since_dt = window_start_dt
-        feedback_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "workspace_feedback",
-                AuditLog.created_at >= feedback_since_dt,
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(2000)
-        ).all()
-        if not feedback_rows:
-            st.caption("No workspace feedback events in the selected window.")
-        else:
-            feedback_counter: Counter[str] = Counter()
-            sentiment_counter: Counter[str] = Counter()
-            flattened_feedback_rows: list[dict] = []
-            for row in feedback_rows:
-                payload = _audit_changes(row)
-                workspace = str(payload.get("workspace") or "unknown").strip().lower() or "unknown"
-                sentiment = str(payload.get("sentiment") or "unknown").strip().lower() or "unknown"
-                note = str(payload.get("note") or "").strip()
-                feedback_counter[workspace] += 1
-                sentiment_counter[sentiment] += 1
-                flattened_feedback_rows.append(
-                    {
-                        "id": int(row.id),
-                        "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
-                        "actor": str(row.actor or ""),
-                        "workspace": workspace,
-                        "sentiment": sentiment,
-                        "note": note,
-                    }
-                )
-
-            total_feedback = len(flattened_feedback_rows)
-            down_count = int(sentiment_counter.get("down", 0))
-            up_count = int(sentiment_counter.get("up", 0))
-            down_rate = (down_count / total_feedback) if total_feedback else 0.0
-            f1, f2, f3, f4 = st.columns(4)
-            f1.metric("Feedback Events", total_feedback)
-            f2.metric("Needs Improvement", down_count)
-            f3.metric("Helpful", up_count)
-            f4.metric("Needs Improvement Rate", f"{down_rate * 100:.1f}%")
-
-            by_workspace_df = pd.DataFrame(
-                [
-                    {
-                        "workspace": workspace,
-                        "feedback_count": count,
-                        "needs_improvement": int(
-                            len(
+                        bundle_buffer = BytesIO()
+                        with zipfile.ZipFile(bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
+                            handoff_kpis_df = pd.DataFrame(
                                 [
-                                    r
-                                    for r in flattened_feedback_rows
-                                    if r["workspace"] == workspace and r["sentiment"] == "down"
+                                    {
+                                        "environment": settings.app_env,
+                                        "total_handoff_applied": int(total_handoff_applied),
+                                        "total_handoff_cleared": int(total_handoff_cleared),
+                                        "handoff_clear_rate_pct": round(float(clear_rate) * 100.0, 2),
+                                        "top_actor": top_actor or "",
+                                        "top_target": top_target or "",
+                                        "most_cleared_target": most_cleared_target or "",
+                                        "generated_at_utc": utcnow_naive().isoformat(),
+                                    }
                                 ]
                             )
-                        ),
-                    }
-                    for workspace, count in feedback_counter.most_common(50)
-                ]
-            )
-            if not by_workspace_df.empty:
-                by_workspace_df["needs_improvement_rate"] = by_workspace_df.apply(
-                    lambda r: round(
-                        float(r["needs_improvement"]) / float(r["feedback_count"])
-                        if float(r["feedback_count"]) > 0
-                        else 0.0,
-                        4,
-                    ),
-                    axis=1,
-                )
-            by_sentiment_df = pd.DataFrame(
-                [{"sentiment": k, "count": v} for k, v in sentiment_counter.items()]
-            ).sort_values(by="count", ascending=False)
-            fc1, fc2 = st.columns(2)
-            with fc1:
-                st.markdown("#### Feedback by Workspace")
-                st.dataframe(by_workspace_df, use_container_width=True, hide_index=True)
-            with fc2:
-                st.markdown("#### Feedback by Sentiment")
-                st.dataframe(by_sentiment_df, use_container_width=True, hide_index=True)
-
-            notes_only_df = pd.DataFrame([r for r in flattened_feedback_rows if r.get("note")]).sort_values(
-                by="created_at", ascending=False
-            )
-            with st.expander("Recent Feedback Notes", expanded=False):
-                if notes_only_df.empty:
-                    st.caption("No note text submitted in the selected window.")
+                            bundle_zip.writestr("handoff_kpis.csv", handoff_kpis_df.to_csv(index=False))
+                            if not handoff_df_for_export.empty:
+                                agg_df = handoff_df_for_export.copy()
+                                agg_df.insert(0, "environment", settings.app_env)
+                                bundle_zip.writestr(
+                                    "handoff_target_aggregate.csv",
+                                    agg_df.to_csv(index=False),
+                                )
+                            bundle_zip.writestr(
+                                "handoff_events_filtered.csv",
+                                filtered_handoff_df.to_csv(index=False),
+                            )
+                            full_events_df = handoff_events_df.copy()
+                            full_events_df.insert(0, "environment", settings.app_env)
+                            bundle_zip.writestr(
+                                "handoff_events_full_window.csv",
+                                full_events_df.to_csv(index=False),
+                            )
+                        bundle_buffer.seek(0)
+                        st.download_button(
+                            "Export Handoff Governance Bundle (ZIP)",
+                            data=bundle_buffer.getvalue(),
+                            file_name=f"handoff_governance_bundle_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            key="admin_handoff_events_bundle_zip_btn",
+                        )
+                        st.dataframe(
+                            filtered_handoff_df.head(200),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+    
+                with st.expander("Recent Navigation Events", expanded=False):
+                    st.dataframe(pd.DataFrame(event_rows[:200]), use_container_width=True, hide_index=True)
+    
+                st.markdown("#### Workflow Baseline Metrics")
+                switch_events: list[dict] = []
+                for row in nav_events:
+                    payload = _audit_changes(row)
+                    if str(row.action or "").strip().lower() != "page_switch":
+                        continue
+                    try:
+                        delta = float(payload.get("seconds_since_last_page") or 0.0)
+                    except Exception:
+                        delta = 0.0
+                    switch_events.append(
+                        {
+                            "actor": str(row.actor or "unknown"),
+                            "created_at": row.created_at,
+                            "from_page": str(payload.get("from_page") or "").strip().lower(),
+                            "to_page": str(payload.get("to_page") or "").strip().lower(),
+                            "delta_s": delta,
+                        }
+                    )
+    
+                if not switch_events:
+                    st.caption("No page-switch telemetry yet for baseline metrics.")
                 else:
-                    st.dataframe(notes_only_df.head(300), use_container_width=True, hide_index=True)
-                    note_options = {
-                        (
-                            f"#{int(r['id'])} | {r['workspace']} | {r['sentiment']} | "
-                            f"{str(r['created_at'])[:19]} | {str(r['note'])[:70]}"
-                        ): r
-                        for _, r in notes_only_df.head(300).iterrows()
+                    def _median(values: list[float]) -> float:
+                        vals = sorted(v for v in values if v >= 0)
+                        if not vals:
+                            return 0.0
+                        n = len(vals)
+                        mid = n // 2
+                        if n % 2 == 1:
+                            return float(vals[mid])
+                        return float((vals[mid - 1] + vals[mid]) / 2.0)
+    
+                    all_deltas = [float(r["delta_s"]) for r in switch_events if float(r["delta_s"]) > 0]
+                    bounce_count = len([v for v in all_deltas if v < 10.0])
+                    bounce_rate = (bounce_count / len(all_deltas)) if all_deltas else 0.0
+    
+                    # Session click-depth: per actor, new session starts after 30m inactivity.
+                    sessions: list[int] = []
+                    by_actor: dict[str, list[dict]] = {}
+                    for row in switch_events:
+                        by_actor.setdefault(str(row["actor"]), []).append(row)
+                    for actor_rows in by_actor.values():
+                        actor_rows_sorted = sorted(actor_rows, key=lambda r: r["created_at"] or utcnow_naive())
+                        session_count = 0
+                        prev_ts = None
+                        for ev in actor_rows_sorted:
+                            ts = ev["created_at"]
+                            if ts is None:
+                                continue
+                            if prev_ts is None or (ts - prev_ts).total_seconds() > 1800:
+                                if session_count > 0:
+                                    sessions.append(session_count)
+                                session_count = 1
+                            else:
+                                session_count += 1
+                            prev_ts = ts
+                        if session_count > 0:
+                            sessions.append(session_count)
+    
+                    def _workflow_median(pairs: set[tuple[str, str]]) -> float:
+                        vals = [
+                            float(r["delta_s"])
+                            for r in switch_events
+                            if (str(r["from_page"]), str(r["to_page"])) in pairs and float(r["delta_s"]) > 0
+                        ]
+                        return _median(vals)
+    
+                    listing_pairs = {
+                        ("operations_home", "listings"),
+                        ("products", "listings"),
+                        ("inventory_intake_wizard", "listings"),
+                        ("listings", "ebay_workspace"),
                     }
-                    selected_feedback_label = st.selectbox(
-                        "Create follow-up from feedback note",
-                        options=["None"] + list(note_options.keys()),
-                        key="admin_workspace_feedback_followup_select",
+                    fulfillment_pairs = {
+                        ("operations_home", "shipping"),
+                        ("orders", "shipping"),
+                        ("sales", "shipping"),
+                        ("shipping", "orders"),
+                    }
+                    reconcile_pairs = {
+                        ("shipping", "sync"),
+                        ("sales", "reports"),
+                        ("sync", "reports"),
+                        ("reports", "documents"),
+                    }
+    
+                    b1, b2, b3, b4 = st.columns(4)
+                    b1.metric("Median Switch Latency (s)", f"{_median(all_deltas):.1f}")
+                    b2.metric("Bounce Rate (<10s)", f"{bounce_rate * 100:.1f}%")
+                    b3.metric("Median Click-Depth / Session", f"{_median([float(v) for v in sessions]):.1f}")
+                    b4.metric("Switch Events (window)", len(switch_events))
+    
+                    wf_df = pd.DataFrame(
+                        [
+                            {
+                                "workflow": "Listing handoff",
+                                "median_transition_seconds": round(_workflow_median(listing_pairs), 2),
+                            },
+                            {
+                                "workflow": "Fulfillment handoff",
+                                "median_transition_seconds": round(_workflow_median(fulfillment_pairs), 2),
+                            },
+                            {
+                                "workflow": "Reconcile handoff",
+                                "median_transition_seconds": round(_workflow_median(reconcile_pairs), 2),
+                            },
+                        ]
                     )
-                    followup_owner = st.text_input(
-                        "Follow-up Owner",
-                        value=user.username,
-                        key="admin_workspace_feedback_followup_owner",
+                    st.dataframe(wf_df, use_container_width=True, hide_index=True)
+                    baseline_summary_df = pd.DataFrame(
+                        [
+                            {"metric": "median_switch_latency_seconds", "value": round(_median(all_deltas), 4)},
+                            {"metric": "bounce_rate_lt_10s", "value": round(bounce_rate, 6)},
+                            {"metric": "median_click_depth_per_session", "value": round(_median([float(v) for v in sessions]), 4)},
+                            {"metric": "switch_event_count", "value": int(len(switch_events))},
+                            {"metric": "window_start", "value": window_start_dt.isoformat(timespec="seconds") if window_start_dt else ""},
+                            {"metric": "window_end", "value": utcnow_naive().isoformat(timespec="seconds")},
+                        ]
                     )
-                    followup_priority = st.selectbox(
-                        "Follow-up Priority",
-                        options=["high", "medium", "low"],
-                        index=1,
-                        key="admin_workspace_feedback_followup_priority",
+                    combined_baseline_export = pd.concat(
+                        [
+                            baseline_summary_df.assign(section="summary"),
+                            wf_df.rename(columns={"median_transition_seconds": "value"}).assign(section="workflow"),
+                        ],
+                        ignore_index=True,
                     )
-                    followup_due_days = st.number_input(
-                        "Due in Days",
-                        min_value=0,
-                        max_value=60,
-                        value=7,
-                        step=1,
-                        key="admin_workspace_feedback_followup_due_days",
-                    )
-                    if st.button(
-                        "Create Follow-up Task From Selected Feedback",
-                        key="admin_workspace_feedback_create_followup_btn",
-                        disabled=selected_feedback_label == "None",
-                    ):
-                        selected_row = note_options.get(selected_feedback_label)
-                        if not selected_row:
-                            st.error("Select a feedback note first.")
-                        else:
+                    ex1, ex2 = st.columns(2)
+                    with ex1:
+                        st.download_button(
+                            "Download Baseline Metrics CSV",
+                            data=combined_baseline_export.to_csv(index=False).encode("utf-8"),
+                            file_name=f"ux_baseline_metrics_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="admin_nav_baseline_metrics_csv_btn",
+                        )
+                    with ex2:
+                        if st.button("Record Baseline Snapshot Event", key="admin_nav_baseline_snapshot_btn"):
                             try:
-                                task_id = f"wf-feedback-{int(selected_row['id'])}-{utcnow_naive().strftime('%Y%m%d%H%M%S')}"
-                                due_date = (utcnow_naive() + timedelta(days=int(followup_due_days))).date()
-                                workspace = str(selected_row.get("workspace") or "unknown").strip().lower()
-                                sentiment = str(selected_row.get("sentiment") or "unknown").strip().lower()
-                                note = str(selected_row.get("note") or "").strip()
                                 repo.record_audit_event(
-                                    entity_type="workspace_followup",
+                                    entity_type="navigation_baseline",
                                     entity_id=None,
-                                    action="create",
+                                    action="snapshot",
                                     actor=user.username,
                                     changes={
-                                        "task_id": task_id,
-                                        "workflow": f"feedback:{workspace}",
-                                        "title": f"[feedback/{sentiment}] {workspace} UX follow-up",
-                                        "owner": str(followup_owner or user.username).strip() or user.username,
-                                        "priority": str(followup_priority).strip().lower(),
-                                        "due_date": due_date.isoformat(),
-                                        "note": note,
-                                        "source_feedback_id": int(selected_row["id"]),
-                                        "source_workspace": workspace,
-                                        "source_sentiment": sentiment,
+                                        "environment": settings.app_env,
+                                        "recorded_at": utcnow_naive().isoformat(timespec="seconds"),
+                                        "summary": baseline_summary_df.to_dict(orient="records"),
+                                        "workflow_handoffs": wf_df.to_dict(orient="records"),
                                     },
                                 )
-                                st.success(f"Created follow-up task `{task_id}`.")
-                                st.rerun()
+                                st.success("Baseline metrics snapshot recorded.")
                             except Exception as exc:
-                                st.error(f"Unable to create follow-up task from feedback: {exc}")
-            st.download_button(
-                "Download Workspace Feedback CSV",
-                data=pd.DataFrame(flattened_feedback_rows).to_csv(index=False).encode("utf-8"),
-                file_name=f"workspace_feedback_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="admin_workspace_feedback_csv_btn",
+                                st.error(f"Unable to record baseline snapshot: {exc}")
+    
+        st.markdown("### Workspace Feedback Insights")
+        st.caption("Aggregated from audit events (`entity_type=workspace_feedback`) to prioritize UX fixes.")
+        load_workspace_feedback_insights = st.checkbox(
+            "Load Workspace Feedback Insights (slower)",
+            value=False,
+            key="admin_load_workspace_feedback_insights",
+        )
+        if not load_workspace_feedback_insights:
+            st.caption(
+                "Workspace feedback insights are skipped by default. "
+                "Enable `Load Workspace Feedback Insights (slower)` to fetch them."
             )
-            feedback_bundle_buffer = BytesIO()
-            with zipfile.ZipFile(feedback_bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
-                feedback_events_df = pd.DataFrame(flattened_feedback_rows)
-                feedback_events_df.insert(0, "environment", settings.app_env)
-                feedback_events_df.insert(1, "lookback_days", int(feedback_lookback_days))
-                bundle_zip.writestr("workspace_feedback_events.csv", feedback_events_df.to_csv(index=False))
-                workspace_export_df = by_workspace_df.copy()
-                workspace_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("workspace_feedback_by_workspace.csv", workspace_export_df.to_csv(index=False))
-                sentiment_export_df = by_sentiment_df.copy()
-                sentiment_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("workspace_feedback_by_sentiment.csv", sentiment_export_df.to_csv(index=False))
-                notes_export_df = notes_only_df.copy()
-                if not notes_export_df.empty:
-                    notes_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("workspace_feedback_notes.csv", notes_export_df.to_csv(index=False))
-                summary_export_df = pd.DataFrame(
+        else:
+            feedback_lookback_days = st.number_input(
+                "Feedback Lookback Window (days)",
+                min_value=1,
+                max_value=365,
+                value=30,
+                step=1,
+                key="admin_workspace_feedback_lookback_days",
+            )
+            feedback_since_dt = utcnow_naive() - timedelta(days=int(feedback_lookback_days))
+            if window_start_dt is not None and window_start_dt > feedback_since_dt:
+                feedback_since_dt = window_start_dt
+            feedback_rows = repo.db.scalars(
+                select(AuditLog)
+                .where(
+                    AuditLog.entity_type == "workspace_feedback",
+                    AuditLog.created_at >= feedback_since_dt,
+                )
+                .order_by(AuditLog.created_at.desc())
+                .limit(2000)
+            ).all()
+            if not feedback_rows:
+                st.caption("No workspace feedback events in the selected window.")
+            else:
+                feedback_counter: Counter[str] = Counter()
+                sentiment_counter: Counter[str] = Counter()
+                flattened_feedback_rows: list[dict] = []
+                for row in feedback_rows:
+                    payload = _audit_changes(row)
+                    workspace = str(payload.get("workspace") or "unknown").strip().lower() or "unknown"
+                    sentiment = str(payload.get("sentiment") or "unknown").strip().lower() or "unknown"
+                    note = str(payload.get("note") or "").strip()
+                    feedback_counter[workspace] += 1
+                    sentiment_counter[sentiment] += 1
+                    flattened_feedback_rows.append(
+                        {
+                            "id": int(row.id),
+                            "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                            "actor": str(row.actor or ""),
+                            "workspace": workspace,
+                            "sentiment": sentiment,
+                            "note": note,
+                        }
+                    )
+    
+                total_feedback = len(flattened_feedback_rows)
+                down_count = int(sentiment_counter.get("down", 0))
+                up_count = int(sentiment_counter.get("up", 0))
+                down_rate = (down_count / total_feedback) if total_feedback else 0.0
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("Feedback Events", total_feedback)
+                f2.metric("Needs Improvement", down_count)
+                f3.metric("Helpful", up_count)
+                f4.metric("Needs Improvement Rate", f"{down_rate * 100:.1f}%")
+    
+                by_workspace_df = pd.DataFrame(
                     [
                         {
-                            "environment": settings.app_env,
-                            "lookback_days": int(feedback_lookback_days),
-                            "feedback_events": int(total_feedback),
-                            "needs_improvement_count": int(down_count),
-                            "helpful_count": int(up_count),
-                            "needs_improvement_rate_pct": round(float(down_rate) * 100.0, 2),
-                            "generated_at_utc": utcnow_naive().isoformat(),
+                            "workspace": workspace,
+                            "feedback_count": count,
+                            "needs_improvement": int(
+                                len(
+                                    [
+                                        r
+                                        for r in flattened_feedback_rows
+                                        if r["workspace"] == workspace and r["sentiment"] == "down"
+                                    ]
+                                )
+                            ),
                         }
+                        for workspace, count in feedback_counter.most_common(50)
                     ]
                 )
-                bundle_zip.writestr("workspace_feedback_summary.csv", summary_export_df.to_csv(index=False))
-            feedback_bundle_buffer.seek(0)
-            st.download_button(
-                "Export Workspace Feedback Governance Bundle (ZIP)",
-                data=feedback_bundle_buffer.getvalue(),
-                file_name=(
-                    f"workspace_feedback_governance_bundle_{settings.app_env}_"
-                    f"{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.zip"
-                ),
-                mime="application/zip",
-                key="admin_workspace_feedback_bundle_zip_btn",
-            )
+                if not by_workspace_df.empty:
+                    by_workspace_df["needs_improvement_rate"] = by_workspace_df.apply(
+                        lambda r: round(
+                            float(r["needs_improvement"]) / float(r["feedback_count"])
+                            if float(r["feedback_count"]) > 0
+                            else 0.0,
+                            4,
+                        ),
+                        axis=1,
+                    )
+                by_sentiment_df = pd.DataFrame(
+                    [{"sentiment": k, "count": v} for k, v in sentiment_counter.items()]
+                ).sort_values(by="count", ascending=False)
+                fc1, fc2 = st.columns(2)
+                with fc1:
+                    st.markdown("#### Feedback by Workspace")
+                    st.dataframe(by_workspace_df, use_container_width=True, hide_index=True)
+                with fc2:
+                    st.markdown("#### Feedback by Sentiment")
+                    st.dataframe(by_sentiment_df, use_container_width=True, hide_index=True)
+    
+                notes_only_df = pd.DataFrame([r for r in flattened_feedback_rows if r.get("note")]).sort_values(
+                    by="created_at", ascending=False
+                )
+                with st.expander("Recent Feedback Notes", expanded=False):
+                    if notes_only_df.empty:
+                        st.caption("No note text submitted in the selected window.")
+                    else:
+                        st.dataframe(notes_only_df.head(300), use_container_width=True, hide_index=True)
+                        note_options = {
+                            (
+                                f"#{int(r['id'])} | {r['workspace']} | {r['sentiment']} | "
+                                f"{str(r['created_at'])[:19]} | {str(r['note'])[:70]}"
+                            ): r
+                            for _, r in notes_only_df.head(300).iterrows()
+                        }
+                        selected_feedback_label = st.selectbox(
+                            "Create follow-up from feedback note",
+                            options=["None"] + list(note_options.keys()),
+                            key="admin_workspace_feedback_followup_select",
+                        )
+                        followup_owner = st.text_input(
+                            "Follow-up Owner",
+                            value=user.username,
+                            key="admin_workspace_feedback_followup_owner",
+                        )
+                        followup_priority = st.selectbox(
+                            "Follow-up Priority",
+                            options=["high", "medium", "low"],
+                            index=1,
+                            key="admin_workspace_feedback_followup_priority",
+                        )
+                        followup_due_days = st.number_input(
+                            "Due in Days",
+                            min_value=0,
+                            max_value=60,
+                            value=7,
+                            step=1,
+                            key="admin_workspace_feedback_followup_due_days",
+                        )
+                        if st.button(
+                            "Create Follow-up Task From Selected Feedback",
+                            key="admin_workspace_feedback_create_followup_btn",
+                            disabled=selected_feedback_label == "None",
+                        ):
+                            selected_row = note_options.get(selected_feedback_label)
+                            if not selected_row:
+                                st.error("Select a feedback note first.")
+                            else:
+                                try:
+                                    task_id = f"wf-feedback-{int(selected_row['id'])}-{utcnow_naive().strftime('%Y%m%d%H%M%S')}"
+                                    due_date = (utcnow_naive() + timedelta(days=int(followup_due_days))).date()
+                                    workspace = str(selected_row.get("workspace") or "unknown").strip().lower()
+                                    sentiment = str(selected_row.get("sentiment") or "unknown").strip().lower()
+                                    note = str(selected_row.get("note") or "").strip()
+                                    repo.record_audit_event(
+                                        entity_type="workspace_followup",
+                                        entity_id=None,
+                                        action="create",
+                                        actor=user.username,
+                                        changes={
+                                            "task_id": task_id,
+                                            "workflow": f"feedback:{workspace}",
+                                            "title": f"[feedback/{sentiment}] {workspace} UX follow-up",
+                                            "owner": str(followup_owner or user.username).strip() or user.username,
+                                            "priority": str(followup_priority).strip().lower(),
+                                            "due_date": due_date.isoformat(),
+                                            "note": note,
+                                            "source_feedback_id": int(selected_row["id"]),
+                                            "source_workspace": workspace,
+                                            "source_sentiment": sentiment,
+                                        },
+                                    )
+                                    st.success(f"Created follow-up task `{task_id}`.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Unable to create follow-up task from feedback: {exc}")
+                st.download_button(
+                    "Download Workspace Feedback CSV",
+                    data=pd.DataFrame(flattened_feedback_rows).to_csv(index=False).encode("utf-8"),
+                    file_name=f"workspace_feedback_{settings.app_env}_{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="admin_workspace_feedback_csv_btn",
+                )
+                feedback_bundle_buffer = BytesIO()
+                with zipfile.ZipFile(feedback_bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
+                    feedback_events_df = pd.DataFrame(flattened_feedback_rows)
+                    feedback_events_df.insert(0, "environment", settings.app_env)
+                    feedback_events_df.insert(1, "lookback_days", int(feedback_lookback_days))
+                    bundle_zip.writestr("workspace_feedback_events.csv", feedback_events_df.to_csv(index=False))
+                    workspace_export_df = by_workspace_df.copy()
+                    workspace_export_df.insert(0, "environment", settings.app_env)
+                    bundle_zip.writestr("workspace_feedback_by_workspace.csv", workspace_export_df.to_csv(index=False))
+                    sentiment_export_df = by_sentiment_df.copy()
+                    sentiment_export_df.insert(0, "environment", settings.app_env)
+                    bundle_zip.writestr("workspace_feedback_by_sentiment.csv", sentiment_export_df.to_csv(index=False))
+                    notes_export_df = notes_only_df.copy()
+                    if not notes_export_df.empty:
+                        notes_export_df.insert(0, "environment", settings.app_env)
+                    bundle_zip.writestr("workspace_feedback_notes.csv", notes_export_df.to_csv(index=False))
+                    summary_export_df = pd.DataFrame(
+                        [
+                            {
+                                "environment": settings.app_env,
+                                "lookback_days": int(feedback_lookback_days),
+                                "feedback_events": int(total_feedback),
+                                "needs_improvement_count": int(down_count),
+                                "helpful_count": int(up_count),
+                                "needs_improvement_rate_pct": round(float(down_rate) * 100.0, 2),
+                                "generated_at_utc": utcnow_naive().isoformat(),
+                            }
+                        ]
+                    )
+                    bundle_zip.writestr("workspace_feedback_summary.csv", summary_export_df.to_csv(index=False))
+                feedback_bundle_buffer.seek(0)
+                st.download_button(
+                    "Export Workspace Feedback Governance Bundle (ZIP)",
+                    data=feedback_bundle_buffer.getvalue(),
+                    file_name=(
+                        f"workspace_feedback_governance_bundle_{settings.app_env}_"
+                        f"{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.zip"
+                    ),
+                    mime="application/zip",
+                    key="admin_workspace_feedback_bundle_zip_btn",
+                )
 
         st.markdown("### Workspace Rollout Parity Checker")
         st.caption(
@@ -12901,12 +17226,24 @@ def render_admin(repo: InventoryRepository) -> None:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Unable to save threshold: {exc}")
+        load_parity_audit_evidence = st.checkbox(
+            "Load Parity Audit Evidence (slower)",
+            value=False,
+            key="admin_parity_load_audit_evidence",
+            help="Defers the large audit-log scan used for parity evidence and task-completion counters.",
+        )
         since_dt = utcnow_naive() - timedelta(days=int(lookback_days))
         parity_specs = _workspace_parity_specs()
         role_permission_map = st.session_state.get("auth_role_permissions", DEFAULT_PERMISSIONS)
-        audit_rows = repo.db.scalars(
-            select(AuditLog).where(AuditLog.created_at >= since_dt).order_by(AuditLog.created_at.desc()).limit(5000)
-        ).all()
+        if load_parity_audit_evidence:
+            audit_rows = repo.db.scalars(
+                select(AuditLog).where(AuditLog.created_at >= since_dt).order_by(AuditLog.created_at.desc()).limit(5000)
+            ).all()
+        else:
+            audit_rows = []
+            st.caption(
+                "Audit evidence loading is deferred. Enable `Load Parity Audit Evidence (slower)` for full audit/task gap checks."
+            )
         min_task_events = int(min_task_events_input)
         task_completion_counts: Counter[str] = Counter()
         for row in audit_rows:
@@ -12928,7 +17265,7 @@ def render_admin(repo: InventoryRepository) -> None:
 
             entity_types = {str(v).strip().lower() for v in spec.get("audit_entity_types", []) if str(v).strip()}
             actions = {str(v).strip().lower() for v in spec.get("audit_actions", []) if str(v).strip()}
-            observed = False
+            observed = False if load_parity_audit_evidence else True
             observed_count = 0
             for row in audit_rows:
                 row_entity = str(row.entity_type or "").strip().lower()
@@ -12957,6 +17294,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     "viewer_has_permission": bool(viewer_ok),
                     "ops_has_permission": bool(ops_ok),
                     "admin_has_permission": bool(admin_ok),
+                    "audit_check_enabled": bool(load_parity_audit_evidence),
                     "audit_observed_in_window": bool(observed),
                     "audit_match_count": int(observed_count),
                     "task_completion_required": bool(task_workflow_keys),
@@ -12970,7 +17308,9 @@ def render_admin(repo: InventoryRepository) -> None:
         permission_gap_df = parity_df[
             (~parity_df["ops_has_permission"]) | (~parity_df["admin_has_permission"])
         ]
-        audit_gap_df = parity_df[~parity_df["audit_observed_in_window"]]
+        audit_gap_df = parity_df[
+            (parity_df["audit_check_enabled"] == True) & (~parity_df["audit_observed_in_window"])
+        ]
         task_gap_df = parity_df[
             (parity_df["task_completion_required"] == True)
             & (parity_df["task_completion_observed"] == False)
@@ -12982,14 +17322,17 @@ def render_admin(repo: InventoryRepository) -> None:
         p4.metric("No Task Completion Evidence", len(task_gap_df))
         open_followups_count = 0
         overdue_followups_count = 0
-        followup_snapshot_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(AuditLog.entity_type == "workspace_followup")
-            .order_by(AuditLog.created_at.desc())
-            .limit(1000)
-        ).all()
+        followup_snapshot_rows: list[AuditLog] = []
+        if load_parity_audit_evidence:
+            followup_snapshot_rows = repo.db.scalars(
+                select(AuditLog)
+                .where(AuditLog.entity_type == "workspace_followup")
+                .order_by(AuditLog.created_at.desc())
+                .limit(1000)
+            ).all()
         if followup_snapshot_rows:
             created_by_key: dict[str, AuditLog] = {}
+            created_payload_by_key: dict[str, dict[str, Any]] = {}
             resolved_keys: set[str] = set()
             for row in followup_snapshot_rows:
                 payload = _audit_changes(row)
@@ -12999,6 +17342,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 action = str(row.action or "").strip().lower()
                 if action == "create" and task_key not in created_by_key:
                     created_by_key[task_key] = row
+                    created_payload_by_key[task_key] = payload if isinstance(payload, dict) else {}
                 if action in {"resolve", "closed"}:
                     resolved_keys.add(task_key)
             today = utcnow_naive().date()
@@ -13006,7 +17350,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 if task_key in resolved_keys:
                     continue
                 open_followups_count += 1
-                payload = _audit_changes(row)
+                payload = created_payload_by_key.get(task_key, {})
                 due_raw = str(payload.get("due_date") or "").strip()
                 if due_raw:
                     try:
@@ -13317,17 +17661,27 @@ def render_admin(repo: InventoryRepository) -> None:
                 except Exception as exc:
                     st.error(f"Unable to record parity snapshot: {exc}")
 
+        load_parity_history = st.checkbox(
+            "Load Parity History + Follow-up Tables (slower)",
+            value=False,
+            key="admin_parity_load_history",
+            help="Defers recent snapshots, release decision history, and follow-up task table hydration.",
+        )
         recent_df = pd.DataFrame()
         st.markdown("#### Recent Parity Snapshots")
-        parity_snapshot_rows = repo.db.scalars(
-            select(AuditLog)
-            .where(
-                AuditLog.entity_type == "workspace_parity",
-                AuditLog.action == "snapshot",
-            )
-            .order_by(AuditLog.created_at.desc())
-            .limit(30)
-        ).all()
+        parity_snapshot_rows: list[AuditLog] = []
+        if load_parity_history:
+            parity_snapshot_rows = repo.db.scalars(
+                select(AuditLog)
+                .where(
+                    AuditLog.entity_type == "workspace_parity",
+                    AuditLog.action == "snapshot",
+                )
+                .order_by(AuditLog.created_at.desc())
+                .limit(30)
+            ).all()
+        else:
+            st.caption("Parity history loading is deferred. Enable the load toggle above to hydrate history tables.")
         if not parity_snapshot_rows:
             st.caption("No parity snapshots recorded yet.")
         else:
@@ -13591,29 +17945,37 @@ def render_admin(repo: InventoryRepository) -> None:
 
             decisions_df = pd.DataFrame()
             st.markdown("#### Recent Release Decisions")
-            decision_rows = repo.db.scalars(
-                select(AuditLog)
-                .where(
-                    AuditLog.entity_type == "workspace_parity_decision",
-                    AuditLog.action == "decision",
-                )
-                .order_by(AuditLog.created_at.desc())
-                .limit(50)
-            ).all()
+            decision_rows: list[AuditLog] = []
+            if load_parity_history:
+                decision_rows = repo.db.scalars(
+                    select(AuditLog)
+                    .where(
+                        AuditLog.entity_type == "workspace_parity_decision",
+                        AuditLog.action == "decision",
+                    )
+                    .order_by(AuditLog.created_at.desc())
+                    .limit(50)
+                ).all()
+            decision_payload_by_id: dict[int, dict[str, Any]] = {}
+            for row in decision_rows:
+                decision_payload_by_id[int(row.id)] = _audit_changes(row)
             latest_snapshot_row = parity_snapshot_rows[0] if parity_snapshot_rows else None
             latest_decision_row = decision_rows[0] if decision_rows else None
             latest_approved_row = next(
                 (
                     row
                     for row in decision_rows
-                    if str((_audit_changes(row).get("decision") or "")).strip().lower() == "approved"
+                    if str((decision_payload_by_id.get(int(row.id), {}).get("decision") or "")).strip().lower()
+                    == "approved"
                 ),
                 None,
             )
             status_cols = st.columns(3)
             with status_cols[0]:
                 latest_decision = (
-                    str((_audit_changes(latest_decision_row).get("decision") or "none")).strip().lower()
+                    str((decision_payload_by_id.get(int(latest_decision_row.id), {}).get("decision") or "none"))
+                    .strip()
+                    .lower()
                     if latest_decision_row
                     else "none"
                 )
@@ -13632,8 +17994,9 @@ def render_admin(repo: InventoryRepository) -> None:
             if latest_decision_row is None:
                 st.warning("No release decision recorded yet. Capture a parity decision before cutover.")
             else:
-                latest_decision = str((_audit_changes(latest_decision_row).get("decision") or "")).strip().lower()
-                decision_note = str((_audit_changes(latest_decision_row).get("note") or "")).strip()
+                latest_decision_payload = decision_payload_by_id.get(int(latest_decision_row.id), {})
+                latest_decision = str((latest_decision_payload.get("decision") or "")).strip().lower()
+                decision_note = str((latest_decision_payload.get("note") or "")).strip()
                 if latest_decision == "rejected":
                     st.error(
                         "Latest parity release decision is `rejected`. Resolve parity gaps and record a new decision before cutover."
@@ -13665,34 +18028,38 @@ def render_admin(repo: InventoryRepository) -> None:
             if not decision_rows:
                 st.caption("No release decisions recorded yet.")
             else:
-                decisions_df = pd.DataFrame(
-                    [
+                decision_table_rows: list[dict[str, Any]] = []
+                for row in decision_rows:
+                    payload = decision_payload_by_id.get(int(row.id), {})
+                    decision_table_rows.append(
                         {
                             "id": row.id,
                             "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
                             "actor": row.actor,
                             "snapshot_id": row.entity_id,
-                            "decision": _audit_changes(row).get("decision", ""),
-                            "note": _audit_changes(row).get("note", ""),
-                            "environment": _audit_changes(row).get("environment", ""),
+                            "decision": payload.get("decision", ""),
+                            "note": payload.get("note", ""),
+                            "environment": payload.get("environment", ""),
                         }
-                        for row in decision_rows
-                    ]
-                )
+                    )
+                decisions_df = pd.DataFrame(decision_table_rows)
                 st.dataframe(decisions_df, use_container_width=True, hide_index=True)
 
             display_df = pd.DataFrame()
             st.markdown("#### Follow-up Tasks")
-            followup_rows = repo.db.scalars(
-                select(AuditLog)
-                .where(AuditLog.entity_type == "workspace_followup")
-                .order_by(AuditLog.created_at.desc())
-                .limit(500)
-            ).all()
+            followup_rows: list[AuditLog] = []
+            if load_parity_history:
+                followup_rows = repo.db.scalars(
+                    select(AuditLog)
+                    .where(AuditLog.entity_type == "workspace_followup")
+                    .order_by(AuditLog.created_at.desc())
+                    .limit(500)
+                ).all()
             if not followup_rows:
                 st.caption("No follow-up tasks recorded yet.")
             else:
                 created_by_key: dict[str, AuditLog] = {}
+                created_payload_by_key: dict[str, dict[str, Any]] = {}
                 resolved_keys: set[str] = set()
                 overdue_alerted_keys: set[str] = set()
                 for row in followup_rows:
@@ -13703,6 +18070,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     action = str(row.action or "").strip().lower()
                     if action == "create" and task_key not in created_by_key:
                         created_by_key[task_key] = row
+                        created_payload_by_key[task_key] = payload if isinstance(payload, dict) else {}
                     if action in {"resolve", "closed"}:
                         resolved_keys.add(task_key)
                     if action == "overdue_alert":
@@ -13712,7 +18080,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 today = utcnow_naive().date()
                 priority_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "": 4}
                 for task_key, row in created_by_key.items():
-                    payload = _audit_changes(row)
+                    payload = created_payload_by_key.get(task_key, {})
                     is_open = task_key not in resolved_keys
                     due_raw = str(payload.get("due_date") or "").strip()
                     due_dt = None
@@ -13934,55 +18302,77 @@ def render_admin(repo: InventoryRepository) -> None:
                             st.error(f"Unable to resolve follow-up: {exc}")
 
             st.markdown("#### Parity Governance Bundle")
-            parity_bundle_buffer = BytesIO()
-            with zipfile.ZipFile(parity_bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
-                readiness_summary_df = pd.DataFrame(
-                    [
-                        {
-                            "environment": settings.app_env,
-                            "lookback_days": int(lookback_days),
-                            "readiness_score": int(score),
-                            "readiness_status": str(readiness),
-                            "permission_gap_count": int(len(permission_gap_df)),
-                            "audit_gap_count": int(len(audit_gap_df)),
-                            "open_followups_count": int(open_followups_count),
-                            "overdue_followups_count": int(overdue_followups_count),
-                            "generated_at_utc": utcnow_naive().isoformat(),
-                        }
-                    ]
+            parity_bundle_cache_key = f"admin_parity_governance_bundle_{settings.app_env}"
+            if st.button(
+                "Prepare Parity Governance Bundle",
+                key="admin_parity_governance_bundle_prepare_btn",
+                help="Builds ZIP once and caches it for download in this session.",
+            ):
+                try:
+                    parity_bundle_buffer = BytesIO()
+                    generated_at = utcnow_naive()
+                    with zipfile.ZipFile(parity_bundle_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle_zip:
+                        readiness_summary_df = pd.DataFrame(
+                            [
+                                {
+                                    "environment": settings.app_env,
+                                    "lookback_days": int(lookback_days),
+                                    "readiness_score": int(score),
+                                    "readiness_status": str(readiness),
+                                    "permission_gap_count": int(len(permission_gap_df)),
+                                    "audit_gap_count": int(len(audit_gap_df)),
+                                    "open_followups_count": int(open_followups_count),
+                                    "overdue_followups_count": int(overdue_followups_count),
+                                    "generated_at_utc": generated_at.isoformat(),
+                                }
+                            ]
+                        )
+                        bundle_zip.writestr("parity_readiness_summary.csv", readiness_summary_df.to_csv(index=False))
+                        parity_export_df = parity_df.copy()
+                        parity_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_workflows.csv", parity_export_df.to_csv(index=False))
+                        perm_gap_export_df = permission_gap_df.copy()
+                        if not perm_gap_export_df.empty:
+                            perm_gap_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_permission_gaps.csv", perm_gap_export_df.to_csv(index=False))
+                        audit_gap_export_df = audit_gap_df.copy()
+                        if not audit_gap_export_df.empty:
+                            audit_gap_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_audit_gaps.csv", audit_gap_export_df.to_csv(index=False))
+                        snapshot_export_df = recent_df.copy()
+                        if not snapshot_export_df.empty:
+                            snapshot_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_recent_snapshots.csv", snapshot_export_df.to_csv(index=False))
+                        decision_export_df = decisions_df.copy()
+                        if not decision_export_df.empty:
+                            decision_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_release_decisions.csv", decision_export_df.to_csv(index=False))
+                        followup_export_df = display_df.copy()
+                        if not followup_export_df.empty:
+                            followup_export_df.insert(0, "environment", settings.app_env)
+                        bundle_zip.writestr("parity_followup_tasks_filtered.csv", followup_export_df.to_csv(index=False))
+                    parity_bundle_buffer.seek(0)
+                    st.session_state[parity_bundle_cache_key] = {
+                        "bytes": parity_bundle_buffer.getvalue(),
+                        "generated_at": generated_at.isoformat(timespec="seconds"),
+                        "file_name": (
+                            f"parity_governance_bundle_{settings.app_env}_"
+                            f"{generated_at.strftime('%Y%m%d_%H%M%S')}.zip"
+                        ),
+                    }
+                    st.success("Parity governance bundle prepared.")
+                except Exception as exc:
+                    st.error(f"Unable to prepare parity governance bundle: {exc}")
+            parity_bundle_cached = st.session_state.get(parity_bundle_cache_key) or {}
+            parity_bundle_bytes = parity_bundle_cached.get("bytes")
+            if parity_bundle_bytes:
+                st.caption(f"Prepared at {parity_bundle_cached.get('generated_at', '')} UTC.")
+                st.download_button(
+                    "Export Parity Governance Bundle (ZIP)",
+                    data=parity_bundle_bytes,
+                    file_name=str(parity_bundle_cached.get("file_name") or "parity_governance_bundle.zip"),
+                    mime="application/zip",
+                    key="admin_parity_governance_bundle_zip_btn",
                 )
-                bundle_zip.writestr("parity_readiness_summary.csv", readiness_summary_df.to_csv(index=False))
-                parity_export_df = parity_df.copy()
-                parity_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_workflows.csv", parity_export_df.to_csv(index=False))
-                perm_gap_export_df = permission_gap_df.copy()
-                if not perm_gap_export_df.empty:
-                    perm_gap_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_permission_gaps.csv", perm_gap_export_df.to_csv(index=False))
-                audit_gap_export_df = audit_gap_df.copy()
-                if not audit_gap_export_df.empty:
-                    audit_gap_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_audit_gaps.csv", audit_gap_export_df.to_csv(index=False))
-                snapshot_export_df = recent_df.copy()
-                if not snapshot_export_df.empty:
-                    snapshot_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_recent_snapshots.csv", snapshot_export_df.to_csv(index=False))
-                decision_export_df = decisions_df.copy()
-                if not decision_export_df.empty:
-                    decision_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_release_decisions.csv", decision_export_df.to_csv(index=False))
-                followup_export_df = display_df.copy()
-                if not followup_export_df.empty:
-                    followup_export_df.insert(0, "environment", settings.app_env)
-                bundle_zip.writestr("parity_followup_tasks_filtered.csv", followup_export_df.to_csv(index=False))
-            parity_bundle_buffer.seek(0)
-            st.download_button(
-                "Export Parity Governance Bundle (ZIP)",
-                data=parity_bundle_buffer.getvalue(),
-                file_name=(
-                    f"parity_governance_bundle_{settings.app_env}_"
-                    f"{utcnow_naive().strftime('%Y%m%d_%H%M%S')}.zip"
-                ),
-                mime="application/zip",
-                key="admin_parity_governance_bundle_zip_btn",
-            )
+            else:
+                st.caption("Prepare the parity governance bundle to enable download.")

@@ -9,6 +9,7 @@ import streamlit.components.v1 as components
 
 from app.auth import current_user, ensure_permission
 from app.components.ui_helpers import iso_or_none
+from app.components.ui_helpers import format_ebay_sync_note_for_customer
 from app.components.document_templates import TEMPLATES, build_document_html
 from app.components.views.shared import dataframe_to_xlsx_bytes, render_help_panel
 from app.components.views.workspace_shell import render_workspace_feedback
@@ -97,6 +98,59 @@ def _build_items_for_listing(listing, quantity: int, unit_price: float) -> list[
             "category": (product.category if product else ""),
         }
     ]
+
+
+def _to_money_float(value) -> float:
+    if isinstance(value, dict):
+        value = value.get("value")
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _extract_ebay_marketplace_financials(order) -> dict:
+    payload_raw = str(getattr(order, "marketplace_payload_json", "") or "").strip()
+    if not payload_raw:
+        return {"tax_amount": 0.0, "discount_amount": 0.0}
+    try:
+        payload = json.loads(payload_raw)
+    except Exception:
+        return {"tax_amount": 0.0, "discount_amount": 0.0}
+    if not isinstance(payload, dict):
+        return {"tax_amount": 0.0, "discount_amount": 0.0}
+
+    pricing = payload.get("pricingSummary") if isinstance(payload.get("pricingSummary"), dict) else {}
+    subtotal = _to_money_float(pricing.get("priceSubtotal"))
+    delivery_cost = _to_money_float(pricing.get("deliveryCost"))
+    delivery_discount_raw = _to_money_float(pricing.get("deliveryDiscount"))
+    total = _to_money_float(pricing.get("total"))
+    explicit_tax = _to_money_float(pricing.get("totalTax"))
+
+    line_tax = 0.0
+    line_items = payload.get("lineItems")
+    if isinstance(line_items, list):
+        for line in line_items:
+            if not isinstance(line, dict):
+                continue
+            taxes = line.get("taxes")
+            if isinstance(taxes, list):
+                for tx in taxes:
+                    if not isinstance(tx, dict):
+                        continue
+                    line_tax += _to_money_float(tx.get("amount")) or _to_money_float(tx.get("taxAmount"))
+
+    tax_amount = float(max(explicit_tax, line_tax))
+    if tax_amount <= 0 and total > 0:
+        # eBay total generally equals subtotal + shipping + deliveryDiscount (+/-) + tax.
+        inferred = total - subtotal - delivery_cost - delivery_discount_raw
+        tax_amount = float(max(0.0, round(inferred, 2)))
+
+    discount_amount = float(abs(delivery_discount_raw)) if delivery_discount_raw < 0 else 0.0
+    return {
+        "tax_amount": float(max(0.0, tax_amount)),
+        "discount_amount": float(max(0.0, discount_amount)),
+    }
 
 
 def _parse_csv_set(value: str) -> set[str]:
@@ -481,7 +535,15 @@ def render_documents(repo: InventoryRepository) -> None:
         fees = float(selected.fees or 0)
         shipping_cost = float(selected.shipping_cost or 0)
         total = float(selected.total_amount or subtotal)
+        source_marketplace_normalized = str(selected.marketplace or "").strip().lower()
         notes = selected.notes or ""
+        if source_marketplace_normalized == "ebay":
+            notes = format_ebay_sync_note_for_customer(notes)
+        marketplace_financials = (
+            _extract_ebay_marketplace_financials(selected)
+            if source_marketplace_normalized == "ebay"
+            else {"tax_amount": 0.0, "discount_amount": 0.0}
+        )
     elif source_type == "Sale":
         sales = repo.list_sales()
         if not sales:
@@ -507,6 +569,30 @@ def render_documents(repo: InventoryRepository) -> None:
         shipping_cost = float(selected.shipping_cost or 0)
         total = subtotal
         notes = ""
+        source_marketplace_normalized = str(selected.marketplace or "").strip().lower()
+        marketplace_financials = {"tax_amount": 0.0, "discount_amount": 0.0}
+        if source_marketplace_normalized == "ebay":
+            linked_order = None
+            order_id = getattr(selected, "order_id", None)
+            if order_id is not None:
+                linked_order = next(
+                    (row for row in repo.list_orders() if int(row.id) == int(order_id)),
+                    None,
+                )
+            if linked_order is not None:
+                notes = format_ebay_sync_note_for_customer(getattr(linked_order, "notes", "") or "")
+                order_financials = _extract_ebay_marketplace_financials(linked_order)
+                order_subtotal = float(getattr(linked_order, "subtotal_amount", 0.0) or 0.0)
+                ratio = (float(subtotal) / order_subtotal) if order_subtotal > 0 else 1.0
+                ratio = max(0.0, min(1.0, ratio))
+                marketplace_financials = {
+                    "tax_amount": round(float(order_financials.get("tax_amount") or 0.0) * ratio, 2),
+                    "discount_amount": round(float(order_financials.get("discount_amount") or 0.0) * ratio, 2),
+                }
+                if float(fees or 0.0) <= 0.0:
+                    fees = round(float(getattr(linked_order, "fees", 0.0) or 0.0) * ratio, 2)
+                if float(shipping_cost or 0.0) <= 0.0:
+                    shipping_cost = round(float(getattr(linked_order, "shipping_cost", 0.0) or 0.0) * ratio, 2)
     else:
         listings = repo.list_listings()
         if not listings:
@@ -578,6 +664,8 @@ def render_documents(repo: InventoryRepository) -> None:
         shipping_cost = float(listing_shipping_cost or 0.0)
         total = round(float(subtotal + fees + shipping_cost), 2)
         notes = str(selected.marketplace_details or "").strip()
+        source_marketplace_normalized = str(selected.marketplace or "").strip().lower()
+        marketplace_financials = {"tax_amount": 0.0, "discount_amount": 0.0}
 
     default_doc_number = (
         f"{'INV' if doc_type == 'invoice' else 'RCT'}-{datetime.now().strftime('%Y%m%d')}-{selected.id}"
@@ -586,8 +674,12 @@ def render_documents(repo: InventoryRepository) -> None:
     memo_notes_default = selected_profile.notes if selected_profile and selected_profile.notes.strip() else notes
     memo_notes = st.text_area("Notes", value=memo_notes_default)
     st.markdown("### Tax Settings")
+    st.caption(
+        "Golden, CO local default profile is codified at 7.50% "
+        "(CO 2.90 + Jefferson County 0.50 + Golden 3.00 + CD 0.10 + RTD 1.00)."
+    )
     default_tax_jurisdiction = get_runtime_str(repo, "invoicing_tax_jurisdiction", "Golden, Colorado")
-    default_tax_rate_raw = get_runtime_str(repo, "invoicing_tax_rate_percent_default", "8.81")
+    default_tax_rate_raw = get_runtime_str(repo, "invoicing_tax_rate_percent_default", "7.50")
     try:
         default_tax_rate = float(default_tax_rate_raw)
     except Exception:
@@ -703,6 +795,18 @@ def render_documents(repo: InventoryRepository) -> None:
         value=True,
         help="When enabled, you can manually mark each line taxable/exempt for mixed invoices.",
     )
+    marketplace_overrides_available = source_marketplace_normalized == "ebay" and source_type in {"Order", "Sale"}
+    use_marketplace_overrides = False
+    if marketplace_overrides_available:
+        st.info(
+            "eBay handles marketplace tax collection/remittance. "
+            "Use imported marketplace tax/discount values on this invoice when available."
+        )
+        use_marketplace_overrides = st.checkbox(
+            "Use eBay Marketplace Tax/Discount Values",
+            value=True,
+            key=f"documents_use_ebay_marketplace_financials_{source_type.lower()}_{int(selected.id)}",
+        )
     auto_taxable_subtotal = _taxable_subtotal_auto(items, exempt_categories)
     if use_line_item_taxability and items:
         line_tax_rows = []
@@ -752,17 +856,34 @@ def render_documents(repo: InventoryRepository) -> None:
         taxable_subtotal += float(shipping_cost or 0.0)
     taxable_subtotal = max(0.0, taxable_subtotal)
     tax_amount = round(taxable_subtotal * (float(tax_rate_percent) / 100.0), 2)
-    calculated_total = round(float(subtotal or 0.0) + float(fees or 0.0) + float(shipping_cost or 0.0) + tax_amount, 2)
+    discount_amount = 0.0
+    tax_label = f"Sales Tax ({tax_jurisdiction or 'Local'})"
+    if use_marketplace_overrides:
+        tax_amount = float(round(float(marketplace_financials.get("tax_amount") or 0.0), 2))
+        discount_amount = float(round(float(marketplace_financials.get("discount_amount") or 0.0), 2))
+        tax_label = "Marketplace Tax (Collected by eBay)"
+    show_fees_on_customer_doc = source_marketplace_normalized != "ebay"
+    displayed_fees = float(fees or 0.0) if show_fees_on_customer_doc else 0.0
+
+    calculated_total = round(
+        float(subtotal or 0.0)
+        + float(displayed_fees or 0.0)
+        + float(shipping_cost or 0.0)
+        - float(discount_amount or 0.0)
+        + float(tax_amount or 0.0),
+        2,
+    )
     use_calculated_total = st.checkbox(
         "Use tax-adjusted computed total",
         value=True,
         help="When off, document uses the source record total field and still displays tax as informational.",
     )
     document_total = float(calculated_total if use_calculated_total else total)
-    t1, t2, t3 = st.columns(3)
+    t1, t2, t3, t4 = st.columns(4)
     t1.metric("Taxable Subtotal", f"${taxable_subtotal:,.2f}")
     t2.metric("Tax Amount", f"${tax_amount:,.2f}")
-    t3.metric("Document Total", f"${document_total:,.2f}")
+    t3.metric("Discount", f"${discount_amount:,.2f}")
+    t4.metric("Document Total", f"${document_total:,.2f}")
 
     html = build_document_html(
         doc_type=doc_type,
@@ -783,10 +904,13 @@ def render_documents(repo: InventoryRepository) -> None:
         notes=memo_notes,
         items=items,
         subtotal=subtotal,
-        fees=fees,
+        fees=displayed_fees,
+        show_fees=show_fees_on_customer_doc,
         shipping_cost=shipping_cost,
+        discount_amount=discount_amount,
+        discount_label="Marketplace Discount" if use_marketplace_overrides else "Discount",
         tax_amount=tax_amount,
-        tax_label=f"Sales Tax ({tax_jurisdiction or 'Local'})",
+        tax_label=tax_label,
         total=document_total,
     )
     html_bytes = html.encode("utf-8")

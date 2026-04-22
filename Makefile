@@ -40,8 +40,8 @@ k8s-migrate-prod:
 
 qa-unit:
 	python -m coverage run --source=app -m unittest discover -s tests -p "test_*.py"
-	python -m coverage report -m --fail-under=30
-	python -m coverage report -m --include="app/repository.py,app/services/*.py,app/auth.py,app/page_common.py,app/config.py" --fail-under=85
+	python -m coverage report -m --fail-under=38
+	python -m coverage report -m --include="app/repository.py,app/services/*.py,app/auth.py,app/page_common.py,app/config.py" --fail-under=88
 	python -m coverage xml -o coverage.xml
 	python -m coverage json -o coverage.json
 

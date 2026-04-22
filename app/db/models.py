@@ -32,6 +32,9 @@ class TimestampMixin:
 
 class Product(Base, TimestampMixin):
     __tablename__ = "products"
+    __table_args__ = (
+        Index("ix_products_acquired_at_id", "acquired_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     sku: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -108,6 +111,8 @@ class MarketplaceListing(Base, TimestampMixin):
             postgresql_where=text("external_listing_id <> ''"),
             sqlite_where=text("external_listing_id <> ''"),
         ),
+        Index("ix_marketplace_listings_listed_at_id", "listed_at", "id"),
+        Index("ix_marketplace_listings_created_at_id", "created_at", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -119,7 +124,7 @@ class MarketplaceListing(Base, TimestampMixin):
     listing_title: Mapped[str] = mapped_column(String(255))
     listing_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     listing_status: Mapped[str] = mapped_column(
-        Enum("draft", "active", "ended", name="listing_status_enum"), default="draft"
+        Enum("draft", "active", "ended", "sold", name="listing_status_enum"), default="draft"
     )
     review_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -137,20 +142,41 @@ class Order(Base, TimestampMixin):
     __tablename__ = "orders"
     __table_args__ = (
         UniqueConstraint("marketplace", "external_order_id", name="uq_marketplace_order"),
+        Index("ix_orders_sold_at_id", "sold_at", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     marketplace: Mapped[str] = mapped_column(String(64), index=True)
     external_order_id: Mapped[str] = mapped_column(String(128), default="")
     order_status: Mapped[str] = mapped_column(String(32), default="paid")
+    buyer_username: Mapped[str] = mapped_column(String(128), default="", index=True)
+    buyer_name: Mapped[str] = mapped_column(String(255), default="")
+    buyer_email: Mapped[str] = mapped_column(String(255), default="")
+    ship_to_city: Mapped[str] = mapped_column(String(128), default="")
+    ship_to_state: Mapped[str] = mapped_column(String(64), default="")
+    ship_to_postal_code: Mapped[str] = mapped_column(String(32), default="")
+    ship_to_country: Mapped[str] = mapped_column(String(8), default="")
     subtotal_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     fees: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     shipping_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    shipping_label_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    shipping_label_currency: Mapped[str] = mapped_column(String(8), default="USD")
+    shipping_provider: Mapped[str] = mapped_column(String(64), default="")
+    shipping_service: Mapped[str] = mapped_column(String(128), default="")
+    tracking_number: Mapped[str] = mapped_column(String(128), default="")
+    tracking_status: Mapped[str] = mapped_column(String(64), default="")
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     sold_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
+    marketplace_payload_json: Mapped[str] = mapped_column(Text, default="{}")
     notes: Mapped[str] = mapped_column(Text, default="")
 
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order")
+    finance_entries: Mapped[list["OrderFinanceEntry"]] = relationship(
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
     sales: Mapped[list["Sale"]] = relationship(back_populates="order")
     returns: Mapped[list["ReturnRecord"]] = relationship(back_populates="order")
 
@@ -176,8 +202,43 @@ class OrderItem(Base, TimestampMixin):
     listing: Mapped[MarketplaceListing | None] = relationship(back_populates="order_items")
 
 
+class OrderFinanceEntry(Base, TimestampMixin):
+    __tablename__ = "order_finance_entries"
+    __table_args__ = (
+        Index("ix_order_finance_entries_order_kind", "order_id", "entry_kind"),
+        Index("ix_order_finance_entries_order_tx", "order_id", "transaction_id"),
+        Index("ix_order_finance_entries_external_order", "external_order_id"),
+        Index("ix_order_finance_entries_kind_txdate_created", "entry_kind", "transaction_date", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    marketplace: Mapped[str] = mapped_column(String(64), default="ebay", index=True)
+    external_order_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    transaction_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    line_item_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    legacy_item_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    sku: Mapped[str] = mapped_column(String(128), default="", index=True)
+    entry_kind: Mapped[str] = mapped_column(String(32), default="other", index=True)
+    fee_type: Mapped[str] = mapped_column(String(128), default="", index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    booking_entry: Mapped[str] = mapped_column(String(16), default="")
+    transaction_type: Mapped[str] = mapped_column(String(64), default="", index=True)
+    transaction_status: Mapped[str] = mapped_column(String(64), default="")
+    transaction_date: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    memo: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(64), default="ebay_finances", index=True)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    order: Mapped[Order] = relationship(back_populates="finance_entries")
+
+
 class Sale(Base, TimestampMixin):
     __tablename__ = "sales"
+    __table_args__ = (
+        Index("ix_sales_sold_at_id", "sold_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -218,6 +279,9 @@ class Sale(Base, TimestampMixin):
 
 class ReturnRecord(Base, TimestampMixin):
     __tablename__ = "returns"
+    __table_args__ = (
+        Index("ix_returns_returned_at_id", "returned_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     sale_id: Mapped[int | None] = mapped_column(ForeignKey("sales.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -332,6 +396,38 @@ class EbayPublishPreset(Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
+class EbayCategorySuggestion(Base, TimestampMixin):
+    __tablename__ = "ebay_category_suggestions"
+    __table_args__ = (
+        UniqueConstraint(
+            "environment",
+            "marketplace_id",
+            "query_norm",
+            "category_id",
+            name="uq_ebay_category_suggestion_env_market_query_category",
+        ),
+        Index(
+            "ix_ebay_category_suggestion_lookup",
+            "environment",
+            "marketplace_id",
+            "query_norm",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    marketplace_id: Mapped[str] = mapped_column(String(32), default="EBAY_US", index=True)
+    query_raw: Mapped[str] = mapped_column(String(255), default="")
+    query_norm: Mapped[str] = mapped_column(String(255), default="", index=True)
+    category_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    category_name: Mapped[str] = mapped_column(String(255), default="")
+    path: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(32), default="ebay_taxonomy")
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    created_by: Mapped[str] = mapped_column(String(128), default="system")
+
+
 class EbayListingTemplateProfile(Base, TimestampMixin):
     __tablename__ = "ebay_listing_template_profiles"
     __table_args__ = (
@@ -442,6 +538,57 @@ class IntegrationQueueJob(Base, TimestampMixin):
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    requested_by: Mapped[str] = mapped_column(String(128), default="system", index=True)
+    updated_by: Mapped[str] = mapped_column(String(128), default="system")
+
+
+class NotificationOutbox(Base, TimestampMixin):
+    __tablename__ = "notification_outbox"
+    __table_args__ = (
+        Index(
+            "ix_notification_outbox_dispatch",
+            "status",
+            "next_attempt_at",
+            "created_at",
+        ),
+        Index(
+            "ix_notification_outbox_lock",
+            "status",
+            "locked_at",
+        ),
+        Index(
+            "ix_notification_outbox_env_status_due_id",
+            "environment",
+            "status",
+            "next_attempt_at",
+            "id",
+        ),
+        Index(
+            "ix_notification_outbox_env_channel_dedupe_status",
+            "environment",
+            "channel",
+            "dedupe_key",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    channel: Mapped[str] = mapped_column(String(32), default="slack", index=True)
+    event_type: Mapped[str] = mapped_column(String(64), default="", index=True)
+    entity_type: Mapped[str] = mapped_column(String(64), default="", index=True)
+    entity_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    max_attempts: Mapped[int] = mapped_column(default=6)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    locked_by: Mapped[str] = mapped_column(String(128), default="", index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
     requested_by: Mapped[str] = mapped_column(String(128), default="system", index=True)
     updated_by: Mapped[str] = mapped_column(String(128), default="system")
@@ -654,6 +801,7 @@ class MediaAsset(Base, TimestampMixin):
     s3_key: Mapped[str] = mapped_column(String(512), unique=True)
     s3_url: Mapped[str] = mapped_column(Text)
     uploaded_by: Mapped[str] = mapped_column(String(128), default="system")
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
     product: Mapped[Product | None] = relationship(back_populates="media_assets")
     listing: Mapped[MarketplaceListing | None] = relationship(back_populates="media_assets")
@@ -687,7 +835,10 @@ class PurchaseLot(Base, TimestampMixin):
 
 class ProductLotAssignment(Base, TimestampMixin):
     __tablename__ = "product_lot_assignments"
-    __table_args__ = (UniqueConstraint("product_id", "lot_id", name="uq_product_lot_assignment"),)
+    __table_args__ = (
+        UniqueConstraint("product_id", "lot_id", name="uq_product_lot_assignment"),
+        Index("ix_product_lot_assignments_acq_id", "acquired_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
@@ -740,6 +891,9 @@ class PurchaseDocument(Base, TimestampMixin):
 
 class InventoryMovement(Base):
     __tablename__ = "inventory_movements"
+    __table_args__ = (
+        Index("ix_inventory_movements_occ_at_id", "occurred_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int | None] = mapped_column(
@@ -768,4 +922,71 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(32), index=True)
     actor: Mapped[str] = mapped_column(String(128), default="system")
     changes_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+
+class WorkflowDraft(Base, TimestampMixin):
+    __tablename__ = "workflow_drafts"
+    __table_args__ = (
+        UniqueConstraint(
+            "environment",
+            "workflow_key",
+            "username",
+            "scope_key",
+            name="uq_workflow_draft_env_key_user_scope",
+        ),
+        Index(
+            "ix_workflow_draft_lookup",
+            "environment",
+            "workflow_key",
+            "username",
+            "scope_key",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    workflow_key: Mapped[str] = mapped_column(String(64), index=True)
+    username: Mapped[str] = mapped_column(String(128), index=True)
+    scope_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    schema_version: Mapped[str] = mapped_column(String(16), default="v1")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    draft_json: Mapped[str] = mapped_column(Text, default="{}")
+    autosave_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_step: Mapped[str] = mapped_column(String(64), default="")
+    resumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    updated_by: Mapped[str] = mapped_column(String(128), default="system")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class WorkflowEvent(Base):
+    __tablename__ = "workflow_events"
+    __table_args__ = (
+        Index(
+            "ix_workflow_event_lookup",
+            "environment",
+            "workflow_key",
+            "username",
+            "scope_key",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    draft_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workflow_drafts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    workflow_key: Mapped[str] = mapped_column(String(64), index=True)
+    username: Mapped[str] = mapped_column(String(128), index=True)
+    scope_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="ok", index=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_by: Mapped[str] = mapped_column(String(128), default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)

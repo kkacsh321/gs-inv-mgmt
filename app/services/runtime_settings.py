@@ -44,20 +44,53 @@ def get_runtime_value(repo: Any, key: str, default: Any) -> Any:
     if row is None:
         return default
 
-    raw = row.value
-    value_type = (row.value_type or "str").strip().lower()
-    if value_type == "bool":
+    return _coerce_runtime_value(raw=row.value, value_type=row.value_type, default=default)
+
+
+def _coerce_runtime_value(*, raw: Any, value_type: Any, default: Any) -> Any:
+    normalized_type = str(value_type or "str").strip().lower()
+    if normalized_type == "bool":
         return _to_bool(raw, bool(default))
-    if value_type == "int":
+    if normalized_type == "int":
         return _to_int(raw, int(default))
-    if value_type == "float":
+    if normalized_type == "float":
         return _to_float(raw, float(default))
-    if value_type == "json":
+    if normalized_type == "json":
         try:
             return json.loads(raw)
         except Exception:
             return default
     return raw
+
+
+def get_runtime_values(repo: Any, defaults_by_key: dict[str, Any]) -> dict[str, Any]:
+    resolved_defaults = dict(defaults_by_key or {})
+    if not resolved_defaults:
+        return {}
+    try:
+        rows = repo.list_runtime_settings(environment=settings.app_env, active_only=True)
+    except Exception:
+        rows = []
+    row_by_key = {
+        str(getattr(row, "key", "") or "").strip(): row
+        for row in rows
+        if str(getattr(row, "key", "") or "").strip()
+    }
+    resolved: dict[str, Any] = {}
+    for key, default in resolved_defaults.items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        row = row_by_key.get(normalized_key)
+        if row is None:
+            resolved[normalized_key] = default
+            continue
+        resolved[normalized_key] = _coerce_runtime_value(
+            raw=getattr(row, "value", None),
+            value_type=getattr(row, "value_type", "str"),
+            default=default,
+        )
+    return resolved
 
 
 def get_runtime_bool(repo: Any, key: str, default: bool) -> bool:

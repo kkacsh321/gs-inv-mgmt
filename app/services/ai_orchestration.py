@@ -77,6 +77,7 @@ def execute_comp_summary(
     spot_context: dict[str, Any] | None,
     system_message: str,
     instruction: str,
+    workflow: str = "comp",
 ) -> AIExecutionResult:
     comp_rules_context = get_runtime_str(
         repo,
@@ -92,7 +93,7 @@ def execute_comp_summary(
         label="Comp Rules Context",
         context_text=comp_rules_context,
     )
-    chain = resolve_comp_llm_runtime_chain(repo)
+    chain = resolve_comp_llm_runtime_chain(repo, workflow=workflow)
     text, used_cfg, fallback_errors = generate_comp_ai_summary_with_fallback(
         chain,
         query=query,
@@ -110,6 +111,7 @@ def execute_comp_summary(
             "query": query,
             "ebay_rows": len(ebay_rows or []),
             "web_rows": len(web_rows or []),
+            "workflow": str(workflow or "comp").strip().lower(),
         },
     )
     return AIExecutionResult(text=text, used_config=used_cfg, fallback_errors=fallback_errors, citation=citation)
@@ -126,6 +128,7 @@ def execute_multimodal_task(
     additional_images: list[tuple[bytes, str]] | None = None,
     max_output_tokens_override: int | None = None,
     context: dict[str, Any] | None = None,
+    workflow: str = "comp",
 ) -> AIExecutionResult:
     lowered_tool = str(tool_name or "").strip().lower()
     if "grader" in lowered_tool:
@@ -143,7 +146,7 @@ def execute_multimodal_task(
             label="Grading Rules Context",
             context_text=grading_rules_context,
         )
-    chain = resolve_comp_llm_runtime_chain(repo)
+    chain = resolve_comp_llm_runtime_chain(repo, workflow=workflow)
     text, used_cfg, fallback_errors = generate_multimodal_ai_markdown_with_fallback(
         chain,
         system_message=system_message,
@@ -157,6 +160,6 @@ def execute_multimodal_task(
         tool_name=tool_name,
         used_config=used_cfg,
         fallback_errors=fallback_errors,
-        context=context,
+        context={**dict(context or {}), "workflow": str(workflow or "comp").strip().lower()},
     )
     return AIExecutionResult(text=text, used_config=used_cfg, fallback_errors=fallback_errors, citation=citation)

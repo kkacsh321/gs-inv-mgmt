@@ -4,6 +4,7 @@ import tempfile
 import zipfile
 from datetime import datetime
 from io import BytesIO
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -36,6 +37,31 @@ class InMemoryMediaFile:
 
 def as_money(value: float) -> str:
     return f"${value:,.2f}"
+
+
+def safe_switch_page(
+    page_path: str,
+    *,
+    error_prefix: str = "Navigation failed",
+    info_message: str = "",
+) -> bool:
+    resolved = str(page_path or "").strip()
+    if not resolved:
+        st.error(f"{error_prefix}: missing target page path.")
+        return False
+    if not hasattr(st, "switch_page"):
+        st.error(f"{error_prefix}: switch_page is unavailable in this runtime.")
+        if str(info_message or "").strip():
+            st.info(str(info_message).strip())
+        return False
+    try:
+        st.switch_page(resolved)
+        return True
+    except Exception as exc:
+        st.error(f"{error_prefix}: {exc}")
+        if str(info_message or "").strip():
+            st.info(str(info_message).strip())
+        return False
 
 
 def handoff_to_documents_draft(
@@ -125,8 +151,7 @@ def handoff_to_documents_draft(
     st.session_state["documents_prefill_applied"] = False
     st.session_state["workspace_handoff_from"] = str(handoff_from or "").strip()
     st.session_state["workspace_handoff_target"] = "documents"
-    if hasattr(st, "switch_page"):
-        st.switch_page("pages/16_Documents.py")
+    safe_switch_page("pages/16_Documents.py")
 
 
 def render_help_panel(
@@ -158,8 +183,12 @@ def render_table_toolbar(
     section_key: str,
     export_basename: str,
     active_filters: dict[str, object] | None = None,
+    defer_exports: bool = False,
+    row_count: int | None = None,
+    export_df_factory: Callable[[], pd.DataFrame] | None = None,
 ) -> None:
-    st.caption(f"Rows: {len(df)}")
+    resolved_row_count = int(row_count) if row_count is not None else int(len(df.index))
+    st.caption(f"Rows: {resolved_row_count}")
     filter_parts: list[str] = []
     for key, value in (active_filters or {}).items():
         if value is None:
@@ -175,26 +204,39 @@ def render_table_toolbar(
             filter_parts.append(f"{key}={raw}")
     if filter_parts:
         st.caption("Active filters: " + " | ".join(filter_parts))
+    if bool(defer_exports):
+        load_exports = st.checkbox(
+            "Load Table Exports (slower)",
+            value=False,
+            key=f"{section_key}_load_exports",
+            help="Defers CSV/XLSX export byte generation unless explicitly requested.",
+        )
+        if not load_exports:
+            st.caption(
+                "Table exports are deferred. Enable `Load Table Exports (slower)` to prepare CSV/XLSX downloads."
+            )
+            return
     c1, c2 = st.columns(2)
+    export_df = export_df_factory() if export_df_factory is not None else df
     with c1:
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download CSV",
             data=csv_bytes,
             file_name=f"{export_basename}.csv",
             mime="text/csv",
             key=f"{section_key}_export_csv",
-            disabled=df.empty,
+            disabled=export_df.empty,
         )
     with c2:
-        xlsx_bytes = dataframe_to_xlsx_bytes(df, sheet_name="data")
+        xlsx_bytes = dataframe_to_xlsx_bytes(export_df, sheet_name="data")
         st.download_button(
             label="Download XLSX",
             data=xlsx_bytes,
             file_name=f"{export_basename}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"{section_key}_export_xlsx",
-            disabled=df.empty,
+            disabled=export_df.empty,
         )
 
 
@@ -216,9 +258,16 @@ def infer_media_type(content_type: str) -> str:
 
 
 def generate_sku(category: str, metal_type: str) -> str:
-    category_part = (category or "GEN")[:3].upper()
-    metal_part = (metal_type or "MIX")[:3].upper()
-    ts = utcnow_naive().strftime("%y%m%d%H%M")
+    def _abbr(value: str, fallback: str) -> str:
+        token = "".join(ch for ch in str(value or "") if ch.isalnum()).upper()
+        if not token:
+            token = fallback
+        return token[:2]
+
+    category_part = _abbr(category, "GN")
+    metal_part = _abbr(metal_type, "MX")
+    # Very short date code: 2-digit year + day-of-year (e.g., 26102)
+    ts = utcnow_naive().strftime("%y%j")
     rand = uuid4().hex[:4].upper()
     return f"GS-{category_part}-{metal_part}-{ts}-{rand}"
 
@@ -272,11 +321,25 @@ def render_existing_media_attach_selector(
     section_title: str,
     help_text: str,
     limit: int = 300,
+    defer_load: bool = False,
+    preloaded_rows: list[Any] | None = None,
 ) -> list[int]:
     with st.expander(section_title, expanded=False):
         st.caption(help_text)
-        all_rows = repo.list_media_assets()
-        rows = all_rows[: max(1, int(limit))]
+        if defer_load:
+            load_key = f"{key_prefix}_load_media"
+            load_media = st.checkbox(
+                "Load media options (slower)",
+                value=bool(st.session_state.get(load_key, False)),
+                key=load_key,
+            )
+            if not load_media:
+                st.caption("Enable media loading to browse and attach existing assets.")
+                return []
+        if preloaded_rows is not None:
+            rows = list(preloaded_rows)
+        else:
+            rows = repo.list_media_assets(limit=max(1, int(limit)))
         search_text = st.text_input(
             "Filter media (filename/type/id)",
             value="",
@@ -512,9 +575,21 @@ def render_media_gallery(
 
             if media.media_type == "image":
                 if preview_bytes is not None:
-                    st.image(preview_bytes, use_container_width=True)
+                    try:
+                        st.image(preview_bytes, use_container_width=True)
+                    except Exception:
+                        if media.s3_url:
+                            try:
+                                st.image(media.s3_url, use_container_width=True)
+                            except Exception:
+                                st.caption("Image preview unavailable (invalid image bytes/URL content).")
+                        else:
+                            st.caption("Image preview unavailable (invalid image bytes).")
                 else:
-                    st.image(media.s3_url, use_container_width=True)
+                    try:
+                        st.image(media.s3_url, use_container_width=True)
+                    except Exception:
+                        st.caption("Image preview unavailable (invalid image URL content).")
             elif media.media_type == "video":
                 if preview_bytes is not None:
                     st.video(preview_bytes, format=preview_content_type)
@@ -577,9 +652,21 @@ def render_media_file_actions(
 
     if selected.media_type == "image":
         if data is not None:
-            st.image(data, use_container_width=True)
+            try:
+                st.image(data, use_container_width=True)
+            except Exception:
+                if selected.s3_url:
+                    try:
+                        st.image(selected.s3_url, use_container_width=True)
+                    except Exception:
+                        st.caption("Image preview unavailable (invalid image bytes/URL content).")
+                else:
+                    st.caption("Image preview unavailable (invalid image bytes).")
         elif selected.s3_url:
-            st.image(selected.s3_url, use_container_width=True)
+            try:
+                st.image(selected.s3_url, use_container_width=True)
+            except Exception:
+                st.caption("Image preview unavailable (invalid image URL content).")
     elif selected.media_type == "video":
         if data is not None:
             st.video(data, format=content_type)
@@ -797,10 +884,11 @@ def render_ebay_push_history(
     with qa2:
         if st.button("Open in Sync", key=f"{key_prefix}_open_sync_{selected.id}"):
             st.session_state["sync_focus_run_id"] = selected.id
-            try:
-                st.switch_page("app/pages/18_Sync.py")
-            except Exception:
-                st.info("Open Sync page from sidebar, then run will be preselected.")
+            safe_switch_page(
+                "pages/18_Sync.py",
+                error_prefix="Open Sync failed",
+                info_message="Open Sync page from sidebar; selected run will stay preselected.",
+            )
     with qa3:
         if st.button(
             "Resolve All Unresolved Errors",

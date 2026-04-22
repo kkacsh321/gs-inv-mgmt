@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import requests
+
 from app.services import llm_runtime
 from app.services.llm_runtime import LLMRuntimeConfig
 
@@ -42,6 +44,24 @@ class LLMRuntimeTests(unittest.TestCase):
         repo = RepoError()
         self.assertTrue(llm_runtime._runtime_bool_from_repo(repo, "x", True))
         self.assertEqual(llm_runtime._runtime_int_from_repo(repo, "x", 7), 7)
+        self.assertEqual(llm_runtime._runtime_str_from_repo(repo, "x", "fallback"), "fallback")
+
+    def test_workflow_profile_selector_parses_id_and_name(self) -> None:
+        class Repo:
+            def get_runtime_setting(self, *, environment: str, key: str, active_only: bool):
+                mapping = {
+                    "ai_workflow_profile_listing": SimpleNamespace(value="42"),
+                    "ai_workflow_profile_intake": SimpleNamespace(value="LocalAI Intake"),
+                }
+                return mapping.get(key)
+
+        repo = Repo()
+        self.assertEqual(llm_runtime._workflow_profile_selector(repo, "listing"), (42, ""))
+        self.assertEqual(
+            llm_runtime._workflow_profile_selector(repo, "intake"),
+            (None, "localai intake"),
+        )
+        self.assertEqual(llm_runtime._workflow_profile_selector(repo, "unknown"), (None, ""))
 
     def test_resolve_comp_llm_runtime_config_prefers_db_then_env(self) -> None:
         db_row = SimpleNamespace(
@@ -240,6 +260,71 @@ class LLMRuntimeTests(unittest.TestCase):
         chain = llm_runtime.resolve_comp_llm_runtime_chain(Repo())
         self.assertEqual(len(chain), 1)
         self.assertEqual(chain[0].provider, "localai")
+
+    @patch("app.services.llm_runtime._runtime_int_from_repo", return_value=8)
+    @patch("app.services.llm_runtime._runtime_bool_from_repo", return_value=True)
+    @patch("app.services.llm_runtime.resolve_comp_llm_runtime_config")
+    def test_resolve_chain_prioritizes_workflow_selected_profile(
+        self, mock_primary, _mock_fallback_enabled, _mock_max_profiles
+    ) -> None:
+        primary = LLMRuntimeConfig(
+            source="db",
+            enabled=True,
+            provider="openai",
+            model="gpt-4o-mini",
+            multimodal_model="gpt-4o-mini",
+            base_url="https://api.openai.com/v1",
+            endpoint_type="responses",
+            api_key="k",
+            temperature=0.2,
+            max_output_tokens=600,
+            timeout_seconds=60,
+        )
+        mock_primary.return_value = primary
+
+        selected = SimpleNamespace(
+            id=9,
+            name="Listing Profile",
+            is_default=False,
+            is_active=True,
+            provider="localai",
+            model="listing-model",
+            multimodal_model="",
+            base_url="http://localai:8080/v1",
+            endpoint_type="chat_completions",
+            api_key="",
+            temperature=0.1,
+            max_output_tokens=900,
+            timeout_seconds=45,
+        )
+        default_row = SimpleNamespace(
+            id=1,
+            name="Default",
+            is_default=True,
+            is_active=True,
+            provider="openai",
+            model="gpt-4o-mini",
+            multimodal_model="",
+            base_url="https://api.openai.com/v1",
+            endpoint_type="responses",
+            api_key="k",
+            temperature=0.2,
+            max_output_tokens=600,
+            timeout_seconds=60,
+        )
+
+        class Repo:
+            def list_ai_provider_configs(self, *, environment: str, active_only: bool):
+                return [default_row, selected]
+
+            def get_runtime_setting(self, *, environment: str, key: str, active_only: bool):
+                if key == "ai_workflow_profile_listing":
+                    return SimpleNamespace(value="Listing Profile")
+                return None
+
+        chain = llm_runtime.resolve_comp_llm_runtime_chain(Repo(), workflow="listing")
+        self.assertGreaterEqual(len(chain), 2)
+        self.assertEqual(chain[0].model, "listing-model")
 
     def test_generate_comp_ai_summary_validates_and_parses_chat_and_responses(self) -> None:
         disabled_cfg = LLMRuntimeConfig(
@@ -758,6 +843,38 @@ class LLMRuntimeTests(unittest.TestCase):
                 instruction="inst",
                 image_bytes=b"img",
             )
+
+    @patch("app.services.llm_runtime.generate_multimodal_ai_markdown")
+    def test_generate_multimodal_with_fallback_retries_transient_error(self, mock_generate) -> None:
+        cfg = LLMRuntimeConfig(
+            source="db",
+            enabled=True,
+            provider="localai",
+            model="qwen3-vl",
+            multimodal_model="qwen3-vl",
+            base_url="http://localai:8080/v1",
+            endpoint_type="chat_completions",
+            api_key="",
+            temperature=0.2,
+            max_output_tokens=400,
+            timeout_seconds=20,
+        )
+        transient = requests.HTTPError(
+            "500 Server Error",
+            response=SimpleNamespace(status_code=500),
+        )
+        mock_generate.side_effect = [transient, "ok-after-retry"]
+        text, used, errors = llm_runtime.generate_multimodal_ai_markdown_with_fallback(
+            [cfg],
+            system_message="sys",
+            instruction="inst",
+            image_bytes=b"img",
+        )
+        self.assertEqual(text, "ok-after-retry")
+        self.assertEqual(used.provider, "localai")
+        self.assertEqual(mock_generate.call_count, 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("recovered after transient error retry", errors[0])
 
     def test_generate_multimodal_with_fallback_all_fail(self) -> None:
         cfg = LLMRuntimeConfig(

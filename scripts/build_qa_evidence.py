@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -77,13 +78,32 @@ def _playwright_summary(playwright_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _coverage_gate_summary(
+    *,
+    coverage: dict[str, Any],
+    global_gate: float,
+    scoped_core_gate: float,
+) -> dict[str, Any]:
+    global_pct = _safe_float(coverage.get("global_percent"))
+    scoped_pct = _safe_float(coverage.get("scoped_core_percent"))
+    return {
+        "global_gate_percent": round(float(global_gate), 2),
+        "scoped_core_gate_percent": round(float(scoped_core_gate), 2),
+        "global_pass": bool(global_pct >= float(global_gate)),
+        "scoped_core_pass": bool(scoped_pct >= float(scoped_core_gate)),
+        "all_pass": bool(global_pct >= float(global_gate) and scoped_pct >= float(scoped_core_gate)),
+    }
+
+
 def _build_markdown(
     *,
     unit_outcome: str,
     playwright_outcome: str,
     coverage: dict[str, Any],
     playwright: dict[str, Any],
+    coverage_gates: dict[str, Any],
 ) -> str:
+    gate_status = "PASS" if bool(coverage_gates.get("all_pass")) else "FAIL"
     return "\n".join(
         [
             "# QA Evidence Summary",
@@ -96,6 +116,7 @@ def _build_markdown(
             f"- Global coverage: `{coverage.get('global_percent_display')}%`",
             f"- Scoped-core coverage: `{coverage.get('scoped_core_percent')}%`",
             f"- Lines: covered `{coverage.get('covered_lines')}` / total `{coverage.get('num_statements')}` (missing `{coverage.get('missing_lines')}`)",
+            f"- Gate result: `{gate_status}` (global `>={coverage_gates.get('global_gate_percent')}%`, scoped-core `>={coverage_gates.get('scoped_core_gate_percent')}%`)",
             "",
             "## Playwright",
             f"- Expected passed: `{playwright.get('expected', 0)}`",
@@ -117,6 +138,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default="qa-evidence")
     parser.add_argument("--unit-outcome", default="unknown")
     parser.add_argument("--playwright-outcome", default="unknown")
+    parser.add_argument("--coverage-gate-global", default="38")
+    parser.add_argument("--coverage-gate-core", default="88")
     parser.add_argument("--summary-out", default="")
     args = parser.parse_args()
 
@@ -128,11 +151,19 @@ def main() -> None:
 
     coverage = _coverage_summary(coverage_payload)
     playwright = _playwright_summary(playwright_payload)
+    coverage_gates = _coverage_gate_summary(
+        coverage=coverage,
+        global_gate=_safe_float(args.coverage_gate_global),
+        scoped_core_gate=_safe_float(args.coverage_gate_core),
+    )
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     evidence = {
+        "generated_at_utc": generated_at,
         "unit_outcome": args.unit_outcome,
         "playwright_outcome": args.playwright_outcome,
         "coverage": coverage,
+        "coverage_gates": coverage_gates,
         "playwright": playwright,
     }
 
@@ -141,10 +172,12 @@ def main() -> None:
         playwright_outcome=args.playwright_outcome,
         coverage=coverage,
         playwright=playwright,
+        coverage_gates=coverage_gates,
     )
 
     (output_dir / "qa_evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
     (output_dir / "qa_evidence.md").write_text(summary_md, encoding="utf-8")
+    (output_dir / "coverage_gates.json").write_text(json.dumps(coverage_gates, indent=2), encoding="utf-8")
 
     if args.summary_out:
         Path(args.summary_out).write_text(summary_md, encoding="utf-8")

@@ -1,11 +1,15 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:8501";
+if (process.env.FORCE_COLOR && process.env.NO_COLOR) {
+  delete process.env.NO_COLOR;
+}
 process.env.E2E_USERNAME = process.env.E2E_USERNAME || "e2e";
 process.env.E2E_PASSWORD = process.env.E2E_PASSWORD || "e2e-password-123";
 
 export default defineConfig({
   testDir: "tests/e2e",
+  globalSetup: "./tests/e2e/global.setup.ts",
   timeout: 45_000,
   expect: {
     timeout: 10_000,

@@ -127,7 +127,7 @@ class SeedTests(unittest.TestCase):
                 "lots": 3,
                 "products": 6,
                 "assignments": 6,
-                "listings": 4,
+                "listings": 5,
                 "sales": 3,
                 "media": 3,
                 "coin_refs": 3,

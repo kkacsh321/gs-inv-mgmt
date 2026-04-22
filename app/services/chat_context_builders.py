@@ -59,12 +59,14 @@ def build_listings_snapshot(repo: Any, *, max_scan_rows: int) -> tuple[str, list
     draft = sum(1 for l in listings if (l.listing_status or "").strip().lower() == "draft")
     active = sum(1 for l in listings if (l.listing_status or "").strip().lower() == "active")
     ended = sum(1 for l in listings if (l.listing_status or "").strip().lower() == "ended")
+    sold = sum(1 for l in listings if (l.listing_status or "").strip().lower() == "sold")
     pending_review = sum(1 for l in listings if (l.review_status or "pending").strip().lower() != "approved")
     lines = [
         f"Listing status snapshot across `{total}` listings:",
         f"- Draft: `{draft}`",
         f"- Active: `{active}`",
         f"- Ended: `{ended}`",
+        f"- Sold: `{sold}`",
         f"- Pending/Not approved review: `{pending_review}`",
     ]
     citations = [

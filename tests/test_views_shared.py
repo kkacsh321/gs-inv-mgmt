@@ -175,7 +175,29 @@ class SharedViewsTests(unittest.TestCase):
         self.assertEqual(shared.infer_media_type("video/mp4"), "video")
         self.assertEqual(shared.infer_media_type("application/pdf"), "other")
         sku = shared.generate_sku("bullion", "silver")
-        self.assertTrue(sku.startswith("GS-BUL-SIL-"))
+        self.assertTrue(sku.startswith("GS-BU-SI-"))
+
+    def test_safe_switch_page_success_and_failure(self):
+        fake_ok = _FakeSt()
+        with patch.object(shared, "st", fake_ok):
+            self.assertTrue(shared.safe_switch_page("pages/03_Listings.py"))
+        self.assertEqual(fake_ok.switch_pages, ["pages/03_Listings.py"])
+
+        class _FailSwitchSt(_FakeSt):
+            def switch_page(self, _page):
+                raise RuntimeError("bad route")
+
+        fake_fail = _FailSwitchSt()
+        with patch.object(shared, "st", fake_fail):
+            self.assertFalse(
+                shared.safe_switch_page(
+                    "pages/03_Listings.py",
+                    error_prefix="Open page failed",
+                    info_message="Use sidebar.",
+                )
+            )
+        self.assertTrue(any("Open page failed" in msg for msg in fake_fail.errors))
+        self.assertTrue(any("Use sidebar." in msg for msg in fake_fail.infos))
 
     def test_upload_media_for_listing(self):
         created = []
@@ -251,11 +273,54 @@ class SharedViewsTests(unittest.TestCase):
             )
         self.assertEqual(len(fake_st.download_calls), 2)
 
+    def test_render_table_toolbar_deferred_exports_skip_generation_by_default(self):
+        fake_st = _FakeSt()
+        df = shared.pd.DataFrame([{"a": 1}, {"a": 2}])
+        with patch.object(shared, "st", fake_st):
+            shared.render_table_toolbar(
+                df=df,
+                section_key="k_defer",
+                export_basename="exp",
+                active_filters={"status": ["open"]},
+                defer_exports=True,
+            )
+        self.assertEqual(len(fake_st.download_calls), 0)
+        self.assertTrue(any("Table exports are deferred" in c for c in fake_st.captions))
+
+    def test_render_table_toolbar_deferred_exports_loads_when_enabled(self):
+        fake_st = _FakeSt()
+        fake_st.checkbox_map["k_defer_on_load_exports"] = True
+        df = shared.pd.DataFrame([{"a": 1}, {"a": 2}])
+        with patch.object(shared, "st", fake_st):
+            shared.render_table_toolbar(
+                df=df,
+                section_key="k_defer_on",
+                export_basename="exp",
+                active_filters={"status": ["open"]},
+                defer_exports=True,
+            )
+        self.assertEqual(len(fake_st.download_calls), 2)
+
+    def test_render_table_toolbar_supports_row_count_and_export_factory(self):
+        fake_st = _FakeSt()
+        preview_df = shared.pd.DataFrame([{"a": 1}])
+        full_df = shared.pd.DataFrame([{"a": 1}, {"a": 2}, {"a": 3}])
+        with patch.object(shared, "st", fake_st):
+            shared.render_table_toolbar(
+                df=preview_df,
+                section_key="k_factory",
+                export_basename="exp",
+                row_count=3,
+                export_df_factory=lambda: full_df,
+            )
+        self.assertTrue(any("Rows: 3" in c for c in fake_st.captions))
+        self.assertEqual(len(fake_st.download_calls), 2)
+
     def test_render_existing_media_attach_selector_empty(self):
         fake_st = _FakeSt()
 
         class Repo:
-            def list_media_assets(self):
+            def list_media_assets(self, include_archived: bool = False, limit: int = 300):
                 return []
 
         with patch.object(shared, "st", fake_st):
@@ -284,7 +349,7 @@ class SharedViewsTests(unittest.TestCase):
         )
 
         class Repo:
-            def list_media_assets(self):
+            def list_media_assets(self, include_archived: bool = False, limit: int = 300):
                 return [row]
 
         with patch.object(shared, "st", fake_st):

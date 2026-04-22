@@ -60,6 +60,8 @@ def evaluate_ebay_readiness(
         blockers.append("At least 1 image/video required")
     if status == "ended":
         blockers.append("Listing is ended")
+    if status == "sold":
+        blockers.append("Listing is sold")
 
     if not (category_id or "").strip():
         blockers.append("Missing eBay category ID")

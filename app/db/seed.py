@@ -123,6 +123,19 @@ def seed_dev_data(wipe: bool = False) -> dict:
                     actor="seed-script",
                 )
 
+        # Keep sandbox seller-ops controls enabled for deterministic e2e flows
+        # in non-production environments.
+        if hasattr(repo, "upsert_runtime_setting"):
+            repo.upsert_runtime_setting(
+                environment=settings.app_env,
+                key="ebay_allow_sandbox_seller_ops",
+                value="true",
+                value_type="bool",
+                description="Enable sandbox seller operations during non-prod seed/e2e.",
+                is_active=True,
+                actor="seed-script",
+            )
+
         lot_specs = [
             {
                 "lot_code": "LOT-2026-001",
@@ -312,6 +325,18 @@ def seed_dev_data(wipe: bool = False) -> dict:
                 "marketplace_url": "https://www.ebay.com/itm/EBAY-LIST-10001",
                 "marketplace_details": "{\"watchers\": 21, \"promoted\": true}",
                 "listed_at": _utc(10),
+            },
+            {
+                "sku": "GS-BUL-SIL-001",
+                "marketplace": "ebay",
+                "external_listing_id": "EBAY-LIST-E2E-DRAFT",
+                "listing_title": "E2E Seed Listing Draft (eBay)",
+                "listing_price": Decimal("39.00"),
+                "quantity_listed": 3,
+                "listing_status": "draft",
+                "marketplace_url": "",
+                "marketplace_details": "{\"e2e_fixture\": true, \"review_status\": \"pending\"}",
+                "listed_at": _utc(1),
             },
             {
                 "sku": "GS-COL-MIX-003",

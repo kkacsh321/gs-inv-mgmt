@@ -28,6 +28,16 @@ def _bootstrap_views_package() -> None:
         pkg = types.ModuleType("app.components.views")
         pkg.__path__ = []
         sys.modules["app.components.views"] = pkg
+    if "app.components.views.ebay" not in sys.modules:
+        fake_ebay_view = types.ModuleType("app.components.views.ebay")
+        fake_ebay_view.render_ebay_connection_status_card = lambda *args, **kwargs: None
+        sys.modules["app.components.views.ebay"] = fake_ebay_view
+    if "app.components.views.listing_wizard" not in sys.modules:
+        fake_listing_wizard_view = types.ModuleType("app.components.views.listing_wizard")
+        fake_listing_wizard_view.DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE = ""
+        fake_listing_wizard_view.DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT = ""
+        fake_listing_wizard_view.DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE = ""
+        sys.modules["app.components.views.listing_wizard"] = fake_listing_wizard_view
     if "app.db.seed" not in sys.modules:
         fake_seed = types.ModuleType("app.db.seed")
         fake_seed.seed_dev_data = lambda *args, **kwargs: {}
@@ -87,6 +97,68 @@ admin = _load_admin_module()
 
 
 class AdminHelpersTests(unittest.TestCase):
+    def test_summarize_ai_quality_metrics(self):
+        rows = [
+            (
+                datetime(2026, 4, 20, 10, 0, 0),
+                "qa",
+                "listing_wizard_apply",
+                '{"workflow":"listing_wizard","acceptance":{"prompt_version_id":"v1"}}',
+            ),
+            (
+                datetime(2026, 4, 20, 10, 5, 0),
+                "qa",
+                "listing_wizard_outcome",
+                '{"workflow":"listing_wizard","acceptance":{"prompt_version_id":"v1"},"outcome":{"accepted_as_is":true,"edited_fields":[]}}',
+            ),
+            (
+                datetime(2026, 4, 21, 9, 0, 0),
+                "qa",
+                "listing_wizard_outcome",
+                '{"workflow":"listing_wizard","acceptance":{"prompt_version_id":"v2"},"outcome":{"accepted_as_is":false,"edited_fields":["title","details"]}}',
+            ),
+        ]
+        out = admin._summarize_ai_quality_metrics(rows, workflow_filter="all")
+        self.assertEqual(out["apply_events"], 1)
+        self.assertEqual(out["outcome_events"], 2)
+        self.assertEqual(out["accepted_as_is_count"], 1)
+        self.assertEqual(out["edited_count"], 1)
+        self.assertIn("listing_wizard", out["workflow_totals"])
+        self.assertIn("v1", out["version_totals"])
+        self.assertIn("v2", out["version_totals"])
+        self.assertEqual(len(out["daily_rows"]), 2)
+        self.assertGreaterEqual(len(out["edited_fields_top_rows"]), 2)
+
+    def test_summarize_ai_quality_metrics_workflow_filter(self):
+        rows = [
+            (
+                datetime(2026, 4, 20, 10, 0, 0),
+                "qa",
+                "listing_wizard_outcome",
+                '{"workflow":"listing_wizard","acceptance":{"prompt_version_id":"v1"},"outcome":{"accepted_as_is":true,"edited_fields":[]}}',
+            ),
+            (
+                datetime(2026, 4, 20, 10, 1, 0),
+                "qa",
+                "listing_wizard_outcome",
+                '{"workflow":"intake","acceptance":{"prompt_version_id":"v-intake"},"outcome":{"accepted_as_is":false,"edited_fields":["title"]}}',
+            ),
+        ]
+        out = admin._summarize_ai_quality_metrics(rows, workflow_filter="intake")
+        self.assertEqual(out["outcome_events"], 1)
+        self.assertEqual(out["accepted_as_is_count"], 0)
+        self.assertEqual(out["edited_count"], 1)
+        self.assertEqual(set(out["workflow_totals"].keys()), {"intake"})
+
+    def test_go_live_evidence_pack_includes_lifecycle_retention_signoffs(self):
+        admin_source = (Path(__file__).resolve().parents[1] / "app" / "components" / "views" / "admin.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("lifecycle_retention_policy_signoffs.csv", admin_source)
+        self.assertIn("Lifecycle Retention Policy Sign-Off Tracker", admin_source)
+        self.assertIn("economics_threshold_signoffs.csv", admin_source)
+        self.assertIn("Economics Threshold Sign-Off Tracker", admin_source)
+
     def test_audit_changes_parsing(self):
         row_ok = SimpleNamespace(changes_json='{"a":1}')
         row_bad = SimpleNamespace(changes_json="{")
@@ -145,6 +217,73 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertNotIn("invalid", domains)
         self.assertEqual(csv_out, ",".join(domains))
 
+    def test_ebay_finding_recommended_runtime_settings(self):
+        rows = admin._ebay_finding_recommended_runtime_settings()
+        self.assertEqual(len(rows), 5)
+        by_key = {key: (value, value_type, description) for key, value, value_type, description in rows}
+        self.assertEqual(by_key["comp_ebay_max_calls_per_run"][0], "3")
+        self.assertEqual(by_key["comp_ebay_max_calls_per_10m"][0], "12")
+        self.assertEqual(by_key["ebay_finding_rate_limit_cooldown_seconds"][0], "600")
+        self.assertEqual(by_key["ebay_finding_rate_limit_severe_cooldown_seconds"][0], "3600")
+        self.assertEqual(by_key["ebay_finding_rate_limit_probe_interval_seconds"][0], "120")
+        self.assertTrue(all(parts[1] == "int" for parts in by_key.values()))
+
+    def test_runtime_seed_defaults_include_oauth_refresh_failure_controls(self):
+        rows = admin._runtime_setting_seed_defaults()
+        keys = {str(row.get("key") or "") for row in rows}
+        self.assertIn("ebay_user_token_auto_refresh_failure_cooldown_minutes", keys)
+        self.assertIn("slack_notify_ebay_oauth_refresh_failures", keys)
+
+    def test_ebay_token_auto_refresh_diagnostics(self):
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        runtime_int_values = {
+            "ebay_user_token_auto_refresh_interval_hours": 12,
+            "ebay_user_token_auto_refresh_min_ttl_minutes": 45,
+            "ebay_user_token_auto_refresh_failure_cooldown_minutes": 30,
+        }
+        runtime_str_values = {
+            "ebay_user_access_token_refreshed_at": "2026-04-18T10:00:00",
+            "ebay_user_access_token_expires_at": "2026-04-18T12:20:00",
+            "ebay_user_access_token_refresh_failed_at": "2026-04-18T11:50:00",
+            "ebay_user_access_token_refresh_last_error": "boom",
+        }
+        with patch.object(admin, "utcnow_naive", return_value=now), patch.object(
+            admin,
+            "get_runtime_int",
+            side_effect=lambda _repo, key, default=0: int(runtime_int_values.get(key, default)),
+        ), patch.object(
+            admin,
+            "get_runtime_str",
+            side_effect=lambda _repo, key, default="": str(runtime_str_values.get(key, default)),
+        ):
+            payload = admin._ebay_token_auto_refresh_diagnostics(SimpleNamespace())
+        self.assertEqual(payload["interval_hours"], 12)
+        self.assertEqual(payload["min_ttl_minutes"], 45)
+        self.assertEqual(payload["failure_cooldown_minutes"], 30)
+        self.assertEqual(payload["expires_in_minutes"], 20)
+        self.assertEqual(payload["next_refresh_due_at"], "2026-04-18T22:00:00")
+        self.assertEqual(payload["failure_cooldown_until"], "2026-04-18T12:20:00")
+        self.assertTrue(payload["failure_cooldown_active"])
+        self.assertEqual(payload["last_error"], "boom")
+
+    def test_clear_ebay_token_refresh_failure_state(self):
+        calls = []
+
+        class _Repo:
+            def upsert_runtime_setting(self, **kwargs):
+                calls.append(kwargs)
+
+        with patch.object(admin, "settings", SimpleNamespace(app_env="prod")):
+            admin._clear_ebay_token_refresh_failure_state(_Repo(), actor="qa")
+        self.assertEqual(len(calls), 2)
+        by_key = {str(row.get("key") or ""): row for row in calls}
+        self.assertIn("ebay_user_access_token_refresh_failed_at", by_key)
+        self.assertIn("ebay_user_access_token_refresh_last_error", by_key)
+        self.assertEqual(by_key["ebay_user_access_token_refresh_failed_at"]["value"], "")
+        self.assertEqual(by_key["ebay_user_access_token_refresh_last_error"]["value"], "")
+        self.assertEqual(by_key["ebay_user_access_token_refresh_failed_at"]["environment"], "prod")
+        self.assertEqual(by_key["ebay_user_access_token_refresh_last_error"]["actor"], "qa")
+
     def test_build_env_coverage_rows_statuses(self):
         env_values = {"A": "", "B": "x", "C": "custom"}
         defaults = {"A": "1", "B": "x", "D": "d"}
@@ -158,6 +297,59 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertEqual(by_key["C"]["status"], "set")
         self.assertEqual(by_key["D"]["status"], "missing")
         self.assertFalse(by_key["D"]["editable"])
+
+    def test_slack_ops_queue_snapshot_metrics(self):
+        now = datetime(2026, 4, 20, 12, 0, 0)
+        rows = [
+            SimpleNamespace(
+                id=1,
+                action="command_ingest",
+                status="blocked",
+                retry_count=0,
+                max_retries=2,
+                next_attempt_at=None,
+                requested_by="ops1",
+                created_at=now,
+                last_error="Awaiting approval",
+                payload_json='{"command":{"intent":"operations"},"approval":{"required":true,"status":"pending","requested_at":"2026-04-20T10:00:00","requested_by":"ops1"}}',
+            ),
+            SimpleNamespace(
+                id=2,
+                action="command_ingest",
+                status="success",
+                retry_count=1,
+                max_retries=2,
+                next_attempt_at=None,
+                requested_by="ops2",
+                created_at=now,
+                last_error="",
+                payload_json='{"command":{"intent":"comp"},"approval":{"required":false,"status":"not_required"}}',
+            ),
+            SimpleNamespace(
+                id=3,
+                action="command_ingest",
+                status="failed",
+                retry_count=2,
+                max_retries=2,
+                next_attempt_at=None,
+                requested_by="ops3",
+                created_at=now,
+                last_error="boom",
+                payload_json='{"command":{"intent":"intake"}}',
+            ),
+        ]
+        out = admin._slack_ops_queue_snapshot(rows, now=now)
+        self.assertEqual(out["total_count"], 3)
+        self.assertEqual(out["blocked_count"], 1)
+        self.assertEqual(out["success_count"], 1)
+        self.assertEqual(out["failed_count"], 1)
+        self.assertEqual(out["pending_approval_count"], 1)
+        self.assertGreater(out["pending_approval_avg_hours"], 1.9)
+        self.assertGreater(out["pending_approval_max_hours"], 1.9)
+        by_id = {row["id"]: row for row in out["rows"]}
+        self.assertEqual(by_id[1]["intent"], "operations")
+        self.assertEqual(by_id[1]["approval_status"], "pending")
+        self.assertEqual(by_id[2]["intent"], "comp")
 
     def test_apply_required_and_all_env_defaults(self):
         calls = []
@@ -277,6 +469,7 @@ class AdminHelpersTests(unittest.TestCase):
         keys = {row.get("key") for row in defaults}
         self.assertIn("app_build_version", keys)
         self.assertIn("app_build_sha", keys)
+        self.assertIn("ebay_finding_rate_limit_probe_interval_seconds", keys)
         self.assertTrue(all("value_type" in row for row in defaults))
 
 
