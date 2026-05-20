@@ -106,6 +106,91 @@ class ListingReadinessTests(unittest.TestCase):
         )
         self.assertLess(result.score, 100)
 
+    def test_cached_required_item_specifics_block_when_missing(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update(
+            {
+                "aspects": {"Brand": ["US Mint"]},
+                "category_aspects": [
+                    {"name": "Brand", "required": True, "values": []},
+                    {"name": "Color", "required": True, "values": ["Red"]},
+                    {"name": "Size", "required": False, "values": []},
+                ],
+            }
+        )
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("Missing required eBay item specific: Color", result.blockers)
+        self.assertNotIn("Missing required eBay item specific: Brand", result.blockers)
+
+    def test_category_condition_policy_blocks_invalid_condition(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update(
+            {
+                "condition": "NEW",
+                "category_conditions": [
+                    {"condition": "USED_EXCELLENT", "label": "Used", "condition_id": "3000"},
+                ],
+            }
+        )
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("Selected eBay condition is not valid for this category: NEW", result.blockers)
+
+    def test_category_condition_policy_allows_supported_condition(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update(
+            {
+                "condition": "USED_EXCELLENT",
+                "category_conditions": [
+                    {"condition": "USED_EXCELLENT", "label": "Used", "condition_id": "3000"},
+                ],
+            }
+        )
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(result.blockers, [])
+
+    def test_condition_description_over_1000_chars_blocks_publish(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update({"condition_description": "x" * 1001})
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "blocked")
+        self.assertIn(
+            "eBay condition description must be 1000 characters or fewer (currently 1001)",
+            result.blockers,
+        )
+
+    def test_numerical_coin_grade_requires_approved_grader_evidence(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update(
+            {
+                "listing_title": "2021 Silver Eagle MS69 Type 2",
+                "aspects": {"Certification": ["Uncertified"]},
+            }
+        )
+        result = evaluate_ebay_readiness(**kwargs)
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn(
+            "Numerical coin grade requires an approved grading company item specific "
+            "(Certification or Professional Grader).",
+            result.blockers,
+        )
+
+    def test_numerical_coin_grade_allows_approved_grader_evidence(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update(
+            {
+                "listing_title": "2021 Silver Eagle PCGS MS69 Type 2",
+                "aspects": {"Certification": ["PCGS"], "Grade": ["MS 69"]},
+            }
+        )
+        result = evaluate_ebay_readiness(**kwargs)
+
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(result.blockers, [])
+
 
 if __name__ == "__main__":
     unittest.main()

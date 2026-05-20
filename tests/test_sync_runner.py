@@ -95,6 +95,10 @@ class _FakeRepo:
         _ = (start_dt, end_dt)
         return list(self._fee_reconciliation_rows)
 
+    def report_returns_rows(self, *, start_dt, end_dt):
+        _ = (start_dt, end_dt)
+        return []
+
 
 class SyncRunnerTests(unittest.TestCase):
     def test_normalized_fee_source_coverage_health(self) -> None:
@@ -129,6 +133,54 @@ class SyncRunnerTests(unittest.TestCase):
         self.assertEqual(sync_runner._parse_daily_cron_hhmm_utc("15 6 * * *", default_hour=16, default_minute=0), (6, 15))
         self.assertEqual(sync_runner._parse_daily_cron_hhmm_utc("* * * * *", default_hour=16, default_minute=0), (16, 0))
         self.assertEqual(sync_runner._parse_daily_cron_hhmm_utc("bad expr", default_hour=16, default_minute=0), (16, 0))
+
+    def test_interval_job_due_uses_last_attempt_timestamp(self) -> None:
+        repo = _FakeRepo(_FakeDB())
+        now = datetime(2026, 5, 6, 12, 0, tzinfo=ZoneInfo("UTC"))
+
+        def runtime_str(_repo, key, default):
+            if key == "ai_accountant_monitor_last_attempt_at":
+                return "2026-05-06T07:00:00+00:00"
+            return default
+
+        with patch("app.services.sync_runner._resolve_schedule_timezone", return_value=ZoneInfo("UTC")), patch(
+            "app.services.sync_runner.datetime"
+        ) as dt_mod, patch("app.services.sync_runner.get_runtime_int", return_value=6), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=runtime_str
+        ):
+            dt_mod.now.return_value = now
+            dt_mod.fromisoformat.side_effect = datetime.fromisoformat
+            due, _local_now, _local_date = sync_runner._is_interval_job_due(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                timezone_key="ai_accountant_monitor_timezone",
+                interval_hours_key="ai_accountant_monitor_interval_hours",
+                default_timezone="UTC",
+                default_interval_hours=6,
+            )
+        self.assertFalse(due)
+
+        def stale_runtime_str(_repo, key, default):
+            if key == "ai_accountant_monitor_last_attempt_at":
+                return "2026-05-06T05:00:00+00:00"
+            return default
+
+        with patch("app.services.sync_runner._resolve_schedule_timezone", return_value=ZoneInfo("UTC")), patch(
+            "app.services.sync_runner.datetime"
+        ) as dt_mod, patch("app.services.sync_runner.get_runtime_int", return_value=6), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=stale_runtime_str
+        ):
+            dt_mod.now.return_value = now
+            dt_mod.fromisoformat.side_effect = datetime.fromisoformat
+            due, _local_now, _local_date = sync_runner._is_interval_job_due(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                timezone_key="ai_accountant_monitor_timezone",
+                interval_hours_key="ai_accountant_monitor_interval_hours",
+                default_timezone="UTC",
+                default_interval_hours=6,
+            )
+        self.assertTrue(due)
 
     def test_resolve_timezone_and_notification_route_helpers(self) -> None:
         repo = _FakeRepo(_FakeDB())
@@ -199,6 +251,8 @@ class SyncRunnerTests(unittest.TestCase):
         ) as backup_job, patch(
             "app.services.sync_runner._run_daily_slack_report"
         ) as report_job, patch(
+            "app.services.sync_runner._run_ai_accountant_monitor_schedule"
+        ) as ai_accountant_job, patch(
             "app.services.sync_runner._run_notification_outbox"
         ) as outbox_job:
             with patch("app.services.sync_runner._run_notification_outbox_cleanup") as outbox_cleanup_job, patch(
@@ -211,6 +265,7 @@ class SyncRunnerTests(unittest.TestCase):
         gov_job.assert_called_once()
         backup_job.assert_called_once()
         report_job.assert_called_once()
+        ai_accountant_job.assert_called_once()
         outbox_job.assert_called_once()
         outbox_cleanup_job.assert_called_once()
         lifecycle_cleanup_job.assert_called_once()
@@ -280,6 +335,31 @@ class SyncRunnerTests(unittest.TestCase):
             sync_runner._run_ebay_token_auto_refresh()
         dispatch.assert_not_called()
 
+    def test_run_ebay_token_auto_refresh_transient_network_logs_warning_without_alert(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.maybe_auto_refresh_ebay_user_token",
+            return_value={
+                "status": "failed",
+                "reason": "transient_network_unavailable",
+                "error": "NameResolutionError: failed to resolve api.ebay.com",
+            },
+        ), patch("app.services.sync_runner.dispatch_slack_alert") as dispatch, patch(
+            "app.services.sync_runner._log"
+        ) as log:
+            sync_runner._run_ebay_token_auto_refresh()
+        self.assertTrue(repo.integration_events)
+        evt = repo.integration_events[-1]
+        self.assertEqual(evt.get("integration"), "ebay_oauth")
+        self.assertEqual(evt.get("action"), "auto_refresh")
+        self.assertEqual(evt.get("status"), "warning")
+        dispatch.assert_not_called()
+        self.assertTrue(any("transient network" in str(c.args[0]).lower() for c in log.call_args_list))
+
     def test_run_notification_outbox_success(self) -> None:
         db = _FakeSession()
         repo = _FakeRepo(_FakeDB())
@@ -296,6 +376,28 @@ class SyncRunnerTests(unittest.TestCase):
         proc.assert_called_once()
         self.assertTrue(repo.integration_events)
         self.assertEqual(repo.integration_events[-1]["integration"], "notification_outbox")
+
+    def test_run_notification_outbox_defaults_enabled_when_setting_missing(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+
+        def runtime_bool(_repo, key, default=False):
+            self.assertEqual(key, "notification_outbox_runner_enabled")
+            self.assertTrue(default)
+            return default
+
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.get_runtime_bool", side_effect=runtime_bool
+        ), patch("app.services.sync_runner.get_runtime_int", return_value=50), patch(
+            "app.services.sync_runner.process_due_notification_outbox",
+            return_value={"due": 0, "sent": 0, "failed": 0},
+        ) as proc:
+            sync_runner._run_notification_outbox()
+
+        proc.assert_called_once()
 
     def test_run_notification_outbox_cleanup_disabled(self) -> None:
         db = _FakeSession()
@@ -675,6 +777,160 @@ class SyncRunnerTests(unittest.TestCase):
             sync_runner._run_daily_slack_report()
         self.assertTrue(any("disabled" in str(c.args[0]).lower() for c in log.call_args_list))
 
+    def test_run_ai_accountant_monitor_schedule_disabled(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.get_runtime_bool", return_value=False), patch(
+            "app.services.sync_runner._log"
+        ) as log:
+            sync_runner._run_ai_accountant_monitor_schedule()
+        self.assertTrue(any("AI Accountant monitor disabled" in str(call.args[0]) for call in log.call_args_list))
+
+    def test_run_ai_accountant_monitor_schedule_success(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        local_now = datetime(2026, 4, 9, 8, 31, tzinfo=ZoneInfo("UTC"))
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.get_runtime_bool", side_effect=[True, True, False]
+        ), patch(
+            "app.services.sync_runner._is_interval_job_due",
+            return_value=(True, local_now, "2026-04-09"),
+        ), patch(
+            "app.services.sync_runner.get_runtime_int", return_value=30
+        ), patch(
+            "app.services.sync_runner._app_default_timezone", return_value="UTC"
+        ), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=["interval", "P1", "slack", "#accounting"]
+        ), patch(
+            "app.services.sync_runner.run_ai_accountant_monitor",
+            return_value={
+                "item_count": 3,
+                "actionable_count": 2,
+                "audit_id": 11,
+                "slack_outbox_id": 12,
+                "period_label": "2026-03-10 to 2026-04-09",
+                "review_enabled": True,
+                "review_hash": "a" * 64,
+                "review_error": "",
+                "review_compact_retry": False,
+                "review_runtime_route": "localai/Qwen (chat, db, ready)",
+            },
+        ) as monitor, patch("app.services.sync_runner._log"):
+            sync_runner._run_ai_accountant_monitor_schedule()
+
+        monitor.assert_called_once()
+        self.assertTrue(any(row["key"] == "ai_accountant_monitor_last_success_at" for row in repo.runtime_updates))
+        event = next(event for event in repo.integration_events if event.get("integration") == "ai_accountant")
+        self.assertEqual(event["details"]["schedule_mode"], "interval")
+        self.assertTrue(event["details"]["review_enabled"])
+        self.assertEqual(event["details"]["review_status"], "completed")
+        self.assertEqual(event["details"]["review_hash"], "a" * 12)
+        self.assertEqual(event["details"]["review_runtime_route"], "localai/Qwen (chat, db, ready)")
+
+    def test_run_ai_accountant_monitor_schedule_honors_notification_route(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        local_now = datetime(2026, 4, 9, 8, 31, tzinfo=ZoneInfo("UTC"))
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.get_runtime_bool", side_effect=[True, True, False]
+        ), patch(
+            "app.services.sync_runner._is_interval_job_due",
+            return_value=(True, local_now, "2026-04-09"),
+        ), patch(
+            "app.services.sync_runner.get_runtime_int", return_value=30
+        ), patch(
+            "app.services.sync_runner._app_default_timezone", return_value="UTC"
+        ), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=["interval", "P1", "disabled", "#accounting"]
+        ), patch(
+            "app.services.sync_runner.run_ai_accountant_monitor",
+            return_value={
+                "item_count": 3,
+                "actionable_count": 2,
+                "audit_id": 11,
+                "slack_outbox_id": None,
+                "period_label": "2026-03-10 to 2026-04-09",
+            },
+        ) as monitor, patch("app.services.sync_runner._log"):
+            sync_runner._run_ai_accountant_monitor_schedule()
+
+        monitor.assert_called_once()
+        self.assertFalse(monitor.call_args.kwargs["slack_enabled"])
+
+    def test_run_ai_accountant_monitor_schedule_interval_failure_marks_interval_attempt(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        local_now = datetime(2026, 4, 9, 8, 31, tzinfo=ZoneInfo("UTC"))
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.get_runtime_bool", side_effect=[True, False, False]
+        ), patch(
+            "app.services.sync_runner._is_interval_job_due",
+            return_value=(True, local_now, "2026-04-09"),
+        ) as interval_due, patch(
+            "app.services.sync_runner.get_runtime_int", return_value=30
+        ), patch(
+            "app.services.sync_runner._app_default_timezone", return_value="UTC"
+        ), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=["interval", "P1", ""]
+        ), patch(
+            "app.services.sync_runner.run_ai_accountant_monitor",
+            side_effect=RuntimeError("monitor failed"),
+        ), patch("app.services.sync_runner._log"):
+            sync_runner._run_ai_accountant_monitor_schedule()
+
+        self.assertEqual(interval_due.call_count, 2)
+        self.assertTrue(any(row["key"] == "ai_accountant_monitor_last_attempt_at" for row in repo.runtime_updates))
+        self.assertFalse(
+            any(row["key"] == "ai_accountant_monitor_last_attempt_local_date" for row in repo.runtime_updates)
+        )
+        event = next(event for event in repo.integration_events if event.get("integration") == "ai_accountant")
+        self.assertEqual(event["status"], "error")
+        self.assertEqual(event["details"]["schedule_mode"], "interval")
+
+    def test_run_ai_accountant_monitor_schedule_daily_failure_marks_daily_attempt(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        local_now = datetime(2026, 4, 9, 8, 31, tzinfo=ZoneInfo("UTC"))
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.get_runtime_bool", side_effect=[True, False, False]
+        ), patch(
+            "app.services.sync_runner._is_daily_job_due",
+            return_value=(True, local_now, "2026-04-09"),
+        ) as daily_due, patch(
+            "app.services.sync_runner.get_runtime_int", return_value=30
+        ), patch(
+            "app.services.sync_runner._app_default_timezone", return_value="UTC"
+        ), patch(
+            "app.services.sync_runner.get_runtime_str", side_effect=["daily", "P1", ""]
+        ), patch(
+            "app.services.sync_runner.run_ai_accountant_monitor",
+            side_effect=RuntimeError("monitor failed"),
+        ), patch("app.services.sync_runner._log"):
+            sync_runner._run_ai_accountant_monitor_schedule()
+
+        self.assertEqual(daily_due.call_count, 2)
+        self.assertTrue(
+            any(row["key"] == "ai_accountant_monitor_last_attempt_local_date" for row in repo.runtime_updates)
+        )
+        self.assertFalse(any(row["key"] == "ai_accountant_monitor_last_attempt_at" for row in repo.runtime_updates))
+        event = next(event for event in repo.integration_events if event.get("integration") == "ai_accountant")
+        self.assertEqual(event["status"], "error")
+        self.assertEqual(event["details"]["schedule_mode"], "daily")
+
     def test_run_daily_slack_report_success(self) -> None:
         db = _FakeSession()
         repo = _FakeRepo(_FakeDB())
@@ -707,6 +963,110 @@ class SyncRunnerTests(unittest.TestCase):
         dispatch.assert_called_once()
         mark_attempt.assert_called()
         self.assertTrue(any(e.get("action") == "daily_report" for e in repo.integration_events))
+
+    def test_run_daily_slack_report_uses_actual_economics_net(self) -> None:
+        db = _FakeSession()
+        repo = _FakeRepo(_FakeDB())
+        now = datetime(2026, 4, 9, 14, 0, 0)
+        settings = SimpleNamespace(sync_runner_actor="runner", app_env="local")
+        sale = SimpleNamespace(
+            id=11,
+            product_id=1,
+            sold_at=now,
+            quantity_sold=1,
+            sold_price=100.0,
+            fees=10.0,
+            shipping_cost=5.0,
+            shipping_label_cost=9.0,
+        )
+        repo.list_sales = lambda: [sale]
+        repo.list_products = lambda: [
+            SimpleNamespace(
+                id=1,
+                acquisition_cost=None,
+                acquisition_tax_paid=None,
+                acquisition_shipping_paid=None,
+                acquisition_handling_paid=None,
+                product_cost=20.0,
+                current_quantity=1,
+            )
+        ]
+        repo.report_sale_unit_cost_maps = lambda end_dt, default_unit_cost_by_product: {
+            "fifo_unit_cost_by_sale": {11: 12.5},
+            "fifo_unit_cost_source_by_sale": {11: "lot_expected_quantity_fallback"},
+        }
+        repo.report_sales_actual_econ_rows = lambda start_dt, end_dt: [
+            {
+                "sale_id": 11,
+                "sold_price": 100.0,
+                "allocated_fee_actual": 7.5,
+                "allocated_shipping_charged": 5.0,
+                "allocated_shipping_actual": 4.25,
+                "net_before_cogs_actual": 93.25,
+            }
+        ]
+        repo.report_returns_rows = lambda start_dt, end_dt: [
+            {
+                "return_id": 9,
+                "sale_id": 11,
+                "product_id": 1,
+                "quantity": 1,
+                "refund_amount": 30.0,
+                "refund_fees": 2.0,
+                "refund_shipping": 3.0,
+            }
+        ]
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.utcnow_naive", return_value=now
+        ), patch(
+            "app.services.sync_runner.get_runtime_bool", return_value=True
+        ), patch(
+            "app.services.sync_runner.get_runtime_int", side_effect=[8, 2]
+        ), patch(
+            "app.services.sync_runner.get_runtime_float", return_value=80.0
+        ), patch(
+            "app.services.sync_runner._is_daily_job_due",
+            return_value=(True, datetime(2026, 4, 9, 8, 1), "2026-04-09"),
+        ), patch(
+            "app.services.sync_runner.get_runtime_str", return_value=""
+        ), patch(
+            "app.services.sync_runner.build_slack_alert_text", return_value="daily report"
+        ) as build_text, patch(
+            "app.services.sync_runner.dispatch_slack_alert", return_value={"status": "sent", "channel": "#ops"}
+        ), patch(
+            "app.services.sync_runner._mark_daily_job_attempt"
+        ), patch(
+            "app.services.sync_runner._log"
+        ):
+            sync_runner._run_daily_slack_report()
+
+        context = build_text.call_args.kwargs["context"]
+        self.assertEqual(context["gross_24h"], "100.00")
+        self.assertEqual(context["net_24h"], "93.25")
+        self.assertEqual(context["cogs_24h"], "12.50")
+        self.assertEqual(context["profit_before_returns_24h"], "80.75")
+        self.assertEqual(context["returns_24h_count"], 1)
+        self.assertEqual(context["returns_refund_24h"], "35.00")
+        self.assertEqual(context["returns_cogs_reversal_24h"], "12.50")
+        self.assertEqual(context["returns_profit_impact_24h"], "-22.50")
+        self.assertEqual(context["net_after_returns_24h"], "58.25")
+        self.assertEqual(context["estimated_profit_24h"], "58.25")
+        self.assertIn("lot_expected_quantity_fallback", context["cogs_source_mix"])
+        event = next(e for e in repo.integration_events if e.get("action") == "daily_report")
+        self.assertAlmostEqual(event["details"]["net_24h"], 93.25)
+        self.assertAlmostEqual(event["details"]["cogs_24h"], 12.5)
+        self.assertAlmostEqual(event["details"]["profit_before_returns_24h"], 80.75)
+        self.assertEqual(event["details"]["returns_24h_count"], 1)
+        self.assertAlmostEqual(event["details"]["returns_refund_24h"], 35.0)
+        self.assertAlmostEqual(event["details"]["returns_cogs_reversal_24h"], 12.5)
+        self.assertAlmostEqual(event["details"]["returns_profit_impact_24h"], -22.5)
+        self.assertAlmostEqual(event["details"]["estimated_profit_24h"], 58.25)
+        self.assertEqual(
+            event["details"]["cogs_source_totals"],
+            {"lot_expected_quantity_fallback": 12.5},
+        )
 
     def test_run_daily_slack_report_logs_fee_coverage_alert(self) -> None:
         db = _FakeSession()

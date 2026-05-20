@@ -42,6 +42,10 @@ Status legend:
   - [x] Extend exports for sales/fees/shipping/refunds/COGS inputs.
   - [x] Add reconciliation report (channel totals vs local totals).
   - [x] Add quick validation checks and discrepancy flags.
+  - [x] April 26, 2026 hardening: aligned dashboard, Reports, reconciliation, QBO-style exports, and Ask/chat report snapshots on the same net/profit convention (`gross + shipping charged - fees - label spend - COGS`).
+  - [x] April 26, 2026 hardening: added assignment allocated dollars and allocation weights for mixed-value lots bought at one bulk price.
+  - [x] April 26, 2026 hardening: added expected total quantity support for whole-lot cost allocation so partially checked-in lots do not overstate early sale COGS.
+  - [x] April 28, 2026 hardening: QBO sales/refund adjustment exports now preserve COGS source, restocked return COGS reversal, and estimated return profit impact for close-review staging.
 
 ## GS-V03-004 Cost Basis and Margin Analytics
 - Status: `[x]`
@@ -50,6 +54,9 @@ Status legend:
   - [x] Implement lot-specific and FIFO cost-basis calculations.
   - [x] Add margin views for SKU/channel/period.
   - [x] Add exportable profitability reports.
+  - [x] April 26, 2026 hardening: documented and tested cost-basis precedence across product-lot assignment costs, remaining lot-total allocation, product landed acquisition cost, and `product_cost` fallback.
+  - [x] April 26, 2026 hardening: Ask/AI inventory and reports context now prefers FIFO/lot repository cost maps before product-level fallbacks.
+  - [x] April 28, 2026 hardening: Purchase Lot P/L now FIFO-attributes sales across repurchase lots and exposes sold COGS source totals for selected lots.
 
 ## GS-V03-005 Media-Driven Listing Workflow
 - Status: `[x]`
@@ -61,6 +68,9 @@ Status legend:
   - [x] Add a “Create eBay Listing from Product” action that reuses product data + selected media.
   - [x] Persist linkage between source product media selections and generated marketplace listings.
   - [x] Add validation for required listing fields/media before publish/create.
+  - [x] Add explicit main-image selection for eBay listing payloads so the chosen image is sent first in `imageUrls` and recorded in publish/revise/direct-post metadata.
+  - [x] April 28, 2026 UX hardening: Products table and `Product Detail/Edit` now render as full-width inline sections instead of a narrow side panel.
+  - [x] April 28, 2026 direct-post hardening: eBay dependency preflight blocks live auction publish when the selected payment policy requires immediate payment but no `Auction Buy It Now` price is set.
 
 ## GS-V03-006 eBay Seller Operations Console
 - Status: `[x]`
@@ -68,7 +78,9 @@ Status legend:
 - Tasks:
   - [x] Add direct publish flow from Listings to eBay (inventory item + offer + publish).
   - [x] Add user/environment-scoped eBay publish presets with one-click apply.
-  - [x] Add eBay media upload path (selected image EPS upload + one MP4 video attach).
+  - [x] Add eBay media upload path (selected image EPS upload + one MP4/MOV video attach with MOV conversion, diagnostics, and non-blocking image-only warnings when no supported video is selected).
+  - [x] Add eBay Taxonomy item-specifics lookup/cache per category and readiness blockers for missing cached required specifics.
+  - [x] Add preflight guard for immediate-payment auction policy mismatches before calling eBay `publishOffer`.
   - [x] Add eBay operation dashboard tiles (drafts pending publish, active, ended, sync failures).
   - [x] Add listing revision/end/relist actions from app for existing eBay-linked listings.
   - [x] Add dedicated eBay Ops page with filtered listing tables and bulk end/relist/revise queue actions.

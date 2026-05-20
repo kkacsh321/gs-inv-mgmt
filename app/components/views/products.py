@@ -607,7 +607,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         "Include Archived",
         value=False,
         key="products_filter_include_archived",
-        help="Show archived products in table and side-panel selection.",
+        help="Show archived products in table and detail selection.",
     )
     product_filter_categories = normalize_multiselect_values(
         product_filter_categories,
@@ -655,8 +655,9 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         filtered_rows.append(row)
 
     filtered_df = pd.DataFrame(filtered_rows)
-    st.markdown("### Product Table + Side Panel")
-    table_col, panel_col = st.columns([2, 1])
+    st.markdown("### Product Table")
+    table_col = st.container()
+    panel_col = st.container()
     with table_col:
         render_table_toolbar(
             df=filtered_df,
@@ -680,7 +681,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
         )
 
     with panel_col:
-        st.markdown("#### Product Detail/Edit")
+        st.markdown("### Product Detail/Edit")
         if not filtered_rows:
             st.info("No filtered products available.")
         else:
@@ -1061,6 +1062,25 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                             value=utc_today(),
                             key=f"assign_lot_acquired_date_{selected_product.id}",
                         )
+                    lb1, lb2 = st.columns(2)
+                    with lb1:
+                        assign_allocated_cost = st.number_input(
+                            "Allocated Lot Cost Total",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.01,
+                            key=f"assign_lot_allocated_cost_{selected_product.id}",
+                            help="Optional total dollar share for this product/quantity in a mixed lot.",
+                        )
+                    with lb2:
+                        assign_allocation_weight = st.number_input(
+                            "Allocation Weight",
+                            min_value=0.0,
+                            value=0.0,
+                            step=0.01,
+                            key=f"assign_lot_allocation_weight_{selected_product.id}",
+                            help="Optional proportional share used to split whole-lot cost across mixed products.",
+                        )
                     assign_submit = st.form_submit_button("Assign To Lot")
 
                 if assign_submit:
@@ -1077,6 +1097,8 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                                 quantity_acquired=int(assign_qty),
                                 unit_cost=to_decimal_or_none(assign_unit_cost),
                                 unit_tax_paid=to_decimal_or_none(assign_unit_tax),
+                                allocated_cost=to_decimal_or_none(assign_allocated_cost),
+                                allocation_weight=to_decimal_or_none(assign_allocation_weight),
                                 acquired_at=datetime.combine(assign_acquired_date, datetime.min.time()),
                             )
                             st.success("Product linked to purchase lot.")
@@ -1858,6 +1880,7 @@ def render_products(repo: InventoryRepository, storage: MediaStorageService) -> 
                                 "unit_shipping_paid": float(row.unit_shipping_paid) if getattr(row, "unit_shipping_paid", None) is not None else None,
                                 "unit_handling_paid": float(row.unit_handling_paid) if getattr(row, "unit_handling_paid", None) is not None else None,
                                 "allocated_cost": float(row.allocated_cost) if row.allocated_cost is not None else None,
+                                "allocation_weight": float(row.allocation_weight) if getattr(row, "allocation_weight", None) is not None else None,
                                 "allocated_tax_paid": float(row.allocated_tax_paid) if getattr(row, "allocated_tax_paid", None) is not None else None,
                                 "allocated_shipping_paid": float(row.allocated_shipping_paid) if getattr(row, "allocated_shipping_paid", None) is not None else None,
                                 "allocated_handling_paid": float(row.allocated_handling_paid) if getattr(row, "allocated_handling_paid", None) is not None else None,

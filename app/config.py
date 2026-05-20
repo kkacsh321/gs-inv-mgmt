@@ -84,7 +84,7 @@ class Settings:
     yahoo_symbol_silver: str = os.getenv("YAHOO_SYMBOL_SILVER", "SI=F")
     yahoo_symbol_platinum: str = os.getenv("YAHOO_SYMBOL_PLATINUM", "PL=F")
 
-    sync_runner_enabled: bool = os.getenv("SYNC_RUNNER_ENABLED", "false").lower() == "true"
+    sync_runner_enabled: bool = os.getenv("SYNC_RUNNER_ENABLED", "true").lower() == "true"
     sync_runner_interval_seconds: int = int(os.getenv("SYNC_RUNNER_INTERVAL_SECONDS", "900"))
     sync_runner_actor: str = os.getenv("SYNC_RUNNER_ACTOR", "sync-worker")
     sync_runner_run_once: bool = os.getenv("SYNC_RUNNER_RUN_ONCE", "false").lower() == "true"

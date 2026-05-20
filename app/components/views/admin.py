@@ -125,6 +125,38 @@ from app.components.views.listing_wizard import (
 from app.utils.time import utcnow_naive
 
 
+def _business_status_safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _business_status_product_default_landed_unit_cost(product: Any) -> float:
+    landed = (
+        _business_status_safe_float(getattr(product, "landed_unit_cost", None))
+        + _business_status_safe_float(getattr(product, "acquisition_shipping_paid", None))
+        + _business_status_safe_float(getattr(product, "acquisition_handling_paid", None))
+    )
+    if landed > 0:
+        return landed
+    return _business_status_safe_float(getattr(product, "product_cost", None))
+
+
+def _business_status_format_cogs_source_mix(
+    source_totals: dict[str, float],
+    source_counts: dict[str, int],
+) -> str:
+    if not source_totals:
+        return ""
+    parts = [
+        f"{source} ${float(total):,.2f}/{int(source_counts.get(source, 0))} sale(s)"
+        for source, total in sorted(source_totals.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+        if float(total or 0.0) > 0 or int(source_counts.get(source, 0)) > 0
+    ]
+    return "; ".join(parts)
+
+
 def _audit_changes(row: AuditLog) -> dict:
     try:
         payload = json.loads(str(getattr(row, "changes_json", "") or "{}"))
@@ -145,10 +177,74 @@ def _build_business_status_context(repo: InventoryRepository, *, days: int = 1) 
     orders = repo.list_orders()
 
     sales_window = [s for s in sales if getattr(s, "sold_at", None) and s.sold_at >= since]
-    gross_window = float(sum(float(getattr(s, "sold_price", 0.0) or 0.0) for s in sales_window))
-    fees_window = float(sum(float(getattr(s, "fees", 0.0) or 0.0) for s in sales_window))
-    shipping_window = float(sum(float(getattr(s, "shipping_cost", 0.0) or 0.0) for s in sales_window))
-    net_window = gross_window - fees_window - shipping_window
+    default_unit_cost_by_product = {
+        int(getattr(product, "id")): _business_status_product_default_landed_unit_cost(product)
+        for product in products
+        if getattr(product, "id", None) is not None
+    }
+    fifo_unit_cost_by_sale: dict[int, float] = {}
+    fifo_unit_cost_source_by_sale: dict[int, str] = {}
+    if hasattr(repo, "report_sale_unit_cost_maps"):
+        try:
+            maps_payload = repo.report_sale_unit_cost_maps(
+                end_dt=now,
+                default_unit_cost_by_product=default_unit_cost_by_product,
+            ) or {}
+            fifo_unit_cost_by_sale = {
+                int(k): _business_status_safe_float(v)
+                for k, v in dict(maps_payload.get("fifo_unit_cost_by_sale") or {}).items()
+            }
+            fifo_unit_cost_source_by_sale = {
+                int(k): str(v or "").strip() or "unknown"
+                for k, v in dict(maps_payload.get("fifo_unit_cost_source_by_sale") or {}).items()
+            }
+        except Exception:
+            db = getattr(repo, "db", None)
+            if db is not None and hasattr(db, "rollback"):
+                db.rollback()
+            fifo_unit_cost_by_sale = {}
+            fifo_unit_cost_source_by_sale = {}
+    cogs_window = 0.0
+    cogs_source_totals: dict[str, float] = {}
+    cogs_source_counts: dict[str, int] = {}
+    for sale in sales_window:
+        sale_id = getattr(sale, "id", None)
+        product_id = int(getattr(sale, "product_id", 0) or 0)
+        quantity = int(getattr(sale, "quantity_sold", 0) or 0)
+        if sale_id is not None and int(sale_id) in fifo_unit_cost_by_sale:
+            unit_cost = _business_status_safe_float(fifo_unit_cost_by_sale.get(int(sale_id)))
+            cost_source = fifo_unit_cost_source_by_sale.get(int(sale_id), "unknown")
+        else:
+            unit_cost = _business_status_safe_float(default_unit_cost_by_product.get(product_id, 0.0))
+            cost_source = "product_default_landed_cost" if unit_cost > 0 else "missing_cost_basis"
+        sale_cogs = unit_cost * quantity
+        cogs_window += sale_cogs
+        cogs_source_totals[cost_source] = cogs_source_totals.get(cost_source, 0.0) + sale_cogs
+        cogs_source_counts[cost_source] = cogs_source_counts.get(cost_source, 0) + 1
+    cogs_source_mix = _business_status_format_cogs_source_mix(cogs_source_totals, cogs_source_counts)
+    cogs_source_mix_line = f"- COGS source mix: {cogs_source_mix}\n" if cogs_source_mix else ""
+    actual_rows = []
+    if hasattr(repo, "report_sales_actual_econ_rows"):
+        try:
+            actual_rows = list(repo.report_sales_actual_econ_rows(start_dt=since, end_dt=now) or [])
+        except Exception:
+            db = getattr(repo, "db", None)
+            if db is not None and hasattr(db, "rollback"):
+                db.rollback()
+            actual_rows = []
+
+    if actual_rows:
+        gross_window = float(sum(float(row.get("sold_price") or 0.0) for row in actual_rows))
+        fees_window = float(sum(float(row.get("allocated_fee_actual") or 0.0) for row in actual_rows))
+        shipping_window = float(sum(float(row.get("allocated_shipping_charged") or 0.0) for row in actual_rows))
+        label_window = float(sum(float(row.get("allocated_shipping_actual") or 0.0) for row in actual_rows))
+        net_window = float(sum(float(row.get("net_before_cogs_actual") or 0.0) for row in actual_rows))
+    else:
+        gross_window = float(sum(float(getattr(s, "sold_price", 0.0) or 0.0) for s in sales_window))
+        fees_window = float(sum(float(getattr(s, "fees", 0.0) or 0.0) for s in sales_window))
+        shipping_window = float(sum(float(getattr(s, "shipping_cost", 0.0) or 0.0) for s in sales_window))
+        label_window = float(sum(float(getattr(s, "shipping_label_cost", 0.0) or 0.0) for s in sales_window))
+        net_window = gross_window + shipping_window - fees_window - label_window
 
     low_stock = [p for p in products if int(getattr(p, "current_quantity", 0) or 0) <= 1]
     draft_listings = [l for l in listings if str(getattr(l, "listing_status", "") or "").strip().lower() == "draft"]
@@ -169,7 +265,13 @@ def _build_business_status_context(repo: InventoryRepository, *, days: int = 1) 
         "sale_count": int(metrics.get("sale_count", len(sales))),
         "sales_window_count": int(len(sales_window)),
         "gross_window": f"{gross_window:,.2f}",
+        "fees_window": f"{fees_window:,.2f}",
+        "shipping_window": f"{shipping_window:,.2f}",
+        "label_window": f"{label_window:,.2f}",
         "net_window": f"{net_window:,.2f}",
+        "cogs_window": f"{cogs_window:,.2f}",
+        "cogs_source_mix": cogs_source_mix,
+        "cogs_source_mix_line": cogs_source_mix_line,
         "order_count": int(len(orders)),
         "orders_window_count": int(len(orders_window)),
         "inventory_cost": f"{float(metrics.get('inventory_cost', 0.0)):,.2f}",
@@ -1164,6 +1266,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Max eBay sold-comp rows fetched for Listing Wizard AI quick pricing context.",
         },
         {
+            "key": "listing_wizard_recent_product_limit",
+            "value": "75",
+            "value_type": "int",
+            "description": "Maximum recent products shown in Listing Wizard Step 1 before product search is used.",
+        },
+        {
             "key": "purchase_doc_auto_apply_linked_lot_fields",
             "value": "false",
             "value_type": "bool",
@@ -1423,6 +1531,36 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "3",
             "value_type": "int",
             "description": "Maximum number of active AI runtime profiles to attempt per request.",
+        },
+        {
+            "key": "ai_workflow_profile_listing",
+            "value": "",
+            "value_type": "str",
+            "description": "Preferred AI runtime profile id for listing workflow calls (blank uses default chain order).",
+        },
+        {
+            "key": "ai_workflow_profile_intake",
+            "value": "",
+            "value_type": "str",
+            "description": "Preferred AI runtime profile id for intake workflow calls (blank uses default chain order).",
+        },
+        {
+            "key": "ai_workflow_profile_comp",
+            "value": "",
+            "value_type": "str",
+            "description": "Preferred AI runtime profile id for comp workflow calls (blank uses default chain order).",
+        },
+        {
+            "key": "ai_workflow_profile_risk",
+            "value": "",
+            "value_type": "str",
+            "description": "Preferred AI runtime profile id for risk workflow calls (blank uses default chain order).",
+        },
+        {
+            "key": "ai_workflow_profile_accounting",
+            "value": "",
+            "value_type": "str",
+            "description": "Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
         },
         {
             "key": "ai_quality_title_min_words",
@@ -1732,7 +1870,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
         },
         {
             "key": "slack_notifications_enabled",
-            "value": "false",
+            "value": "true",
             "value_type": "bool",
             "description": "Master toggle for Slack notifications.",
         },
@@ -1821,6 +1959,137 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Number of consecutive below-threshold weeks required before daily-report fee coverage alert is triggered.",
         },
         {
+            "key": "ai_accountant_monitor_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Enable sync-runner scheduled AI Accountant monitor pass.",
+        },
+        {
+            "key": "ai_accountant_monitor_timezone",
+            "value": "America/Denver",
+            "value_type": "str",
+            "description": "IANA timezone used by the scheduled AI Accountant monitor.",
+        },
+        {
+            "key": "ai_accountant_monitor_schedule_mode",
+            "value": "interval",
+            "value_type": "str",
+            "description": "AI Accountant monitor schedule mode: `interval` for several times per day, or `daily` for one local HH:MM run.",
+        },
+        {
+            "key": "ai_accountant_monitor_interval_hours",
+            "value": "6",
+            "value_type": "int",
+            "description": "When schedule mode is `interval`, run the AI Accountant monitor every N hours.",
+        },
+        {
+            "key": "ai_accountant_monitor_local_time",
+            "value": "08:30",
+            "value_type": "str",
+            "description": "Local HH:MM trigger for the scheduled AI Accountant monitor.",
+        },
+        {
+            "key": "ai_accountant_monitor_lookback_days",
+            "value": "30",
+            "value_type": "int",
+            "description": "Lookback window in days for scheduled AI Accountant monitor checks.",
+        },
+        {
+            "key": "ai_accountant_monitor_min_severity",
+            "value": "P1",
+            "value_type": "str",
+            "description": "Minimum severity to record/alert from scheduled AI Accountant monitor (`P0`, `P1`, or `P2`).",
+        },
+        {
+            "key": "ai_accountant_monitor_slack_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Queue Slack notification-outbox messages for scheduled AI Accountant monitor findings.",
+        },
+        {
+            "key": "ai_accountant_monitor_channel",
+            "value": "",
+            "value_type": "str",
+            "description": "Optional Slack channel override for scheduled AI Accountant monitor alerts.",
+        },
+        {
+            "key": "ai_accountant_monitor_record_empty",
+            "value": "false",
+            "value_type": "bool",
+            "description": "Record an in-app AI Accountant monitor message even when no actionable findings exist.",
+        },
+        {
+            "key": "ai_accountant_monitor_llm_review_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Run and audit a read-only AI Accountant LLM review during scheduled monitor passes.",
+        },
+        {
+            "key": "ai_accountant_monitor_review_instruction",
+            "value": (
+                "Review the scheduled AI Accountant monitor evidence. Return concise markdown with close/watch status, "
+                "highest-risk findings, corrections to make, profit/cost-basis notes, and tax/advisor-review notes."
+            ),
+            "value_type": "str",
+            "description": "Instruction prompt for automated scheduled AI Accountant monitor reviews.",
+        },
+        {
+            "key": "ai_accountant_monitor_review_max_rows",
+            "value": "25",
+            "value_type": "int",
+            "description": "Maximum monitor rows sent to scheduled AI Accountant LLM reviews.",
+        },
+        {
+            "key": "ai_accountant_monitor_review_max_exception_rows",
+            "value": "25",
+            "value_type": "int",
+            "description": "Maximum accounting exception rows sent to scheduled AI Accountant LLM reviews.",
+        },
+        {
+            "key": "ai_accountant_chat_ai_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Enable the AI Accountant identity/system prompt for accounting/tax chat questions even when generic chat refinement is off.",
+        },
+        {
+            "key": "ai_accountant_web_research_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Allow AI Accountant chat/Slack answers to fetch external web-research context for tax/accounting questions.",
+        },
+        {
+            "key": "ai_accountant_web_research_limit",
+            "value": "5",
+            "value_type": "int",
+            "description": "Maximum external web-search rows attached to AI Accountant research context.",
+        },
+        {
+            "key": "ai_accountant_web_research_timeout_seconds",
+            "value": "10",
+            "value_type": "int",
+            "description": "HTTP timeout for optional AI Accountant external web research.",
+        },
+        {
+            "key": "accountant_llm_system_message",
+            "value": (
+                "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller watching cost basis, "
+                "lot allocation, COGS, gross/net sales, marketplace fees, shipping label spend, returns, tax evidence, "
+                "close readiness, and sign-off evidence. Cite evidence, label estimates versus actuals, identify concrete "
+                "corrections, and route unsupported tax/legal conclusions to human advisor review."
+            ),
+            "value_type": "str",
+            "description": "Primary identity/system message for AI Accountant reviews, chat, and Slack answers.",
+        },
+        {
+            "key": "ai_accountant_chat_instruction",
+            "value": (
+                "Answer as the AI Accountant. Use app evidence as source of truth, use web research only as external context, "
+                "and return concise markdown with direct answer, evidence checked, risks/corrections, and advisor-review notes."
+            ),
+            "value_type": "str",
+            "description": "Instruction prompt for interactive AI Accountant chat and Slack responses.",
+        },
+        {
             "key": "slack_notify_backup_success",
             "value": "false",
             "value_type": "bool",
@@ -1864,7 +2133,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
         },
         {
             "key": "slack_template_business_status_report",
-            "value": ":bar_chart: *GoldenStackers Business Status* (`{env}`)\n- Window: `{window_days}` day(s)\n- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n- Orders: `{orders_window_count}`\n- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n- Low stock: `{low_stock_count}` | Unlisted: `{unlisted_count}`\n- As of UTC: `{as_of_utc}`",
+            "value": ":bar_chart: *GoldenStackers Business Status* (`{env}`)\n- Window: `{window_days}` day(s)\n- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n- Estimated COGS: `${cogs_window}`\n{cogs_source_mix_line}- Orders: `{orders_window_count}`\n- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n- Low stock: `{low_stock_count}` | Unlisted: `{unlisted_count}`\n- As of UTC: `{as_of_utc}`",
             "value_type": "str",
             "description": "Template for manual business status report notifications.",
         },
@@ -1912,7 +2181,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
         },
         {
             "key": "slack_notify_system_health_critical",
-            "value": "false",
+            "value": "true",
             "value_type": "bool",
             "description": "Send Slack notifications when System Health critical-signal thresholds are breached.",
         },
@@ -1953,6 +2222,12 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Notification route for manual business status reports (`slack`, `email`, `both`, `disabled`).",
         },
         {
+            "key": "notification_route_ai_accountant_monitor",
+            "value": "slack",
+            "value_type": "str",
+            "description": "Notification route for scheduled AI Accountant monitor alerts (`slack`, `email`, `both`, `disabled`).",
+        },
+        {
             "key": "notification_email_enabled",
             "value": "false",
             "value_type": "bool",
@@ -1963,6 +2238,60 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "",
             "value_type": "str",
             "description": "Default comma-separated notification email recipients (future email delivery).",
+        },
+        {
+            "key": "notification_outbox_runner_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Enable sync-runner outbox processor.",
+        },
+        {
+            "key": "notification_outbox_runner_limit",
+            "value": "50",
+            "value_type": "int",
+            "description": "Max queued outbox rows to process per sync-runner pass.",
+        },
+        {
+            "key": "notification_outbox_backoff_base_seconds",
+            "value": "60",
+            "value_type": "int",
+            "description": "Base retry backoff seconds for notification outbox.",
+        },
+        {
+            "key": "notification_outbox_backoff_max_seconds",
+            "value": "3600",
+            "value_type": "int",
+            "description": "Max retry backoff seconds for notification outbox.",
+        },
+        {
+            "key": "notification_outbox_retain_sent_days",
+            "value": "14",
+            "value_type": "int",
+            "description": "Retention window for sent outbox rows.",
+        },
+        {
+            "key": "notification_outbox_retain_failed_days",
+            "value": "30",
+            "value_type": "int",
+            "description": "Retention window for failed outbox rows.",
+        },
+        {
+            "key": "notification_outbox_cleanup_enabled",
+            "value": "true",
+            "value_type": "bool",
+            "description": "Enable daily outbox retention cleanup.",
+        },
+        {
+            "key": "notification_outbox_cleanup_timezone",
+            "value": "America/Denver",
+            "value_type": "str",
+            "description": "IANA timezone for outbox cleanup schedule.",
+        },
+        {
+            "key": "notification_outbox_cleanup_local_time",
+            "value": "03:15",
+            "value_type": "str",
+            "description": "Local HH:MM time for outbox cleanup schedule.",
         },
         {
             "key": "slack_http_timeout_seconds",
@@ -2128,7 +2457,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
         },
         {
             "key": "health_auto_alert_critical_enabled",
-            "value": "false",
+            "value": "true",
             "value_type": "bool",
             "description": "Enable automatic System Health critical-signal alert dispatch.",
         },
@@ -4129,6 +4458,9 @@ def _record_governance_snapshot_event(
 
 
 def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
+    def _rv(key: str, default: str = "") -> str:
+        return get_runtime_str(repo, key, default)
+
     st.markdown("### Governance Exports")
     st.caption(
         "Centralized export hub for operations governance artifacts across handoffs, workspace feedback, parity/follow-ups, and photo-comp tuning."
@@ -4905,6 +5237,55 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     lifecycle_retention_signoff_dev_ready = lifecycle_retention_signoff_dev_status == "approved"
     lifecycle_retention_signoff_prod_ready = lifecycle_retention_signoff_prod_status == "approved"
 
+    accounting_close_signoff_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "accounting_close_signoff")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    accounting_close_signoff_rows: list[dict[str, Any]] = []
+    latest_accounting_close_signoff_by_key: dict[str, dict[str, Any]] = {}
+    for row in accounting_close_signoff_logs:
+        payload = _audit_changes(row)
+        target_env = str(payload.get("target_env") or "").strip().lower()
+        signoff_type = str(payload.get("signoff_type") or "").strip().lower()
+        close_period = str(payload.get("close_period") or "").strip()
+        composite_key = f"{target_env}::{signoff_type}" if target_env and signoff_type else ""
+        entry = {
+            "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+            "actor": str(row.actor or ""),
+            "target_env": target_env,
+            "signoff_type": signoff_type,
+            "close_period": close_period,
+            "signoff_date": str(payload.get("signoff_date") or ""),
+            "owner": str(payload.get("owner") or ""),
+            "status": str(payload.get("status") or "").strip().lower(),
+            "close_readiness_status": str(payload.get("close_readiness_status") or ""),
+            "exception_count": int(payload.get("exception_count") or 0),
+            "unresolved_blocker_count": int(payload.get("unresolved_blocker_count") or 0),
+            "period_drift_warn_count": int(payload.get("period_drift_warn_count") or 0),
+            "accounting_packet_ref": str(payload.get("accounting_packet_ref") or ""),
+            "accounting_packet_hash": str(
+                payload.get("accounting_packet_hash")
+                or payload.get("accounting_close_packet_evidence_hash_sha256")
+                or ""
+            ),
+            "evidence_link": str(payload.get("evidence_link") or ""),
+            "notes": str(payload.get("notes") or "")[:220],
+        }
+        accounting_close_signoff_rows.append(entry)
+        if composite_key and composite_key not in latest_accounting_close_signoff_by_key:
+            latest_accounting_close_signoff_by_key[composite_key] = entry
+    accounting_close_signoff_df = pd.DataFrame(accounting_close_signoff_rows)
+    accounting_model_dev_status = str(
+        (latest_accounting_close_signoff_by_key.get("dev::accounting_model_acceptance") or {}).get("status") or ""
+    )
+    accounting_model_prod_status = str(
+        (latest_accounting_close_signoff_by_key.get("prod::accounting_model_acceptance") or {}).get("status") or ""
+    )
+    accounting_model_dev_ready = accounting_model_dev_status == "approved"
+    accounting_model_prod_ready = accounting_model_prod_status == "approved"
+
     restore_drill_logs = repo.db.scalars(
         select(AuditLog)
         .where(AuditLog.entity_type == "backup_restore_drill")
@@ -5038,6 +5419,62 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     legal_signoff_approved = sum(
         1 for row in latest_legal_signoff_by_key.values() if str(row.get("status") or "").strip().lower() == "approved"
     )
+    tax_profile_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "tax_profile")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    tax_profile_rows: list[dict[str, Any]] = []
+    for row in tax_profile_logs:
+        payload = _audit_changes(row)
+        tax_profile_rows.append(
+            {
+                "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                "actor": str(row.actor or ""),
+                "profile_key": str(payload.get("profile_key") or ""),
+                "profile_name": str(payload.get("profile_name") or ""),
+                "jurisdiction": str(payload.get("jurisdiction") or ""),
+                "tax_rate_percent": float(payload.get("tax_rate_percent") or 0.0),
+                "shipping_taxable": bool(payload.get("shipping_taxable")),
+                "facilitator_channels": str(payload.get("facilitator_channels") or ""),
+                "tax_exempt_categories": str(payload.get("tax_exempt_categories") or ""),
+                "effective_from": str(payload.get("effective_from") or ""),
+                "effective_to": str(payload.get("effective_to") or ""),
+                "human_validation_status": str(payload.get("human_validation_status") or ""),
+                "advisor_evidence_link": str(payload.get("advisor_evidence_link") or ""),
+                "source_notes": str(payload.get("source_notes") or "")[:220],
+                "is_active": bool(payload.get("is_active", True)),
+            }
+        )
+    tax_profile_df = pd.DataFrame(tax_profile_rows)
+    tax_signoff_logs = repo.db.scalars(
+        select(AuditLog)
+        .where(AuditLog.entity_type == "tax_reporting_signoff")
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(signoff_history_limit)
+    ).all()
+    tax_signoff_rows: list[dict[str, Any]] = []
+    for row in tax_signoff_logs:
+        payload = _audit_changes(row)
+        tax_signoff_rows.append(
+            {
+                "recorded_at_utc": row.created_at.isoformat(timespec="seconds") if row.created_at else "",
+                "actor": str(row.actor or ""),
+                "target_env": str(payload.get("target_env") or ""),
+                "tax_period": str(payload.get("tax_period") or ""),
+                "jurisdiction": str(payload.get("jurisdiction") or ""),
+                "profile_key": str(payload.get("profile_key") or ""),
+                "status": str(payload.get("status") or "").strip().lower(),
+                "owner": str(payload.get("owner") or ""),
+                "signoff_date": str(payload.get("signoff_date") or ""),
+                "tax_packet_ref": str(payload.get("tax_packet_ref") or ""),
+                "advisor_evidence_link": str(payload.get("advisor_evidence_link") or ""),
+                "tax_exception_count": int(payload.get("tax_exception_count") or 0),
+                "notes": str(payload.get("notes") or "")[:220],
+            }
+        )
+    tax_signoff_df = pd.DataFrame(tax_signoff_rows)
     legal_required_total_prod = len(legal_policy_catalog)
     legal_approved_prod = sum(
         1
@@ -5210,6 +5647,19 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     lifecycle_retention_missing_envs = sorted(
         list(lifecycle_retention_required_envs - lifecycle_retention_approved_envs)
     )
+    accounting_model_required_envs = {"dev", "prod"}
+    accounting_model_approved_envs = {
+        env_name
+        for env_name in accounting_model_required_envs
+        if str(
+            (latest_accounting_close_signoff_by_key.get(f"{env_name}::accounting_model_acceptance") or {}).get(
+                "status"
+            )
+            or ""
+        ).strip().lower()
+        == "approved"
+    }
+    accounting_model_missing_envs = sorted(list(accounting_model_required_envs - accounting_model_approved_envs))
     checklist_status_df = pd.DataFrame(
         [
             {
@@ -5230,6 +5680,10 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "lifecycle_retention_signoff_approved_env_count": int(len(lifecycle_retention_approved_envs)),
                 "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
                 "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
+                "accounting_model_signoff_required_env_count": int(len(accounting_model_required_envs)),
+                "accounting_model_signoff_approved_env_count": int(len(accounting_model_approved_envs)),
+                "accounting_model_signoff_missing_env_count": int(len(accounting_model_missing_envs)),
+                "accounting_model_signoff_missing_envs": ",".join(accounting_model_missing_envs),
             }
         ]
     )
@@ -5273,6 +5727,9 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     pl1, pl2 = st.columns(2)
     pl1.metric("Lifecycle Retention Dev", lifecycle_retention_signoff_dev_status or "missing")
     pl2.metric("Lifecycle Retention Prod", lifecycle_retention_signoff_prod_status or "missing")
+    pac1, pac2 = st.columns(2)
+    pac1.metric("Accounting Model Dev", accounting_model_dev_status or "missing")
+    pac2.metric("Accounting Model Prod", accounting_model_prod_status or "missing")
     if fee_calibration_missing_envs:
         st.warning(
             "Fee calibration sign-off missing for: "
@@ -5289,6 +5746,12 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         st.warning(
             "Lifecycle retention policy sign-off missing for: "
             + ", ".join(lifecycle_retention_missing_envs)
+            + ". This now reduces go-live readiness score."
+        )
+    if accounting_model_missing_envs:
+        st.warning(
+            "Accounting model acceptance sign-off missing for: "
+            + ", ".join(accounting_model_missing_envs)
             + ". This now reduces go-live readiness score."
         )
     with st.expander("Readiness Scoring Config", expanded=False):
@@ -5491,6 +5954,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
     readiness_score -= float(len(fee_calibration_missing_envs)) * float(readiness_weight_env_missing)
     readiness_score -= float(len(economics_threshold_missing_envs)) * float(readiness_weight_env_missing)
     readiness_score -= float(len(lifecycle_retention_missing_envs)) * float(readiness_weight_env_missing)
+    readiness_score -= float(len(accounting_model_missing_envs)) * float(readiness_weight_env_missing)
     readiness_score -= float(len(runtime_missing)) * float(readiness_weight_runtime_missing)
     readiness_score -= min(
         float(readiness_penalty_terminal_queue_failure_max),
@@ -5530,6 +5994,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "economics_threshold_signoff_missing_envs": ",".join(economics_threshold_missing_envs),
                 "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
                 "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
+                "accounting_model_signoff_missing_env_count": int(len(accounting_model_missing_envs)),
+                "accounting_model_signoff_missing_envs": ",".join(accounting_model_missing_envs),
                 "required_runtime_missing_count": int(len(runtime_missing)),
                 "env_untracked_count": int(len(untracked_env_keys)),
                 "queue_job_count": int(len(queue_df)),
@@ -5563,6 +6029,10 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                 "lifecycle_retention_signoff_prod_status": lifecycle_retention_signoff_prod_status,
                 "lifecycle_retention_signoff_dev_ready": bool(lifecycle_retention_signoff_dev_ready),
                 "lifecycle_retention_signoff_prod_ready": bool(lifecycle_retention_signoff_prod_ready),
+                "accounting_model_signoff_dev_status": accounting_model_dev_status,
+                "accounting_model_signoff_prod_status": accounting_model_prod_status,
+                "accounting_model_signoff_dev_ready": bool(accounting_model_dev_ready),
+                "accounting_model_signoff_prod_ready": bool(accounting_model_prod_ready),
                 "restore_drills_180d_count": int(restore_drill_180d_count),
                 "restore_drills_180d_pass_count": int(restore_drill_180d_pass_count),
                 "restore_drill_last_at_utc": restore_drill_last_at,
@@ -5625,6 +6095,7 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
             pack_zip.writestr("integration_automation_hardening_signoffs.csv", automation_hardening_df.to_csv(index=False))
             pack_zip.writestr("ebay_fee_calibration_signoffs.csv", fee_calibration_df.to_csv(index=False))
             pack_zip.writestr("economics_threshold_signoffs.csv", economics_threshold_df.to_csv(index=False))
+            pack_zip.writestr("accounting_close_signoffs.csv", accounting_close_signoff_df.to_csv(index=False))
             pack_zip.writestr(
                 "lifecycle_retention_policy_signoffs.csv",
                 lifecycle_retention_signoff_df.to_csv(index=False),
@@ -5633,6 +6104,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
             pack_zip.writestr("backup_dr_checklist_snapshots.csv", dr_checklist_df.to_csv(index=False))
             pack_zip.writestr("go_live_section_signoffs.csv", go_live_signoff_df.to_csv(index=False))
             pack_zip.writestr("commerce_legal_signoffs.csv", legal_signoff_df.to_csv(index=False))
+            pack_zip.writestr("tax_profiles.csv", tax_profile_df.to_csv(index=False))
+            pack_zip.writestr("tax_reporting_signoffs.csv", tax_signoff_df.to_csv(index=False))
             pack_zip.writestr("integration_error_signal_counts_24h.csv", signal_counts_df.to_csv(index=False))
             pack_zip.writestr("integration_error_signal_samples_24h.csv", signal_samples_df.to_csv(index=False))
             pack_zip.writestr("integration_queue_snapshot.csv", queue_df.to_csv(index=False))
@@ -5684,6 +6157,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "economics_threshold_signoff_missing_envs": ",".join(economics_threshold_missing_envs),
                     "lifecycle_retention_signoff_missing_env_count": int(len(lifecycle_retention_missing_envs)),
                     "lifecycle_retention_signoff_missing_envs": ",".join(lifecycle_retention_missing_envs),
+                    "accounting_model_signoff_missing_env_count": int(len(accounting_model_missing_envs)),
+                    "accounting_model_signoff_missing_envs": ",".join(accounting_model_missing_envs),
                     "required_runtime_missing_count": int(len(runtime_missing)),
                     "queue_job_count": int(len(queue_df)),
                     "critical_alert_evidence_7d_count": int(len(critical_alert_evidence_df)),
@@ -5716,6 +6191,10 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "lifecycle_retention_signoff_prod_status": lifecycle_retention_signoff_prod_status,
                     "lifecycle_retention_signoff_dev_ready": bool(lifecycle_retention_signoff_dev_ready),
                     "lifecycle_retention_signoff_prod_ready": bool(lifecycle_retention_signoff_prod_ready),
+                    "accounting_model_signoff_dev_status": accounting_model_dev_status,
+                    "accounting_model_signoff_prod_status": accounting_model_prod_status,
+                    "accounting_model_signoff_dev_ready": bool(accounting_model_dev_ready),
+                    "accounting_model_signoff_prod_ready": bool(accounting_model_prod_ready),
                     "restore_drills_180d_count": int(restore_drill_180d_count),
                     "restore_drills_180d_pass_count": int(restore_drill_180d_pass_count),
                     "restore_drill_last_at_utc": restore_drill_last_at,
@@ -5786,6 +6265,10 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "lifecycle_retention_signoff_missing_envs": payload.get(
                         "lifecycle_retention_signoff_missing_envs"
                     ),
+                    "accounting_model_signoff_missing_env_count": payload.get(
+                        "accounting_model_signoff_missing_env_count"
+                    ),
+                    "accounting_model_signoff_missing_envs": payload.get("accounting_model_signoff_missing_envs"),
                     "required_runtime_missing_count": payload.get("required_runtime_missing_count"),
                     "provider_validation_signoff_dev_status": payload.get("provider_validation_signoff_dev_status"),
                     "provider_validation_signoff_prod_status": payload.get("provider_validation_signoff_prod_status"),
@@ -5801,6 +6284,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                     "economics_threshold_signoff_prod_status": payload.get("economics_threshold_signoff_prod_status"),
                     "lifecycle_retention_signoff_dev_status": payload.get("lifecycle_retention_signoff_dev_status"),
                     "lifecycle_retention_signoff_prod_status": payload.get("lifecycle_retention_signoff_prod_status"),
+                    "accounting_model_signoff_dev_status": payload.get("accounting_model_signoff_dev_status"),
+                    "accounting_model_signoff_prod_status": payload.get("accounting_model_signoff_prod_status"),
                     "restore_drills_180d_count": payload.get("restore_drills_180d_count"),
                     "restore_drill_last_result": payload.get("restore_drill_last_result"),
                     "go_live_signoff_items_total": payload.get("go_live_signoff_items_total"),
@@ -6213,6 +6698,492 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         )
     else:
         st.caption("No economics threshold sign-off records yet.")
+
+    st.markdown("#### Accounting Close Sign-Off Tracker")
+    st.caption(
+        "Capture accounting model acceptance and recurring monthly close review with owner/date/evidence references."
+    )
+    accounting_signoff_type_catalog: list[tuple[str, str]] = [
+        ("accounting_model_acceptance", "Accounting model acceptance"),
+        ("monthly_close_review", "Monthly close review"),
+    ]
+    current_close_period = now_ts.strftime("%Y-%m")
+    accounting_coverage_rows: list[dict[str, Any]] = []
+    for target_env in ["dev", "prod"]:
+        for signoff_type, signoff_label in accounting_signoff_type_catalog:
+            latest = latest_accounting_close_signoff_by_key.get(f"{target_env}::{signoff_type}") or {}
+            accounting_coverage_rows.append(
+                {
+                    "environment": target_env,
+                    "signoff_type": signoff_type,
+                    "signoff_label": signoff_label,
+                    "status": str(latest.get("status") or "missing"),
+                    "owner": str(latest.get("owner") or ""),
+                    "close_period": str(latest.get("close_period") or ""),
+                    "signoff_date": str(latest.get("signoff_date") or ""),
+                    "close_readiness_status": str(latest.get("close_readiness_status") or ""),
+                    "exception_count": int(latest.get("exception_count") or 0),
+                    "unresolved_blocker_count": int(latest.get("unresolved_blocker_count") or 0),
+                    "period_drift_warn_count": int(latest.get("period_drift_warn_count") or 0),
+                    "evidence_link": str(latest.get("evidence_link") or ""),
+                }
+            )
+    st.dataframe(pd.DataFrame(accounting_coverage_rows), use_container_width=True, hide_index=True)
+    acs1, acs2 = st.columns([2, 1])
+    with acs1:
+        accounting_seed_target = st.selectbox(
+            "Seed Missing Accounting Sign-Off Rows For",
+            options=["prod", "dev", "dev+prod"],
+            index=0,
+            key="admin_accounting_close_signoff_seed_target",
+        )
+    with acs2:
+        if st.button("Seed Missing Accounting Sign-Off Items", key="admin_accounting_close_signoff_seed_btn"):
+            target_envs = ["dev", "prod"] if accounting_seed_target == "dev+prod" else [accounting_seed_target]
+            seeded_count = 0
+            try:
+                for target_env in target_envs:
+                    for signoff_type, signoff_label in accounting_signoff_type_catalog:
+                        composite_key = f"{target_env}::{signoff_type}"
+                        if composite_key in latest_accounting_close_signoff_by_key:
+                            continue
+                        repo.record_audit_event(
+                            entity_type="accounting_close_signoff",
+                            entity_id=None,
+                            action="seed_missing",
+                            actor=user.username,
+                            changes={
+                                "target_env": str(target_env or "").strip().lower(),
+                                "signoff_type": str(signoff_type or "").strip().lower(),
+                                "signoff_label": str(signoff_label or "").strip(),
+                                "close_period": current_close_period,
+                                "signoff_date": str(utcnow_naive().date().isoformat()),
+                                "owner": str(user.username or "").strip(),
+                                "status": "needs_followup",
+                                "close_readiness_status": "",
+                                "exception_count": 0,
+                                "unresolved_blocker_count": 0,
+                                "period_drift_warn_count": 0,
+                                "accounting_packet_ref": "",
+                                "accounting_packet_hash": "",
+                                "evidence_link": "",
+                                "notes": "Auto-seeded missing accounting sign-off item from Admin tracker.",
+                                "seeded": True,
+                            },
+                        )
+                        seeded_count += 1
+                if seeded_count <= 0:
+                    st.info("No missing accounting sign-off rows to seed for the selected target.")
+                else:
+                    st.success(f"Seeded {seeded_count} missing accounting sign-off row(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to seed accounting sign-off rows: {exc}")
+    acq1, acq2, acq3 = st.columns(3)
+    with acq1:
+        quick_accounting_env = st.selectbox(
+            "Quick Approve Accounting Env",
+            options=["prod", "dev"],
+            index=0,
+            key="admin_accounting_close_signoff_quick_env",
+        )
+    with acq2:
+        quick_accounting_type = st.selectbox(
+            "Quick Approve Accounting Item",
+            options=[f"{label} [{key}]" for key, label in accounting_signoff_type_catalog],
+            index=0,
+            key="admin_accounting_close_signoff_quick_type",
+        )
+        quick_accounting_type_key = str(quick_accounting_type.rsplit("[", 1)[-1].rstrip("]")).strip().lower()
+        quick_accounting_type_label = next(
+            (label for key, label in accounting_signoff_type_catalog if key == quick_accounting_type_key),
+            quick_accounting_type,
+        )
+    with acq3:
+        if st.button("Quick Mark Accounting Approved", key="admin_accounting_close_signoff_quick_approve_btn"):
+            try:
+                repo.record_audit_event(
+                    entity_type="accounting_close_signoff",
+                    entity_id=None,
+                    action="quick_approve",
+                    actor=user.username,
+                    changes={
+                        "target_env": str(quick_accounting_env or "").strip().lower(),
+                        "signoff_type": str(quick_accounting_type_key or "").strip().lower(),
+                        "signoff_label": str(quick_accounting_type_label or "").strip(),
+                        "close_period": current_close_period,
+                        "signoff_date": str(utcnow_naive().date().isoformat()),
+                        "owner": str(user.username or "").strip(),
+                        "status": "approved",
+                        "close_readiness_status": "close_ready",
+                        "exception_count": 0,
+                        "unresolved_blocker_count": 0,
+                        "period_drift_warn_count": 0,
+                        "accounting_packet_ref": "",
+                        "accounting_packet_hash": "",
+                        "evidence_link": "",
+                        "notes": "Quick approved from accounting close sign-off tracker.",
+                        "quick_action": True,
+                    },
+                )
+                st.success("Accounting sign-off quick-approved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to quick-approve accounting sign-off: {exc}")
+    accounting_type_options = {
+        f"{label} [{key}]": (key, label)
+        for key, label in accounting_signoff_type_catalog
+    }
+    with st.form("admin_accounting_close_signoff_form"):
+        acf1, acf2 = st.columns(2)
+        with acf1:
+            selected_accounting_type = st.selectbox(
+                "Accounting Sign-Off Item",
+                options=list(accounting_type_options.keys()),
+                index=0,
+                key="admin_accounting_close_signoff_type",
+            )
+            accounting_signoff_type, accounting_signoff_label = accounting_type_options.get(
+                selected_accounting_type,
+                ("accounting_model_acceptance", "Accounting model acceptance"),
+            )
+            accounting_target_env = st.selectbox(
+                "Environment",
+                options=["dev", "prod"],
+                index=1,
+                key="admin_accounting_close_signoff_target_env",
+            )
+            accounting_close_period = st.text_input(
+                "Close Period",
+                value=current_close_period,
+                key="admin_accounting_close_signoff_close_period",
+                help="Use YYYY-MM for monthly close review, or a release identifier for model acceptance.",
+            )
+            accounting_signoff_date = st.date_input(
+                "Sign-Off Date",
+                value=utcnow_naive().date(),
+                key="admin_accounting_close_signoff_date",
+            )
+            accounting_owner = st.text_input(
+                "Owner",
+                value=str(user.username or ""),
+                key="admin_accounting_close_signoff_owner",
+            )
+        with acf2:
+            accounting_status = st.selectbox(
+                "Status",
+                options=["approved", "blocked", "needs_followup"],
+                index=0,
+                key="admin_accounting_close_signoff_status",
+            )
+            accounting_close_readiness_status = st.selectbox(
+                "Close Readiness Status",
+                options=["close_ready", "review_needed", "blocked", "not_run"],
+                index=0,
+                key="admin_accounting_close_signoff_readiness_status",
+            )
+            accounting_exception_count = st.number_input(
+                "Exception Count",
+                min_value=0,
+                max_value=1000000,
+                value=0,
+                step=1,
+                key="admin_accounting_close_signoff_exception_count",
+            )
+            accounting_unresolved_blocker_count = st.number_input(
+                "Unresolved Blocker Count",
+                min_value=0,
+                max_value=1000000,
+                value=0,
+                step=1,
+                key="admin_accounting_close_signoff_blocker_count",
+            )
+            accounting_period_drift_warn_count = st.number_input(
+                "Period Drift Warning Count",
+                min_value=0,
+                max_value=1000000,
+                value=0,
+                step=1,
+                key="admin_accounting_close_signoff_period_drift_warn_count",
+                help="Use the `period_drift_warn_count` from Reports Accounting Close Readiness.",
+            )
+            accounting_evidence_link = st.text_input(
+                "Evidence Link",
+                placeholder="report/export/ticket URL",
+                key="admin_accounting_close_signoff_evidence_link",
+            )
+        accounting_packet_ref = st.text_input(
+            "Accounting Packet Reference",
+            placeholder="Accounting Close Packet filename, storage path, or artifact ID",
+            key="admin_accounting_close_signoff_packet_ref",
+        )
+        accounting_packet_hash = st.text_input(
+            "Accounting Packet Evidence Hash",
+            placeholder="accounting_close_packet_evidence_hash_sha256",
+            key="admin_accounting_close_signoff_packet_hash",
+        )
+        accounting_notes = st.text_area(
+            "Notes",
+            placeholder="Model assumptions, open exceptions, reviewer comments, or monthly close context.",
+            key="admin_accounting_close_signoff_notes",
+        )
+        save_accounting_signoff = st.form_submit_button("Record Accounting Sign-Off")
+    if save_accounting_signoff:
+        try:
+            repo.record_audit_event(
+                entity_type="accounting_close_signoff",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "target_env": str(accounting_target_env or "").strip().lower(),
+                    "signoff_type": str(accounting_signoff_type or "").strip().lower(),
+                    "signoff_label": str(accounting_signoff_label or "").strip(),
+                    "close_period": str(accounting_close_period or "").strip(),
+                    "signoff_date": str(accounting_signoff_date.isoformat()),
+                    "owner": str(accounting_owner or "").strip(),
+                    "status": str(accounting_status or "").strip().lower(),
+                    "close_readiness_status": str(accounting_close_readiness_status or "").strip().lower(),
+                    "exception_count": int(accounting_exception_count or 0),
+                    "unresolved_blocker_count": int(accounting_unresolved_blocker_count or 0),
+                    "period_drift_warn_count": int(accounting_period_drift_warn_count or 0),
+                    "accounting_packet_ref": str(accounting_packet_ref or "").strip(),
+                    "accounting_packet_hash": str(accounting_packet_hash or "").strip(),
+                    "evidence_link": str(accounting_evidence_link or "").strip(),
+                    "notes": str(accounting_notes or "").strip(),
+                },
+            )
+            st.success("Accounting sign-off recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record accounting sign-off: {exc}")
+    if not accounting_close_signoff_df.empty:
+        st.dataframe(accounting_close_signoff_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Accounting Close Sign-Off CSV",
+            data=accounting_close_signoff_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"accounting_close_signoffs_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_accounting_close_signoff_download_csv_btn",
+        )
+    else:
+        st.caption("No accounting close sign-off records yet.")
+
+    st.markdown("#### Tax Profile + Sign-Off Tracker")
+    st.caption(
+        "Capture repeatable tax assumptions and advisor/human validation evidence. These records support review only; validate filing/remittance treatment with a tax advisor."
+    )
+    with st.form("admin_tax_profile_form"):
+        tpf1, tpf2 = st.columns(2)
+        with tpf1:
+            tax_profile_key = st.text_input(
+                "Tax Profile Key",
+                value="local_default",
+                key="admin_tax_profile_key",
+            )
+            tax_profile_name = st.text_input(
+                "Tax Profile Name",
+                value="Local default tax assumptions",
+                key="admin_tax_profile_name",
+            )
+            tax_profile_jurisdiction = st.text_input(
+                "Jurisdiction",
+                value=str(_rv("invoicing_tax_jurisdiction", "Golden, Colorado") or "Golden, Colorado"),
+                key="admin_tax_profile_jurisdiction",
+            )
+            tax_profile_rate = st.number_input(
+                "Tax Rate Percent",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(_business_status_safe_float(_rv("invoicing_tax_rate_percent_default", "7.50"))),
+                step=0.01,
+                key="admin_tax_profile_rate_percent",
+            )
+            tax_profile_shipping_taxable = st.checkbox(
+                "Shipping Taxable",
+                value=str(_rv("invoicing_tax_shipping_taxable_default", "false")).strip().lower() == "true",
+                key="admin_tax_profile_shipping_taxable",
+            )
+        with tpf2:
+            tax_profile_facilitators = st.text_input(
+                "Marketplace Facilitator Channels",
+                value=str(_rv("marketplace_facilitator_channels_csv", "ebay") or "ebay"),
+                key="admin_tax_profile_facilitator_channels",
+            )
+            tax_profile_exempt_categories = st.text_input(
+                "Tax Exempt Categories",
+                value=str(_rv("invoicing_tax_exempt_categories_csv", "bullion,coins") or "bullion,coins"),
+                key="admin_tax_profile_exempt_categories",
+            )
+            tax_profile_effective_from = st.date_input(
+                "Effective From",
+                value=utcnow_naive().date(),
+                key="admin_tax_profile_effective_from",
+            )
+            tax_profile_effective_to = st.text_input(
+                "Effective To (optional)",
+                value="",
+                key="admin_tax_profile_effective_to",
+                help="Use YYYY-MM-DD if this profile has a known end date.",
+            )
+            tax_profile_validation_status = st.selectbox(
+                "Human Validation Status",
+                options=["needs_validation", "advisor_validated", "expired", "blocked"],
+                index=0,
+                key="admin_tax_profile_validation_status",
+            )
+            tax_profile_active = st.checkbox("Active Profile", value=True, key="admin_tax_profile_active")
+        tax_profile_evidence = st.text_input(
+            "Advisor / Evidence Link",
+            placeholder="advisor note, state guidance, ticket, or tax packet reference",
+            key="admin_tax_profile_evidence_link",
+        )
+        tax_profile_notes = st.text_area(
+            "Source Notes",
+            placeholder="Jurisdiction/channel assumptions, exemption basis, shipping-taxability notes, and validation caveats.",
+            key="admin_tax_profile_source_notes",
+        )
+        save_tax_profile = st.form_submit_button("Record Tax Profile")
+    if save_tax_profile:
+        try:
+            repo.record_audit_event(
+                entity_type="tax_profile",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "profile_key": str(tax_profile_key or "").strip().lower(),
+                    "profile_name": str(tax_profile_name or "").strip(),
+                    "jurisdiction": str(tax_profile_jurisdiction or "").strip(),
+                    "tax_rate_percent": float(tax_profile_rate or 0.0),
+                    "shipping_taxable": bool(tax_profile_shipping_taxable),
+                    "facilitator_channels": str(tax_profile_facilitators or "").strip(),
+                    "tax_exempt_categories": str(tax_profile_exempt_categories or "").strip(),
+                    "effective_from": str(tax_profile_effective_from.isoformat()),
+                    "effective_to": str(tax_profile_effective_to or "").strip(),
+                    "human_validation_status": str(tax_profile_validation_status or "").strip().lower(),
+                    "advisor_evidence_link": str(tax_profile_evidence or "").strip(),
+                    "source_notes": str(tax_profile_notes or "").strip(),
+                    "is_active": bool(tax_profile_active),
+                },
+            )
+            st.success("Tax profile recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record tax profile: {exc}")
+    with st.form("admin_tax_reporting_signoff_form"):
+        tsf1, tsf2 = st.columns(2)
+        with tsf1:
+            tax_signoff_env = st.selectbox(
+                "Environment",
+                options=["dev", "prod"],
+                index=1,
+                key="admin_tax_signoff_env",
+            )
+            tax_signoff_period = st.text_input(
+                "Tax Period",
+                value=now_ts.strftime("%Y-%m"),
+                key="admin_tax_signoff_period",
+                help="Use YYYY-MM for monthly, YYYY-Q# for quarterly, or another reviewed period identifier.",
+            )
+            tax_signoff_jurisdiction = st.text_input(
+                "Sign-Off Jurisdiction",
+                value=str(_rv("invoicing_tax_jurisdiction", "Golden, Colorado") or "Golden, Colorado"),
+                key="admin_tax_signoff_jurisdiction",
+            )
+            tax_signoff_profile_key = st.text_input(
+                "Tax Profile Key Used",
+                value="local_default",
+                key="admin_tax_signoff_profile_key",
+            )
+        with tsf2:
+            tax_signoff_status = st.selectbox(
+                "Status",
+                options=["approved", "blocked", "needs_followup"],
+                index=1,
+                key="admin_tax_signoff_status",
+            )
+            tax_signoff_owner = st.text_input(
+                "Owner",
+                value=str(user.username or ""),
+                key="admin_tax_signoff_owner",
+            )
+            tax_signoff_date = st.date_input(
+                "Sign-Off Date",
+                value=utcnow_naive().date(),
+                key="admin_tax_signoff_date",
+            )
+            tax_exception_count = st.number_input(
+                "Tax Exception Count",
+                min_value=0,
+                max_value=1000000,
+                value=0,
+                step=1,
+                key="admin_tax_signoff_exception_count",
+            )
+        tax_packet_ref = st.text_input(
+            "Tax Packet Reference",
+            placeholder="Tax Review Packet filename, storage path, or artifact ID",
+            key="admin_tax_signoff_packet_ref",
+        )
+        tax_advisor_evidence = st.text_input(
+            "Advisor / Evidence Link",
+            placeholder="advisor email, review ticket, or filing workpaper reference",
+            key="admin_tax_signoff_advisor_evidence",
+        )
+        tax_signoff_notes = st.text_area(
+            "Notes",
+            placeholder="Open exceptions, advisor comments, exemption/shipping/facilitator assumptions, or filing caveats.",
+            key="admin_tax_signoff_notes",
+        )
+        save_tax_signoff = st.form_submit_button("Record Tax Reporting Sign-Off")
+    if save_tax_signoff:
+        try:
+            repo.record_audit_event(
+                entity_type="tax_reporting_signoff",
+                entity_id=None,
+                action="record",
+                actor=user.username,
+                changes={
+                    "target_env": str(tax_signoff_env or "").strip().lower(),
+                    "tax_period": str(tax_signoff_period or "").strip(),
+                    "jurisdiction": str(tax_signoff_jurisdiction or "").strip(),
+                    "profile_key": str(tax_signoff_profile_key or "").strip().lower(),
+                    "status": str(tax_signoff_status or "").strip().lower(),
+                    "owner": str(tax_signoff_owner or "").strip(),
+                    "signoff_date": str(tax_signoff_date.isoformat()),
+                    "tax_packet_ref": str(tax_packet_ref or "").strip(),
+                    "advisor_evidence_link": str(tax_advisor_evidence or "").strip(),
+                    "tax_exception_count": int(tax_exception_count or 0),
+                    "notes": str(tax_signoff_notes or "").strip(),
+                },
+            )
+            st.success("Tax reporting sign-off recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to record tax reporting sign-off: {exc}")
+    if not tax_profile_df.empty:
+        st.dataframe(tax_profile_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Tax Profiles CSV",
+            data=tax_profile_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"tax_profiles_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_tax_profiles_download_csv_btn",
+        )
+    else:
+        st.caption("No tax profiles recorded yet.")
+    if not tax_signoff_df.empty:
+        st.dataframe(tax_signoff_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Tax Reporting Sign-Off CSV",
+            data=tax_signoff_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"tax_reporting_signoffs_{settings.app_env}_{now_ts.strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key="admin_tax_reporting_signoff_download_csv_btn",
+        )
+    else:
+        st.caption("No tax reporting sign-offs recorded yet.")
 
     st.markdown("#### Lifecycle Retention Policy Sign-Off Tracker")
     st.caption(
@@ -9557,6 +10528,7 @@ def render_admin(repo: InventoryRepository) -> None:
         current_intake_profile = _workflow_profile_current("ai_workflow_profile_intake")
         current_comp_profile = _workflow_profile_current("ai_workflow_profile_comp")
         current_risk_profile = _workflow_profile_current("ai_workflow_profile_risk")
+        current_accounting_profile = _workflow_profile_current("ai_workflow_profile_accounting")
         profile_labels = [str(choice["label"]) for choice in profile_choices]
 
         with st.form("admin_ai_workflow_profile_routing_form"):
@@ -9586,6 +10558,12 @@ def render_admin(repo: InventoryRepository) -> None:
                     options=profile_labels,
                     index=_workflow_profile_index(current_risk_profile),
                     key="admin_ai_workflow_profile_risk",
+                )
+                accounting_label = st.selectbox(
+                    "Accounting Workflow Profile",
+                    options=profile_labels,
+                    index=_workflow_profile_index(current_accounting_profile),
+                    key="admin_ai_workflow_profile_accounting",
                 )
             sr1, sr2 = st.columns(2)
             with sr1:
@@ -9632,6 +10610,15 @@ def render_admin(repo: InventoryRepository) -> None:
                     is_active=True,
                     actor=user.username,
                 )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ai_workflow_profile_accounting",
+                    value=label_to_value.get(str(accounting_label), ""),
+                    value_type="str",
+                    description="Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
+                    is_active=True,
+                    actor=user.username,
+                )
                 st.success("Workflow AI profile routing saved.")
                 st.rerun()
             except Exception as exc:
@@ -9655,6 +10642,10 @@ def render_admin(repo: InventoryRepository) -> None:
                     (
                         "ai_workflow_profile_risk",
                         "Preferred AI runtime profile id for risk workflow calls (blank uses default chain order).",
+                    ),
+                    (
+                        "ai_workflow_profile_accounting",
+                        "Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
                     ),
                 ]:
                     repo.upsert_runtime_setting(
@@ -13797,7 +14788,7 @@ def render_admin(repo: InventoryRepository) -> None:
             with s1:
                 slack_enabled = st.checkbox(
                     "Enable Slack Notifications",
-                    value=_rb("slack_notifications_enabled", False),
+                    value=_rb("slack_notifications_enabled", True),
                 )
                 slack_default_channel = st.text_input(
                     "Default Slack Channel",
@@ -13862,7 +14853,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 )
                 slack_notify_system_health_critical = st.checkbox(
                     "Notify System Health Critical",
-                    value=_rb("slack_notify_system_health_critical", False),
+                    value=_rb("slack_notify_system_health_critical", True),
                 )
                 slack_daily_cron = st.text_input(
                     "Daily Summary Cron (UTC)",
@@ -13960,7 +14951,7 @@ def render_admin(repo: InventoryRepository) -> None:
                 )
                 health_auto_alert_critical_enabled = st.checkbox(
                     "Auto-Alert Health Critical Signals",
-                    value=_rb("health_auto_alert_critical_enabled", False),
+                    value=_rb("health_auto_alert_critical_enabled", True),
                     help="When enabled, System Health can auto-send Slack critical alerts on threshold breach.",
                 )
                 health_auto_alert_cooldown_minutes = st.number_input(
@@ -14248,6 +15239,8 @@ def render_admin(repo: InventoryRepository) -> None:
                             ":bar_chart: *GoldenStackers Business Status* (`{env}`)\n"
                             "- Window: `{window_days}` day(s)\n"
                             "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Estimated COGS: `${cogs_window}`\n"
+                            "{cogs_source_mix_line}"
                             "- Orders: `{orders_window_count}`\n"
                             "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
                             "- Low stock: `{low_stock_count}` | Unlisted: `{unlisted_count}`\n"
@@ -14472,6 +15465,11 @@ def render_admin(repo: InventoryRepository) -> None:
                     options=route_options,
                     index=_route_index(_rv("notification_route_business_reports", "slack")),
                 )
+                route_ai_accountant_monitor = st.selectbox(
+                    "Route: AI Accountant Monitor",
+                    options=route_options,
+                    index=_route_index(_rv("notification_route_ai_accountant_monitor", "slack")),
+                )
                 notification_email_enabled = st.checkbox(
                     "Enable Notification Email Pipeline (future)",
                     value=_rb("notification_email_enabled", False),
@@ -14490,6 +15488,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("notification_route_backup_events", route_backup_events, "str", "Notification route for backup events."),
                     ("notification_route_system_health_critical", route_system_health_critical, "str", "Notification route for system-health critical events."),
                     ("notification_route_business_reports", route_business_reports, "str", "Notification route for manual business reports."),
+                    ("notification_route_ai_accountant_monitor", route_ai_accountant_monitor, "str", "Notification route for scheduled AI Accountant monitor alerts."),
                     ("notification_email_enabled", "true" if notification_email_enabled else "false", "bool", "Enable notification email pipeline."),
                     ("notification_email_recipients_csv", notification_email_recipients_csv.strip(), "str", "Default notification email recipients (CSV)."),
                 ]
@@ -14517,7 +15516,7 @@ def render_admin(repo: InventoryRepository) -> None:
             with o1:
                 outbox_runner_enabled = st.checkbox(
                     "Enable Outbox Runner",
-                    value=_rb("notification_outbox_runner_enabled", False),
+                    value=_rb("notification_outbox_runner_enabled", True),
                 )
                 outbox_runner_limit = st.number_input(
                     "Runner Batch Limit",
@@ -14920,6 +15919,8 @@ def render_admin(repo: InventoryRepository) -> None:
                             ":bar_chart: *GoldenStackers Weekly Business Summary* (`{env}`)\n"
                             "- Window: `{window_days}` day(s)\n"
                             "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Estimated COGS: `${cogs_window}`\n"
+                            "{cogs_source_mix_line}"
                             "- Orders: `{orders_window_count}`\n"
                             "- Inventory cost basis: `${inventory_cost}`\n"
                             "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
@@ -14937,6 +15938,8 @@ def render_admin(repo: InventoryRepository) -> None:
                             "- Active listings: `{active_count}`\n"
                             "- Inventory cost basis: `${inventory_cost}`\n"
                             "- Sales (last `{window_days}`d): `{sales_window_count}` (net `${net_window}`)\n"
+                            "- Estimated COGS: `${cogs_window}`\n"
+                            "{cogs_source_mix_line}"
                             "- As of UTC: `{as_of_utc}`"
                         )
                     else:
@@ -14945,6 +15948,8 @@ def render_admin(repo: InventoryRepository) -> None:
                         default_template = (
                             ":clipboard: *GoldenStackers Daily Business Snapshot* (`{env}`)\n"
                             "- Sales 24h: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                            "- Estimated COGS: `${cogs_window}`\n"
+                            "{cogs_source_mix_line}"
                             "- Orders 24h: `{orders_window_count}`\n"
                             "- Products: `{product_count}` | Listings: `{listing_count}`\n"
                             "- Draft listings: `{draft_count}` | Low stock: `{low_stock_count}`\n"
@@ -14990,6 +15995,8 @@ def render_admin(repo: InventoryRepository) -> None:
         preview_default_template = (
             ":clipboard: *GoldenStackers Daily Business Snapshot* (`{env}`)\n"
             "- Sales 24h: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+            "- Estimated COGS: `${cogs_window}`\n"
+            "{cogs_source_mix_line}"
             "- Orders 24h: `{orders_window_count}`\n"
             "- Products: `{product_count}` | Listings: `{listing_count}`\n"
             "- Draft listings: `{draft_count}` | Low stock: `{low_stock_count}`\n"
@@ -15002,6 +16009,8 @@ def render_admin(repo: InventoryRepository) -> None:
                 ":bar_chart: *GoldenStackers Weekly Business Summary* (`{env}`)\n"
                 "- Window: `{window_days}` day(s)\n"
                 "- Sales: `{sales_window_count}` | Gross: `${gross_window}` | Net: `${net_window}`\n"
+                "- Estimated COGS: `${cogs_window}`\n"
+                "{cogs_source_mix_line}"
                 "- Orders: `{orders_window_count}`\n"
                 "- Inventory cost basis: `${inventory_cost}`\n"
                 "- Listings: `{listing_count}` (active `{active_count}`, draft `{draft_count}`)\n"
@@ -15019,6 +16028,8 @@ def render_admin(repo: InventoryRepository) -> None:
                 "- Active listings: `{active_count}`\n"
                 "- Inventory cost basis: `${inventory_cost}`\n"
                 "- Sales (last `{window_days}`d): `{sales_window_count}` (net `${net_window}`)\n"
+                "- Estimated COGS: `${cogs_window}`\n"
+                "{cogs_source_mix_line}"
                 "- As of UTC: `{as_of_utc}`"
             )
         preview_context = _build_business_status_context(repo, days=preview_days)

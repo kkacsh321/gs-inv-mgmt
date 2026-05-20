@@ -48,6 +48,385 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertEqual(sale_movement.quantity_after, 7)
         self.assertEqual(sale_movement.quantity_delta, -3)
 
+    def test_create_sale_for_bundle_listing_updates_each_component_inventory(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-EXTRA", qty=12)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Mixed bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "primary_product_id": primary.id,
+                        "components": [
+                            {
+                                "product_id": primary.id,
+                                "sku": primary.sku,
+                                "quantity_per_listing": 2,
+                                "current_quantity": 20,
+                            },
+                            {
+                                "product_id": extra.id,
+                                "sku": extra.sku,
+                                "quantity_per_listing": 3,
+                                "current_quantity": 12,
+                            },
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 2, 15, 30, 0),
+        )
+
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 16)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 6)
+        movements = [
+            m for m in self.repo.list_inventory_movements(limit=50)
+            if m.reference_type == "sale" and m.reference_id == sale.id
+        ]
+        self.assertEqual(sorted(m.movement_type for m in movements), ["sale_bundle_component", "sale_bundle_component"])
+        self.assertEqual(sorted((m.product_id, m.quantity_delta) for m in movements), [(primary.id, -4), (extra.id, -6)])
+
+    def test_update_sale_for_bundle_listing_reconciles_component_inventory(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-UPD-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-UPD-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Update bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=5,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 1},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=1,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 2, 15, 30, 0),
+        )
+
+        self.repo.update_sale(sale.id, {"quantity_sold": 3}, actor="qa-user")
+
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 17)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 14)
+
+    def test_report_sale_unit_cost_maps_prices_bundle_components_per_listing_unit(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-COGS-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-COGS-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="COGS bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 2, 15, 30, 0),
+        )
+
+        cost_maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 3, 0, 0, 0),
+            default_unit_cost_by_product={primary.id: 25.0, extra.id: 25.0},
+        )
+
+        self.assertAlmostEqual(
+            float(cost_maps["fifo_unit_cost_by_sale"][int(sale.id)]),
+            125.0,
+            places=2,
+        )
+        self.assertEqual(cost_maps["fifo_unit_cost_source_by_sale"][int(sale.id)], "product_default_landed_cost")
+
+    def test_bundle_sale_without_primary_product_link_uses_component_cogs(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-NOLINK-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-NOLINK-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="No primary product link bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            external_order_id="EBAY-BUNDLE-NOLINK",
+            sold_at=datetime(2026, 3, 2, 15, 30, 0),
+        )
+
+        cost_maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 3, 0, 0, 0),
+            default_unit_cost_by_product={primary.id: 10.0, extra.id: 5.0},
+        )
+        exceptions = self.repo.report_accounting_exception_rows(
+            start_dt=datetime(2026, 3, 1, 0, 0, 0),
+            end_dt=datetime(2026, 3, 3, 0, 0, 0),
+        )
+        sale_exceptions = [row for row in exceptions if int(row.get("entity_id") or 0) == int(sale.id)]
+
+        self.assertAlmostEqual(float(cost_maps["fifo_unit_cost_by_sale"][int(sale.id)]), 35.0, places=2)
+        self.assertEqual(cost_maps["fifo_unit_cost_source_by_sale"][int(sale.id)], "product_default_landed_cost")
+        self.assertFalse([row for row in sale_exceptions if row.get("exception_type") == "missing_product_link"])
+        self.assertFalse([row for row in sale_exceptions if row.get("exception_type") == "missing_cost_basis"])
+        sale_rows = self.repo.report_sales_rows(
+            start_dt=datetime(2026, 3, 1, 0, 0, 0),
+            end_dt=datetime(2026, 3, 3, 0, 0, 0),
+        )
+        sale_row = next(row for row in sale_rows if int(row.get("sale_id") or 0) == int(sale.id))
+        self.assertEqual(sale_row["product_id"], primary.id)
+        self.assertEqual(sale_row["sku"], primary.sku)
+        self.assertEqual(sale_row["product_title"], primary.title)
+
+    def test_report_sales_rows_exposes_bundle_inventory_basis(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-REPORT-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-REPORT-EXTRA", qty=20)
+        sold_at = datetime(2026, 3, 2, 15, 30, 0)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Report bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=sold_at,
+        )
+
+        rows = self.repo.report_sales_rows(
+            start_dt=sold_at - timedelta(days=1),
+            end_dt=sold_at + timedelta(days=1),
+        )
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+
+        self.assertTrue(row["listing_is_bundle"])
+        self.assertEqual(row["listing_bundle_kind"], "mixed_product_bundle")
+        self.assertEqual(row["listing_bundle_component_count"], 2)
+        self.assertEqual(row["listing_bundle_units_per_listing"], 5)
+        self.assertEqual(row["listing_bundle_inventory_units_sold"], 10)
+
+    def test_dashboard_live_metrics_profit_uses_bundle_component_cogs(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-DASH-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-DASH-EXTRA", qty=20)
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Dashboard bundle",
+            listing_price=Decimal("150.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("300.00"),
+            fees=Decimal("30.00"),
+            shipping_cost=Decimal("10.00"),
+            shipping_label_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now, include_fee_type_breakdown=False)
+
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 250.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 25.0, places=2)
+        self.assertEqual(metrics["sales_30d_bundle_sale_count"], 1)
+        self.assertEqual(metrics["sales_30d_bundle_inventory_units_sold"], 10)
+
+    def test_dashboard_live_metrics_profit_applies_return_impact(self) -> None:
+        product = self._create_product(sku="GS-DASH-RETURN-PROFIT", qty=3)
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("100.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=now - timedelta(hours=12),
+            actor="qa-user",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now, include_fee_type_breakdown=False)
+
+        self.assertAlmostEqual(metrics["sales_30d_net"], 91.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 25.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_profit_before_returns"], 66.0, places=2)
+        self.assertEqual(metrics["returns_30d_count"], 1)
+        self.assertAlmostEqual(metrics["returns_30d_refund_total"], 100.0, places=2)
+        self.assertAlmostEqual(metrics["returns_30d_cogs_reversal"], 25.0, places=2)
+        self.assertAlmostEqual(metrics["returns_30d_profit_impact"], -75.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net_after_returns"], -9.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], -9.0, places=2)
+
+    def test_dashboard_return_impact_uses_bundle_cogs_without_sale_product_link(self) -> None:
+        primary = self._create_product(sku="GS-DASH-BUNDLE-RETURN-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-DASH-BUNDLE-RETURN-EXTRA", qty=20)
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Dashboard bundle return",
+            listing_price=Decimal("150.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("300.00"),
+            fees=Decimal("30.00"),
+            shipping_cost=Decimal("10.00"),
+            shipping_label_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=None,
+            listing_id=listing.id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("150.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=now - timedelta(hours=12),
+            actor="qa-user",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now, include_fee_type_breakdown=False)
+
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 250.0, places=2)
+        self.assertAlmostEqual(metrics["returns_30d_refund_total"], 150.0, places=2)
+        self.assertAlmostEqual(metrics["returns_30d_cogs_reversal"], 125.0, places=2)
+        self.assertAlmostEqual(metrics["returns_30d_profit_impact"], -25.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 0.0, places=2)
+
     def test_update_sale_non_inventory_fields_does_not_create_movement(self) -> None:
         product = self._create_product(sku="GS-TEST-002", qty=12)
         sale = self.repo.create_sale(
@@ -286,12 +665,12 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertEqual(metrics["sales_7d_count"], 1)
         self.assertEqual(metrics["sales_30d_count"], 2)
         self.assertAlmostEqual(metrics["sales_30d_gross"], 180.0, places=2)
-        self.assertAlmostEqual(metrics["sales_30d_net"], 153.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net"], 164.0, places=2)
         self.assertAlmostEqual(metrics["sales_30d_shipping_charged"], 9.0, places=2)
         self.assertAlmostEqual(metrics["sales_30d_shipping_label_spend"], 7.0, places=2)
         self.assertAlmostEqual(metrics["sales_30d_shipping_delta"], 2.0, places=2)
         self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 60.0, places=2)
-        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 93.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 104.0, places=2)
         self.assertEqual(metrics["orders_7d_count"], 2)
         self.assertEqual(metrics["orders_30d_count"], 2)
         self.assertEqual(metrics["orders_30d_shipped"], 1)
@@ -299,7 +678,7 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["ebay_fees_30d_total"], 18.0, places=2)
         self.assertEqual(metrics["ebay_fee_type_breakdown_30d"], {})
 
-    def test_dashboard_live_metrics_prefers_normalized_label_spend_rows(self) -> None:
+    def test_dashboard_live_metrics_ignores_unlinked_normalized_label_spend_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
         product = self._create_product(sku="GS-DASH-002", qty=25)
         self.repo.update_product(
@@ -373,9 +752,142 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
 
         metrics = self.repo.dashboard_live_metrics(now=now)
         self.assertAlmostEqual(metrics["sales_30d_shipping_charged"], 5.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_shipping_label_spend"], 4.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_shipping_delta"], 1.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net"], 91.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 71.0, places=2)
+        self.assertAlmostEqual(metrics["ebay_fees_30d_total"], 10.0, places=2)
+        self.assertEqual(metrics["ebay_fee_type_breakdown_30d"], {})
+
+    def test_dashboard_and_shipping_report_use_linked_normalized_label_spend_once(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-DASH-NORM-LINK", qty=25)
+        self.repo.update_product(product.id, {"acquisition_cost": Decimal("20.00")}, actor="qa-user")
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="DASH-ORD-NORM-LINK",
+            order_status="shipped",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {
+                    "marketplace": "ebay",
+                    "external_order_id": order.external_order_id,
+                    "transaction_id": "TX-LABEL-LINK",
+                    "entry_kind": "shipping_label",
+                    "fee_type": "SHIPPING_LABEL",
+                    "amount": Decimal("8.97"),
+                    "currency": "USD",
+                    "transaction_type": "SHIPPING_LABEL",
+                    "transaction_status": "FUNDS_AVAILABLE_FOR_PAYOUT",
+                    "transaction_date": now - timedelta(days=1),
+                    "source": "finance_transactions",
+                    "raw": {},
+                }
+            ],
+            actor="qa-user",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now)
+        self.assertAlmostEqual(metrics["sales_30d_shipping_charged"], 5.0, places=2)
         self.assertAlmostEqual(metrics["sales_30d_shipping_label_spend"], 8.97, places=2)
-        self.assertAlmostEqual(metrics["ebay_fees_30d_total"], 7.0, places=2)
-        self.assertAlmostEqual(metrics["ebay_fee_type_breakdown_30d"]["FINAL_VALUE_FEE"], 7.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_shipping_delta"], -3.97, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net"], 86.03, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 66.03, places=2)
+
+        rows = self.repo.report_shipping_economics_rows(start_dt=now - timedelta(days=2), end_dt=now)
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+        self.assertAlmostEqual(float(row.get("shipping_label_spend") or 0.0), 8.97, places=2)
+        self.assertEqual(row.get("shipping_label_spend_source"), "normalized_order_finance_entries_shipping_label_sum")
+
+    def test_dashboard_profit_uses_linked_normalized_fee_and_label_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-DASH-NORM-ACTUALS", qty=25)
+        self.repo.update_product(product.id, {"acquisition_cost": Decimal("20.00")}, actor="qa-user")
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="DASH-ORD-NORM-ACTUALS",
+            order_status="shipped",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {
+                    "marketplace": "ebay",
+                    "external_order_id": order.external_order_id,
+                    "transaction_id": "TX-FEE-ACTUALS",
+                    "entry_kind": "marketplace_fee",
+                    "fee_type": "FINAL_VALUE_FEE",
+                    "amount": Decimal("7.50"),
+                    "currency": "USD",
+                    "transaction_type": "SALE",
+                    "transaction_status": "FUNDS_AVAILABLE_FOR_PAYOUT",
+                    "transaction_date": now - timedelta(days=1),
+                    "source": "finance_transactions_orderLineItems",
+                    "raw": {},
+                },
+                {
+                    "marketplace": "ebay",
+                    "external_order_id": order.external_order_id,
+                    "transaction_id": "TX-LABEL-ACTUALS",
+                    "entry_kind": "shipping_label",
+                    "fee_type": "SHIPPING_LABEL",
+                    "amount": Decimal("4.25"),
+                    "currency": "USD",
+                    "transaction_type": "SHIPPING_LABEL",
+                    "transaction_status": "FUNDS_AVAILABLE_FOR_PAYOUT",
+                    "transaction_date": now - timedelta(days=1),
+                    "source": "finance_transactions",
+                    "raw": {},
+                },
+            ],
+            actor="qa-user",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now)
+
+        self.assertAlmostEqual(metrics["sales_30d_shipping_charged"], 5.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_shipping_label_spend"], 4.25, places=2)
+        self.assertAlmostEqual(metrics["ebay_fees_30d_total"], 7.5, places=2)
+        self.assertAlmostEqual(metrics["ebay_fee_type_breakdown_30d"]["FINAL_VALUE_FEE"], 7.5, places=2)
+        self.assertAlmostEqual(metrics["sales_7d_net"], 93.25, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net"], 93.25, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 73.25, places=2)
 
     def test_report_shipping_economics_rows_and_summary(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -435,6 +947,113 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(row.get("shipping_delta_charged_minus_spend") or 0.0), 8.5, places=2)
         self.assertEqual(int(row.get("label_spend_covered_count") or 0), 1)
 
+    def test_report_shipping_economics_uses_listing_product_for_bundle_sale_without_product_link(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-SHIP-BUNDLE-LISTING", qty=5)
+        listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Shipping bundle listing",
+            listing_price=Decimal("50.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "single_product_lot",
+                        "components": [
+                            {"product_id": product.id, "sku": product.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("5.00"),
+            shipping_cost=Decimal("6.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            external_order_id="EBAY-SHIP-BUNDLE-LISTING",
+            sold_at=now - timedelta(days=1),
+        )
+
+        rows = self.repo.report_shipping_economics_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+
+        self.assertEqual(row["sku"], product.sku)
+        self.assertEqual(row["product_title"], product.title)
+        self.assertAlmostEqual(float(row.get("shipping_delta_charged_minus_spend") or 0.0), 2.0, places=2)
+
+    def test_report_shipping_economics_uses_actual_econ_weighted_order_allocation(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product_a = self._create_product(sku="GS-SHIP-WEIGHT-A", qty=10)
+        product_b = self._create_product(sku="GS-SHIP-WEIGHT-B", qty=10)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="SHIP-WEIGHTED-ALLOC",
+            order_status="shipped",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("10.00"),
+            shipping_label_cost=Decimal("12.00"),
+            items=[
+                {"product_id": product_a.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("75.00")},
+                {"product_id": product_b.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("25.00")},
+            ],
+            actor="qa-user",
+        )
+        sale_a = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("75.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product_a.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        sale_b = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("25.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product_b.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [{"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("8.00")}],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_shipping_economics_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        by_sale_id = {int(row.get("sale_id") or 0): row for row in rows}
+
+        self.assertAlmostEqual(float(by_sale_id[sale_a.id].get("shipping_charged_to_buyer") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(by_sale_id[sale_a.id].get("shipping_label_spend") or 0.0), 6.0, places=2)
+        self.assertAlmostEqual(
+            float(by_sale_id[sale_a.id].get("shipping_delta_charged_minus_spend") or 0.0),
+            1.5,
+            places=2,
+        )
+        self.assertAlmostEqual(float(by_sale_id[sale_b.id].get("shipping_charged_to_buyer") or 0.0), 2.5, places=2)
+        self.assertAlmostEqual(float(by_sale_id[sale_b.id].get("shipping_label_spend") or 0.0), 2.0, places=2)
+        self.assertEqual(
+            by_sale_id[sale_a.id].get("shipping_label_spend_source"),
+            "normalized_order_finance_entries_shipping_label_sum",
+        )
+
     def test_report_tax_estimate_detail_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
         taxable = self._create_product(sku="GS-TAX-001", qty=5)
@@ -484,6 +1103,103 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(exempt_row.get("taxable_shipping_subtotal") or 0.0), 4.0, places=2)
         self.assertAlmostEqual(float(exempt_row.get("taxable_subtotal") or 0.0), 4.0, places=2)
         self.assertAlmostEqual(float(exempt_row.get("estimated_tax_collected") or 0.0), 0.4, places=2)
+
+    def test_report_tax_estimate_detail_rows_use_listing_product_for_bundle_sale_without_product_link(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-TAX-BUNDLE-LISTING", qty=5)
+        self.repo.update_product(product.id, {"category": "bullion"}, actor="qa-user")
+        listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Tax bundle listing",
+            listing_price=Decimal("100.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "single_product_lot",
+                        "components": [
+                            {"product_id": product.id, "sku": product.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            external_order_id="EBAY-TAX-BUNDLE-LISTING",
+            sold_at=now - timedelta(days=1),
+        )
+
+        rows = self.repo.report_tax_estimate_detail_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+            tax_rate_percent=10.0,
+            shipping_taxable=True,
+            tax_exempt_categories={"bullion"},
+            marketplaces={"ebay"},
+        )
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+
+        self.assertEqual(row["sku"], product.sku)
+        self.assertEqual(row["product_title"], product.title)
+        self.assertEqual(row["category"], "bullion")
+        self.assertEqual(bool(row["is_tax_exempt_category"]), True)
+        self.assertAlmostEqual(float(row.get("taxable_item_subtotal") or 0.0), 0.0, places=2)
+        self.assertAlmostEqual(float(row.get("taxable_shipping_subtotal") or 0.0), 5.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_tax_collected") or 0.0), 0.5, places=2)
+
+    def test_report_tax_estimate_detail_rows_use_actual_shipping_charged(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-TAX-NORM-SHIP", qty=5)
+        self.repo.update_product(product.id, {"category": "collectible"}, actor="qa-user")
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="TAX-NORM-SHIP",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        rows = self.repo.report_tax_estimate_detail_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+            tax_rate_percent=10.0,
+            shipping_taxable=True,
+            tax_exempt_categories=set(),
+            marketplaces={"ebay"},
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertAlmostEqual(float(row.get("field_shipping_cost") or 0.0), 0.0, places=2)
+        self.assertAlmostEqual(float(row.get("shipping_cost") or 0.0), 5.0, places=2)
+        self.assertEqual(row.get("shipping_cost_source"), "actual_economics_allocated_shipping_charged")
+        self.assertAlmostEqual(float(row.get("taxable_shipping_subtotal") or 0.0), 5.0, places=2)
+        self.assertAlmostEqual(float(row.get("taxable_subtotal") or 0.0), 105.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_tax_collected") or 0.0), 10.5, places=2)
 
     def test_report_ebay_fee_reconciliation_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -721,6 +1437,12 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
             },
         )
         self.assertEqual(execute_mock.call_count, 18)
+        dashboard_call = execute_mock.call_args_list[0]
+        dashboard_sql = str(dashboard_call.args[0])
+        dashboard_params = dict(dashboard_call.args[1])
+        self.assertIn("s.sold_at <= :end_dt", dashboard_sql)
+        self.assertIn("sold_at <= :end_dt", dashboard_sql)
+        self.assertEqual(dashboard_params.get("end_dt"), now)
         for row in rows:
             self.assertGreaterEqual(float(row.get("elapsed_ms") or 0.0), 0.0)
             self.assertAlmostEqual(float(row.get("planning_ms") or 0.0), 0.321, places=3)
@@ -911,6 +1633,54 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(row.get("returns_refund_total") or 0.0), 6.5, places=2)
         self.assertFalse(bool(row.get("reconcile_flag")))
 
+    def test_report_marketplace_reconciliation_uses_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-RECON-NORM-ACTUALS", qty=8)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-RECON-NORM-ACTUALS",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            quantity_sold=1,
+            order_id=order.id,
+            product_id=product.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+            actor="qa-user",
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_marketplace_reconciliation_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertAlmostEqual(float(row.get("sales_fees") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(row.get("sales_shipping_cost") or 0.0), 5.0, places=2)
+        self.assertAlmostEqual(float(row.get("sales_shipping_label_cost") or 0.0), 4.25, places=2)
+        self.assertAlmostEqual(float(row.get("sales_net_before_returns") or 0.0), 93.25, places=2)
+        self.assertAlmostEqual(float(row.get("net_after_returns") or 0.0), 93.25, places=2)
+
     def test_report_sales_actual_econ_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
         product = self._create_product(sku="GS-ACTUAL-ECON-001", qty=10)
@@ -970,8 +1740,118 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(row2.get("allocated_fee_actual") or 0.0), 4.0, places=2)
         self.assertAlmostEqual(float(row1.get("allocated_shipping_actual") or 0.0), 3.0, places=2)
         self.assertAlmostEqual(float(row2.get("allocated_shipping_actual") or 0.0), 2.0, places=2)
-        self.assertAlmostEqual(float(row1.get("net_before_cogs_actual") or 0.0), 51.0, places=2)
-        self.assertAlmostEqual(float(row2.get("net_before_cogs_actual") or 0.0), 34.0, places=2)
+        self.assertAlmostEqual(float(row1.get("net_before_cogs_actual") or 0.0), 53.4, places=2)
+        self.assertAlmostEqual(float(row2.get("net_before_cogs_actual") or 0.0), 35.6, places=2)
+
+    def test_report_sales_actual_econ_rows_prefers_normalized_finance_entries(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-ACTUAL-ECON-NORM-001", qty=10)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-ACTUAL-ECON-NORM-1",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("4.00"),
+            shipping_label_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            order_id=order.id,
+            product_id=product.id,
+            external_order_id="EBAY-ACTUAL-ECON-NORM-1",
+            sold_at=now - timedelta(days=1),
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_sales_actual_econ_rows(start_dt=now - timedelta(days=30), end_dt=now)
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+        self.assertEqual(row.get("actual_fee_source"), "normalized_order_finance_entries_marketplace_fee_sum")
+        self.assertEqual(row.get("actual_shipping_source"), "normalized_order_finance_entries_shipping_label_sum")
+        self.assertAlmostEqual(float(row.get("allocated_fee_actual") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(row.get("allocated_shipping_actual") or 0.0), 4.25, places=2)
+        self.assertAlmostEqual(float(row.get("net_before_cogs_actual") or 0.0), 92.25, places=2)
+
+    def test_economics_reports_use_listing_product_for_bundle_sale_without_product_link(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-ECON-BUNDLE-LISTING", qty=10)
+        listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Economics bundle listing",
+            listing_price=Decimal("100.00"),
+            quantity_listed=2,
+            external_listing_id="EBAY-ECON-BUNDLE-LISTING",
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "single_product_lot",
+                        "components": [
+                            {"product_id": product.id, "sku": product.sku, "quantity_per_listing": 2},
+                        ],
+                    },
+                    "ebay_publish": {
+                        "fee_estimate": {
+                            "estimated_total_fees": 8.0,
+                            "quantity": 2,
+                        }
+                    },
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            listing_id=listing.id,
+            product_id=None,
+            external_order_id="EBAY-ECON-BUNDLE-LISTING-ORDER",
+            sold_at=now - timedelta(days=1),
+            actor="qa-user",
+        )
+
+        actual_rows = self.repo.report_sales_actual_econ_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+        )
+        fact_rows = self.repo.report_economics_intelligence_fact_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+            marketplaces={"ebay"},
+        )
+        fee_rows = self.repo.report_ebay_fee_reconciliation_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+        )
+
+        actual = next(row for row in actual_rows if int(row.get("sale_id") or 0) == int(sale.id))
+        fact = next(row for row in fact_rows if int(row.get("sale_id") or 0) == int(sale.id))
+        fee = next(row for row in fee_rows if int(row.get("sale_id") or 0) == int(sale.id))
+        self.assertEqual(actual["sku"], product.sku)
+        self.assertEqual(actual["product_title"], product.title)
+        self.assertEqual(fact["product_id"], product.id)
+        self.assertEqual(fact["sku"], product.sku)
+        self.assertEqual(fact["product_title"], product.title)
+        self.assertEqual(fee["sku"], product.sku)
+        self.assertEqual(fee["product_title"], product.title)
 
     def test_report_economics_intelligence_fact_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -1033,11 +1913,69 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(row.get("actual_fee_alloc") or 0.0), 10.0, places=2)
         self.assertAlmostEqual(float(row.get("expected_shipping_alloc") or 0.0), 4.0, places=2)
         self.assertAlmostEqual(float(row.get("actual_shipping_alloc") or 0.0), 5.0, places=2)
-        self.assertAlmostEqual(float(row.get("estimated_net_before_cogs") or 0.0), 92.0, places=2)
-        self.assertAlmostEqual(float(row.get("actual_net_before_cogs") or 0.0), 85.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_net_before_cogs") or 0.0), 95.0, places=2)
+        self.assertAlmostEqual(float(row.get("actual_net_before_cogs") or 0.0), 89.0, places=2)
         self.assertAlmostEqual(float(row.get("fee_variance_actual_minus_estimated") or 0.0), 6.0, places=2)
         self.assertAlmostEqual(float(row.get("shipping_delta_expected_minus_actual") or 0.0), -1.0, places=2)
-        self.assertAlmostEqual(float(row.get("net_variance_actual_minus_estimated") or 0.0), -7.0, places=2)
+        self.assertAlmostEqual(float(row.get("net_variance_actual_minus_estimated") or 0.0), -6.0, places=2)
+
+    def test_report_economics_intelligence_fact_rows_prefers_normalized_finance_entries(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-ECON-FACT-NORM-001", qty=10)
+        listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Economics Fact Normalized",
+            listing_price=Decimal("100.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps({"ebay_publish": {"fee_estimate": {"estimated_total_fees": 8.0, "quantity": 1}}}),
+            actor="qa-user",
+        )
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-ECON-FACT-NORM-1",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("4.00"),
+            shipping_label_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": listing.id, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            order_id=order.id,
+            listing_id=listing.id,
+            product_id=product.id,
+            external_order_id="EBAY-ECON-FACT-NORM-1",
+            sold_at=now - timedelta(days=1),
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_economics_intelligence_fact_rows(
+            start_dt=now - timedelta(days=30),
+            end_dt=now,
+            marketplaces={"ebay"},
+        )
+        row = next(r for r in rows if int(r.get("sale_id") or 0) == int(sale.id))
+        self.assertEqual(row.get("actual_fee_source"), "normalized_order_finance_entries_marketplace_fee_sum")
+        self.assertEqual(row.get("actual_shipping_source"), "normalized_order_finance_entries_shipping_label_sum")
+        self.assertAlmostEqual(float(row.get("actual_fee_alloc") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(row.get("actual_shipping_alloc") or 0.0), 4.25, places=2)
+        self.assertAlmostEqual(float(row.get("actual_net_before_cogs") or 0.0), 92.25, places=2)
+        self.assertAlmostEqual(float(row.get("net_variance_actual_minus_estimated") or 0.0), 0.5, places=2)
 
     def test_report_listing_review_activity_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -1159,6 +2097,336 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertEqual(str(item_row.get("sku") or ""), str(product.sku or ""))
         self.assertAlmostEqual(float(item_row.get("line_total") or 0.0), 30.0, places=2)
 
+    def test_report_orders_rows_include_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-ORDER-RPT-NORM", qty=6)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-ORDER-RPT-NORM",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_orders_rows(start_dt=now - timedelta(days=7), end_dt=now)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertAlmostEqual(float(row.get("field_fees") or 0.0), 0.0, places=2)
+        self.assertAlmostEqual(float(row.get("field_shipping_label_cost") or 0.0), 9.0, places=2)
+        self.assertAlmostEqual(float(row.get("actual_fee") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(row.get("actual_shipping_label_cost") or 0.0), 4.25, places=2)
+        self.assertAlmostEqual(float(row.get("shipping_delta_charged_minus_actual") or 0.0), -4.0, places=2)
+        self.assertAlmostEqual(float(row.get("actual_shipping_delta_charged_minus_label") or 0.0), 0.75, places=2)
+        self.assertAlmostEqual(float(row.get("actual_net_before_cogs") or 0.0), 93.25, places=2)
+        self.assertEqual(row.get("actual_fee_source"), "normalized_order_finance_entries_marketplace_fee_sum")
+        self.assertEqual(row.get("actual_shipping_source"), "normalized_order_finance_entries_shipping_label_sum")
+
+    def test_lot_profitability_snapshot_uses_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-LOT-PNL-NORM", qty=1)
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-NORM",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=3),
+            total_cost=Decimal("20.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            acquired_at=now - timedelta(days=3),
+        )
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="LOT-PNL-NORM-ORDER",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+
+        snapshot = self.repo.lot_profitability_snapshot(lot.id)
+        row = snapshot["rows"][0]
+
+        self.assertAlmostEqual(float(row.get("estimated_net_before_cogs_from_lot") or 0.0), 93.25, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_cogs") or 0.0), 20.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_profit") or 0.0), 73.25, places=2)
+        self.assertEqual(row.get("cost_source"), "lot_equal_quantity_fallback")
+        self.assertEqual(snapshot["summary"].get("cost_source"), "lot_equal_quantity_fallback")
+        self.assertAlmostEqual(
+            float((snapshot["summary"].get("cost_source_totals") or {}).get("lot_equal_quantity_fallback") or 0.0),
+            20.0,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            float(snapshot["summary"].get("estimated_net_before_cogs") or 0.0),
+            93.25,
+            places=2,
+        )
+
+    def test_lot_profitability_snapshot_applies_return_impact(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-LOT-PNL-RETURN", qty=1)
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-RETURN",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=3),
+            total_cost=Decimal("25.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=Decimal("25.00"),
+            acquired_at=now - timedelta(days=3),
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("100.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=now - timedelta(hours=12),
+            actor="qa-user",
+        )
+
+        snapshot = self.repo.lot_profitability_snapshot(lot.id)
+        row = snapshot["rows"][0]
+        summary = snapshot["summary"]
+
+        self.assertEqual(int(row.get("qty_returned_from_lot") or 0), 1)
+        self.assertAlmostEqual(float(row.get("returns_refund_total") or 0.0), 100.0, places=2)
+        self.assertAlmostEqual(float(row.get("returns_cogs_reversal") or 0.0), 25.0, places=2)
+        self.assertAlmostEqual(float(row.get("returns_profit_impact") or 0.0), -75.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_net_before_cogs_before_returns") or 0.0), 91.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_cogs_before_returns") or 0.0), 25.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_profit_before_returns") or 0.0), 66.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_net_before_cogs_from_lot") or 0.0), -9.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_cogs") or 0.0), 0.0, places=2)
+        self.assertAlmostEqual(float(row.get("estimated_lot_profit") or 0.0), -9.0, places=2)
+        self.assertAlmostEqual(float(summary.get("returns_refund_total") or 0.0), 100.0, places=2)
+        self.assertAlmostEqual(float(summary.get("returns_cogs_reversal") or 0.0), 25.0, places=2)
+        self.assertAlmostEqual(float(summary.get("estimated_lot_profit_before_returns") or 0.0), 66.0, places=2)
+        self.assertAlmostEqual(float(summary.get("estimated_lot_profit") or 0.0), -9.0, places=2)
+
+    def test_lot_profitability_snapshot_uses_bundle_components_without_sale_product_link(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        primary = self._create_product(sku="GS-LOT-PNL-BUNDLE-PRIMARY", qty=10)
+        extra = self._create_product(sku="GS-LOT-PNL-BUNDLE-EXTRA", qty=10)
+        primary_lot = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-BUNDLE-PRIMARY",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=3),
+            total_cost=Decimal("20.00"),
+        )
+        extra_lot = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-BUNDLE-EXTRA",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=3),
+            total_cost=Decimal("60.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=primary.id,
+            lot_id=primary_lot.id,
+            quantity_acquired=2,
+            unit_cost=Decimal("10.00"),
+            acquired_at=now - timedelta(days=3),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=extra.id,
+            lot_id=extra_lot.id,
+            quantity_acquired=3,
+            unit_cost=Decimal("20.00"),
+            acquired_at=now - timedelta(days=3),
+        )
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Lot P/L bundle",
+            listing_price=Decimal("150.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("150.00"),
+            fees=Decimal("15.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("5.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("150.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=now - timedelta(hours=12),
+            actor="qa-user",
+        )
+
+        primary_snapshot = self.repo.lot_profitability_snapshot(primary_lot.id)
+        primary_row = primary_snapshot["rows"][0]
+        extra_snapshot = self.repo.lot_profitability_snapshot(extra_lot.id)
+        extra_row = extra_snapshot["rows"][0]
+
+        self.assertEqual(int(primary_row.get("qty_sold_est_from_lot") or 0), 2)
+        self.assertEqual(int(extra_row.get("qty_sold_est_from_lot") or 0), 3)
+        self.assertAlmostEqual(float(primary_row.get("estimated_gross_sales_from_lot") or 0.0), 60.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("estimated_gross_sales_from_lot") or 0.0), 90.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("returns_refund_total") or 0.0), 60.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("returns_refund_total") or 0.0), 90.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("returns_cogs_reversal") or 0.0), 20.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("returns_cogs_reversal") or 0.0), 60.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("estimated_lot_profit") or 0.0), -6.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("estimated_lot_profit") or 0.0), -9.0, places=2)
+
+    def test_lot_profitability_snapshot_uses_fifo_lot_consumption_for_repurchase_products(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-LOT-PNL-FIFO",
+            title="Lot P/L FIFO Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=2,
+            acquired_at=now - timedelta(days=20),
+        )
+        lot1 = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-FIFO-OLD",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=10),
+            total_cost=Decimal("10.00"),
+        )
+        lot2 = self.repo.create_purchase_lot(
+            lot_code="LOT-PNL-FIFO-NEW",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=5),
+            total_cost=Decimal("60.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot1.id,
+            quantity_acquired=1,
+            unit_cost=Decimal("10.00"),
+            acquired_at=now - timedelta(days=10),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot2.id,
+            quantity_acquired=3,
+            unit_cost=Decimal("20.00"),
+            acquired_at=now - timedelta(days=5),
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=2,
+            product_id=product.id,
+            sold_at=now - timedelta(days=7),
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("120.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        old_snapshot = self.repo.lot_profitability_snapshot(lot1.id)
+        old_row = old_snapshot["rows"][0]
+        self.assertEqual(int(old_row.get("qty_sold_est_from_lot") or 0), 1)
+        self.assertAlmostEqual(float(old_row.get("estimated_gross_sales_from_lot") or 0.0), 50.0, places=2)
+        self.assertAlmostEqual(float(old_row.get("estimated_lot_cogs") or 0.0), 10.0, places=2)
+
+        new_snapshot = self.repo.lot_profitability_snapshot(lot2.id)
+        new_row = new_snapshot["rows"][0]
+        self.assertEqual(int(new_row.get("qty_sold_est_from_lot") or 0), 1)
+        self.assertAlmostEqual(float(new_row.get("estimated_gross_sales_from_lot") or 0.0), 120.0, places=2)
+        self.assertAlmostEqual(float(new_row.get("estimated_lot_cogs") or 0.0), 20.0, places=2)
+        self.assertAlmostEqual(float(new_row.get("estimated_lot_profit") or 0.0), 100.0, places=2)
+        self.assertEqual(new_row.get("cost_source"), "assignment_unit_landed_cost")
+        self.assertAlmostEqual(
+            float((new_snapshot["summary"].get("cost_source_totals") or {}).get("assignment_unit_landed_cost") or 0.0),
+            20.0,
+            places=2,
+        )
+
     def test_report_products_and_listings_rows_date_bounded(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
         product_in = self._create_product(sku="GS-PROD-RPT-IN", qty=4)
@@ -1244,6 +2512,52 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertEqual(str(row.get("sku") or ""), str(product.sku or ""))
         self.assertAlmostEqual(float(row.get("sold_price") or 0.0), 50.0, places=2)
         self.assertEqual(str(row.get("shipping_provider") or ""), "USPS")
+
+    def test_report_sales_rows_include_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-SALE-RPT-NORM", qty=10)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="SALE-RPT-NORM",
+            order_status="paid",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_sales_rows(start_dt=now - timedelta(days=7), end_dt=now)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertAlmostEqual(float(row.get("field_net_before_cogs") or 0.0), 86.0, places=2)
+        self.assertAlmostEqual(float(row.get("actual_fee") or 0.0), 7.5, places=2)
+        self.assertAlmostEqual(float(row.get("actual_shipping_charged") or 0.0), 5.0, places=2)
+        self.assertAlmostEqual(float(row.get("actual_shipping_label_cost") or 0.0), 4.25, places=2)
+        self.assertAlmostEqual(float(row.get("actual_net_before_cogs") or 0.0), 93.25, places=2)
+        self.assertEqual(row.get("actual_fee_source"), "normalized_order_finance_entries_marketplace_fee_sum")
+        self.assertEqual(row.get("actual_shipping_source"), "normalized_order_finance_entries_shipping_label_sum")
 
     def test_report_returns_rows_date_bounded(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -1346,6 +2660,9 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertEqual(str(row.get("sku") or ""), str(product.sku or ""))
         self.assertEqual(int(row.get("quantity_acquired") or 0), 2)
         self.assertAlmostEqual(float(row.get("unit_cost") or 0.0), 10.0, places=2)
+        self.assertAlmostEqual(float(row.get("resolved_landed_unit_cost") or 0.0), 10.0, places=2)
+        self.assertAlmostEqual(float(row.get("resolved_landed_total_cost") or 0.0), 20.0, places=2)
+        self.assertEqual(str(row.get("cost_source") or ""), "assignment_unit_landed_cost")
 
     def test_report_sale_unit_cost_maps(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -1400,10 +2717,624 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
             default_unit_cost_by_product={int(product.id): 9.0},
         )
         fifo_map = payload.get("fifo_unit_cost_by_sale") or {}
+        total_map = payload.get("fifo_total_cost_by_sale") or {}
+        evidence_map = payload.get("fifo_cogs_evidence_by_sale") or {}
         weighted_map = payload.get("lot_weighted_unit_cost_by_product") or {}
         self.assertAlmostEqual(float(fifo_map.get(int(sale1.id)) or 0.0), 10.0, places=3)
         self.assertAlmostEqual(float(fifo_map.get(int(sale2.id)) or 0.0), (38.0 / 3.0), places=3)
+        self.assertAlmostEqual(float(total_map.get(int(sale2.id)) or 0.0), 38.0, places=3)
+        sale2_evidence = evidence_map.get(int(sale2.id)) or []
+        self.assertEqual(len(sale2_evidence), 2)
+        self.assertEqual([int(row.get("quantity") or 0) for row in sale2_evidence], [1, 2])
+        self.assertEqual([int(row.get("lot_id") or 0) for row in sale2_evidence], [int(lot1.id), int(lot2.id)])
+        self.assertEqual(
+            [str(row.get("cost_source") or "") for row in sale2_evidence],
+            ["assignment_unit_landed_cost", "assignment_unit_landed_cost"],
+        )
+        self.assertAlmostEqual(float(sale2_evidence[0].get("unit_cost") or 0.0), 10.0, places=3)
+        self.assertAlmostEqual(float(sale2_evidence[1].get("unit_cost") or 0.0), 14.0, places=3)
         self.assertAlmostEqual(float(weighted_map.get(int(product.id)) or 0.0), 11.6, places=3)
+
+    def test_report_sale_unit_cost_maps_do_not_consume_future_repurchase_lots(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-COSTMAP-FUTURE-LOT",
+            title="Future Lot Guard",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=10,
+            acquired_at=now - timedelta(days=20),
+        )
+        lot1 = self.repo.create_purchase_lot(
+            lot_code="LOT-FIFO-OLD",
+            vendor="Vendor",
+            purchase_date=now - timedelta(days=10),
+            total_cost=Decimal("10.00"),
+        )
+        lot2 = self.repo.create_purchase_lot(
+            lot_code="LOT-FIFO-FUTURE",
+            vendor="Vendor",
+            purchase_date=now - timedelta(days=5),
+            total_cost=Decimal("60.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot1.id,
+            quantity_acquired=1,
+            unit_cost=Decimal("10.00"),
+            acquired_at=now - timedelta(days=10),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot2.id,
+            quantity_acquired=3,
+            unit_cost=Decimal("20.00"),
+            acquired_at=now - timedelta(days=5),
+        )
+        sale_before_lot2 = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=2,
+            product_id=product.id,
+            sold_at=now - timedelta(days=7),
+        )
+        sale_after_lot2 = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        payload = self.repo.report_sale_unit_cost_maps(
+            end_dt=now,
+            default_unit_cost_by_product={int(product.id): 0.0},
+        )
+        fifo_map = payload.get("fifo_unit_cost_by_sale") or {}
+        self.assertAlmostEqual(float(fifo_map.get(int(sale_before_lot2.id)) or 0.0), 5.0, places=3)
+        self.assertAlmostEqual(float(fifo_map.get(int(sale_after_lot2.id)) or 0.0), 20.0, places=3)
+
+    def test_dashboard_inventory_cost_uses_fifo_remaining_cost_after_multiple_repurchase_lots(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-DASH-MULTI-LOT-REPURCHASE",
+            title="Multi Lot Repurchase",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=0,
+            acquired_at=now - timedelta(days=12),
+        )
+        lot1 = self.repo.create_purchase_lot(
+            lot_code="LOT-REPURCHASE-OLD",
+            vendor="Vendor",
+            purchase_date=now - timedelta(days=10),
+            total_cost=Decimal("20.00"),
+        )
+        lot2 = self.repo.create_purchase_lot(
+            lot_code="LOT-REPURCHASE-NEW",
+            vendor="Vendor",
+            purchase_date=now - timedelta(days=5),
+            total_cost=Decimal("60.00"),
+        )
+        self.repo.record_product_repurchase(
+            product_id=product.id,
+            quantity_acquired=2,
+            unit_cost=Decimal("10.00"),
+            acquired_at=now - timedelta(days=10),
+            lot_id=lot1.id,
+            actor="qa-user",
+        )
+        sale1 = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=8),
+        )
+        self.repo.record_product_repurchase(
+            product_id=product.id,
+            quantity_acquired=3,
+            unit_cost=Decimal("20.00"),
+            acquired_at=now - timedelta(days=5),
+            lot_id=lot2.id,
+            actor="qa-user",
+        )
+        sale2 = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("150.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            quantity_sold=3,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        payload = self.repo.report_sale_unit_cost_maps(
+            end_dt=now,
+            default_unit_cost_by_product={int(product.id): 0.0},
+        )
+        fifo_map = payload.get("fifo_unit_cost_by_sale") or {}
+        remaining_map = payload.get("fifo_remaining_unit_cost_by_product") or {}
+        self.assertAlmostEqual(float(fifo_map.get(int(sale1.id)) or 0.0), 10.0, places=3)
+        self.assertAlmostEqual(float(fifo_map.get(int(sale2.id)) or 0.0), (50.0 / 3.0), places=3)
+        self.assertAlmostEqual(float(remaining_map.get(int(product.id)) or 0.0), 20.0, places=3)
+
+        metrics = self.repo.dashboard_metrics()
+        self.assertAlmostEqual(metrics["inventory_cost"], 20.0, places=2)
+
+    def test_report_accounting_exception_rows_flags_cost_shipping_fee_and_lot_issues(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        missing_cost_product = self.repo.create_product(
+            sku="GS-ACCT-EX-MISSING",
+            title="Missing Cost Product",
+            category="coin",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=2,
+            acquired_at=now - timedelta(days=5),
+        )
+        missing_cost_sale = self.repo.create_sale(
+            marketplace="ebay",
+            external_order_id="EBAY-ACCT-MISSING",
+            sold_price=Decimal("20.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=None,
+            quantity_sold=1,
+            product_id=missing_cost_product.id,
+            sold_at=now - timedelta(days=1),
+        )
+        negative_margin_product = self.repo.create_product(
+            sku="GS-ACCT-EX-MARGIN",
+            title="Negative Margin Product",
+            category="coin",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=Decimal("20.00"),
+            current_quantity=2,
+            acquired_at=now - timedelta(days=5),
+        )
+        negative_margin_sale = self.repo.create_sale(
+            marketplace="local",
+            external_order_id="LOCAL-ACCT-MARGIN",
+            sold_price=Decimal("10.00"),
+            fees=Decimal("1.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=negative_margin_product.id,
+            sold_at=now - timedelta(hours=12),
+        )
+        p1 = self.repo.create_product(
+            sku="GS-ACCT-EX-LOT-1",
+            title="Lot Over Product 1",
+            category="coin",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=now - timedelta(days=5),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-ACCT-EX-LOT-2",
+            title="Lot Over Product 2",
+            category="coin",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=now - timedelta(days=5),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-ACCT-OVER",
+            vendor="Vendor",
+            purchase_date=now - timedelta(days=4),
+            total_cost=Decimal("10.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=Decimal("7.00"),
+            acquired_at=now - timedelta(days=4),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=Decimal("7.00"),
+            acquired_at=now - timedelta(days=4),
+        )
+
+        rows = self.repo.report_accounting_exception_rows(
+            start_dt=now - timedelta(days=7),
+            end_dt=now,
+        )
+        by_type = {}
+        for row in rows:
+            by_type.setdefault(str(row.get("exception_type")), []).append(row)
+
+        self.assertIn("missing_cost_basis", by_type)
+        self.assertIn("missing_shipping_label_spend", by_type)
+        self.assertIn("missing_fee_evidence", by_type)
+        self.assertIn("fee_source_fallback", by_type)
+        self.assertIn("nonpositive_margin", by_type)
+        self.assertIn("lot_overallocated", by_type)
+        missing_cost_exception = next(
+            row
+            for row in by_type["missing_cost_basis"]
+            if int(row.get("entity_id") or 0) == int(missing_cost_sale.id)
+        )
+        negative_margin_exception = next(
+            row
+            for row in by_type["nonpositive_margin"]
+            if int(row.get("entity_id") or 0) == int(negative_margin_sale.id)
+        )
+        self.assertIn("Source=missing_cost_basis", str(missing_cost_exception.get("details") or ""))
+        self.assertIn("COGS source=product_default_landed_cost", str(negative_margin_exception.get("details") or ""))
+        self.assertIn("Evidence:", str(negative_margin_exception.get("details") or ""))
+        self.assertAlmostEqual(float(by_type["lot_overallocated"][0].get("amount") or 0.0), 4.0, places=2)
+
+    def test_accounting_exception_flags_unmatched_shipping_label_finance_entry(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        product = self._create_product(sku="GS-UNMATCHED-LABEL", qty=5)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-UNMATCHED-LABEL",
+            order_status="shipped",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("25.00")}],
+            actor="qa-user",
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {
+                    "marketplace": "ebay",
+                    "external_order_id": order.external_order_id,
+                    "transaction_id": "TX-UNMATCHED-LABEL",
+                    "entry_kind": "shipping_label",
+                    "fee_type": "SHIPPING_LABEL",
+                    "amount": Decimal("8.97"),
+                    "currency": "USD",
+                    "transaction_type": "SHIPPING_LABEL",
+                    "transaction_status": "FUNDS_AVAILABLE_FOR_PAYOUT",
+                    "transaction_date": now - timedelta(days=1),
+                    "source": "finance_transactions",
+                    "raw": {},
+                }
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        matches = [
+            row
+            for row in rows
+            if row.get("exception_type") == "unmatched_shipping_label_finance_entry"
+            and row.get("reference") == order.external_order_id
+        ]
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["severity"], "P2")
+        self.assertAlmostEqual(float(matches[0].get("amount") or 0.0), 8.97, places=2)
+
+    def test_accounting_exception_flags_active_bundle_listing_stock_shortage(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        primary = self._create_product(sku="GS-BUNDLE-SHORT-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-SHORT-EXTRA", qty=5)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Short mixed bundle",
+            listing_price=Decimal("75.00"),
+            quantity_listed=3,
+            external_listing_id="EBAY-BUNDLE-SHORT",
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "primary_product_id": primary.id,
+                        "components": [
+                            {
+                                "product_id": primary.id,
+                                "sku": primary.sku,
+                                "quantity_per_listing": 2,
+                            },
+                            {
+                                "product_id": extra.id,
+                                "sku": extra.sku,
+                                "quantity_per_listing": 3,
+                            },
+                        ],
+                    }
+                }
+            ),
+            listed_at=now - timedelta(days=1),
+        )
+        self.repo.update_listing(
+            listing.id,
+            {
+                "review_status": "approved",
+                "reviewed_by": "reviewer",
+                "reviewed_at": now - timedelta(hours=2),
+                "listing_status": "active",
+            },
+            actor="publisher",
+        )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        matches = [
+            row
+            for row in rows
+            if row.get("exception_type") == "active_bundle_listing_stock_shortage"
+            and int(row.get("entity_id") or 0) == int(listing.id)
+        ]
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["severity"], "P1")
+        self.assertEqual(matches[0]["entity_type"], "listing")
+        self.assertEqual(matches[0]["reference"], "EBAY-BUNDLE-SHORT")
+        self.assertAlmostEqual(float(matches[0].get("amount") or 0.0), 2.0, places=2)
+        self.assertIn("Available complete bundle listings from current stock: 1", matches[0]["details"])
+        self.assertIn(f"{extra.sku}: needs 9, stock 5", matches[0]["details"])
+
+    def test_accounting_exception_uses_remaining_bundle_listing_quantity_after_sales(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        primary = self._create_product(sku="GS-BUNDLE-REMAIN-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-REMAIN-EXTRA", qty=9)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Remaining mixed bundle",
+            listing_price=Decimal("75.00"),
+            quantity_listed=3,
+            external_listing_id="EBAY-BUNDLE-REMAIN",
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "primary_product_id": primary.id,
+                        "components": [
+                            {
+                                "product_id": primary.id,
+                                "sku": primary.sku,
+                                "quantity_per_listing": 2,
+                            },
+                            {
+                                "product_id": extra.id,
+                                "sku": extra.sku,
+                                "quantity_per_listing": 3,
+                            },
+                        ],
+                    }
+                }
+            ),
+            listed_at=now - timedelta(days=2),
+        )
+        self.repo.update_listing(
+            listing.id,
+            {
+                "review_status": "approved",
+                "reviewed_by": "reviewer",
+                "reviewed_at": now - timedelta(hours=2),
+                "listing_status": "active",
+            },
+            actor="publisher",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("150.00"),
+            fees=Decimal("15.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            external_order_id="EBAY-BUNDLE-REMAIN-SALE",
+            sold_at=now - timedelta(days=1),
+        )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        matches = [
+            row
+            for row in rows
+            if row.get("exception_type")
+            in {"active_bundle_listing_stock_shortage", "active_bundle_component_overcommitted"}
+            and str(row.get("reference") or "").find("EBAY-BUNDLE-REMAIN") >= 0
+        ]
+
+        self.assertEqual(matches, [])
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 3)
+
+    def test_accounting_exception_flags_aggregate_bundle_component_overcommit(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        product = self._create_product(sku="GS-BUNDLE-AGG-SHORT", qty=5)
+
+        for index in range(2):
+            listing = self.repo.create_listing(
+                product_id=product.id,
+                marketplace="ebay",
+                listing_title=f"Aggregate bundle {index + 1}",
+                listing_price=Decimal("60.00"),
+                quantity_listed=1,
+                external_listing_id=f"EBAY-BUNDLE-AGG-{index + 1}",
+                marketplace_details=json.dumps(
+                    {
+                        "bundle": {
+                            "enabled": True,
+                            "kind": "single_product_lot",
+                            "primary_product_id": product.id,
+                            "components": [
+                                {
+                                    "product_id": product.id,
+                                    "sku": product.sku,
+                                    "quantity_per_listing": 3,
+                                },
+                            ],
+                        }
+                    }
+                ),
+                listed_at=now - timedelta(days=1, minutes=index),
+            )
+            self.repo.update_listing(
+                listing.id,
+                {
+                    "review_status": "approved",
+                    "reviewed_by": "reviewer",
+                    "reviewed_at": now - timedelta(hours=2),
+                    "listing_status": "active",
+                },
+                actor="publisher",
+            )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        matches = [
+            row
+            for row in rows
+            if row.get("exception_type") == "active_bundle_component_overcommitted"
+            and int(row.get("entity_id") or 0) == int(product.id)
+        ]
+        per_listing_matches = [
+            row for row in rows if row.get("exception_type") == "active_bundle_listing_stock_shortage"
+        ]
+
+        self.assertEqual(per_listing_matches, [])
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["severity"], "P1")
+        self.assertEqual(matches[0]["entity_type"], "product")
+        self.assertEqual(matches[0]["sku"], product.sku)
+        self.assertAlmostEqual(float(matches[0].get("amount") or 0.0), 1.0, places=2)
+        self.assertIn("collectively require 6 unit(s), but current stock is 5", matches[0]["details"])
+        self.assertIn("EBAY-BUNDLE-AGG-1", matches[0]["reference"])
+        self.assertIn("EBAY-BUNDLE-AGG-2", matches[0]["reference"])
+
+    def test_accounting_exception_uses_normalized_fee_evidence_for_linked_sales(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        product = self._create_product(sku="GS-FEE-EVIDENCE", qty=5)
+        self.repo.update_product(product.id, {"acquisition_cost": Decimal("5.00")}, actor="qa-user")
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-FEE-EVIDENCE",
+            order_status="shipped",
+            sold_at=now - timedelta(days=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("50.00")}],
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            external_order_id=order.external_order_id,
+            sold_price=Decimal("50.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("0.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            sold_at=now - timedelta(days=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {
+                    "marketplace": "ebay",
+                    "external_order_id": order.external_order_id,
+                    "transaction_id": "TX-FEE-EVIDENCE",
+                    "entry_kind": "marketplace_fee",
+                    "fee_type": "FINAL_VALUE_FEE",
+                    "amount": Decimal("7.50"),
+                    "currency": "USD",
+                    "transaction_type": "SALE",
+                    "transaction_status": "FUNDS_AVAILABLE_FOR_PAYOUT",
+                    "transaction_date": now - timedelta(days=1),
+                    "source": "finance_transactions_orderLineItems",
+                    "raw": {},
+                }
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        sale_exceptions = [row for row in rows if int(row.get("entity_id") or 0) == int(sale.id)]
+
+        self.assertFalse(
+            [row for row in sale_exceptions if row.get("exception_type") == "missing_fee_evidence"],
+            sale_exceptions,
+        )
+        self.assertFalse(
+            [row for row in sale_exceptions if row.get("exception_type") == "nonpositive_margin"],
+            sale_exceptions,
+        )
+
+    def test_accounting_exception_uses_listing_product_for_bundle_sale_without_product_link(self) -> None:
+        now = datetime(2026, 4, 26, 12, 0, 0)
+        product = self._create_product(sku="GS-ACCT-BUNDLE-LISTING", qty=5)
+        listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Accounting bundle listing",
+            listing_price=Decimal("50.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "single_product_lot",
+                        "components": [
+                            {"product_id": product.id, "sku": product.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            external_order_id="EBAY-ACCT-BUNDLE-LISTING",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("0.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        rows = self.repo.report_accounting_exception_rows(start_dt=now - timedelta(days=7), end_dt=now)
+        sale_exceptions = [row for row in rows if int(row.get("entity_id") or 0) == int(sale.id)]
+        by_type = {str(row.get("exception_type") or ""): row for row in sale_exceptions}
+
+        self.assertEqual(by_type["missing_shipping_label_spend"]["sku"], product.sku)
+        self.assertEqual(by_type["missing_fee_evidence"]["sku"], product.sku)
+        self.assertNotIn("missing_product_link", by_type)
 
     def test_report_listing_format_outcome_rows(self) -> None:
         now = datetime(2026, 4, 12, 12, 0, 0)
@@ -1491,6 +3422,7 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
             sold_price=Decimal("50.00"),
             fees=Decimal("5.00"),
             shipping_cost=Decimal("3.00"),
+            shipping_label_cost=Decimal("1.25"),
             quantity_sold=2,
             product_id=product.id,
             sold_at=now - timedelta(hours=1),
@@ -1507,9 +3439,110 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertAlmostEqual(float(row.get("gross_sales") or 0.0), 50.0, places=2)
         self.assertAlmostEqual(float(row.get("fees") or 0.0), 5.0, places=2)
         self.assertAlmostEqual(float(row.get("shipping_cost") or 0.0), 3.0, places=2)
-        self.assertAlmostEqual(float(row.get("net_sales") or 0.0), 42.0, places=2)
+        self.assertAlmostEqual(float(row.get("shipping_label_cost") or 0.0), 1.25, places=2)
+        self.assertAlmostEqual(float(row.get("net_sales") or 0.0), 46.75, places=2)
         self.assertTrue(str(row.get("cycle_start") or "").strip())
         self.assertTrue(str(row.get("cycle_end") or "").strip())
+
+    def test_report_inventory_cycle_rows_use_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-CYCLE-NORM-ACTUALS", qty=2)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="EBAY-CYCLE-NORM-ACTUALS",
+            order_status="paid",
+            sold_at=now - timedelta(hours=1),
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("3.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 2, "unit_price": Decimal("25.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("5.00"),
+            shipping_cost=Decimal("3.00"),
+            shipping_label_cost=Decimal("1.25"),
+            quantity_sold=2,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now - timedelta(hours=1),
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("4.00")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("2.00")},
+            ],
+            actor="qa-user",
+        )
+
+        rows = self.repo.report_inventory_cycle_rows(end_dt=now)
+        row = next(r for r in rows if int(r.get("product_id") or 0) == int(product.id))
+
+        self.assertEqual(str(row.get("cycle_status") or ""), "closed")
+        self.assertAlmostEqual(float(row.get("fees") or 0.0), 4.0, places=2)
+        self.assertAlmostEqual(float(row.get("shipping_cost") or 0.0), 3.0, places=2)
+        self.assertAlmostEqual(float(row.get("shipping_label_cost") or 0.0), 2.0, places=2)
+        self.assertAlmostEqual(float(row.get("net_sales") or 0.0), 47.0, places=2)
+
+    def test_report_inventory_cycle_rows_allocates_bundle_sale_to_component_products(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        primary = self._create_product(sku="GS-CYCLE-BUNDLE-PRIMARY", qty=4)
+        extra = self._create_product(sku="GS-CYCLE-BUNDLE-EXTRA", qty=6)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Cycle bundle",
+            listing_price=Decimal("100.00"),
+            quantity_listed=1,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 1},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("8.00"),
+            shipping_cost=Decimal("4.00"),
+            shipping_label_cost=Decimal("2.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            external_order_id="EBAY-CYCLE-BUNDLE",
+            sold_at=now - timedelta(hours=1),
+        )
+
+        rows = self.repo.report_inventory_cycle_rows(end_dt=now)
+        primary_row = next(r for r in rows if int(r.get("product_id") or 0) == int(primary.id))
+        extra_row = next(r for r in rows if int(r.get("product_id") or 0) == int(extra.id))
+
+        self.assertEqual(int(primary_row.get("qty_out_movements") or 0), 1)
+        self.assertEqual(int(primary_row.get("qty_sold_sales") or 0), 1)
+        self.assertAlmostEqual(float(primary_row.get("gross_sales") or 0.0), 25.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("fees") or 0.0), 2.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("shipping_cost") or 0.0), 1.0, places=2)
+        self.assertAlmostEqual(float(primary_row.get("shipping_label_cost") or 0.0), 0.5, places=2)
+        self.assertAlmostEqual(float(primary_row.get("net_sales") or 0.0), 23.5, places=2)
+
+        self.assertEqual(int(extra_row.get("qty_out_movements") or 0), 3)
+        self.assertEqual(int(extra_row.get("qty_sold_sales") or 0), 3)
+        self.assertAlmostEqual(float(extra_row.get("gross_sales") or 0.0), 75.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("fees") or 0.0), 6.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("shipping_cost") or 0.0), 3.0, places=2)
+        self.assertAlmostEqual(float(extra_row.get("shipping_label_cost") or 0.0), 1.5, places=2)
+        self.assertAlmostEqual(float(extra_row.get("net_sales") or 0.0), 70.5, places=2)
 
     def test_create_sale_can_link_to_order(self) -> None:
         product = self._create_product(sku="GS-ORD-003", qty=8)
@@ -1704,6 +3737,192 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.repo.update_return(ret.id, {"restocked": False, "disposition": "scrap"}, actor="qa-user")
         self.assertEqual(self.db.get(Product, product.id).current_quantity, 6)
 
+    def test_create_return_restock_for_bundle_sale_restores_each_component(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-RET-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-RET-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Return bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 2},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 3},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=2,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 23, 12, 0, 0),
+        )
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 16)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 14)
+
+        ret = self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("50.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=datetime(2026, 3, 24, 9, 0, 0),
+            actor="qa-user",
+        )
+
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 18)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 17)
+        movements = [
+            m for m in self.repo.list_inventory_movements(limit=200)
+            if m.reference_type == "return" and m.reference_id == ret.id
+        ]
+        self.assertEqual(
+            sorted((m.product_id, m.quantity_delta, m.movement_type) for m in movements),
+            [
+                (primary.id, 2, "return_bundle_component_restock"),
+                (extra.id, 3, "return_bundle_component_restock"),
+            ],
+        )
+        return_rows = self.repo.report_returns_rows(
+            start_dt=datetime(2026, 3, 23, 0, 0, 0),
+            end_dt=datetime(2026, 3, 25, 0, 0, 0),
+        )
+        return_row = next(row for row in return_rows if int(row.get("return_id") or 0) == int(ret.id))
+        self.assertTrue(return_row["listing_is_bundle"])
+        self.assertEqual(return_row["listing_bundle_kind"], "mixed_product_bundle")
+        self.assertEqual(return_row["listing_bundle_component_count"], 2)
+        self.assertEqual(return_row["listing_bundle_units_per_return"], 5)
+        self.assertEqual(return_row["listing_bundle_inventory_units_returned"], 5)
+
+    def test_bundle_return_uses_listing_product_when_sale_has_no_product_link(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-RET-LINK-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-RET-LINK-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Return bundle product fallback",
+            listing_price=Decimal("50.00"),
+            quantity_listed=2,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "kind": "mixed_product_bundle",
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 1},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("5.00"),
+            shipping_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=None,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 23, 12, 0, 0),
+        )
+
+        ret = self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("50.00"),
+            return_status="processed",
+            disposition="restock",
+            restocked=True,
+            returned_at=datetime(2026, 3, 24, 9, 0, 0),
+            actor="qa-user",
+        )
+
+        self.assertEqual(ret.product_id, primary.id)
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 20)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 20)
+        return_rows = self.repo.report_returns_rows(
+            start_dt=datetime(2026, 3, 23, 0, 0, 0),
+            end_dt=datetime(2026, 3, 25, 0, 0, 0),
+        )
+        return_row = next(row for row in return_rows if int(row.get("return_id") or 0) == int(ret.id))
+        self.assertEqual(return_row["product_id"], primary.id)
+        self.assertEqual(return_row["sku"], primary.sku)
+        self.assertEqual(return_row["product_title"], primary.title)
+        self.assertTrue(return_row["listing_is_bundle"])
+        self.assertEqual(return_row["listing_bundle_inventory_units_returned"], 3)
+
+    def test_update_return_restock_for_bundle_sale_reconciles_components(self) -> None:
+        primary = self._create_product(sku="GS-BUNDLE-RET-UPD-PRIMARY", qty=20)
+        extra = self._create_product(sku="GS-BUNDLE-RET-UPD-EXTRA", qty=20)
+        listing = self.repo.create_listing(
+            product_id=primary.id,
+            marketplace="ebay",
+            listing_title="Return update bundle",
+            listing_price=Decimal("50.00"),
+            quantity_listed=3,
+            marketplace_details=json.dumps(
+                {
+                    "bundle": {
+                        "enabled": True,
+                        "components": [
+                            {"product_id": primary.id, "sku": primary.sku, "quantity_per_listing": 1},
+                            {"product_id": extra.id, "sku": extra.sku, "quantity_per_listing": 2},
+                        ],
+                    }
+                }
+            ),
+            actor="qa-user",
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            quantity_sold=3,
+            product_id=primary.id,
+            listing_id=listing.id,
+            sold_at=datetime(2026, 3, 23, 12, 0, 0),
+        )
+        ret = self.repo.create_return(
+            marketplace="ebay",
+            sale_id=sale.id,
+            quantity=1,
+            refund_amount=Decimal("50.00"),
+            return_status="processed",
+            disposition="damaged",
+            restocked=False,
+            returned_at=datetime(2026, 3, 24, 9, 0, 0),
+            actor="qa-user",
+        )
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 17)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 14)
+
+        self.repo.update_return(ret.id, {"restocked": True, "quantity": 2, "disposition": "restock"}, actor="qa-user")
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 19)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 18)
+
+        self.repo.update_return(ret.id, {"restocked": False, "disposition": "scrap"}, actor="qa-user")
+        self.assertEqual(self.db.get(Product, primary.id).current_quantity, 17)
+        self.assertEqual(self.db.get(Product, extra.id).current_quantity, 14)
+
     def test_create_shipping_preset_and_manage_default(self) -> None:
         p1 = self.repo.create_shipping_preset(
             name="USPS Ground",
@@ -1843,6 +4062,75 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
             external_listing_id="",
         )
         self.assertNotEqual(first.id, second.id)
+
+    def test_list_listings_supports_recent_limit(self) -> None:
+        product = self._create_product(sku="GS-LST-LIMIT", qty=3)
+        first = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Old Listing",
+            listing_price=Decimal("10.00"),
+            quantity_listed=1,
+        )
+        second = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="New Listing",
+            listing_price=Decimal("11.00"),
+            quantity_listed=1,
+        )
+
+        rows = self.repo.list_listings(limit=1)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id, second.id)
+        self.assertNotEqual(rows[0].id, first.id)
+
+    def test_listing_lookup_helpers_avoid_full_listing_scans(self) -> None:
+        product = self._create_product(sku="GS-LST-LOOKUP", qty=3)
+        other = self._create_product(sku="GS-LST-LOOKUP-OTHER", qty=1)
+        ebay_listing = self.repo.create_listing(
+            product_id=product.id,
+            marketplace="ebay",
+            listing_title="Lookup eBay",
+            listing_price=Decimal("10.00"),
+            quantity_listed=1,
+            external_listing_id="EBAY-LOOKUP-1",
+        )
+        self.repo.create_listing(
+            product_id=product.id,
+            marketplace="local",
+            listing_title="Lookup Local",
+            listing_price=Decimal("11.00"),
+            quantity_listed=1,
+            external_listing_id="LOCAL-LOOKUP-1",
+        )
+        self.repo.create_listing(
+            product_id=other.id,
+            marketplace="ebay",
+            listing_title="Other eBay",
+            listing_price=Decimal("12.00"),
+            quantity_listed=1,
+            external_listing_id="EBAY-OTHER-1",
+        )
+
+        self.assertEqual(self.repo.get_listing(ebay_listing.id).id, ebay_listing.id)
+        ebay_rows = self.repo.list_listings_for_product(product.id, marketplace="ebay")
+        self.assertEqual([row.id for row in ebay_rows], [ebay_listing.id])
+        self.assertEqual(
+            self.repo.find_listing_owner_by_external_id(
+                marketplace="ebay",
+                external_listing_id="EBAY-LOOKUP-1",
+            ),
+            ebay_listing.id,
+        )
+        self.assertIsNone(
+            self.repo.find_listing_owner_by_external_id(
+                marketplace="ebay",
+                external_listing_id="EBAY-LOOKUP-1",
+                exclude_listing_id=ebay_listing.id,
+            )
+        )
 
     def test_create_listing_forces_draft_and_pending_review(self) -> None:
         product = self._create_product(sku="GS-LST-003", qty=2)
@@ -2716,6 +5004,634 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(assignment.allocated_cost, Decimal("31.50"))
         self.assertTrue(any(a.id == assignment.id for a in self.repo.list_product_lot_assignments()))
+
+    def test_lot_total_cost_feeds_cost_maps_and_dashboard_when_assignment_costs_blank(self) -> None:
+        p1 = self.repo.create_product(
+            sku="GS-LOT-COST-MAP-1",
+            title="Lot Cost Product 1",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=2,
+            acquired_at=datetime(2026, 3, 27, 8, 0, 0),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-LOT-COST-MAP-2",
+            title="Lot Cost Product 2",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=4,
+            acquired_at=datetime(2026, 3, 27, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-COST-MAP-1",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 3, 27, 7, 0, 0),
+            total_cost=Decimal("120.00"),
+            total_tax_paid=Decimal("12.00"),
+            notes="whole-lot cost",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=2,
+            unit_cost=None,
+            acquired_at=datetime(2026, 3, 27, 8, 0, 0),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=4,
+            unit_cost=None,
+            acquired_at=datetime(2026, 3, 27, 8, 0, 0),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 28),
+            default_unit_cost_by_product={p1.id: 0.0, p2.id: 0.0},
+        )
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p1.id], 22.0)
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p2.id], 22.0)
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][p1.id], "lot_equal_quantity_fallback")
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][p2.id], "lot_equal_quantity_fallback")
+
+        metrics = self.repo.dashboard_metrics()
+        self.assertAlmostEqual(metrics["inventory_cost"], 132.0)
+
+    def test_lot_cost_maps_allocate_only_remaining_lot_cost_to_blank_assignments(self) -> None:
+        p1 = self.repo.create_product(
+            sku="GS-LOT-REMAIN-1",
+            title="Explicit Cost Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=2,
+            acquired_at=datetime(2026, 3, 28, 8, 0, 0),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-LOT-REMAIN-2",
+            title="Blank Cost Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=4,
+            acquired_at=datetime(2026, 3, 28, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-REMAIN-1",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 3, 28, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+            notes="remaining allocation",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=2,
+            unit_cost=Decimal("30.00"),
+            acquired_at=datetime(2026, 3, 28, 8, 0, 0),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=4,
+            unit_cost=None,
+            acquired_at=datetime(2026, 3, 28, 8, 0, 0),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 29),
+            default_unit_cost_by_product={p1.id: 0.0, p2.id: 0.0},
+        )
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p1.id], 30.0)
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p2.id], 10.0)
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][p1.id], "assignment_unit_landed_cost")
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][p2.id], "lot_equal_quantity_fallback")
+
+    def test_expected_lot_quantity_prevents_partial_check_in_from_absorbing_full_lot_cost(self) -> None:
+        product = self.repo.create_product(
+            sku="GS-LOT-PARTIAL-1",
+            title="Partial Lot Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=2,
+            acquired_at=datetime(2026, 3, 29, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-PARTIAL-1",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 3, 29, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+            expected_total_quantity=10,
+            notes="partial check-in",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot.id,
+            quantity_acquired=2,
+            unit_cost=None,
+            acquired_at=datetime(2026, 3, 29, 8, 0, 0),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 30),
+            default_unit_cost_by_product={product.id: 0.0},
+        )
+
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][product.id], 10.0)
+        self.assertAlmostEqual(maps["fifo_remaining_unit_cost_by_product"][product.id], 10.0)
+        self.assertEqual(
+            maps["lot_weighted_unit_cost_source_by_product"][product.id],
+            "lot_expected_quantity_fallback",
+        )
+        self.assertEqual(
+            maps["fifo_remaining_unit_cost_source_by_product"][product.id],
+            "lot_expected_quantity_fallback",
+        )
+
+        exceptions = self.repo.report_accounting_exception_rows(
+            start_dt=datetime(2026, 3, 29),
+            end_dt=datetime(2026, 3, 30),
+        )
+        self.assertTrue(
+            any(
+                row.get("exception_type") == "lot_allocation_pending_check_in"
+                and int(row.get("entity_id") or 0) == int(lot.id)
+                for row in exceptions
+            )
+        )
+
+    def test_dashboard_profit_uses_expected_lot_quantity_cogs_for_partial_lot_sale(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-DASH-PARTIAL-LOT",
+            title="Dashboard Partial Lot Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=1,
+            acquired_at=now - timedelta(days=2),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-DASH-PARTIAL",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=2, hours=1),
+            total_cost=Decimal("200.00"),
+            expected_total_quantity=20,
+            notes="partial dashboard check-in",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot.id,
+            quantity_acquired=2,
+            unit_cost=None,
+            acquired_at=now - timedelta(days=2),
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("30.00"),
+            fees=Decimal("3.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=now,
+            default_unit_cost_by_product={product.id: 0.0},
+        )
+        self.assertAlmostEqual(maps["fifo_unit_cost_by_sale"][sale.id], 10.0, places=2)
+        self.assertEqual(
+            maps["fifo_unit_cost_source_by_sale"][sale.id],
+            "lot_expected_quantity_fallback",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now)
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 10.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 18.0, places=2)
+        self.assertEqual(
+            metrics["sales_30d_cogs_source_counts"],
+            {"lot_expected_quantity_fallback": 1},
+        )
+        profit_basis_rows = self.repo.dashboard_profit_basis_rows(now=now)
+        profit_basis = next(row for row in profit_basis_rows if int(row["sale_id"]) == int(sale.id))
+        self.assertAlmostEqual(profit_basis["net_before_cogs"], 28.0, places=2)
+        self.assertAlmostEqual(profit_basis["fifo_cogs"], 10.0, places=2)
+        self.assertAlmostEqual(profit_basis["profit_before_returns"], 18.0, places=2)
+        self.assertEqual(profit_basis["fifo_cost_source"], "lot_expected_quantity_fallback")
+        self.assertEqual(profit_basis["fifo_cogs_evidence_rows"], 1)
+
+    def test_dashboard_live_metrics_exclude_future_dated_sales_from_profit_window(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-DASH-FUTURE-SALE",
+            title="Dashboard Future Sale Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=Decimal("10.00"),
+            product_cost=None,
+            current_quantity=2,
+            acquired_at=now - timedelta(days=1),
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("30.00"),
+            fees=Decimal("3.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(hours=1),
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("999.00"),
+            fees=Decimal("99.00"),
+            shipping_cost=Decimal("9.00"),
+            shipping_label_cost=Decimal("8.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now + timedelta(days=1),
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now)
+
+        self.assertEqual(metrics["sales_30d_count"], 1)
+        self.assertAlmostEqual(metrics["sales_30d_gross"], 30.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_net"], 28.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 10.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], 18.0, places=2)
+
+    def test_dashboard_profit_flags_equal_fallback_lot_cogs_for_review(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-DASH-EQUAL-FALLBACK",
+            title="Dashboard Equal Fallback Product",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=None,
+            current_quantity=1,
+            acquired_at=now - timedelta(days=2),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-DASH-EQUAL-FALLBACK",
+            vendor="Dealer",
+            purchase_date=now - timedelta(days=2, hours=1),
+            total_cost=Decimal("200.00"),
+            notes="under-defined partial lot",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=product.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            acquired_at=now - timedelta(days=2),
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("30.00"),
+            fees=Decimal("3.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("4.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=now,
+            default_unit_cost_by_product={product.id: 0.0},
+        )
+        self.assertAlmostEqual(maps["fifo_unit_cost_by_sale"][sale.id], 200.0, places=2)
+        self.assertEqual(
+            maps["fifo_unit_cost_source_by_sale"][sale.id],
+            "lot_equal_quantity_fallback",
+        )
+
+        metrics = self.repo.dashboard_live_metrics(now=now)
+        self.assertAlmostEqual(metrics["sales_30d_est_cogs"], 200.0, places=2)
+        self.assertAlmostEqual(metrics["sales_30d_est_profit"], -172.0, places=2)
+        self.assertEqual(
+            metrics["sales_30d_cogs_source_counts"],
+            {"lot_equal_quantity_fallback": 1},
+        )
+        self.assertEqual(metrics["sales_30d_cogs_review_count"], 1)
+        self.assertEqual(metrics["sales_30d_profit_basis_status"], "review_needed")
+
+    def test_lot_allocation_weight_splits_mixed_lot_cost_by_product_value_share(self) -> None:
+        gold = self.repo.create_product(
+            sku="GS-MIXED-LOT-GOLD",
+            title="Mixed Lot Gold Coin",
+            category="coin",
+            description="",
+            metal_type="gold",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 3, 30, 8, 0, 0),
+        )
+        silver = self.repo.create_product(
+            sku="GS-MIXED-LOT-SILVER",
+            title="Mixed Lot Silver Round",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 3, 30, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-MIXED-WEIGHT-1",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 3, 30, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+            notes="mixed value lot",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=gold.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("9"),
+            acquired_at=datetime(2026, 3, 30, 8, 0, 0),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=silver.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("1"),
+            acquired_at=datetime(2026, 3, 30, 8, 0, 0),
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 3, 31),
+            default_unit_cost_by_product={gold.id: 0.0, silver.id: 0.0},
+        )
+
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][gold.id], 90.0)
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][silver.id], 10.0)
+        self.assertAlmostEqual(maps["fifo_remaining_unit_cost_by_product"][gold.id], 90.0)
+        self.assertAlmostEqual(maps["fifo_remaining_unit_cost_by_product"][silver.id], 10.0)
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][gold.id], "lot_allocation_weight")
+        self.assertEqual(maps["lot_weighted_unit_cost_source_by_product"][silver.id], "lot_allocation_weight")
+
+        metrics = self.repo.dashboard_metrics()
+        self.assertAlmostEqual(metrics["inventory_cost"], 100.0)
+
+        exceptions = self.repo.report_accounting_exception_rows(
+            start_dt=datetime(2026, 3, 30),
+            end_dt=datetime(2026, 3, 31),
+        )
+        self.assertFalse(
+            any(
+                row.get("exception_type") == "lot_equal_fallback_review_needed"
+                and int(row.get("entity_id") or 0) == int(lot.id)
+                for row in exceptions
+            )
+        )
+
+    def test_accounting_exception_flags_multi_product_equal_lot_fallback(self) -> None:
+        p1 = self.repo.create_product(
+            sku="GS-MIXED-LOT-EQUAL-1",
+            title="Mixed Lot Equal Fallback 1",
+            category="coin",
+            description="",
+            metal_type="gold",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 4, 1, 8, 0, 0),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-MIXED-LOT-EQUAL-2",
+            title="Mixed Lot Equal Fallback 2",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 4, 1, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-MIXED-EQUAL-FALLBACK",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 4, 1, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+            notes="needs allocation review",
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            acquired_at=datetime(2026, 4, 1, 8, 0, 0),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            acquired_at=datetime(2026, 4, 1, 8, 0, 0),
+        )
+
+        exceptions = self.repo.report_accounting_exception_rows(
+            start_dt=datetime(2026, 4, 1),
+            end_dt=datetime(2026, 4, 2),
+        )
+
+        match = next(
+            row
+            for row in exceptions
+            if row.get("exception_type") == "lot_equal_fallback_review_needed"
+            and int(row.get("entity_id") or 0) == int(lot.id)
+        )
+        self.assertEqual(match["severity"], "P2")
+        self.assertIn("equal quantity fallback", str(match.get("details") or ""))
+
+    def test_report_lot_assignment_rows_exposes_weighted_allocation_basis(self) -> None:
+        p1 = self.repo.create_product(
+            sku="GS-LOT-RPT-WEIGHT-1",
+            title="Weighted Lot Report 1",
+            category="coin",
+            description="",
+            metal_type="gold",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 4, 2, 8, 0, 0),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-LOT-RPT-WEIGHT-2",
+            title="Weighted Lot Report 2",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 4, 2, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-RPT-WEIGHTED",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 4, 2, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("3"),
+            acquired_at=datetime(2026, 4, 2, 8, 0, 0),
+        )
+        self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("1"),
+            acquired_at=datetime(2026, 4, 2, 8, 0, 0),
+        )
+
+        rows = self.repo.report_lot_assignment_rows(
+            start_dt=datetime(2026, 4, 2),
+            end_dt=datetime(2026, 4, 3),
+        )
+        by_sku = {str(row.get("sku") or ""): row for row in rows}
+
+        self.assertEqual(by_sku[p1.sku]["cost_source"], "lot_allocation_weight")
+        self.assertAlmostEqual(float(by_sku[p1.sku]["resolved_landed_unit_cost"] or 0.0), 75.0)
+        self.assertAlmostEqual(float(by_sku[p1.sku]["resolved_landed_total_cost"] or 0.0), 75.0)
+        self.assertEqual(by_sku[p2.sku]["cost_source"], "lot_allocation_weight")
+        self.assertAlmostEqual(float(by_sku[p2.sku]["resolved_landed_unit_cost"] or 0.0), 25.0)
+        self.assertAlmostEqual(float(by_sku[p2.sku]["lot_landed_total"] or 0.0), 100.0)
+
+    def test_update_product_lot_assignment_reprices_mixed_lot_allocation(self) -> None:
+        p1 = self.repo.create_product(
+            sku="GS-MIXED-LOT-EDIT-1",
+            title="Mixed Lot Edit 1",
+            category="coin",
+            description="",
+            metal_type="gold",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 3, 31, 8, 0, 0),
+        )
+        p2 = self.repo.create_product(
+            sku="GS-MIXED-LOT-EDIT-2",
+            title="Mixed Lot Edit 2",
+            category="coin",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+            acquired_at=datetime(2026, 3, 31, 8, 0, 0),
+        )
+        lot = self.repo.create_purchase_lot(
+            lot_code="LOT-MIXED-EDIT-1",
+            vendor="Dealer",
+            purchase_date=datetime(2026, 3, 31, 7, 0, 0),
+            total_cost=Decimal("100.00"),
+        )
+        a1 = self.repo.assign_product_to_lot(
+            product_id=p1.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("1"),
+            acquired_at=datetime(2026, 3, 31, 8, 0, 0),
+        )
+        a2 = self.repo.assign_product_to_lot(
+            product_id=p2.id,
+            lot_id=lot.id,
+            quantity_acquired=1,
+            unit_cost=None,
+            allocation_weight=Decimal("1"),
+            acquired_at=datetime(2026, 3, 31, 8, 0, 0),
+        )
+
+        self.repo.update_product_lot_assignment(
+            a1.id,
+            {"allocation_weight": Decimal("3")},
+            actor="qa-user",
+        )
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=datetime(2026, 4, 1),
+            default_unit_cost_by_product={p1.id: 0.0, p2.id: 0.0},
+        )
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p1.id], 75.0)
+        self.assertAlmostEqual(maps["lot_weighted_unit_cost_by_product"][p2.id], 25.0)
+
+        updated = self.db.get(type(a1), a1.id)
+        self.assertEqual(updated.allocation_weight, Decimal("3"))
+        self.assertEqual(a2.allocation_weight, Decimal("1"))
+
+    def test_product_cost_is_dashboard_and_sale_cogs_fallback_when_acquisition_cost_is_blank(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self.repo.create_product(
+            sku="GS-PRODUCT-COST-FALLBACK",
+            title="Product Cost Fallback",
+            category="bullion",
+            description="",
+            metal_type="silver",
+            weight_oz=None,
+            acquisition_cost=None,
+            product_cost=Decimal("15.00"),
+            current_quantity=3,
+            acquired_at=now - timedelta(days=3),
+        )
+        sale = self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("50.00"),
+            fees=Decimal("5.00"),
+            shipping_cost=Decimal("4.00"),
+            shipping_label_cost=Decimal("3.00"),
+            quantity_sold=2,
+            product_id=product.id,
+            sold_at=now - timedelta(days=1),
+        )
+
+        metrics = self.repo.dashboard_metrics()
+        self.assertAlmostEqual(metrics["inventory_cost"], 15.0)
+
+        live = self.repo.dashboard_live_metrics(now=now)
+        self.assertAlmostEqual(live["sales_30d_est_cogs"], 30.0)
+        self.assertAlmostEqual(live["sales_30d_est_profit"], 16.0)
+
+        maps = self.repo.report_sale_unit_cost_maps(
+            end_dt=now,
+            default_unit_cost_by_product={product.id: 15.0},
+        )
+        self.assertAlmostEqual(maps["fifo_unit_cost_by_sale"][sale.id], 15.0)
 
     def test_record_audit_event_and_entity_filter(self) -> None:
         row = self.repo.record_audit_event(
@@ -4058,7 +6974,46 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["sale_count"], 1)
         self.assertIsInstance(metrics["inventory_cost"], float)
         self.assertEqual(metrics["gross_sales"], 120.0)
-        self.assertEqual(metrics["net_sales"], 105.0)
+        self.assertEqual(metrics["net_sales"], 115.0)
+
+    def test_dashboard_metrics_net_sales_uses_linked_normalized_actuals(self) -> None:
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = self._create_product(sku="GS-MET-NORM-ACTUALS", qty=3)
+        order = self.repo.create_order(
+            marketplace="ebay",
+            external_order_id="DASH-MET-NORM-ACTUALS",
+            order_status="paid",
+            sold_at=now,
+            fees=Decimal("0.00"),
+            shipping_cost=Decimal("5.00"),
+            items=[{"product_id": product.id, "listing_id": None, "quantity": 1, "unit_price": Decimal("100.00")}],
+            actor="qa-user",
+        )
+        self.repo.create_sale(
+            marketplace="ebay",
+            sold_price=Decimal("100.00"),
+            fees=Decimal("10.00"),
+            shipping_cost=Decimal("5.00"),
+            shipping_label_cost=Decimal("9.00"),
+            quantity_sold=1,
+            product_id=product.id,
+            order_id=order.id,
+            external_order_id=order.external_order_id,
+            sold_at=now,
+        )
+        self.repo.replace_order_finance_entries(
+            order.id,
+            [
+                {"entry_kind": "marketplace_fee", "fee_type": "FINAL_VALUE_FEE", "amount": Decimal("7.50")},
+                {"entry_kind": "shipping_label", "fee_type": "SHIPPING_LABEL", "amount": Decimal("4.25")},
+            ],
+            actor="qa-user",
+        )
+
+        metrics = self.repo.dashboard_metrics()
+
+        self.assertEqual(metrics["gross_sales"], 100.0)
+        self.assertAlmostEqual(metrics["net_sales"], 93.25, places=2)
 
     def test_dashboard_metrics_counts_only_active_listings(self) -> None:
         p1 = self._create_product(sku="GS-MET-ACTIVE", qty=2)
@@ -4714,6 +7669,38 @@ class InventoryMovementsRepositoryTests(unittest.TestCase):
         self.assertIsNotNone(assigned2.allocated_tax_paid)
         self.assertIsNotNone(assigned2.allocated_shipping_paid)
         self.assertIsNotNone(assigned2.allocated_handling_paid)
+
+    def test_create_and_update_product_normalize_oversized_metal_type(self) -> None:
+        long_metal_type = (
+            "Copper-Nickel (Golden Dollar), 99.93% Silver (American Eagle Silver Dollar)"
+        )
+        product = self.repo.create_product(
+            sku="GS-LONG-METAL-1",
+            title="Millennium Coinage and Currency Set",
+            category="collectibles",
+            description="US Mint set with certificate.",
+            metal_type=long_metal_type,
+            weight_oz=None,
+            acquisition_cost=None,
+            current_quantity=1,
+        )
+
+        self.assertLessEqual(len(product.metal_type), 64)
+        self.assertEqual(product.metal_type, "copper-nickel, silver")
+        self.assertIn(f"Metal composition: {long_metal_type}", product.description)
+
+        updated_long_metal_type = (
+            "99.9% Gold plated copper alloy with nickel clad presentation token detail"
+        )
+        updated = self.repo.update_product(
+            int(product.id),
+            {"metal_type": updated_long_metal_type},
+            actor="qa-user",
+        )
+
+        self.assertLessEqual(len(updated.metal_type), 64)
+        self.assertEqual(updated.metal_type, "gold, copper, nickel, clad")
+        self.assertIn(f"Metal composition: {updated_long_metal_type}", updated.description)
 
     def test_saved_filter_profile_upsert_existing_row_updates_and_default_demotion(self) -> None:
         old_default = self.repo.upsert_saved_filter_profile(

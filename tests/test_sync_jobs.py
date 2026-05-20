@@ -162,6 +162,15 @@ class _FakeSlackConfig:
 
 
 class SyncJobsTests(unittest.TestCase):
+    def test_transient_ebay_network_error_detection(self) -> None:
+        exc = requests.ConnectionError(
+            "HTTPSConnectionPool(host='api.ebay.com', port=443): "
+            "Max retries exceeded with url: /identity/v1/oauth2/token "
+            "(Caused by NameResolutionError(\"Failed to resolve 'api.ebay.com'\"))"
+        )
+        self.assertTrue(sync_jobs._is_transient_ebay_network_error(exc))
+        self.assertFalse(sync_jobs._is_transient_ebay_network_error(RuntimeError("bad credentials")))
+
     def test_maybe_auto_refresh_skips_during_failure_cooldown(self) -> None:
         repo = _FakeRepo()
         now = datetime(2026, 4, 18, 12, 0, 0)
@@ -197,6 +206,32 @@ class SyncJobsTests(unittest.TestCase):
             result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
         self.assertEqual(result.get("status"), "skipped")
         self.assertEqual(result.get("reason"), "missing_refresh_token")
+
+    def test_maybe_auto_refresh_classifies_transient_network_failure(self) -> None:
+        repo = _FakeRepo()
+        now = datetime(2026, 4, 18, 12, 0, 0)
+        transient = requests.ConnectionError("Failed to resolve 'api.ebay.com'")
+        with patch("app.services.sync_jobs.get_runtime_bool", return_value=True), patch(
+            "app.services.sync_jobs._resolve_ebay_tokens",
+            return_value=("access", "refresh"),
+        ), patch("app.services.sync_jobs.get_runtime_int", side_effect=[12, 45, 30]), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=[
+                "2026-04-18T12:10:00",
+                "2026-04-18T10:00:00",
+                "",
+            ],
+        ), patch("app.services.sync_jobs.utcnow_naive", return_value=now), patch(
+            "app.services.sync_jobs._refresh_ebay_access_token",
+            side_effect=transient,
+        ), patch(
+            "app.services.sync_jobs._persist_ebay_refresh_failure_state"
+        ) as persist_failure, patch("app.services.sync_jobs.EbayClient") as client_cls:
+            client_cls.return_value.is_configured.return_value = True
+            result = sync_jobs.maybe_auto_refresh_ebay_user_token(repo, actor="qa")
+        persist_failure.assert_called_once()
+        self.assertEqual(result.get("status"), "failed")
+        self.assertEqual(result.get("reason"), "transient_network_unavailable")
 
     def test_maybe_auto_refresh_refreshes_when_near_expiry(self) -> None:
         repo = _FakeRepo()
@@ -1227,6 +1262,23 @@ class SyncJobsTests(unittest.TestCase):
         self.assertTrue(any(e.get("code") == "EBAY_PULL_FAILED" for e in repo.errors))
         self.assertTrue(any(u[1].get("status") == "failed" for u in repo.updated_runs))
 
+    def test_execute_ebay_orders_pull_import_transient_network_skips_without_failed_record(self) -> None:
+        repo = _FakeRepoWithDB(db=_FakeDB())
+        transient = requests.ConnectionError("NameResolutionError: failed to resolve api.ebay.com")
+        client = SimpleNamespace(pull_recent_orders=lambda *_args, **_kwargs: (_ for _ in ()).throw(transient))
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):
+            out = sync_jobs.execute_ebay_orders_pull_import(
+                repo,
+                access_token="tok",
+                actor="qa",
+                client=client,
+            )
+        self.assertEqual(out.get("status"), "skipped")
+        self.assertEqual(out.get("failed"), 0)
+        self.assertEqual(out.get("reason"), "transient_network_unavailable")
+        self.assertTrue(any(e.get("code") == "EBAY_NETWORK_UNAVAILABLE" for e in repo.errors))
+        self.assertTrue(any(u[1].get("status") == "skipped" and u[1].get("records_failed") == 0 for u in repo.updated_runs))
+
     def test_execute_ebay_orders_pull_import_refreshes_token_on_auth_failure(self) -> None:
         repo = _FakeRepoWithDB(db=_FakeDB(products=[], listings=[]))
 
@@ -1896,6 +1948,35 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(len(repo.created_runs), 1)
         self.assertGreaterEqual(len(repo.updated_runs), 2)
         self.assertTrue(repo.events)
+
+    def test_execute_ebay_connection_health_check_transient_network_is_partial_warning(self) -> None:
+        repo = _FakeRepo()
+
+        class _Client:
+            SCOPES = []
+
+            def is_configured(self):
+                return True
+
+            def decode_access_token_claims(self, _token):
+                return {"scope": "https://api.ebay.com/oauth/api_scope/sell.account"}
+
+            def get_account_privileges(self, _token):
+                raise requests.ConnectionError("NameResolutionError: failed to resolve api.ebay.com")
+
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=lambda _repo, key, default="": "tok" if key == "ebay_user_access_token" else "",
+        ):
+            out = sync_jobs.execute_ebay_connection_health_check(
+                repo,
+                actor="qa",
+                client=_Client(),
+            )
+        self.assertEqual(out["status"], "partial")
+        self.assertEqual(out["failed"], 0)
+        self.assertEqual(out["warnings"], 1)
+        self.assertTrue(any(u[1].get("status") == "partial" and u[1].get("records_failed") == 0 for u in repo.updated_runs))
 
 
 if __name__ == "__main__":

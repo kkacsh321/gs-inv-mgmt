@@ -64,6 +64,18 @@ def parse_listing_fee_estimate_payload(listing_marketplace_details: str | None) 
     return {}
 
 
+def _normalized_marketplace_fee_total_from_order(order: Any) -> float:
+    entries = getattr(order, "finance_entries", None)
+    if entries is None:
+        entries = getattr(order, "order_finance_entries", None)
+    total = 0.0
+    for entry in entries or []:
+        if str(getattr(entry, "entry_kind", "") or "").strip().lower() != "marketplace_fee":
+            continue
+        total += _safe_float(getattr(entry, "amount", 0.0))
+    return total
+
+
 def build_ebay_fee_reconciliation_rows(sales: list[Any]) -> list[dict]:
     rows: list[dict] = []
     for s in sales:
@@ -85,9 +97,13 @@ def build_ebay_fee_reconciliation_rows(sales: list[Any]) -> list[dict]:
         order_fee_breakdown = _extract_order_fee_breakdown_from_notes(
             str(getattr(order, "notes", "") or "") if order is not None else ""
         )
+        normalized_order_fee = _normalized_marketplace_fee_total_from_order(order) if order is not None else 0.0
         order_marketplace_fee = _safe_float(order_fee_breakdown.get("total_marketplace_fee"))
         sale_fee_field = _safe_float(getattr(s, "fees", 0.0))
-        if order_marketplace_fee > 0:
+        if normalized_order_fee > 0:
+            actual_fee = normalized_order_fee
+            actual_fee_source = "normalized_order_finance_entries_marketplace_fee_sum"
+        elif order_marketplace_fee > 0:
             actual_fee = order_marketplace_fee
             actual_fee_source = "order_fee_breakdown_total_marketplace_fee"
         else:
@@ -124,6 +140,8 @@ def build_ebay_fee_reconciliation_rows(sales: list[Any]) -> list[dict]:
                 "actual_fee": round(actual_fee, 2),
                 "actual_fee_source": actual_fee_source,
                 "sale_fee_field": round(sale_fee_field, 2),
+                "normalized_order_finance_marketplace_fee_total": round(normalized_order_fee, 2),
+                "normalized_order_finance_marketplace_fee_present": bool(normalized_order_fee > 0),
                 "order_fee_breakdown_total_marketplace_fee": round(order_marketplace_fee, 2),
                 "order_fee_breakdown_present": bool(order_marketplace_fee > 0),
                 "delta_sale_fee_field_vs_order_breakdown": round(sale_fee_field - order_marketplace_fee, 2)

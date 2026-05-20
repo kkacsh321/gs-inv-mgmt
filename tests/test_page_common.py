@@ -82,6 +82,7 @@ class PageCommonTests(unittest.TestCase):
         self.assertEqual(page_common._normalize_quick_action("/p"), "products")
         self.assertEqual(page_common._normalize_quick_action("go reports"), "reports")
         self.assertEqual(page_common._normalize_quick_action(" SY "), "sync")
+        self.assertEqual(page_common._normalize_quick_action("acct"), "ai-accountant")
 
     def test_logo_data_url(self):
         with tempfile.TemporaryDirectory() as td:

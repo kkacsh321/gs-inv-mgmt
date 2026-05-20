@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,6 +57,7 @@ inventory_movements = _load_view_module("inventory_movements")
 media = _load_view_module("media")
 operations_home = _load_view_module("operations_home")
 orders = _load_view_module("orders")
+order_map = _load_view_module("order_map")
 returns = _load_view_module("returns")
 sales = _load_view_module("sales")
 shipping = _load_view_module("shipping")
@@ -91,6 +92,8 @@ class _FakeSt:
         self.successes = []
         self.dataframes = []
         self.json_payloads = []
+        self.maps = []
+        self.downloads = []
 
     def subheader(self, *_a, **_k):
         return None
@@ -171,7 +174,11 @@ class _FakeSt:
     def dataframe(self, data, **_k):
         self.dataframes.append(data)
 
-    def download_button(self, *_a, **_k):
+    def map(self, data, **kwargs):
+        self.maps.append((data, kwargs))
+
+    def download_button(self, *args, **kwargs):
+        self.downloads.append((args, kwargs))
         return None
 
     def json(self, payload, **_k):
@@ -234,7 +241,11 @@ class SmallViewsTests(unittest.TestCase):
                 "sales_30d_shipping_label_spend": 15.0,
                 "sales_30d_shipping_delta": 5.0,
                 "sales_30d_est_cogs": 80.0,
+                "sales_30d_profit_before_returns": 170.0,
                 "sales_30d_est_profit": 170.0,
+                "sales_30d_cogs_review_count": 1,
+                "sales_30d_profit_basis_status": "review_needed",
+                "sales_30d_cogs_source_counts": {"lot_equal_quantity_fallback": 1},
             },
             list_sales=lambda: (_ for _ in ()).throw(AssertionError("list_sales should not be called")),
             list_orders=lambda: (_ for _ in ()).throw(AssertionError("list_orders should not be called")),
@@ -243,6 +254,123 @@ class SmallViewsTests(unittest.TestCase):
             dashboard, "as_money", side_effect=lambda v: f"${v:,.2f}"
         ):
             dashboard.render_dashboard(repo)
+        self.assertTrue(any("Estimated profit needs cost-basis review" in msg for msg in fake_st.warnings))
+
+    def test_render_dashboard_fallback_uses_actual_economics_when_available(self) -> None:
+        fake_st = _FakeSt()
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = SimpleNamespace(
+            acquisition_cost=20.0,
+            acquisition_tax_paid=0.0,
+            acquisition_shipping_paid=0.0,
+            acquisition_handling_paid=0.0,
+            product_cost=0.0,
+        )
+        sale = SimpleNamespace(
+            id=11,
+            sold_at=now,
+            sold_price=100.0,
+            fees=10.0,
+            shipping_cost=5.0,
+            shipping_label_cost=9.0,
+            quantity_sold=1,
+            product=product,
+        )
+        money_values = []
+        repo = SimpleNamespace(
+            dashboard_metrics=lambda: {
+                "product_count": 1,
+                "listing_count": 0,
+                "sale_count": 1,
+                "inventory_cost": 20.0,
+                "gross_sales": 100.0,
+                "net_sales": 86.0,
+            },
+            list_sales=lambda: [sale],
+            list_orders=lambda: [],
+            report_sales_actual_econ_rows=lambda start_dt, end_dt: [
+                {
+                    "sale_id": 11,
+                    "sold_price": 100.0,
+                    "allocated_fee_actual": 7.5,
+                    "allocated_shipping_charged": 5.0,
+                    "allocated_shipping_actual": 4.25,
+                    "net_before_cogs_actual": 93.25,
+                }
+            ],
+        )
+        with patch.object(dashboard, "st", fake_st), patch.object(dashboard, "render_help_panel"), patch.object(
+            dashboard, "utcnow_naive", return_value=now
+        ), patch.object(
+            dashboard,
+            "as_money",
+            side_effect=lambda v: money_values.append(round(float(v), 2)) or f"${float(v):,.2f}",
+        ):
+            dashboard.render_dashboard(repo)
+
+        self.assertIn(93.25, money_values)
+        self.assertIn(73.25, money_values)
+        self.assertEqual(money_values[4], 93.25)
+        self.assertEqual(money_values[5], 73.25)
+
+    def test_render_dashboard_fallback_excludes_future_dated_sales(self) -> None:
+        fake_st = _FakeSt()
+        now = datetime(2026, 4, 12, 12, 0, 0)
+        product = SimpleNamespace(
+            acquisition_cost=10.0,
+            acquisition_tax_paid=0.0,
+            acquisition_shipping_paid=0.0,
+            acquisition_handling_paid=0.0,
+            product_cost=0.0,
+        )
+        current_sale = SimpleNamespace(
+            id=11,
+            sold_at=now,
+            sold_price=30.0,
+            fees=3.0,
+            shipping_cost=5.0,
+            shipping_label_cost=4.0,
+            quantity_sold=1,
+            product=product,
+        )
+        future_sale = SimpleNamespace(
+            id=12,
+            sold_at=now + dashboard.timedelta(days=1),
+            sold_price=999.0,
+            fees=99.0,
+            shipping_cost=9.0,
+            shipping_label_cost=8.0,
+            quantity_sold=1,
+            product=product,
+        )
+        money_values = []
+        repo = SimpleNamespace(
+            dashboard_metrics=lambda: {
+                "product_count": 1,
+                "listing_count": 0,
+                "sale_count": 2,
+                "inventory_cost": 20.0,
+                "gross_sales": 1029.0,
+                "net_sales": 957.0,
+            },
+            list_sales=lambda: [current_sale, future_sale],
+            list_orders=lambda: [],
+            report_sales_actual_econ_rows=lambda start_dt, end_dt: [],
+        )
+        with patch.object(dashboard, "st", fake_st), patch.object(dashboard, "render_help_panel"), patch.object(
+            dashboard, "utcnow_naive", return_value=now
+        ), patch.object(
+            dashboard,
+            "as_money",
+            side_effect=lambda v: money_values.append(round(float(v), 2)) or f"${float(v):,.2f}",
+        ):
+            dashboard.render_dashboard(repo)
+
+        self.assertIn(30.0, money_values)
+        self.assertIn(28.0, money_values)
+        self.assertIn(18.0, money_values)
+        self.assertNotIn(1029.0, money_values[3:])
+        self.assertNotIn(929.0, money_values)
 
     def test_render_inventory_movements(self) -> None:
         fake_st = _FakeSt()
@@ -304,6 +432,10 @@ class SmallViewsTests(unittest.TestCase):
             list_products=lambda: [SimpleNamespace(id=10, sku="SKU-1", title="Item")],
             list_listings=lambda: [SimpleNamespace(id=20, marketplace="ebay", listing_title="L1")],
             list_media_assets=lambda include_archived=False: [asset],
+            get_media_asset_archive_blockers=lambda media_id: {
+                "linked_listing_active": 0,
+                "linked_product_active_listings": 0,
+            },
         )
         storage = SimpleNamespace(enabled=True)
         with patch.object(media, "st", st_enabled), patch.object(media, "current_user", return_value=SimpleNamespace(username="u")), patch.object(
@@ -447,6 +579,8 @@ class SmallViewsTests(unittest.TestCase):
             items=[],
             notes="",
         )
+        order_row.shipping_label_cost = 9.0
+        order_row.shipping_label_currency = "USD"
         item_row = SimpleNamespace(
             id=11,
             order_id=1,
@@ -473,6 +607,19 @@ class SmallViewsTests(unittest.TestCase):
             def list_order_items(self):
                 return [item_row]
 
+            def report_orders_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "order_id": 1,
+                        "actual_fee": 7.5,
+                        "actual_fee_source": "normalized_order_finance_entries_marketplace_fee_sum",
+                        "actual_shipping_label_cost": 4.25,
+                        "actual_shipping_delta_charged_minus_label": -0.25,
+                        "actual_shipping_source": "normalized_order_finance_entries_shipping_label_sum",
+                        "actual_net_before_cogs": 92.25,
+                    }
+                ]
+
         repo = Repo()
         with patch.object(orders, "st", fake_st), patch.object(
             orders, "current_user", return_value=SimpleNamespace(username="admin", role="admin")
@@ -497,7 +644,198 @@ class SmallViewsTests(unittest.TestCase):
             orders, "utc_today", return_value=sold_at.date()
         ):
             orders.render_orders(repo)
-        self.assertGreaterEqual(len(fake_st.dataframes), 2)
+        self.assertGreaterEqual(len(fake_st.dataframes), 1)
+        orders_df = fake_st.dataframes[0]
+        self.assertAlmostEqual(float(orders_df.loc[0, "shipping_label_cost"]), 9.0)
+        self.assertAlmostEqual(float(orders_df.loc[0, "actual_shipping_label_cost"]), 4.25)
+        self.assertAlmostEqual(float(orders_df.loc[0, "actual_fee"]), 7.5)
+        self.assertAlmostEqual(float(orders_df.loc[0, "actual_net_before_cogs"]), 92.25)
+        self.assertEqual(
+            str(orders_df.loc[0, "actual_shipping_source"]),
+            "normalized_order_finance_entries_shipping_label_sum",
+        )
+        self.assertEqual(str(orders_df.loc[0, "actual_net_source"]), "order_actuals_rollup")
+
+    def test_order_actual_context_uses_canonical_field_fallback(self) -> None:
+        order = SimpleNamespace(
+            subtotal_amount=100.0,
+            fees=12.0,
+            shipping_cost=8.0,
+            shipping_label_cost=5.0,
+        )
+        fallback = orders._order_actual_context(order, {})
+        self.assertAlmostEqual(fallback["actual_fee"], 12.0)
+        self.assertAlmostEqual(fallback["actual_shipping_label_cost"], 5.0)
+        self.assertAlmostEqual(fallback["actual_shipping_delta"], 3.0)
+        self.assertAlmostEqual(fallback["actual_net_before_cogs"], 91.0)
+        self.assertEqual(fallback["actual_fee_source"], "order_fees_field")
+        self.assertEqual(fallback["actual_shipping_source"], "order_shipping_label_field")
+        self.assertEqual(fallback["actual_net_source"], "order_fields_fallback")
+
+        actual = orders._order_actual_context(
+            order,
+            {
+                "actual_fee": 7.5,
+                "actual_fee_source": "normalized_order_finance_entries_marketplace_fee_sum",
+                "actual_shipping_label_cost": 4.25,
+                "actual_shipping_delta_charged_minus_label": 3.75,
+                "actual_shipping_source": "normalized_order_finance_entries_shipping_label_sum",
+                "actual_net_before_cogs": 96.25,
+            },
+        )
+        self.assertAlmostEqual(actual["actual_fee"], 7.5)
+        self.assertAlmostEqual(actual["actual_shipping_label_cost"], 4.25)
+        self.assertAlmostEqual(actual["actual_shipping_delta"], 3.75)
+        self.assertAlmostEqual(actual["actual_net_before_cogs"], 96.25)
+        self.assertEqual(actual["actual_net_source"], "order_actuals_rollup")
+
+    def test_order_map_builds_state_destination_rows(self) -> None:
+        rows = order_map._build_order_destination_rows(
+            [
+                SimpleNamespace(
+                    id=1,
+                    marketplace="ebay",
+                    order_status="shipped",
+                    ship_to_city="Denver",
+                    ship_to_state="CO",
+                    ship_to_postal_code="80202",
+                    ship_to_country="US",
+                    total_amount=100.0,
+                    shipped_at=datetime(2026, 4, 2, 10, 0, 0),
+                    delivered_at=None,
+                    sold_at=datetime(2026, 4, 1, 10, 0, 0),
+                ),
+                SimpleNamespace(
+                    id=2,
+                    marketplace="local",
+                    order_status="delivered",
+                    ship_to_city="Boulder",
+                    ship_to_state="Colorado",
+                    ship_to_postal_code="80301",
+                    ship_to_country="United States",
+                    total_amount=25.0,
+                    shipped_at=None,
+                    delivered_at=None,
+                    sold_at=datetime(2026, 4, 3, 10, 0, 0),
+                ),
+                SimpleNamespace(
+                    id=3,
+                    marketplace="ebay",
+                    order_status="shipped",
+                    ship_to_city="Toronto",
+                    ship_to_state="",
+                    ship_to_postal_code="M5H",
+                    ship_to_country="CA",
+                    total_amount=75.0,
+                    shipped_at=datetime(2026, 4, 4, 10, 0, 0),
+                    delivered_at=None,
+                    sold_at=datetime(2026, 4, 4, 10, 0, 0),
+                ),
+            ],
+            start_date=date(2026, 4, 1),
+            end_date=date(2026, 4, 30),
+            include_unshipped=True,
+        )
+
+        self.assertEqual(len(rows), 2)
+        colorado = next(row for row in rows if row["destination"] == "CO")
+        self.assertEqual(colorado["order_count"], 2)
+        self.assertAlmostEqual(colorado["total_amount"], 125.0)
+        self.assertIn("Denver", colorado["cities"])
+        self.assertIn("80301", colorado["postal_prefixes"])
+        self.assertEqual(colorado["marketplaces"], "ebay:1, local:1")
+        self.assertEqual(colorado["statuses"], "delivered:1, shipped:1")
+
+    def test_order_map_filters_by_marketplace(self) -> None:
+        ebay_order = SimpleNamespace(marketplace="ebay")
+        local_order = SimpleNamespace(marketplace="local")
+        unknown_order = SimpleNamespace(marketplace="")
+
+        self.assertEqual(order_map._filter_orders_by_marketplaces([ebay_order, local_order], []), [ebay_order, local_order])
+        self.assertEqual(
+            order_map._filter_orders_by_marketplaces([ebay_order, local_order, unknown_order], ["EBAY", "unknown"]),
+            [ebay_order, unknown_order],
+        )
+
+    def test_order_map_filters_by_status(self) -> None:
+        shipped_order = SimpleNamespace(order_status="shipped")
+        paid_order = SimpleNamespace(order_status="paid")
+        unknown_order = SimpleNamespace(order_status="")
+
+        self.assertEqual(order_map._filter_orders_by_statuses([shipped_order, paid_order], []), [shipped_order, paid_order])
+        self.assertEqual(
+            order_map._filter_orders_by_statuses([shipped_order, paid_order, unknown_order], ["SHIPPED", "unknown"]),
+            [shipped_order, unknown_order],
+        )
+
+    def test_order_map_excludes_unshipped_orders_by_default(self) -> None:
+        rows = order_map._build_order_destination_rows(
+            [
+                SimpleNamespace(
+                    id=1,
+                    marketplace="ebay",
+                    ship_to_city="Denver",
+                    ship_to_state="CO",
+                    ship_to_postal_code="80202",
+                    ship_to_country="US",
+                    total_amount=100.0,
+                    order_status="paid",
+                    tracking_status="",
+                    shipped_at=None,
+                    delivered_at=None,
+                    sold_at=datetime(2026, 4, 1, 10, 0, 0),
+                ),
+                SimpleNamespace(
+                    id=2,
+                    marketplace="ebay",
+                    ship_to_city="Austin",
+                    ship_to_state="TX",
+                    ship_to_postal_code="78701",
+                    ship_to_country="US",
+                    total_amount=50.0,
+                    order_status="shipped",
+                    tracking_status="",
+                    shipped_at=None,
+                    delivered_at=None,
+                    sold_at=datetime(2026, 4, 2, 10, 0, 0),
+                ),
+            ],
+            start_date=date(2026, 4, 1),
+            end_date=date(2026, 4, 30),
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["destination"], "TX")
+        self.assertEqual(rows[0]["order_count"], 1)
+
+    def test_render_order_map_outputs_map_and_table(self) -> None:
+        fake_st = _FakeSt()
+        order = SimpleNamespace(
+            id=1,
+            marketplace="ebay",
+            order_status="shipped",
+            ship_to_city="Denver",
+            ship_to_state="CO",
+            ship_to_postal_code="80202",
+            ship_to_country="US",
+            total_amount=100.0,
+            shipped_at=datetime(2026, 4, 2, 10, 0, 0),
+            delivered_at=None,
+            sold_at=datetime(2026, 4, 1, 10, 0, 0),
+        )
+        repo = SimpleNamespace(list_orders=lambda: [order])
+        with patch.object(order_map, "st", fake_st), patch.object(order_map, "render_help_panel"), patch.object(
+            order_map, "utc_today", return_value=date(2026, 4, 30)
+        ):
+            order_map.render_order_map(repo)
+        self.assertEqual(len(fake_st.maps), 1)
+        self.assertEqual(len(fake_st.downloads), 1)
+        self.assertGreaterEqual(len(fake_st.dataframes), 1)
+        self.assertEqual(str(fake_st.dataframes[0].loc[0, "destination"]), "CO")
+        self.assertEqual(str(fake_st.dataframes[0].loc[0, "marketplaces"]), "ebay:1")
+        self.assertEqual(str(fake_st.dataframes[0].loc[0, "statuses"]), "shipped:1")
+        self.assertEqual(fake_st.downloads[0][1]["file_name"], "order_map_destinations_2025-04-30_2026-04-30.csv")
+        self.assertIn(b"destination,country,order_count", fake_st.downloads[0][1]["data"])
 
     def test_render_sales_with_side_panel(self) -> None:
         fake_st = _FakeSt()
@@ -530,6 +868,7 @@ class SmallViewsTests(unittest.TestCase):
             sold_price=120.0,
             fees=5.0,
             shipping_cost=4.0,
+            shipping_label_cost=2.0,
             quantity_sold=1,
             sold_at=sold_at,
             shipped_at=None,
@@ -548,6 +887,19 @@ class SmallViewsTests(unittest.TestCase):
 
             def list_sales(self):
                 return [sale_row]
+
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "sale_id": 10,
+                        "allocated_fee_actual": 7.5,
+                        "allocated_shipping_charged": 4.0,
+                        "allocated_shipping_actual": 4.25,
+                        "net_before_cogs_actual": 112.25,
+                        "actual_fee_source": "normalized_order_finance_entries_marketplace_fee_sum",
+                        "actual_shipping_source": "normalized_order_finance_entries_shipping_label_sum",
+                    }
+                ]
 
         repo = Repo()
         with patch.object(sales, "st", fake_st), patch.object(
@@ -574,6 +926,16 @@ class SmallViewsTests(unittest.TestCase):
         ):
             sales.render_sales(repo)
         self.assertGreaterEqual(len(fake_st.dataframes), 1)
+        rendered_df = fake_st.dataframes[0]
+        self.assertAlmostEqual(float(rendered_df.iloc[0]["actual_fee"]), 7.5)
+        self.assertAlmostEqual(float(rendered_df.iloc[0]["actual_shipping_label_cost"]), 4.25)
+        self.assertAlmostEqual(float(rendered_df.iloc[0]["net"]), 112.25)
+        self.assertEqual(
+            rendered_df.iloc[0]["actual_fee_source"],
+            "normalized_order_finance_entries_marketplace_fee_sum",
+        )
+        self.assertEqual(rendered_df.iloc[0]["net_source"], "actual_economics")
+        self.assertAlmostEqual(sales._sale_net_before_cogs(sale_row), 117.0)
 
     def test_render_sync_minimal(self) -> None:
         fake_st = _FakeSt()

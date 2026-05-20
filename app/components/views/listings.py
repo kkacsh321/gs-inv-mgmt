@@ -7,7 +7,6 @@ import re
 import time
 
 import pandas as pd
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit.errors import StreamlitAPIException
@@ -23,6 +22,7 @@ from app.components.views.shared import (
     MARKETPLACES,
     handoff_to_documents_draft,
     render_help_panel,
+    load_media_bytes,
     render_media_capture_inputs,
     render_media_file_actions,
     render_media_gallery,
@@ -44,8 +44,18 @@ from app.services.ai_quality import (
     is_weak_listing_title,
     load_ai_quality_policy,
 )
-from app.services.ebay_aspects import merge_ebay_aspects_defaults
-from app.services.ebay import EbayClient
+from app.services.ebay_aspects import (
+    merge_ebay_aspects_defaults,
+    missing_required_ebay_aspects,
+    normalize_ebay_category_aspect_rows,
+)
+from app.services.ebay import (
+    EBAY_DEFAULT_INVENTORY_CONDITIONS,
+    EBAY_MAX_CONDITION_DESCRIPTION_CHARS,
+    EbayClient,
+    ebay_condition_label,
+    normalize_ebay_condition_policy_rows,
+)
 from app.services.ebay_fee_estimator import estimate_ebay_fees
 from app.services.listing_orchestration import (
     build_channel_adapters,
@@ -56,6 +66,13 @@ from app.services.listing_readiness import evaluate_ebay_readiness
 from app.services.media_storage import MediaStorageService
 from app.services.runtime_settings import get_runtime_bool, get_runtime_str, get_runtime_values
 from app.services.validation import ValidationService, ValidationError
+from app.services.video_processing import (
+    is_ebay_video_upload_candidate,
+    is_mov_video_media,
+    is_mp4_video_media,
+    mp4_filename_for_media,
+    transcode_mov_to_mp4,
+)
 from app.services.workflow_contracts import build_listing_draft_payload, extract_listing_draft_payload
 from app.utils.time import utc_today, utcnow_naive
 
@@ -86,6 +103,7 @@ LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS = [
     "ebay_pub_upload_to_eps",
     "ebay_pub_upload_video_to_ebay",
     "ebay_pub_selected_images",
+    "ebay_pub_primary_image_label",
     "ebay_pub_selected_video",
     "ebay_pub_package_weight_oz",
     "ebay_pub_package_length_in",
@@ -109,6 +127,7 @@ LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS = [
     "ebay_pub_category_query",
     "ebay_pub_category_query_seed_product_id",
     "ebay_pub_category_suggestions",
+    "ebay_pub_category_aspect_rows",
     "ebay_pub_category_suggestion_select",
     "ebay_pub_manage_offer_id",
     "ebay_manage_offer_id_input",
@@ -172,6 +191,17 @@ def _known_unit_cost(product: object | None) -> float:
     )
 
 
+def _bundle_component(product: object, quantity_per_listing: int) -> dict[str, object]:
+    units = max(1, int(quantity_per_listing or 1))
+    return {
+        "product_id": int(getattr(product, "id", 0) or 0),
+        "sku": str(getattr(product, "sku", "") or "").strip(),
+        "title": str(getattr(product, "title", "") or "").strip(),
+        "quantity_per_listing": units,
+        "current_quantity": int(getattr(product, "current_quantity", 0) or 0),
+    }
+
+
 def _expected_net_score(
     *,
     fee_estimate: dict,
@@ -204,6 +234,57 @@ def _expected_net_score(
         "expected_net": expected_net,
         "expected_margin_pct_of_gross": expected_margin_pct,
         "score": score,
+    }
+
+
+def _build_listing_bundle_metadata(
+    *,
+    enabled: bool,
+    primary_product: object | None,
+    units_per_listing: int,
+    available_lots: int,
+    additional_components: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    lots = max(1, int(available_lots or 1))
+    if not enabled or primary_product is None:
+        return {
+            "enabled": False,
+            "components": [],
+            "units_per_listing_total": 1,
+            "available_lots": lots,
+            "inventory_units_committed": lots,
+        }
+    product_id = int(getattr(primary_product, "id", 0) or 0)
+    component = _bundle_component(primary_product, units_per_listing)
+    components = [component]
+    for extra in list(additional_components or []):
+        if not isinstance(extra, dict):
+            continue
+        try:
+            extra_product_id = int(extra.get("product_id") or 0)
+            extra_units = max(1, int(extra.get("quantity_per_listing") or 1))
+        except Exception:
+            continue
+        if extra_product_id <= 0 or extra_product_id == product_id:
+            continue
+        components.append(
+            {
+                "product_id": extra_product_id,
+                "sku": str(extra.get("sku") or "").strip(),
+                "title": str(extra.get("title") or "").strip(),
+                "quantity_per_listing": extra_units,
+                "current_quantity": max(0, int(extra.get("current_quantity") or 0)),
+            }
+        )
+    units_total = sum(max(1, int(row.get("quantity_per_listing") or 1)) for row in components)
+    return {
+        "enabled": True,
+        "kind": "mixed_product_bundle" if len(components) > 1 else "single_product_lot",
+        "primary_product_id": product_id,
+        "components": components,
+        "units_per_listing_total": units_total,
+        "available_lots": lots,
+        "inventory_units_committed": units_total * lots,
     }
 
 
@@ -397,6 +478,7 @@ def _queue_ebay_publish_category_id_update(category_id: str) -> None:
     resolved = str(category_id or "").strip()
     if not resolved:
         return
+    st.session_state["ebay_pub_last_category_id"] = resolved
     _queue_ebay_publish_updates_preserving_form(
         {"ebay_pub_category_id": resolved},
         flash=f"Applied category ID `{resolved}`.",
@@ -502,6 +584,255 @@ def _listing_publish_meta(listing) -> dict:
     except Exception:
         return {}
     return {}
+
+
+def _listing_marketplace_details_obj(raw_details: str) -> dict:
+    raw = str(raw_details or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"notes": raw}
+    except Exception:
+        return {"notes": raw}
+
+
+def _ebay_primary_image_metadata(selected_images: list[object], primary_image_label: str) -> dict:
+    primary_image_media = selected_images[0] if selected_images else None
+    return {
+        "primary_image_label": str(primary_image_label or "Auto").strip() or "Auto",
+        "primary_image_media_id": int(getattr(primary_image_media, "id", 0) or 0)
+        if primary_image_media is not None
+        else 0,
+        "primary_image_filename": str(getattr(primary_image_media, "original_filename", "") or "").strip()
+        if primary_image_media is not None
+        else "",
+    }
+
+
+def _is_ebay_mp4_video_media(media) -> bool:
+    return is_mp4_video_media(media)
+
+
+def _default_ebay_video_label(video_options: dict[str, object], preferred_media_id: int = 0) -> str:
+    preferred_id = int(preferred_media_id or 0)
+    if preferred_id > 0:
+        for label, media in (video_options or {}).items():
+            if int(getattr(media, "id", 0) or 0) == preferred_id and is_ebay_video_upload_candidate(media):
+                return str(label)
+    for label, media in (video_options or {}).items():
+        if is_ebay_video_upload_candidate(media):
+            return str(label)
+    return ""
+
+
+def _selected_ebay_video_warning(upload_video_to_ebay: bool, selected_video_label: str) -> str:
+    if not bool(upload_video_to_ebay):
+        return ""
+    if str(selected_video_label or "").strip() == "None":
+        return (
+            "Video upload is enabled, but no video is selected. "
+            "The listing will publish without an eBay video."
+        )
+    return ""
+
+
+def _coerce_selected_ebay_video_label(
+    *,
+    upload_video_to_ebay: bool,
+    selected_video_label: str,
+    default_video_label: str,
+    valid_video_labels: set[str],
+) -> str:
+    selected = str(selected_video_label or "").strip() or "None"
+    default = str(default_video_label or "").strip()
+    valid = set(valid_video_labels or {"None"})
+    if selected not in valid:
+        return default if default in valid else "None"
+    if bool(upload_video_to_ebay) and selected == "None" and default and default in valid:
+        return default
+    return selected
+
+
+def _verify_inventory_video_ids(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    sku: str,
+    expected_video_ids: list[str],
+    content_language: str = "en-US",
+    max_attempts: int = 3,
+    sleep_seconds: float = 1.0,
+) -> dict:
+    expected = [str(value or "").strip() for value in expected_video_ids if str(value or "").strip()]
+    if not expected:
+        return {"verified": True, "actual_video_ids": []}
+    last_payload: dict = {}
+    for attempt in range(1, max(1, int(max_attempts or 1)) + 1):
+        payload = ebay.get_inventory_item(
+            access_token=access_token,
+            sku=str(sku or "").strip(),
+            content_language=content_language,
+        )
+        last_payload = payload if isinstance(payload, dict) else {}
+        product_payload = last_payload.get("product") if isinstance(last_payload.get("product"), dict) else {}
+        actual = [str(value or "").strip() for value in product_payload.get("videoIds") or [] if str(value or "").strip()]
+        if all(video_id in actual for video_id in expected):
+            return {"verified": True, "actual_video_ids": actual, "attempts": attempt}
+        if attempt < max(1, int(max_attempts or 1)):
+            time.sleep(max(0.0, float(sleep_seconds or 0.0)))
+    product_payload = last_payload.get("product") if isinstance(last_payload.get("product"), dict) else {}
+    actual = [str(value or "").strip() for value in product_payload.get("videoIds") or [] if str(value or "").strip()]
+    raise RuntimeError(
+        "eBay inventory item did not retain listing videoIds after update. "
+        f"expected={expected}; actual={actual or []}"
+    )
+
+
+def _verify_trading_listing_video_ids(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    listing_id: str,
+    expected_video_ids: list[str],
+    marketplace_id: str = "EBAY_US",
+) -> dict:
+    expected = [str(value or "").strip() for value in expected_video_ids if str(value or "").strip()]
+    if not expected:
+        return {"verified": True, "actual_video_ids": []}
+    result = ebay.get_trading_item_video_ids(
+        access_token=access_token,
+        item_id=str(listing_id or "").strip(),
+        marketplace_id=marketplace_id,
+    )
+    actual = [str(value or "").strip() for value in result.get("video_ids") or [] if str(value or "").strip()]
+    if all(video_id in actual for video_id in expected):
+        return {**result, "verified": True, "actual_video_ids": actual}
+    raise RuntimeError(
+        "Trading GetItem did not return the expected listing video ID. "
+        f"listing_id={listing_id}; expected={expected}; actual={actual or []}"
+    )
+
+
+def _ebay_image_url_from_result(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    direct = str(result.get("imageUrl") or "").strip()
+    if direct:
+        return direct
+    nested = result.get("image")
+    if isinstance(nested, dict):
+        return str(nested.get("imageUrl") or "").strip()
+    return ""
+
+
+def _is_transient_ebay_media_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in [
+            " 500 ",
+            " 502 ",
+            " 503 ",
+            " 504 ",
+            "internal server error",
+            "service unavailable",
+            "gateway",
+            "timed out",
+            "timeout",
+            "temporarily",
+        ]
+    )
+
+
+def _create_eps_image_with_retry(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    media,
+    storage,
+    max_attempts: int = 3,
+) -> tuple[str, dict]:
+    original_url = str(getattr(media, "s3_url", "") or "").strip()
+    filename = str(getattr(media, "original_filename", "") or "image.jpg").strip() or "image.jpg"
+    content_type = str(getattr(media, "content_type", "") or "image/jpeg").strip() or "image/jpeg"
+    errors: list[str] = []
+
+    try:
+        image_bytes, image_content_type = _read_media_bytes(media, storage)
+    except Exception as exc:
+        image_bytes = None
+        image_content_type = ""
+        errors.append(f"media bytes unavailable: {exc}")
+
+    if image_bytes is not None:
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            try:
+                image_result = ebay.create_image_from_file(
+                    access_token=access_token,
+                    file_bytes=image_bytes,
+                    filename=filename,
+                    content_type=image_content_type or content_type,
+                )
+                eps_url = _ebay_image_url_from_result(image_result)
+                if eps_url:
+                    return eps_url, {
+                        "media_asset_id": int(getattr(media, "id", 0) or 0),
+                        "filename": filename,
+                        "source_url": original_url,
+                        "eps_url": eps_url,
+                        "mode": "file_upload",
+                        "attempts": attempt,
+                    }
+                raise RuntimeError("No imageUrl returned from eBay Media API file upload.")
+            except Exception as exc:
+                errors.append(f"file-upload attempt {attempt}: {exc}")
+                if attempt >= max_attempts or not _is_transient_ebay_media_error(exc):
+                    break
+                time.sleep(0.5 * attempt)
+
+    if original_url.startswith("https://"):
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            try:
+                image_result = ebay.create_image_from_url(access_token=access_token, image_url=original_url)
+                eps_url = _ebay_image_url_from_result(image_result)
+                if eps_url:
+                    return eps_url, {
+                        "media_asset_id": int(getattr(media, "id", 0) or 0),
+                        "filename": filename,
+                        "source_url": original_url,
+                        "eps_url": eps_url,
+                        "mode": "url_import",
+                        "attempts": attempt,
+                    }
+                raise RuntimeError("No imageUrl returned from eBay Media API URL import.")
+            except Exception as exc:
+                errors.append(f"url-import attempt {attempt}: {exc}")
+                if attempt >= max_attempts or not _is_transient_ebay_media_error(exc):
+                    break
+                time.sleep(0.5 * attempt)
+    else:
+        errors.append("URL import unavailable because media has no public HTTPS URL.")
+
+    raise RuntimeError("eBay EPS image hosting failed; direct/self-hosted image fallback is disabled. " + " | ".join(errors[:6]))
+
+
+def _merge_ebay_publish_metadata(raw_details: str, metadata: dict) -> str:
+    details_obj = _listing_marketplace_details_obj(raw_details)
+    publish_meta = details_obj.get("ebay_publish")
+    if not isinstance(publish_meta, dict):
+        publish_meta = {}
+    publish_meta.update(metadata or {})
+    details_obj["ebay_publish"] = publish_meta
+    return json.dumps(details_obj, indent=2)
+
+
+def _merge_bundle_metadata(raw_details: str, bundle_metadata: dict) -> str:
+    details_obj = _listing_marketplace_details_obj(raw_details)
+    details_obj["bundle"] = bundle_metadata or {"enabled": False}
+    return json.dumps(details_obj, indent=2)
 
 
 def _listing_is_archived(listing) -> bool:
@@ -634,6 +965,77 @@ def _normalize_aspects_payload(raw_text: str) -> dict[str, list[str]]:
         if vals:
             out[name] = vals
     return out
+
+
+def _norm_aspect_name(value: object) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _category_aspect_table_rows(
+    category_aspects: list[dict[str, object]],
+    existing_aspects: dict[str, list[str]],
+) -> list[dict[str, object]]:
+    existing_keys = {_norm_aspect_name(key): values for key, values in (existing_aspects or {}).items()}
+    rows: list[dict[str, object]] = []
+    for row in normalize_ebay_category_aspect_rows(category_aspects):
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        values = row.get("values") or []
+        current_values = existing_keys.get(_norm_aspect_name(name)) or []
+        rows.append(
+            {
+                "aspect": name,
+                "required": "yes" if bool(row.get("required")) else "no",
+                "status": "filled" if current_values else "missing",
+                "usage": str(row.get("usage") or ""),
+                "mode": str(row.get("mode") or ""),
+                "allowed_values": ", ".join(str(value) for value in values[:8]),
+            }
+        )
+    return rows
+
+
+def _category_aspect_input_key(prefix: str, aspect_name: str) -> str:
+    digest = hashlib.sha1(str(aspect_name or "").strip().lower().encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{digest}"
+
+
+def _condition_option_labels(condition_rows: list[dict[str, object]], current_condition: str = "") -> dict[str, str]:
+    rows = condition_rows if isinstance(condition_rows, list) else []
+    labels: dict[str, str] = {}
+    for row in rows:
+        condition = str((row or {}).get("condition") or "").strip().upper()
+        if not condition:
+            continue
+        label = str((row or {}).get("label") or "").strip() or ebay_condition_label(condition)
+        condition_id = str((row or {}).get("condition_id") or "").strip()
+        labels[condition] = f"{label} ({condition})" + (f" / eBay ID {condition_id}" if condition_id else "")
+    if not labels:
+        labels = {condition: ebay_condition_label(condition) for condition in EBAY_DEFAULT_INVENTORY_CONDITIONS}
+    current = str(current_condition or "").strip().upper()
+    if current and current not in labels:
+        labels[current] = f"{ebay_condition_label(current)} ({current}) - not in loaded category policy"
+    return labels
+
+
+def _condition_options(condition_rows: list[dict[str, object]], current_condition: str = "") -> list[str]:
+    labels = _condition_option_labels(condition_rows, current_condition)
+    ordered = [str((row or {}).get("condition") or "").strip().upper() for row in (condition_rows or [])]
+    options = [condition for condition in ordered if condition in labels]
+    if not options:
+        options = [condition for condition in EBAY_DEFAULT_INVENTORY_CONDITIONS if condition in labels]
+    current = str(current_condition or "").strip().upper()
+    if current and current not in options:
+        options.append(current)
+    return options
+
+
+def _is_condition_valid_for_loaded_policy(condition_rows: list[dict[str, object]], condition: str) -> bool:
+    if not condition_rows:
+        return True
+    allowed = {str((row or {}).get("condition") or "").strip().upper() for row in condition_rows}
+    return str(condition or "").strip().upper() in allowed
 
 
 def _normalize_volume_pricing_tiers(
@@ -1313,17 +1715,10 @@ def _maybe_add_package_data(
 
 
 def _read_media_bytes(media, storage: MediaStorageService) -> tuple[bytes, str]:
-    if storage is not None and storage.enabled and media.s3_bucket and media.s3_key:
-        try:
-            return storage.get_object_bytes(media.s3_bucket, media.s3_key)
-        except Exception:
-            pass
-    if media.s3_url:
-        response = requests.get(media.s3_url, timeout=30)
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type") or media.content_type or "application/octet-stream"
-        return response.content, content_type
-    raise RuntimeError("Media file bytes could not be loaded from storage or URL.")
+    media_bytes, content_type, error = load_media_bytes(media, storage=storage)
+    if media_bytes is not None:
+        return media_bytes, content_type or getattr(media, "content_type", None) or "application/octet-stream"
+    raise RuntimeError(error or "Media file bytes could not be loaded from storage or URL.")
 
 
 def _is_ebay_inventory_internal_error(exc: Exception) -> bool:
@@ -1343,6 +1738,7 @@ def _create_or_replace_inventory_item_with_fallback(
     sku: str,
     payload: dict,
     content_language: str,
+    preserve_video_ids: bool = False,
 ) -> tuple[bool, str]:
     try:
         ebay.create_or_replace_inventory_item(
@@ -1358,8 +1754,9 @@ def _create_or_replace_inventory_item_with_fallback(
         fallback_payload = dict(payload)
         if isinstance(fallback_payload.get("product"), dict):
             fallback_product = dict(fallback_payload["product"])
-            # Remove video IDs on fallback because inventory service can 500 on mixed media states.
-            fallback_product.pop("videoIds", None)
+            if not preserve_video_ids:
+                # Remove video IDs on fallback because inventory service can 500 on mixed media states.
+                fallback_product.pop("videoIds", None)
             fallback_payload["product"] = fallback_product
         fallback_payload.pop("packageWeightAndSize", None)
         time.sleep(1.0)
@@ -1933,6 +2330,7 @@ def _execute_batch_publish_for_listing(
     return_policy_id: str,
     category_id: str,
     product_by_id: dict[int, Product] | None = None,
+    listing_media_rows: list[object] | None = None,
 ) -> dict:
     listing_id = int(listing_obj.id)
     offer_id = ""
@@ -1949,7 +2347,8 @@ def _execute_batch_publish_for_listing(
             product_obj = repo.db.get(Product, int(listing_obj.product_id))
         if product_obj is None:
             raise ValueError("Linked product not found.")
-        listing_media_rows = repo.list_media_assets_for_listing(int(listing_id))
+        if listing_media_rows is None:
+            listing_media_rows = repo.list_media_assets_for_listing(int(listing_id))
         image_urls = [
             str(m.s3_url or "").strip()
             for m in listing_media_rows
@@ -2009,7 +2408,12 @@ def _execute_batch_publish_for_listing(
             marketplace_id=marketplace_id,
             format_type="FIXED_PRICE",
         )
-        publish_result = ebay.publish_offer(access_token=access_token, offer_id=offer_id)
+        publish_result = ebay.publish_offer(
+            access_token=access_token,
+            offer_id=offer_id,
+            inventory_sku=str(product_obj.sku or "").strip(),
+            content_language=content_language,
+        )
         external_listing_id = str(publish_result.get("listingId") or "").strip()
         if not external_listing_id:
             raise RuntimeError("eBay publishOffer did not return listingId.")
@@ -2117,6 +2521,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     if isinstance(publish_flash, dict) and publish_flash:
         level = str(publish_flash.get("level") or "info").strip().lower()
         message = str(publish_flash.get("message") or "").strip()
+        warning_message = str(publish_flash.get("warning") or "").strip()
         offer_id = str(publish_flash.get("offer_id") or "").strip()
         listing_url = str(publish_flash.get("listing_url") or "").strip()
         if level == "error":
@@ -2125,6 +2530,8 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             st.warning(message or "eBay publish action completed with warnings.")
         else:
             st.success(message or "eBay publish action completed.")
+        if warning_message:
+            st.warning(warning_message)
         meta_bits: list[str] = []
         if offer_id:
             meta_bits.append(f"offer_id={offer_id}")
@@ -2175,7 +2582,35 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             "Listings workflow telemetry is deferred. Enable `Load Listings Workflow Telemetry (slower)` "
             "to load workspace feedback and completion state."
         )
-    products = repo.list_products()
+    st.markdown("### Product Working Set")
+    pw1, pw2 = st.columns([1, 1])
+    with pw1:
+        load_all_products = st.checkbox(
+            "Load All Products (slower)",
+            value=False,
+            key="listings_load_all_products",
+            help="When off, Listings product selectors use a recent bounded product set for faster page loads.",
+        )
+    with pw2:
+        recent_product_limit = st.number_input(
+            "Recent Product Limit",
+            min_value=50,
+            max_value=1000,
+            value=500,
+            step=50,
+            key="listings_recent_product_limit",
+            disabled=bool(load_all_products),
+        )
+    products = repo.list_products(
+        limit=None if bool(load_all_products) else int(recent_product_limit or 500)
+    )
+    if load_all_products:
+        st.caption(f"Loaded all product rows: {len(products)}.")
+    else:
+        st.caption(
+            f"Loaded latest {len(products)} product row(s). Enable `Load All Products (slower)` "
+            "to use full product history in create/bulk selectors."
+        )
 
     if not products:
         st.info("Create at least one product before adding listings.")
@@ -2700,6 +3135,109 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
         with c3:
             st.text_input("Initial Status", value="draft", disabled=True)
+        create_bundle_enabled = st.checkbox(
+            "This listing is a product lot / bundle",
+            value=False,
+            key="create_listing_bundle_enabled",
+            help=(
+                "Use when one marketplace listing unit contains multiple inventory units, "
+                "for example one eBay listing for a lot of 10 coins."
+            ),
+        )
+        create_bundle_primary_qty = 1
+        create_bundle_metadata = _build_listing_bundle_metadata(
+            enabled=False,
+            primary_product=selected_product,
+            units_per_listing=1,
+            available_lots=int(quantity_listed),
+        )
+        create_bundle_overcommit = False
+        if create_bundle_enabled:
+            current_stock_qty = int(getattr(selected_product, "current_quantity", 0) or 0) if selected_product is not None else 0
+            create_bundle_primary_qty = int(
+                st.number_input(
+                    "Units of selected product per listing",
+                    min_value=1,
+                    max_value=max(1, current_stock_qty),
+                    value=max(1, min(max(1, current_stock_qty), int(st.session_state.get("create_listing_bundle_primary_qty") or 1))),
+                    step=1,
+                    key="create_listing_bundle_primary_qty",
+                )
+            )
+            create_bundle_extra_options = {
+                label: pid
+                for label, pid in product_map.items()
+                if int(pid or 0) != int(selected_product_id or 0)
+            }
+            st.session_state["create_listing_bundle_extra_product_labels"] = [
+                label
+                for label in list(st.session_state.get("create_listing_bundle_extra_product_labels") or [])
+                if label in create_bundle_extra_options
+            ]
+            create_bundle_extra_labels = st.multiselect(
+                "Additional products in this bundle",
+                options=list(create_bundle_extra_options.keys()),
+                key="create_listing_bundle_extra_product_labels",
+                help="Optional. Choose extra products included in each marketplace listing unit.",
+            )
+            create_bundle_extra_components: list[dict[str, object]] = []
+            for extra_label in create_bundle_extra_labels:
+                extra_product_id = int(create_bundle_extra_options.get(extra_label) or 0)
+                extra_product = product_by_id.get(extra_product_id)
+                if extra_product is None:
+                    continue
+                extra_stock_qty = int(getattr(extra_product, "current_quantity", 0) or 0)
+                extra_qty = int(
+                    st.number_input(
+                        f"Units of {getattr(extra_product, 'sku', '') or extra_product_id} per listing",
+                        min_value=1,
+                        max_value=max(1, extra_stock_qty),
+                        value=max(
+                            1,
+                            min(
+                                max(1, extra_stock_qty),
+                                int(st.session_state.get(f"create_listing_bundle_extra_qty_{extra_product_id}") or 1),
+                            ),
+                        ),
+                        step=1,
+                        key=f"create_listing_bundle_extra_qty_{extra_product_id}",
+                    )
+                )
+                create_bundle_extra_components.append(_bundle_component(extra_product, extra_qty))
+            create_bundle_metadata = _build_listing_bundle_metadata(
+                enabled=True,
+                primary_product=selected_product,
+                units_per_listing=int(create_bundle_primary_qty),
+                available_lots=int(quantity_listed),
+                additional_components=create_bundle_extra_components,
+            )
+            committed_units = int(create_bundle_metadata.get("inventory_units_committed") or 0)
+            create_bundle_overcommitted_components: list[str] = []
+            for component in list(create_bundle_metadata.get("components") or []):
+                if not isinstance(component, dict):
+                    continue
+                units_needed = max(1, int(component.get("quantity_per_listing") or 1)) * int(quantity_listed)
+                stock_qty = max(0, int(component.get("current_quantity") or 0))
+                if units_needed > stock_qty:
+                    create_bundle_overcommitted_components.append(
+                        f"{component.get('sku') or component.get('product_id')}: needs {units_needed}, stock {stock_qty}"
+                    )
+            create_bundle_overcommit = bool(create_bundle_overcommitted_components)
+            create_bundle_bits = [
+                f"{row.get('sku') or row.get('product_id')} x {int(row.get('quantity_per_listing') or 1)}"
+                for row in list(create_bundle_metadata.get("components") or [])
+                if isinstance(row, dict)
+            ]
+            st.caption(
+                f"Bundle composition per listing: {', '.join(create_bundle_bits)}. "
+                f"{int(quantity_listed)} available lot(s) commits {committed_units} total inventory unit(s)."
+            )
+            if create_bundle_overcommit:
+                st.warning(
+                    "This bundle quantity exceeds current stock: "
+                    + " | ".join(create_bundle_overcommitted_components)
+                    + "."
+                )
         listing_status = "draft"
         st.caption("New listings are always created as `draft` until reviewed.")
         listed_date = st.date_input("Listed Date", value=utc_today(), key="create_listing_listed_date")
@@ -2816,6 +3354,8 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                         if selected_product is not None and selected_product.coin_reference_id is not None
                         else None
                     )
+                    if create_bundle_overcommit:
+                        raise ValidationError("Lot/bundle composition exceeds selected product stock.")
                     title_seed = listing_title.strip()
                     if not title_seed and auto_title_from_product and selected_product is not None:
                         if selected_coin_ref is not None:
@@ -2905,6 +3445,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                             resolved_marketplace_details,
                             create_ebay_publish_defaults,
                         )
+                    resolved_marketplace_details = _merge_bundle_metadata(
+                        resolved_marketplace_details,
+                        create_bundle_metadata,
+                    )
                     template_loaded_id = st.session_state.get("create_listing_template_loaded_id")
                     template_loaded_name = str(
                         st.session_state.get("create_listing_template_loaded_name") or ""
@@ -2959,7 +3503,49 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 except (ValueError, ValidationError) as exc:
                     st.error(str(exc))
 
-    listings = repo.list_listings()
+    st.markdown("### Listing Working Set")
+    ws1, ws2 = st.columns([1, 1])
+    with ws1:
+        load_all_listings = st.checkbox(
+            "Load All Listings (slower)",
+            value=False,
+            key="listings_load_all_rows",
+            help="When off, Listings works from the most recent rows for faster page loads.",
+        )
+    with ws2:
+        recent_listing_limit = st.number_input(
+            "Recent Listing Limit",
+            min_value=50,
+            max_value=5000,
+            value=500,
+            step=50,
+            key="listings_recent_row_limit",
+            disabled=bool(load_all_listings),
+        )
+    listings = repo.list_listings(
+        limit=None if bool(load_all_listings) else int(recent_listing_limit or 500)
+    )
+    if load_all_listings:
+        st.caption(f"Loaded all listing rows: {len(listings)}.")
+    else:
+        st.caption(
+            f"Loaded latest {len(listings)} listing row(s). Enable `Load All Listings (slower)` "
+            "for full-history filtering/export."
+        )
+    referenced_product_ids = {
+        int(getattr(row, "product_id", 0) or 0)
+        for row in listings
+        if int(getattr(row, "product_id", 0) or 0) > 0
+    }
+    missing_product_ids = sorted(pid for pid in referenced_product_ids if pid not in product_by_id)
+    if missing_product_ids:
+        referenced_products = repo.list_products(product_ids=missing_product_ids, limit=len(missing_product_ids))
+        for product_row in referenced_products:
+            product_by_id[int(product_row.id)] = product_row
+        products = list(product_by_id.values())
+        st.caption(
+            f"Loaded {len(referenced_products)} additional product row(s) referenced by the current listing set."
+        )
     listing_media_counts: dict[int, int] = {}
     listing_publish_meta_cache: dict[int, dict] = {}
 
@@ -3232,6 +3818,31 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         listing_ids = [int(getattr(row, "id", 0) or 0) for row in listings if int(getattr(row, "id", 0) or 0) > 0]
         listing_media_counts = repo.listing_media_count_map(listing_ids=listing_ids)
     listing_obj_by_id: dict[int, object] = {int(getattr(l, "id", 0) or 0): l for l in listings}
+    listing_media_rows_cache: dict[int, list[object]] = {}
+
+    def _listing_media_rows_cached(listing_id: int) -> list[object]:
+        resolved_listing_id = int(listing_id or 0)
+        if resolved_listing_id <= 0:
+            return []
+        if resolved_listing_id not in listing_media_rows_cache:
+            listing_media_rows_cache[resolved_listing_id] = list(
+                repo.list_media_assets_for_listing(resolved_listing_id)
+            )
+        return list(listing_media_rows_cache[resolved_listing_id])
+
+    def _listing_media_count_cached(listing_id: int) -> int:
+        resolved_listing_id = int(listing_id or 0)
+        if resolved_listing_id <= 0:
+            return 0
+        if resolved_listing_id in listing_media_rows_cache:
+            return len(listing_media_rows_cache[resolved_listing_id])
+        if load_listing_media_counts:
+            return int(listing_media_counts.get(resolved_listing_id, 0))
+        try:
+            return int(repo.count_media_assets_for_listing(resolved_listing_id))
+        except Exception:
+            return 0
+
     listing_format_diagnostics_cache: dict[int, tuple[str, str]] = {}
 
     def _resolve_listing_format_diagnostics(listing_obj: object) -> tuple[str, str]:
@@ -3938,6 +4549,28 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         readiness_rows: list[dict] = []
         readiness_row_by_listing_id: dict[int, dict] = {}
         readiness_created_at_by_listing_id: dict[int, datetime] = {}
+        readiness_category_aspects_cache: dict[tuple[str, str], list[dict]] = {}
+
+        def _cached_readiness_category_aspects(category_id_value: str) -> list[dict]:
+            category_id_clean = str(category_id_value or "").strip()
+            if not category_id_clean:
+                return []
+            runtime_defaults_for_readiness = _get_runtime_defaults_for_readiness()
+            marketplace_id_clean = str(
+                runtime_defaults_for_readiness.get("ebay_marketplace_id") or settings.ebay_marketplace_id or "EBAY_US"
+            ).strip()
+            cache_key = (marketplace_id_clean.upper(), category_id_clean)
+            if cache_key in readiness_category_aspects_cache:
+                return list(readiness_category_aspects_cache.get(cache_key) or [])
+            cached = repo.get_cached_ebay_category_aspects(
+                environment=settings.app_env,
+                marketplace_id=marketplace_id_clean,
+                category_id=category_id_clean,
+            )
+            rows = normalize_ebay_category_aspect_rows((cached or {}).get("aspects") or []) if cached else []
+            readiness_category_aspects_cache[cache_key] = list(rows)
+            return list(rows)
+
         for listing in (ebay_active_listings if load_readiness_evaluation else []):
             publish_meta = _listing_publish_meta_cached(listing)
             format_type = str(
@@ -3960,6 +4593,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             auction_reserve_price = _to_float(publish_meta.get("auction_reserve_price"), 0.0)
             auction_buy_now_price = _to_float(publish_meta.get("auction_buy_now_price"), 0.0)
             best_offer_enabled = bool(publish_meta.get("best_offer_enabled"))
+            readiness_category_id = str(publish_meta.get("category_id") or default_category_id or "").strip()
+            readiness_aspects = publish_meta.get("aspects")
+            if not isinstance(readiness_aspects, dict):
+                readiness_aspects = _normalize_aspects_payload(str(publish_meta.get("aspects_json") or ""))
             readiness = evaluate_ebay_readiness(
                 listing_title=listing.listing_title,
                 listing_price=float(listing.listing_price or 0),
@@ -3971,11 +4608,14 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 format_type=format_type,
                 listing_duration=listing_duration,
                 media_count=int(listing_media_counts.get(int(listing.id), 0)),
-                category_id=default_category_id,
+                category_id=readiness_category_id,
                 merchant_location_key=default_merchant_location_key,
                 payment_policy_id=default_payment_policy_id,
                 fulfillment_policy_id=default_fulfillment_policy_id,
                 return_policy_id=default_return_policy_id,
+                aspects=readiness_aspects,
+                condition_description=str(publish_meta.get("condition_description") or ""),
+                category_aspects=_cached_readiness_category_aspects(readiness_category_id),
             )
             review_status = (listing.review_status or "pending").strip().lower()
             blockers = list(readiness.blockers)
@@ -5151,6 +5791,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                                             return_policy_id=str(publish_defaults.get("return_policy_id") or ""),
                                             category_id=str(publish_defaults.get("category_id") or ""),
                                             product_by_id=product_by_id,
+                                            listing_media_rows=_listing_media_rows_cached(int(listing_id)),
                                         )
                                     )
                                 result_df = pd.DataFrame(result_rows)
@@ -5449,6 +6090,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                                                 return_policy_id=str(publish_defaults.get("return_policy_id") or ""),
                                                 category_id=str(publish_defaults.get("category_id") or ""),
                                                 product_by_id=product_by_id,
+                                                listing_media_rows=_listing_media_rows_cached(int(listing_id)),
                                             )
                                         )
                                     retry_df = pd.DataFrame(retry_rows)
@@ -5552,12 +6194,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     "to include related sales/orders and review history."
                 )
             selected_listing_id = int(selected_listing.id)
-            media_count = int(listing_media_counts.get(selected_listing_id, 0))
-            if not load_listing_media_counts:
-                try:
-                    media_count = int(repo.count_media_assets_for_listing(selected_listing_id))
-                except Exception:
-                    media_count = 0
+            media_count = _listing_media_count_cached(selected_listing_id)
             linked_product = (
                 product_by_id.get(int(selected_listing.product_id or 0))
                 if selected_listing.product_id
@@ -6061,7 +6698,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 for error in errors:
                     st.error(f"Upload failed: {error}")
 
-        listing_media = repo.list_media_assets_for_listing(selected_listing.id)
+        listing_media = _listing_media_rows_cached(int(selected_listing.id))
         if not listing_media:
             st.info("No media currently attached to this listing.")
         else:
@@ -6102,21 +6739,49 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 export_df_factory=_listing_media_export_df,
             )
             _render_listings_df(listing_media_df, total_rows=listing_media_total_rows)
-            render_media_gallery(
-                listing_media,
-                section_title="Listing Media Preview Gallery",
-                columns=3,
-                storage=storage,
+            show_listing_media_previews = st.checkbox(
+                "Show Listing Media Preview Gallery (slower)",
+                value=False,
+                key=f"listings_show_media_preview_gallery_{int(selected_listing.id)}",
+                help=(
+                    "Defers media preview rendering. The table above is DB-only; previews can require browser "
+                    "or storage fetches for images/videos."
+                ),
             )
-            render_media_file_actions(
-                listing_media,
-                storage=storage,
-                key_prefix=f"listing_media_file_actions_{selected_listing.id}",
-                section_title="Listing Media File Access",
-                repo=repo,
-                actor=user.username,
-                user=user,
+            if show_listing_media_previews:
+                render_media_gallery(
+                    listing_media,
+                    section_title="Listing Media Preview Gallery",
+                    columns=3,
+                    storage=storage,
+                    prefer_url_previews=True,
+                )
+            else:
+                st.caption(
+                    "Media previews are deferred. Enable `Show Listing Media Preview Gallery (slower)` "
+                    "to render image/video previews."
+                )
+            show_listing_media_file_actions = st.checkbox(
+                "Load Listing Media File Access + Downloads (slower)",
+                value=False,
+                key=f"listings_show_media_file_actions_{int(selected_listing.id)}",
+                help="Loads selected file preview/download controls only when needed.",
             )
+            if show_listing_media_file_actions:
+                render_media_file_actions(
+                    listing_media,
+                    storage=storage,
+                    key_prefix=f"listing_media_file_actions_{selected_listing.id}",
+                    section_title="Listing Media File Access",
+                    repo=repo,
+                    actor=user.username,
+                    user=user,
+                )
+            else:
+                st.caption(
+                    "Media file access/download controls are deferred. Enable the checkbox above when you need "
+                    "to preview or download stored media bytes."
+                )
 
     st.markdown("### Publish Selected Listing To eBay")
     st.caption(
@@ -6167,14 +6832,20 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     )
     publish_meta = _listing_publish_meta_cached(selected_listing)
     preset_rows: list[object] = []
-    image_media_items = [m for m in listing_media if m.media_type == "image"]
-    video_media_items = [m for m in listing_media if m.media_type == "video"]
+    publish_media_rows = _listing_media_rows_cached(int(selected_listing.id))
+    image_media_items = [m for m in publish_media_rows if m.media_type == "image"]
+    video_media_items = [m for m in publish_media_rows if m.media_type == "video"]
     image_options = {
         f"#{m.id} | {m.original_filename}": m for m in image_media_items
     }
     video_options = {
         f"#{m.id} | {m.original_filename}": m for m in video_media_items
     }
+    prior_video_upload_meta = publish_meta.get("video_upload") if isinstance(publish_meta.get("video_upload"), dict) else {}
+    default_video_label = _default_ebay_video_label(
+        video_options,
+        preferred_media_id=int(_to_float((prior_video_upload_meta or {}).get("media_asset_id"), 0.0)),
+    )
     publish_formats = ["FIXED_PRICE", "AUCTION"]
     auction_durations = ["DAYS_1", "DAYS_3", "DAYS_5", "DAYS_7", "DAYS_10"]
     condition_options = ["NEW", "LIKE_NEW", "USED_EXCELLENT", "USED_VERY_GOOD", "USED_GOOD", "USED_ACCEPTABLE"]
@@ -6241,9 +6912,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         "ebay_pub_currency": default_currency,
         "ebay_pub_content_language": default_content_language,
         "ebay_pub_upload_to_eps": True,
-        "ebay_pub_upload_video_to_ebay": False,
+        "ebay_pub_upload_video_to_ebay": bool(default_video_label),
         "ebay_pub_selected_images": list(image_options.keys()),
-        "ebay_pub_selected_video": "None",
+        "ebay_pub_selected_video": default_video_label or "None",
         "ebay_pub_package_weight_oz": max(0.0, _to_float(product.package_weight_oz, 0.0)),
         "ebay_pub_package_length_in": max(0.0, _to_float(product.package_length_in, 0.0)),
         "ebay_pub_package_width_in": max(0.0, _to_float(product.package_width_in, 0.0)),
@@ -6373,6 +7044,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             "ebay_pub_content_language": str(
                 publish_meta.get("content_language") or defaults["ebay_pub_content_language"]
             ).strip(),
+            "ebay_pub_upload_video_to_ebay": bool(
+                default_video_label and publish_meta.get("upload_video_to_ebay", defaults["ebay_pub_upload_video_to_ebay"])
+            ),
+            "ebay_pub_selected_video": default_video_label or "None",
             "ebay_pub_package_weight_oz": max(
                 0.0,
                 float(_to_float(publish_meta.get("package_weight_oz"), defaults["ebay_pub_package_weight_oz"])),
@@ -6529,8 +7204,14 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         or list(image_options.keys()),
     )
     valid_video_labels = {"None"} | set(video_options.keys())
-    if st.session_state.get("ebay_pub_selected_video") not in valid_video_labels:
-        _safe_session_set("ebay_pub_selected_video", "None")
+    coerced_video_label = _coerce_selected_ebay_video_label(
+        upload_video_to_ebay=bool(st.session_state.get("ebay_pub_upload_video_to_ebay")),
+        selected_video_label=str(st.session_state.get("ebay_pub_selected_video") or "None"),
+        default_video_label=default_video_label,
+        valid_video_labels=valid_video_labels,
+    )
+    if st.session_state.get("ebay_pub_selected_video") != coerced_video_label:
+        _safe_session_set("ebay_pub_selected_video", coerced_video_label)
 
     if load_publish_draft_and_presets:
         st.markdown("#### eBay Publish Presets")
@@ -6924,7 +7605,234 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 _queue_ebay_publish_category_id_update(selected_id)
                 st.rerun()
     current_category_state = str(st.session_state.get("ebay_pub_category_id") or "").strip()
+    last_category_state = str(st.session_state.get("ebay_pub_last_category_id") or "").strip()
+    last_category_listing_id = int(st.session_state.get("ebay_pub_last_category_listing_id") or 0)
+    current_listing_id = int(getattr(selected_listing, "id", 0) or 0)
+    last_category_matches_listing = (
+        not current_listing_id
+        or not last_category_listing_id
+        or last_category_listing_id == current_listing_id
+    )
+    if not current_category_state and last_category_state and last_category_matches_listing:
+        current_category_state = last_category_state
+        st.session_state["ebay_pub_category_id"] = last_category_state
+    if current_category_state:
+        st.session_state["ebay_pub_last_category_id"] = current_category_state
+        st.session_state["ebay_pub_last_category_listing_id"] = current_listing_id
     st.caption(f"Current Category ID in form state: `{current_category_state or '(empty)'}`")
+
+    category_condition_rows = st.session_state.get("ebay_pub_category_condition_rows")
+    if not isinstance(category_condition_rows, list):
+        category_condition_rows = []
+    condition_policy_marketplace_id = str(
+        st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id or "EBAY_US"
+    ).strip()
+    condition_policy_signature = f"{condition_policy_marketplace_id.upper()}:{current_category_state}"
+    if (
+        current_category_state
+        and st.session_state.get("ebay_pub_category_condition_signature") != condition_policy_signature
+    ):
+        category_condition_rows = []
+        st.session_state["ebay_pub_category_condition_rows"] = []
+        st.session_state["ebay_pub_category_condition_signature"] = condition_policy_signature
+    elif not current_category_state and category_condition_rows:
+        category_condition_rows = []
+        st.session_state["ebay_pub_category_condition_rows"] = []
+        st.session_state["ebay_pub_category_condition_signature"] = ""
+
+    cc1, cc2, cc3 = st.columns([1, 1, 2])
+    with cc1:
+        if st.button("Load Category Conditions", key="ebay_pub_load_conditions_btn"):
+            token_for_condition_lookup = str(st.session_state.get("ebay_pub_access_token") or "").strip() or str(
+                default_token or ""
+            ).strip()
+            if not current_category_state:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not token_for_condition_lookup:
+                st.warning("Missing eBay user access token.")
+            else:
+                try:
+                    policies = ebay.get_item_condition_policies(
+                        access_token=token_for_condition_lookup,
+                        category_id=current_category_state,
+                        marketplace_id=condition_policy_marketplace_id,
+                    )
+                    category_condition_rows = normalize_ebay_condition_policy_rows(
+                        policies,
+                        category_id=current_category_state,
+                    )
+                    st.session_state["ebay_pub_category_condition_rows"] = category_condition_rows
+                    st.session_state["ebay_pub_category_condition_signature"] = condition_policy_signature
+                    current_condition = str(st.session_state.get("ebay_pub_condition") or "").strip().upper()
+                    if category_condition_rows and not _is_condition_valid_for_loaded_policy(
+                        category_condition_rows,
+                        current_condition,
+                    ):
+                        st.session_state["ebay_pub_condition"] = str(category_condition_rows[0]["condition"])
+                    st.success(f"Loaded {len(category_condition_rows)} eBay category condition option(s).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Category condition fetch failed: {exc}")
+    with cc2:
+        if st.button("Refresh Category Conditions", key="ebay_pub_refresh_conditions_btn"):
+            token_for_condition_lookup = str(st.session_state.get("ebay_pub_access_token") or "").strip() or str(
+                default_token or ""
+            ).strip()
+            if not current_category_state:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not token_for_condition_lookup:
+                st.warning("Missing eBay user access token.")
+            else:
+                try:
+                    policies = ebay.get_item_condition_policies(
+                        access_token=token_for_condition_lookup,
+                        category_id=current_category_state,
+                        marketplace_id=condition_policy_marketplace_id,
+                    )
+                    category_condition_rows = normalize_ebay_condition_policy_rows(
+                        policies,
+                        category_id=current_category_state,
+                    )
+                    st.session_state["ebay_pub_category_condition_rows"] = category_condition_rows
+                    st.session_state["ebay_pub_category_condition_signature"] = condition_policy_signature
+                    current_condition = str(st.session_state.get("ebay_pub_condition") or "").strip().upper()
+                    if category_condition_rows and not _is_condition_valid_for_loaded_policy(
+                        category_condition_rows,
+                        current_condition,
+                    ):
+                        st.session_state["ebay_pub_condition"] = str(category_condition_rows[0]["condition"])
+                    st.success(f"Refreshed {len(category_condition_rows)} eBay category condition option(s).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Category condition refresh failed: {exc}")
+    with cc3:
+        if category_condition_rows:
+            st.caption(
+                f"eBay category conditions loaded for `{current_category_state}`: "
+                + ", ".join(
+                    f"{row.get('label')} ({row.get('condition')})"
+                    for row in category_condition_rows[:6]
+                )
+            )
+        else:
+            st.caption(
+                "Category-specific condition policy not loaded yet. Load it before publish to avoid eBay 25021 "
+                "condition/category mismatches."
+            )
+
+    current_condition_state = str(st.session_state.get("ebay_pub_condition") or "NEW").strip().upper()
+    condition_options = _condition_options(category_condition_rows, current_condition_state)
+    condition_option_labels = _condition_option_labels(category_condition_rows, current_condition_state)
+
+    category_aspect_rows = st.session_state.get("ebay_pub_category_aspect_rows")
+    if not isinstance(category_aspect_rows, list):
+        category_aspect_rows = []
+    aspect_cache_marketplace_id = str(
+        st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id or "EBAY_US"
+    ).strip()
+    aspect_cache_signature = f"{aspect_cache_marketplace_id.upper()}:{current_category_state}"
+    if current_category_state and st.session_state.get("ebay_pub_category_aspect_signature") != aspect_cache_signature:
+        category_aspect_rows = []
+        st.session_state["ebay_pub_category_aspect_rows"] = category_aspect_rows
+        st.session_state["ebay_pub_category_aspect_signature"] = aspect_cache_signature
+    elif not current_category_state and category_aspect_rows:
+        category_aspect_rows = []
+        st.session_state["ebay_pub_category_aspect_rows"] = []
+        st.session_state["ebay_pub_category_aspect_signature"] = ""
+    car1, car2, car3 = st.columns([1, 1, 2])
+    with car1:
+        if st.button("Load Required Item Specifics", key="ebay_pub_load_required_aspects_btn"):
+            marketplace_for_aspect_lookup = str(
+                st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id or "EBAY_US"
+            ).strip()
+            if not current_category_state:
+                st.warning("Select or enter an eBay category ID first.")
+            else:
+                cached = repo.get_cached_ebay_category_aspects(
+                    environment=settings.app_env,
+                    marketplace_id=marketplace_for_aspect_lookup,
+                    category_id=current_category_state,
+                )
+                if cached:
+                    category_aspect_rows = normalize_ebay_category_aspect_rows(cached.get("aspects") or [])
+                    st.session_state["ebay_pub_category_aspect_rows"] = category_aspect_rows
+                    st.session_state["ebay_pub_category_aspect_signature"] = aspect_cache_signature
+                    st.success(
+                        f"Loaded {len(category_aspect_rows)} cached category item specific(s)."
+                    )
+                else:
+                    token_for_aspect_lookup = str(st.session_state.get("ebay_pub_access_token") or "").strip() or str(
+                        default_token or ""
+                    ).strip()
+                    if not token_for_aspect_lookup:
+                        st.warning("Missing eBay user access token.")
+                        st.stop()
+                    try:
+                        raw_aspects = ebay.get_item_aspects_for_category(
+                            access_token=token_for_aspect_lookup,
+                            category_id=current_category_state,
+                            marketplace_id=marketplace_for_aspect_lookup,
+                        )
+                        category_aspect_rows = normalize_ebay_category_aspect_rows(raw_aspects)
+                        repo.cache_ebay_category_aspects(
+                            environment=settings.app_env,
+                            marketplace_id=marketplace_for_aspect_lookup,
+                            category_id=current_category_state,
+                            aspects=category_aspect_rows,
+                            actor=user.username,
+                        )
+                        st.session_state["ebay_pub_category_aspect_rows"] = category_aspect_rows
+                        st.session_state["ebay_pub_category_aspect_signature"] = aspect_cache_signature
+                        required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+                        st.success(
+                            f"Loaded {len(category_aspect_rows)} category item specific(s) from eBay; "
+                            f"{required_count} required."
+                        )
+                    except Exception as exc:
+                        st.error(f"Required item specifics fetch failed: {exc}")
+    with car2:
+        if st.button("Refresh Required Item Specifics", key="ebay_pub_refresh_required_aspects_btn"):
+            token_for_aspect_lookup = str(st.session_state.get("ebay_pub_access_token") or "").strip() or str(
+                default_token or ""
+            ).strip()
+            marketplace_for_aspect_lookup = str(
+                st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id or "EBAY_US"
+            ).strip()
+            if not current_category_state:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not token_for_aspect_lookup:
+                st.warning("Missing eBay user access token.")
+            else:
+                try:
+                    raw_aspects = ebay.get_item_aspects_for_category(
+                        access_token=token_for_aspect_lookup,
+                        category_id=current_category_state,
+                        marketplace_id=marketplace_for_aspect_lookup,
+                    )
+                    category_aspect_rows = normalize_ebay_category_aspect_rows(raw_aspects)
+                    repo.cache_ebay_category_aspects(
+                        environment=settings.app_env,
+                        marketplace_id=marketplace_for_aspect_lookup,
+                        category_id=current_category_state,
+                        aspects=category_aspect_rows,
+                        actor=user.username,
+                    )
+                    st.session_state["ebay_pub_category_aspect_rows"] = category_aspect_rows
+                    st.session_state["ebay_pub_category_aspect_signature"] = aspect_cache_signature
+                    required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+                    st.success(
+                        f"Refreshed {len(category_aspect_rows)} category item specific(s) from eBay; "
+                        f"{required_count} required."
+                    )
+                except Exception as exc:
+                    st.error(f"Required item specifics fetch failed: {exc}")
+    with car3:
+        if category_aspect_rows:
+            required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+            st.caption(
+                f"eBay category aspects loaded for `{current_category_state or '(no category)'}`: "
+                f"{required_count} required of {len(category_aspect_rows)} total."
+            )
 
     aspects_payload_cache: dict[str, list[str]] | None = None
 
@@ -7015,6 +7923,67 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
         else:
             st.caption("No parsed item specifics yet.")
+        if category_aspect_rows:
+            table_rows = _category_aspect_table_rows(category_aspect_rows, aspects_preview)
+            required_table_rows = [row for row in table_rows if row.get("required") == "yes"]
+            missing_required_rows = missing_required_ebay_aspects(category_aspect_rows, aspects_preview)
+            if required_table_rows:
+                st.caption("Required item specifics from selected eBay category:")
+                st.dataframe(
+                    pd.DataFrame(required_table_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            if missing_required_rows:
+                st.warning(
+                    "Missing required item specifics: "
+                    + ", ".join(str(row.get("name") or "") for row in missing_required_rows)
+                )
+                missing_labels = [str(row.get("name") or "").strip() for row in missing_required_rows]
+                selected_missing = st.selectbox(
+                    "Required Specific",
+                    options=missing_labels,
+                    key="ebay_pub_required_aspect_select",
+                )
+                selected_missing_row = next(
+                    (
+                        row
+                        for row in missing_required_rows
+                        if str(row.get("name") or "").strip() == selected_missing
+                    ),
+                    {},
+                )
+                allowed_values = [
+                    str(value or "").strip()
+                    for value in (selected_missing_row.get("values") or [])
+                    if str(value or "").strip()
+                ]
+                if allowed_values:
+                    required_value = st.selectbox(
+                        "Required Specific Value",
+                        options=[""] + allowed_values,
+                        key=_category_aspect_input_key("ebay_pub_required_aspect_value", selected_missing),
+                    )
+                else:
+                    required_value = st.text_input(
+                        "Required Specific Value",
+                        key=_category_aspect_input_key("ebay_pub_required_aspect_value", selected_missing),
+                    )
+                if st.button("Apply Required Specific", key="ebay_pub_apply_required_aspect_btn"):
+                    if not selected_missing:
+                        st.warning("Select a required item specific first.")
+                    elif not str(required_value or "").strip():
+                        st.warning("Enter a value before applying.")
+                    else:
+                        next_payload = dict(aspects_preview)
+                        next_payload[selected_missing] = [str(required_value).strip()]
+                        _queue_ebay_publish_updates_preserving_form(
+                            {"ebay_pub_aspects_json": json.dumps(next_payload, indent=2)},
+                            flash=f"Applied required item specific `{selected_missing}`.",
+                        )
+                        st.rerun()
+            elif required_table_rows:
+                st.success("All loaded required item specifics are filled.")
         isb1, isb2 = st.columns(2)
         with isb1:
             ebay_pub_aspect_name = st.text_input(
@@ -7095,11 +8064,15 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 "Condition",
                 condition_options,
                 key="ebay_pub_condition",
+                format_func=lambda value: condition_option_labels.get(str(value), str(value)),
             )
 
         d1, d2 = st.columns(2)
         with d1:
             category_id = st.text_input("eBay Category ID", key="ebay_pub_category_id")
+            if str(category_id or "").strip():
+                st.session_state["ebay_pub_last_category_id"] = str(category_id or "").strip()
+                st.session_state["ebay_pub_last_category_listing_id"] = current_listing_id
         with d2:
             listing_duration = (
                 "GTC"
@@ -7362,8 +8335,18 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 "Condition Description",
                 key="ebay_pub_condition_description",
                 height=80,
-                help="Optional additional condition details.",
+                help=f"Optional additional condition details. eBay limit: {EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters.",
             )
+            condition_description_len = len(str(st.session_state.get("ebay_pub_condition_description") or ""))
+            if condition_description_len > EBAY_MAX_CONDITION_DESCRIPTION_CHARS:
+                st.error(
+                    "Condition Description is too long for eBay: "
+                    f"{condition_description_len}/{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters."
+                )
+            else:
+                st.caption(
+                    f"Condition Description: {condition_description_len}/{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters."
+                )
             grading_prefill_msg = _ai_grading_prefill_status(
                 current_value=st.session_state.get("ebay_pub_condition_description"),
                 default_value=default_condition_description,
@@ -7394,9 +8377,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
         with e2:
             upload_video_to_ebay = st.checkbox(
-                "Upload one MP4 video to eBay and attach",
+                "Upload one MP4/MOV video to eBay and attach",
                 key="ebay_pub_upload_video_to_ebay",
-                help="eBay supports one video per listing.",
+                help="eBay supports one video per listing. MOV/QuickTime files are converted to MP4 before upload.",
             )
         if image_options:
             selected_image_labels = st.multiselect(
@@ -7404,8 +8387,20 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 options=list(image_options.keys()),
                 key="ebay_pub_selected_images",
             )
+            primary_image_options = ["Auto", *selected_image_labels]
+            current_primary_label = str(st.session_state.get("ebay_pub_primary_image_label") or "Auto")
+            if current_primary_label not in primary_image_options:
+                current_primary_label = "Auto"
+                _safe_session_set("ebay_pub_primary_image_label", "Auto")
+            primary_image_label = st.selectbox(
+                "Main eBay Image",
+                options=primary_image_options,
+                index=primary_image_options.index(current_primary_label),
+                key="ebay_pub_primary_image_label",
+            )
         else:
             selected_image_labels = []
+            primary_image_label = "Auto"
             st.info("No listing images available for eBay publish.")
         if video_options:
             selected_video_label = st.selectbox(
@@ -7416,6 +8411,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         else:
             selected_video_label = "None"
             st.info("No listing videos available.")
+        media_option_video_warning = _selected_ebay_video_warning(upload_video_to_ebay, selected_video_label)
+        if media_option_video_warning:
+            st.warning(media_option_video_warning)
 
         selected_images_cache: list[object] | None = None
         selected_video_cache: object | None = None
@@ -7424,9 +8422,18 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         def _resolve_selected_images() -> list[object]:
             nonlocal selected_images_cache
             if selected_images_cache is None:
-                selected_images_cache = [
+                rows = [
                     image_options[label] for label in selected_image_labels if label in image_options
                 ]
+                if primary_image_label != "Auto" and primary_image_label in selected_image_labels:
+                    primary_media = image_options.get(primary_image_label)
+                    primary_id = int(getattr(primary_media, "id", 0) or 0) if primary_media is not None else 0
+                    if primary_id > 0:
+                        rows = sorted(
+                            rows,
+                            key=lambda row: 0 if int(getattr(row, "id", 0) or 0) == primary_id else 1,
+                        )
+                selected_images_cache = rows
             return list(selected_images_cache)
 
         def _resolve_selected_video() -> object | None:
@@ -7549,6 +8556,17 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
 
     discovered_offer_id = str(publish_meta.get("offer_id") or "").strip()
+    condition_policy_blocker = category_condition_rows and not _is_condition_valid_for_loaded_policy(
+        category_condition_rows,
+        condition,
+    )
+    if condition_policy_blocker:
+        st.error(
+            f"Selected condition `{condition}` is not valid for eBay category `{current_category_state}`. "
+            "Load/refresh Category Conditions and choose one of the returned options before publishing."
+        )
+    if condition_policy_blocker and (preflight_submit or submit_publish):
+        return
 
     effective_listing_description_source_base = str(listing_description or "").strip()
     if bool(st.session_state.pop("ebay_pub_save_draft_requested", False)):
@@ -7592,6 +8610,15 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     ).strip()
     subtitle = str(st.session_state.get("ebay_pub_subtitle") or "").strip()
     condition_description = str(st.session_state.get("ebay_pub_condition_description") or "").strip()
+    condition_description_len = len(condition_description)
+    if condition_description_len > EBAY_MAX_CONDITION_DESCRIPTION_CHARS:
+        st.error(
+            "eBay condition description must be "
+            f"{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {condition_description_len})."
+        )
+        if preflight_submit or submit_publish:
+            return
     volume_pricing_tiers_cache: list[dict] | None = None
     volume_pricing_errors_cache: list[str] | None = None
 
@@ -7632,6 +8659,35 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 existing_aspects=_get_aspects_payload(),
             )
         return effective_aspects_payload_cache, injected_aspect_keys_cache
+
+    local_category_aspects_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def _local_required_specific_blockers(*, category_id_value: str, marketplace_id_value: str) -> list[str]:
+        category_id_clean = str(category_id_value or "").strip()
+        marketplace_id_clean = str(marketplace_id_value or default_marketplace_id or "EBAY_US").strip()
+        if not category_id_clean:
+            return []
+        cache_key = (marketplace_id_clean.upper(), category_id_clean)
+        if cache_key not in local_category_aspects_cache:
+            cached = repo.get_cached_ebay_category_aspects(
+                environment=settings.app_env,
+                marketplace_id=marketplace_id_clean,
+                category_id=category_id_clean,
+            )
+            local_category_aspects_cache[cache_key] = (
+                normalize_ebay_category_aspect_rows((cached or {}).get("aspects") or [])
+                if cached
+                else []
+            )
+        rows = list(local_category_aspects_cache.get(cache_key) or [])
+        if not rows:
+            return []
+        effective_aspects, _injected = _resolve_effective_aspects_payload()
+        return [
+            f"Missing required eBay item specific: {str((row or {}).get('name') or '').strip()}"
+            for row in missing_required_ebay_aspects(rows, effective_aspects)
+            if str((row or {}).get("name") or "").strip()
+        ]
 
     load_volume_pricing_preview = st.checkbox(
         "Load Volume Pricing Preview (slower)",
@@ -7676,10 +8732,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         token: str,
         marketplace_id: str,
         category_id: str,
+        condition: str,
         merchant_location_key: str,
         payment_policy_id_value: str,
         fulfillment_policy_id_value: str,
         return_policy_id_value: str,
+        format_type_value: str,
+        auction_buy_now_price_value: float,
     ) -> str:
         token_clean = str(token or "").strip()
         token_fingerprint = f"{len(token_clean)}:{token_clean[-16:]}" if token_clean else ""
@@ -7688,10 +8747,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 "token_fingerprint": token_fingerprint,
                 "marketplace_id": str(marketplace_id or "").strip(),
                 "category_id": str(category_id or "").strip(),
+                "condition": str(condition or "").strip().upper(),
                 "merchant_location_key": str(merchant_location_key or "").strip(),
                 "payment_policy_id": str(payment_policy_id_value or "").strip(),
                 "fulfillment_policy_id": str(fulfillment_policy_id_value or "").strip(),
                 "return_policy_id": str(return_policy_id_value or "").strip(),
+                "format_type": str(format_type_value or "").strip().upper(),
+                "auction_buy_now_price": round(float(auction_buy_now_price_value or 0.0), 2),
             },
             sort_keys=True,
         )
@@ -7701,19 +8763,25 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         token: str,
         marketplace_id: str,
         category_id: str,
+        condition_value: str,
         merchant_location_key: str,
         payment_policy_id_value: str,
         fulfillment_policy_id_value: str,
         return_policy_id_value: str,
+        format_type_value: str,
+        auction_buy_now_price_value: float,
     ) -> tuple[dict, bool, str]:
         signature = _preflight_signature(
             token=token,
             marketplace_id=marketplace_id,
             category_id=category_id,
+            condition=condition_value,
             merchant_location_key=merchant_location_key,
             payment_policy_id_value=payment_policy_id_value,
             fulfillment_policy_id_value=fulfillment_policy_id_value,
             return_policy_id_value=return_policy_id_value,
+            format_type_value=format_type_value,
+            auction_buy_now_price_value=auction_buy_now_price_value,
         )
         cached_signature = str(st.session_state.get("ebay_pub_dependency_preflight_signature") or "").strip()
         cached_payload = st.session_state.get("ebay_pub_dependency_preflight_result")
@@ -7727,6 +8795,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             payment_policy_id=str(payment_policy_id_value or "").strip(),
             fulfillment_policy_id=str(fulfillment_policy_id_value or "").strip(),
             return_policy_id=str(return_policy_id_value or "").strip(),
+            format_type=str(format_type_value or "").strip().upper(),
+            auction_buy_now_price=float(auction_buy_now_price_value or 0.0),
+            condition=str(condition_value or "").strip().upper(),
         )
         result_payload["checked_at"] = utcnow_naive().isoformat()
         st.session_state["ebay_pub_dependency_preflight_result"] = result_payload
@@ -7766,10 +8837,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             token=token_to_use,
             marketplace_id=marketplace_id_for_preflight,
             category_id=effective_category_id,
+            condition=condition,
             merchant_location_key=effective_merchant_location_key,
             payment_policy_id_value=payment_policy_id.strip(),
             fulfillment_policy_id_value=fulfillment_policy_id.strip(),
             return_policy_id_value=return_policy_id.strip(),
+            format_type_value=str(publish_format or "FIXED_PRICE").strip().upper(),
+            auction_buy_now_price_value=float(auction_buy_now_price or 0.0),
         )
         result_payload: dict
         if not ebay.is_configured():
@@ -7789,10 +8863,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 token=token_to_use,
                 marketplace_id=marketplace_id_for_preflight,
                 category_id=effective_category_id,
+                condition_value=condition,
                 merchant_location_key=effective_merchant_location_key,
                 payment_policy_id_value=payment_policy_id.strip(),
                 fulfillment_policy_id_value=fulfillment_policy_id.strip(),
                 return_policy_id_value=return_policy_id.strip(),
+                format_type_value=str(publish_format or "FIXED_PRICE").strip().upper(),
+                auction_buy_now_price_value=float(auction_buy_now_price or 0.0),
             )
             if _reused_preflight:
                 st.caption("Using cached dependency preflight result (inputs unchanged).")
@@ -7836,6 +8913,26 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             if context_payload:
                 with st.expander("Last eBay Publish Diagnostics", expanded=False):
                     st.json(context_payload)
+        video_diag_keys = [
+            "upload_video_to_ebay",
+            "video_attached",
+            "video_warning",
+            "video_upload",
+            "inventory_video_verification",
+            "post_offer_video_verification",
+            "post_publish_video_verification",
+            "trading_listing_video_verification",
+        ]
+        video_diag_payload = {
+            key: publish_meta_snapshot.get(key) for key in video_diag_keys if key in publish_meta_snapshot
+        }
+        if video_diag_payload:
+            with st.expander("Last eBay Video Diagnostics", expanded=False):
+                st.caption(
+                    "Shows whether eBay Media upload completed and whether Inventory retained `product.videoIds` "
+                    "after inventory upsert, offer create/update, and live publish."
+                )
+                st.json(video_diag_payload)
 
     st.markdown("#### Manage Existing eBay Listing")
     st.caption("Revise, end, or relist existing eBay-linked listings from this app.")
@@ -7984,7 +9081,12 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
 
         if manage_action == "relist":
             try:
-                publish_result = ebay.publish_offer(access_token=token_to_use, offer_id=effective_offer_id)
+                publish_result = ebay.publish_offer(
+                    access_token=token_to_use,
+                    offer_id=effective_offer_id,
+                    inventory_sku=str(product.sku or "").strip() if product else "",
+                    content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+                )
                 listing_id = str(
                     publish_result.get("listingId") or selected_listing.external_listing_id or ""
                 ).strip()
@@ -8083,14 +9185,24 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             marketplace_id_for_preflight = (
                 st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id
             )
+            local_specific_blockers = _local_required_specific_blockers(
+                category_id_value=effective_category_id,
+                marketplace_id_value=str(marketplace_id_for_preflight or "").strip(),
+            )
+            if local_specific_blockers:
+                st.error("eBay required item specifics blockers: " + " | ".join(local_specific_blockers[:3]))
+                st.stop()
             preflight_result, reused_preflight, _preflight_signature_value = _run_or_reuse_preflight(
                 token=token_to_use,
                 marketplace_id=str(marketplace_id_for_preflight or "").strip(),
                 category_id=effective_category_id,
+                condition_value=condition,
                 merchant_location_key=effective_merchant_location_key,
                 payment_policy_id_value=payment_policy_id.strip(),
                 fulfillment_policy_id_value=fulfillment_policy_id.strip(),
                 return_policy_id_value=return_policy_id.strip(),
+                format_type_value=str(publish_format or "FIXED_PRICE").strip().upper(),
+                auction_buy_now_price_value=float(auction_buy_now_price or 0.0),
             )
             if reused_preflight:
                 st.caption("Using cached dependency preflight result (inputs unchanged).")
@@ -8106,39 +9218,22 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
 
             selected_images = _resolve_selected_images()
             image_urls = []
+            eps_uploads: list[dict] = []
             eps_upload_errors: list[str] = []
             for media in selected_images:
                 original_url = (media.s3_url or "").strip()
                 if use_eps_images:
                     try:
-                        image_bytes, image_content_type = _read_media_bytes(media, storage)
-                        image_result = ebay.create_image_from_file(
+                        eps_url, eps_meta = _create_eps_image_with_retry(
+                            ebay=ebay,
                             access_token=token_to_use,
-                            file_bytes=image_bytes,
-                            filename=(media.original_filename or "image.jpg"),
-                            content_type=image_content_type or (media.content_type or "image/jpeg"),
+                            media=media,
+                            storage=storage,
                         )
-                        eps_url = (image_result.get("imageUrl") or "").strip()
-                        if eps_url:
-                            image_urls.append(eps_url)
-                            continue
-                        raise RuntimeError("No imageUrl returned from eBay Media API.")
-                    except Exception as file_exc:
-                        try:
-                            if original_url and original_url.startswith("https://"):
-                                image_result = ebay.create_image_from_url(access_token=token_to_use, image_url=original_url)
-                                eps_url = (image_result.get("imageUrl") or "").strip()
-                                if eps_url:
-                                    image_urls.append(eps_url)
-                                    continue
-                            raise RuntimeError("Image URL import unavailable (non-public or missing HTTPS URL).")
-                        except Exception as url_exc:
-                            eps_upload_errors.append(
-                                f"{media.original_filename}: file-upload={file_exc} | url-import={url_exc}"
-                            )
-                            # Final fallback: only use direct URL when it is publicly reachable.
-                            if original_url and original_url.startswith("https://"):
-                                image_urls.append(original_url)
+                        image_urls.append(eps_url)
+                        eps_uploads.append(eps_meta)
+                    except Exception as exc:
+                        eps_upload_errors.append(f"{media.original_filename}: {exc}")
                 else:
                     if not original_url or not original_url.startswith("https://"):
                         st.error(
@@ -8147,14 +9242,17 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                         st.stop()
                     image_urls.append(original_url)
 
+            image_source_mode = "ebay_eps" if use_eps_images else "direct_https_urls"
+            if use_eps_images and eps_upload_errors:
+                st.error(
+                    "eBay EPS image hosting failed for one or more selected images. "
+                    "Direct/self-hosted image fallback is disabled. "
+                    + " | ".join(eps_upload_errors[:5])
+                )
+                st.stop()
             if not image_urls:
                 st.error("At least one image is required to revise listing.")
                 st.stop()
-            if eps_upload_errors:
-                st.warning(
-                    "Some EPS uploads failed and were replaced with direct HTTPS image URLs: "
-                    + " | ".join(eps_upload_errors[:5])
-                )
             if len(image_urls) > 24:
                 image_urls = image_urls[:24]
 
@@ -8236,6 +9334,36 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     payload=revise_offer_payload,
                     content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
                 )
+                revised_marketplace_details = _merge_ebay_publish_metadata(
+                    str(selected_listing.marketplace_details or ""),
+                    {
+                        "format": publish_format,
+                        "offer_id": effective_offer_id,
+                        "marketplace_id": str(
+                            st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id
+                        ).strip(),
+                        "category_id": effective_category_id,
+                        "content_language": str(
+                            st.session_state.get("ebay_pub_content_language") or default_content_language
+                        ).strip(),
+                        "listing_title": str(listing_title or selected_listing.listing_title or "").strip(),
+                        "listing_description": effective_listing_description
+                        or listing_title
+                        or selected_listing.listing_title,
+                        "subtitle": subtitle,
+                        "condition_description": condition_description,
+                        "aspects": effective_aspects_payload,
+                        "aspects_json": str(st.session_state.get("ebay_pub_aspects_json") or "").strip(),
+                        "image_source": image_source_mode,
+                        "image_count": len(image_urls),
+                        **_ebay_primary_image_metadata(selected_images, primary_image_label),
+                        "revised_at": utcnow_naive().isoformat(),
+                        "last_publish_error": "",
+                        "last_publish_error_at": "",
+                        "last_publish_error_stage": "",
+                        "last_publish_error_context": {},
+                    },
+                )
                 repo.update_listing(
                     selected_listing.id,
                     {
@@ -8243,6 +9371,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                         "quantity_listed": int(available_quantity),
                         "listing_price": to_decimal(local_listing_price),
                         "listing_status": "active",
+                        "marketplace_details": revised_marketplace_details,
                     },
                     actor=user.username,
                 )
@@ -8366,14 +9495,49 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     preflight_marketplace_id = (
         st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id
     )
+    local_specific_blockers = _local_required_specific_blockers(
+        category_id_value=effective_category_id,
+        marketplace_id_value=str(preflight_marketplace_id or "").strip(),
+    )
+    if local_specific_blockers:
+        st.error("eBay required item specifics blockers: " + " | ".join(local_specific_blockers[:3]))
+        return
+    effective_condition_rows = list(category_condition_rows or [])
+    if not effective_condition_rows and effective_category_id and token_to_use:
+        try:
+            policies = ebay.get_item_condition_policies(
+                access_token=token_to_use,
+                category_id=effective_category_id,
+                marketplace_id=str(preflight_marketplace_id or "").strip(),
+            )
+            effective_condition_rows = normalize_ebay_condition_policy_rows(
+                policies,
+                category_id=effective_category_id,
+            )
+            if effective_condition_rows:
+                st.session_state["ebay_pub_category_condition_rows"] = effective_condition_rows
+                st.session_state["ebay_pub_category_condition_signature"] = (
+                    f"{str(preflight_marketplace_id or '').strip().upper()}:{effective_category_id}"
+                )
+        except Exception as exc:
+            st.warning(f"eBay category condition policy lookup failed; continuing with selected condition: {exc}")
+    if effective_condition_rows and not _is_condition_valid_for_loaded_policy(effective_condition_rows, condition):
+        st.error(
+            f"Selected condition `{condition}` is not valid for eBay category `{effective_category_id}`. "
+            "Load/refresh Category Conditions and choose one of the returned options before publishing."
+        )
+        return
     preflight_result, reused_preflight, _preflight_signature_value = _run_or_reuse_preflight(
         token=token_to_use,
         marketplace_id=str(preflight_marketplace_id or "").strip(),
         category_id=effective_category_id,
+        condition_value=condition,
         merchant_location_key=effective_merchant_location_key,
         payment_policy_id_value=payment_policy_id.strip(),
         fulfillment_policy_id_value=fulfillment_policy_id.strip(),
         return_policy_id_value=return_policy_id.strip(),
+        format_type_value=str(publish_format or "FIXED_PRICE").strip().upper(),
+        auction_buy_now_price_value=float(auction_buy_now_price or 0.0),
     )
     if reused_preflight:
         st.caption("Using cached dependency preflight result (inputs unchanged).")
@@ -8395,50 +9559,16 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         original_url = (media.s3_url or "").strip()
         if use_eps_images:
             try:
-                image_bytes, image_content_type = _read_media_bytes(media, storage)
-                image_result = ebay.create_image_from_file(
+                eps_url, eps_meta = _create_eps_image_with_retry(
+                    ebay=ebay,
                     access_token=token_to_use,
-                    file_bytes=image_bytes,
-                    filename=(media.original_filename or "image.jpg"),
-                    content_type=image_content_type or (media.content_type or "image/jpeg"),
+                    media=media,
+                    storage=storage,
                 )
-                eps_url = (image_result.get("imageUrl") or "").strip()
-                if eps_url:
-                    image_urls.append(eps_url)
-                    eps_uploads.append(
-                        {
-                            "media_asset_id": media.id,
-                            "filename": media.original_filename,
-                            "source_url": original_url,
-                            "eps_url": eps_url,
-                            "mode": "file_upload",
-                        }
-                    )
-                    continue
-                raise RuntimeError("No imageUrl returned from eBay Media API.")
-            except Exception as file_exc:
-                try:
-                    if original_url and original_url.startswith("https://"):
-                        image_result = ebay.create_image_from_url(access_token=token_to_use, image_url=original_url)
-                        eps_url = (image_result.get("imageUrl") or "").strip()
-                        if eps_url:
-                            image_urls.append(eps_url)
-                            eps_uploads.append(
-                                {
-                                    "media_asset_id": media.id,
-                                    "filename": media.original_filename,
-                                    "source_url": original_url,
-                                    "eps_url": eps_url,
-                                    "mode": "url_import_fallback",
-                                }
-                            )
-                            continue
-                    raise RuntimeError("Image URL import unavailable (non-public or missing HTTPS URL).")
-                except Exception as url_exc:
-                    eps_upload_errors.append(f"{media.original_filename}: file-upload={file_exc} | url-import={url_exc}")
-                    # Final fallback to direct URL only when available.
-                    if original_url and original_url.startswith("https://"):
-                        image_urls.append(original_url)
+                image_urls.append(eps_url)
+                eps_uploads.append(eps_meta)
+            except Exception as exc:
+                eps_upload_errors.append(f"{media.original_filename}: {exc}")
         else:
             if not original_url or not original_url.startswith("https://"):
                 st.error(
@@ -8448,70 +9578,97 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 return
             image_urls.append(original_url)
 
+    image_source_mode = "ebay_eps" if use_eps_images else "direct_https_urls"
+    if use_eps_images and eps_upload_errors:
+        st.error(
+            "eBay EPS image hosting failed for one or more selected images. "
+            "Direct/self-hosted image fallback is disabled. "
+            + " | ".join(eps_upload_errors[:5])
+        )
+        return
     if not image_urls:
         st.error(
             "At least one image is required to publish to eBay."
         )
         return
-    if eps_upload_errors:
-        st.warning(
-            "Some EPS uploads failed and were replaced with direct HTTPS image URLs: "
-            + " | ".join(eps_upload_errors[:5])
-        )
     if len(image_urls) > 24:
         image_urls = image_urls[:24]
         st.warning("eBay supports up to 24 images per listing. Extra images were ignored.")
 
     video_ids: list[str] = []
     uploaded_video_info: dict | None = None
+    inventory_video_verification: dict[str, object] = {}
+    post_offer_video_verification: dict[str, object] = {}
+    post_publish_video_verification: dict[str, object] = {}
+    trading_listing_video_verification: dict[str, object] = {}
+    video_selection_warning = _selected_ebay_video_warning(upload_video_to_ebay, selected_video_label)
+    if video_selection_warning:
+        st.warning(video_selection_warning)
     if upload_video_to_ebay and selected_video_label != "None":
         selected_video = _resolve_selected_video()
         if selected_video is None:
-            st.error("Selected video was not found.")
-            return
-        filename_lower = (selected_video.original_filename or "").lower()
-        content_type_lower = (selected_video.content_type or "").lower()
-        if not (filename_lower.endswith(".mp4") or content_type_lower == "video/mp4"):
-            st.error("Only MP4 video upload is currently supported for eBay video attach.")
-            return
-        try:
-            video_bytes, video_content_type = _read_media_bytes(selected_video, storage)
-            video_id = ebay.create_video(
-                access_token=token_to_use,
-                title=selected_video.original_filename or selected_listing.listing_title,
-                size_bytes=len(video_bytes),
-                description=selected_listing.listing_title,
+            video_selection_warning = (
+                "Selected video was not found. The listing will publish without an eBay video."
             )
-            ebay.upload_video(
-                access_token=token_to_use,
-                video_id=video_id,
-                file_bytes=video_bytes,
-                content_type=video_content_type or "video/mp4",
+            st.warning(video_selection_warning)
+            selected_video = None
+        elif not is_ebay_video_upload_candidate(selected_video):
+            video_selection_warning = (
+                f"Selected video `{getattr(selected_video, 'original_filename', '') or selected_video_label}` "
+                "is not an MP4/MOV video supported by this eBay upload flow. "
+                "The listing will publish without an eBay video."
             )
-            final_status = ""
-            for _ in range(30):
-                video_state = ebay.get_video(access_token=token_to_use, video_id=video_id)
-                final_status = str(video_state.get("status") or "").upper()
-                if final_status == "LIVE":
-                    break
-                if final_status in {"PROCESSING_FAILED", "BLOCKED"}:
-                    raise RuntimeError(f"Video status reached terminal failure state: {final_status}")
-                time.sleep(3)
-            if final_status != "LIVE":
-                raise RuntimeError(
-                    "Video upload did not reach LIVE status within timeout. "
-                    f"Last status: {final_status or 'unknown'}"
+            st.warning(video_selection_warning)
+            selected_video = None
+        if selected_video is None:
+            pass
+        else:
+            try:
+                video_bytes, video_content_type = _read_media_bytes(selected_video, storage)
+                original_filename = str(selected_video.original_filename or "listing-video.mp4").strip()
+                upload_filename = mp4_filename_for_media(selected_video)
+                converted_from = ""
+                if is_mov_video_media(selected_video):
+                    video_bytes = transcode_mov_to_mp4(video_bytes, filename=original_filename or "listing-video.mov")
+                    video_content_type = "video/mp4"
+                    converted_from = "mov"
+                video_id = ebay.create_video(
+                    access_token=token_to_use,
+                    title=upload_filename or selected_listing.listing_title,
+                    size_bytes=len(video_bytes),
+                    description=selected_listing.listing_title,
                 )
-            video_ids = [video_id]
-            uploaded_video_info = {
-                "media_asset_id": selected_video.id,
-                "filename": selected_video.original_filename,
-                "video_id": video_id,
-                "status": final_status,
-            }
-        except Exception as exc:
-            st.error(f"eBay video upload failed: {exc}")
-            return
+                ebay.upload_video(
+                    access_token=token_to_use,
+                    video_id=video_id,
+                    file_bytes=video_bytes,
+                )
+                final_status = ""
+                for _ in range(30):
+                    video_state = ebay.get_video(access_token=token_to_use, video_id=video_id)
+                    final_status = str(video_state.get("status") or "").upper()
+                    if final_status == "LIVE":
+                        break
+                    if final_status in {"PROCESSING_FAILED", "BLOCKED"}:
+                        raise RuntimeError(f"Video status reached terminal failure state: {final_status}")
+                    time.sleep(3)
+                if final_status != "LIVE":
+                    raise RuntimeError(
+                        "Video upload did not reach LIVE status within timeout. "
+                        f"Last status: {final_status or 'unknown'}"
+                    )
+                video_ids = [video_id]
+                uploaded_video_info = {
+                    "media_asset_id": selected_video.id,
+                    "filename": upload_filename,
+                    "original_filename": original_filename,
+                    "video_id": video_id,
+                    "status": final_status,
+                    "converted_from": converted_from,
+                }
+            except Exception as exc:
+                st.error(f"eBay video upload failed: {exc}")
+                return
 
     effective_aspects_payload, injected_aspect_keys = _resolve_effective_aspects_payload()
     if injected_aspect_keys:
@@ -8582,6 +9739,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         "return_policy_id": str(return_policy_id or "").strip(),
         "use_eps_images": bool(use_eps_images),
         "upload_video_to_ebay": bool(upload_video_to_ebay),
+        "video_warning": video_selection_warning,
         "available_quantity": int(available_quantity or 1),
     }
     try:
@@ -8609,12 +9767,28 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             sku=product.sku,
             payload=inventory_payload,
             content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+            preserve_video_ids=bool(video_ids),
         )
         if fell_back_inventory:
             st.warning(
                 "eBay inventory upsert succeeded only after fallback payload retry "
-                "(dropped package/video fields). Initial error: "
+                + ("(dropped package fields; video IDs were preserved). Initial error: " if video_ids else "(dropped package/video fields). Initial error: ")
                 + inventory_error
+            )
+        if video_ids:
+            publish_stage = "verify_inventory_video_ids"
+            inventory_video_verification = _verify_inventory_video_ids(
+                ebay=ebay,
+                access_token=token_to_use,
+                sku=str(product.sku or "").strip(),
+                expected_video_ids=video_ids,
+                content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+            )
+            publish_context["inventory_video_ids_verified"] = bool(
+                inventory_video_verification.get("verified")
+            )
+            publish_context["inventory_video_ids"] = list(
+                inventory_video_verification.get("actual_video_ids") or []
             )
         if existing_offer_id:
             publish_stage = "update_existing_offer"
@@ -8636,15 +9810,64 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 marketplace_id=(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
                 format_type=publish_format,
             )
+        if video_ids:
+            publish_stage = "verify_post_offer_inventory_video_ids"
+            post_offer_video_verification = _verify_inventory_video_ids(
+                ebay=ebay,
+                access_token=token_to_use,
+                sku=str(product.sku or "").strip(),
+                expected_video_ids=video_ids,
+                content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+            )
+            publish_context["post_offer_inventory_video_ids_verified"] = bool(
+                post_offer_video_verification.get("verified")
+            )
+            publish_context["post_offer_inventory_video_ids"] = list(
+                post_offer_video_verification.get("actual_video_ids") or []
+            )
         listing_id = ""
         listing_url = ""
         if post_mode == "Publish Live Listing":
             publish_stage = "publish_offer"
-            publish_result = ebay.publish_offer(access_token=token_to_use, offer_id=offer_id)
+            publish_result = ebay.publish_offer(
+                access_token=token_to_use,
+                offer_id=offer_id,
+                inventory_sku=str(product.sku or "").strip(),
+                content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+            )
             listing_id = str(publish_result.get("listingId") or "").strip()
             if not listing_id:
                 raise RuntimeError(f"eBay publishOffer did not return listingId. payload={publish_result}")
             listing_url = ebay.listing_url_for_id(listing_id)
+            if video_ids:
+                publish_stage = "verify_post_publish_inventory_video_ids"
+                post_publish_video_verification = _verify_inventory_video_ids(
+                    ebay=ebay,
+                    access_token=token_to_use,
+                    sku=str(product.sku or "").strip(),
+                    expected_video_ids=video_ids,
+                    content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
+                )
+                publish_context["post_publish_inventory_video_ids_verified"] = bool(
+                    post_publish_video_verification.get("verified")
+                )
+                publish_context["post_publish_inventory_video_ids"] = list(
+                    post_publish_video_verification.get("actual_video_ids") or []
+                )
+                publish_stage = "verify_trading_listing_video_ids"
+                trading_listing_video_verification = _verify_trading_listing_video_ids(
+                    ebay=ebay,
+                    access_token=token_to_use,
+                    listing_id=listing_id,
+                    expected_video_ids=video_ids,
+                    marketplace_id=(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
+                )
+                publish_context["trading_listing_video_ids_verified"] = bool(
+                    trading_listing_video_verification.get("verified")
+                )
+                publish_context["trading_listing_video_ids"] = list(
+                    trading_listing_video_verification.get("actual_video_ids") or []
+                )
 
         details_obj: dict = {}
         existing_details = (selected_listing.marketplace_details or "").strip()
@@ -8657,10 +9880,6 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     details_obj = {"notes": existing_details}
             except Exception:
                 details_obj = {"notes": existing_details}
-        image_source_mode = "ebay_eps" if use_eps_images else "direct_https_urls"
-        if use_eps_images and eps_upload_errors:
-            image_source_mode = "mixed_eps_and_direct_https_urls"
-
         publish_stage = "update_local_listing"
         details_obj["ebay_publish"] = {
             "format": publish_format,
@@ -8702,7 +9921,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             "published_at": utcnow_naive().isoformat(),
             "image_source": image_source_mode,
             "image_count": len(image_urls),
+            **_ebay_primary_image_metadata(selected_images, primary_image_label),
             "video_attached": bool(video_ids),
+            "video_warning": video_selection_warning,
+            "inventory_video_verification": inventory_video_verification,
+            "post_offer_video_verification": post_offer_video_verification,
+            "post_publish_video_verification": post_publish_video_verification,
+            "trading_listing_video_verification": trading_listing_video_verification,
             "last_publish_error": "",
             "last_publish_error_at": "",
             "last_publish_error_stage": "",
@@ -8753,17 +9978,18 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 )
         if post_mode == "Publish Live Listing":
             st.session_state["listings_publish_flash"] = {
-                "level": "success",
+                "level": "warning" if video_selection_warning else "success",
                 "message": (
                     f"Published to eBay. listing_id={listing_id}, offer_id={offer_id}"
                     + (" (reused existing offer)" if recovered_existing_offer else "")
                 ),
+                "warning": video_selection_warning,
                 "offer_id": offer_id,
                 "listing_url": listing_url,
             }
         else:
             st.session_state["listings_publish_flash"] = {
-                "level": "success",
+                "level": "warning" if video_selection_warning else "success",
                 "message": (
                     (
                         f"Saved unpublished eBay offer by reusing existing offer_id={offer_id}. "
@@ -8773,6 +9999,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     +
                     "Use Manage Existing eBay Listing to publish when ready."
                 ),
+                "warning": video_selection_warning,
                 "offer_id": offer_id,
                 "listing_url": ebay.seller_hub_listings_url(),
             }

@@ -96,6 +96,39 @@ class AiChatHelpersTests(unittest.TestCase):
         self.assertEqual(passthrough, text)
         self.assertEqual(rules2, [])
 
+    def test_ai_accountant_web_research_defaults_on_for_tax_questions(self):
+        defaults = {}
+
+        def _runtime_bool(_repo, key, default=True):
+            defaults[str(key)] = default
+            return default
+
+        with patch.object(chat, "get_runtime_bool", side_effect=_runtime_bool):
+            should_attach = chat._should_attach_ai_accountant_web_research(
+                object(),
+                "research Colorado bullion sales tax",
+                is_ai_accountant_request=True,
+            )
+
+        self.assertTrue(should_attach)
+        self.assertEqual(defaults["ai_accountant_web_research_enabled"], True)
+
+        with patch.object(chat, "get_runtime_bool", return_value=False):
+            disabled = chat._should_attach_ai_accountant_web_research(
+                object(),
+                "research Colorado bullion sales tax",
+                is_ai_accountant_request=True,
+            )
+        self.assertFalse(disabled)
+
+        with patch.object(chat, "get_runtime_bool", return_value=True):
+            non_accountant = chat._should_attach_ai_accountant_web_research(
+                object(),
+                "research Colorado bullion sales tax",
+                is_ai_accountant_request=False,
+            )
+        self.assertFalse(non_accountant)
+
     def test_answer_query_routes(self):
         allowed = {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports", "admin"}
         with patch.object(chat, "build_inventory_snapshot", return_value=("inv", [{"s": 1}])), \
@@ -105,11 +138,13 @@ class AiChatHelpersTests(unittest.TestCase):
             patch.object(chat, "build_sync_snapshot", return_value=("sync", [])), \
             patch.object(chat, "build_orders_snapshot", return_value=("orders", [])), \
             patch.object(chat, "build_reports_snapshot", return_value=("reports", [])), \
+            patch.object(chat, "build_accounting_snapshot", return_value=("accounting", [])), \
             patch.object(chat, "build_admin_snapshot", return_value=("admin", [])), \
             patch.object(chat, "build_fallback_help", return_value=("help", [])):
             self.assertEqual(chat._answer_query(object(), "inventory on hand", allowed_domains=allowed, max_scan_rows=10)[2], "inventory_snapshot")
             self.assertEqual(chat._answer_query(object(), "listing review", allowed_domains=allowed, max_scan_rows=10)[2], "listing_snapshot")
-            self.assertEqual(chat._answer_query(object(), "sales margin", allowed_domains=allowed, max_scan_rows=10)[2], "sales_snapshot_30d")
+            self.assertEqual(chat._answer_query(object(), "sales last 30 days", allowed_domains=allowed, max_scan_rows=10)[2], "sales_snapshot_30d")
+            self.assertEqual(chat._answer_query(object(), "accounting close profit", allowed_domains=allowed | {"accounting"}, max_scan_rows=10)[2], "accounting_snapshot")
             self.assertEqual(chat._answer_query(object(), "shipping exception", allowed_domains=allowed, max_scan_rows=10)[2], "shipping_snapshot")
             self.assertEqual(chat._answer_query(object(), "sync failed run", allowed_domains=allowed, max_scan_rows=10)[2], "sync_snapshot")
             self.assertEqual(chat._answer_query(object(), "order fulfillment", allowed_domains=allowed, max_scan_rows=10)[2], "order_snapshot")
@@ -120,6 +155,10 @@ class AiChatHelpersTests(unittest.TestCase):
         denied = {"inventory"}
         msg, _, route = chat._answer_query(object(), "listing review", allowed_domains=denied, max_scan_rows=10)
         self.assertEqual(route, "denied_listings")
+        self.assertIn("not allowed", msg)
+
+        msg, _, route = chat._answer_query(object(), "accounting close", allowed_domains=denied, max_scan_rows=10)
+        self.assertEqual(route, "denied_accounting")
         self.assertIn("not allowed", msg)
 
     def test_goldy_helpers(self):
@@ -138,11 +177,11 @@ class AiChatHelpersTests(unittest.TestCase):
         plan_multi = chat._build_goldy_plan(
             prompt="help",
             mode="multi",
-            selected_agent="finance_agent",
+            selected_agent="accountant_agent",
             allowed_domains={"reports"},
         )
         self.assertEqual(plan_multi["mode"], "multi")
-        self.assertEqual(plan_multi["agent_role"], "finance_agent")
+        self.assertEqual(plan_multi["agent_role"], "accountant_agent")
 
 
 if __name__ == "__main__":

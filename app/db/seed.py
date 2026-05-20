@@ -109,6 +109,7 @@ def seed_dev_data(wipe: bool = False) -> dict:
                 "manage_settings",
                 "manage_profiles",
                 "ai_chat_use",
+                "ai_accountant_use",
                 "ai_comp_use",
                 "ai_coin_grade",
                 "ai_coin_identify",

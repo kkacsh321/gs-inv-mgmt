@@ -136,6 +136,19 @@ class AIOrchestrationTests(unittest.TestCase):
         _args, kwargs = mock_generate.call_args
         self.assertIn("Comp Rules Context:\n", kwargs["instruction"])
 
+        execute_comp_summary(
+            repo=object(),
+            query="x",
+            ebay_rows=[],
+            web_rows=[],
+            spot_context=None,
+            system_message="sys",
+            instruction="accounting inst",
+            workflow="accounting",
+        )
+        _args, kwargs = mock_generate.call_args
+        self.assertEqual(kwargs["instruction"], "accounting inst")
+
     @patch("app.services.ai_orchestration.generate_multimodal_ai_markdown_with_fallback")
     @patch("app.services.ai_orchestration.resolve_comp_llm_runtime_chain")
     def test_execute_multimodal_task_passes_through_and_builds_citation(

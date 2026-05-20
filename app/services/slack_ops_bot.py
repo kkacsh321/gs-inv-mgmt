@@ -7,11 +7,19 @@ from datetime import timedelta
 from typing import Any
 
 from app.db.models import IntegrationQueueJob
+from app.services.ai_accountant_monitor import parse_ai_accountant_answer_prompt, record_ai_accountant_answer
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
 from app.utils.time import utcnow_naive
 
 
-SUPPORTED_INTENTS: tuple[str, ...] = ("intake", "comp", "status", "operations")
+SUPPORTED_INTENTS: tuple[str, ...] = ("intake", "comp", "accountant", "accounting", "tax", "ai-accountant", "status", "operations")
+INTENT_ALIASES: dict[str, str] = {
+    "accounting": "accountant",
+    "tax": "accountant",
+    "ai-accountant": "accountant",
+    "ai_accountant": "accountant",
+    "aiaccountant": "accountant",
+}
 
 # Canonical command contract for Slack-origin operator requests.
 # `write_intent=True` means downstream execution would mutate state and
@@ -19,13 +27,14 @@ SUPPORTED_INTENTS: tuple[str, ...] = ("intake", "comp", "status", "operations")
 COMMAND_ALLOWLIST: dict[str, dict[str, Any]] = {
     "intake": {"intent": "intake", "write_intent": True},
     "comp": {"intent": "comp", "write_intent": False},
+    "accountant": {"intent": "accountant", "write_intent": False},
     "status": {"intent": "status", "write_intent": False},
     "operations": {"intent": "operations", "write_intent": True},
 }
 
 ROLE_INTENT_ALLOWLIST: dict[str, set[str]] = {
-    "admin": {"intake", "comp", "status", "operations"},
-    "ops": {"intake", "comp", "status", "operations"},
+    "admin": {"intake", "comp", "accountant", "status", "operations"},
+    "ops": {"intake", "comp", "accountant", "status", "operations"},
     "viewer": {"comp", "status"},
 }
 
@@ -91,7 +100,8 @@ def _intent_and_args(raw_text: str) -> tuple[str, list[str]]:
     if not normalized:
         return "", []
     parts = normalized.split(" ")
-    intent = str(parts[0] or "").strip().lower()
+    raw_intent = str(parts[0] or "").strip().lower()
+    intent = INTENT_ALIASES.get(raw_intent, raw_intent)
     args = [str(v).strip() for v in parts[1:] if str(v).strip()]
     return intent, args
 
@@ -442,6 +452,16 @@ def ingest_slack_command_request(
     approval_required = bool(routed.get("write_intent", False)) and bool(
         get_runtime_bool(repo, "slack_ops_write_actions_require_approval", True)
     )
+    accountant_answer = None
+    if envelope.intent == "accountant":
+        accountant_answer = parse_ai_accountant_answer_prompt(envelope.command_text)
+        if accountant_answer:
+            record_ai_accountant_answer(
+                repo,
+                actor=envelope.app_username or envelope.slack_username or actor,
+                prompt=envelope.command_text,
+                source="slack",
+            )
     queue_payload = {
         "idempotency_key": envelope.idempotency_key,
         "received_at": utcnow_naive().isoformat(timespec="seconds"),
@@ -467,6 +487,8 @@ def ingest_slack_command_request(
             "command_text": envelope.command_text,
         },
     }
+    if accountant_answer:
+        queue_payload["command"]["ai_accountant_answer"] = accountant_answer
     queued = repo.create_integration_queue_job(
         environment=envelope.environment,
         integration=QUEUE_INTEGRATION,

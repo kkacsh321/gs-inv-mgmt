@@ -24,6 +24,7 @@ DEFAULT_PERMISSIONS = {
         "bulk_update",
         "export",
         "ai_chat_use",
+        "ai_accountant_use",
         "ai_comp_use",
         "ai_coin_grade",
         "ai_coin_identify",
@@ -37,6 +38,7 @@ DEFAULT_PERMISSIONS = {
         "manage_settings",
         "manage_profiles",
         "ai_chat_use",
+        "ai_accountant_use",
         "ai_comp_use",
         "ai_coin_grade",
         "ai_coin_identify",
@@ -764,7 +766,7 @@ def init_user_context_sidebar() -> UserContext:
                 st.session_state["auth_role"] = "viewer"
         st.caption(
             "Role capabilities include core CRUD/export plus AI permissions "
-            "(`ai_chat_use`, `ai_comp_use`, `ai_coin_grade`, `ai_coin_identify`)."
+            "(`ai_chat_use`, `ai_accountant_use`, `ai_comp_use`, `ai_coin_grade`, `ai_coin_identify`)."
         )
 
     return current_user()

@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 def _bootstrap_views_package() -> None:
@@ -54,6 +55,183 @@ listing_wizard = _load_module()
 
 
 class ListingWizardHelperTests(unittest.TestCase):
+    def test_condition_options_use_loaded_category_policy_and_preserve_current_invalid_value(self):
+        rows = [
+            {"condition": "USED_EXCELLENT", "label": "Used", "condition_id": "3000"},
+            {"condition": "USED_ACCEPTABLE", "label": "Acceptable", "condition_id": "6000"},
+        ]
+
+        self.assertEqual(
+            listing_wizard._wizard_condition_options(rows, "NEW"),
+            ["USED_EXCELLENT", "USED_ACCEPTABLE", "NEW"],
+        )
+        labels = listing_wizard._wizard_condition_option_labels(rows, "NEW")
+        self.assertIn("eBay ID 3000", labels["USED_EXCELLENT"])
+        self.assertIn("not in loaded category policy", labels["NEW"])
+        self.assertFalse(listing_wizard._wizard_is_condition_valid_for_loaded_policy(rows, "NEW"))
+        self.assertTrue(listing_wizard._wizard_is_condition_valid_for_loaded_policy(rows, "USED_ACCEPTABLE"))
+
+    def test_load_listing_wizard_product_rows_merges_recent_search_and_selected(self):
+        recent = [
+            types.SimpleNamespace(id=3, sku="RECENT-3", title="Recent 3"),
+            types.SimpleNamespace(id=2, sku="RECENT-2", title="Recent 2"),
+        ]
+        search = [
+            types.SimpleNamespace(id=9, sku="OLD-9", title="Older Search Match"),
+            types.SimpleNamespace(id=2, sku="RECENT-2", title="Recent 2"),
+        ]
+        selected = [types.SimpleNamespace(id=20, sku="OLD-20", title="Saved Draft Product")]
+
+        class Repo:
+            def __init__(self):
+                self.calls = []
+
+            def list_products(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("product_ids"):
+                    return selected
+                if kwargs.get("search_query"):
+                    return search
+                return recent
+
+        repo = Repo()
+        rows = listing_wizard._load_listing_wizard_product_rows(
+            repo,
+            search_query="older",
+            selected_product_id=20,
+            recent_limit=2,
+            search_limit=10,
+        )
+
+        self.assertEqual([row.id for row in rows], [20, 9, 2, 3])
+        self.assertEqual(repo.calls[0]["limit"], 2)
+        self.assertEqual(repo.calls[1]["search_query"], "older")
+        self.assertEqual(repo.calls[2]["product_ids"], [20])
+
+    def test_load_listing_wizard_product_rows_skips_search_when_blank(self):
+        class Repo:
+            def __init__(self):
+                self.calls = []
+
+            def list_products(self, **kwargs):
+                self.calls.append(kwargs)
+                return [types.SimpleNamespace(id=1, sku="SKU", title="Title")]
+
+        repo = Repo()
+        rows = listing_wizard._load_listing_wizard_product_rows(
+            repo,
+            search_query="",
+            selected_product_id=None,
+            recent_limit=75,
+        )
+
+        self.assertEqual([row.id for row in rows], [1])
+        self.assertEqual(len(repo.calls), 1)
+        self.assertEqual(repo.calls[0]["limit"], 75)
+
+    def test_build_listing_bundle_metadata_for_single_product_lot(self):
+        product = types.SimpleNamespace(
+            id=42,
+            sku="COIN-42",
+            title="Copper Coin",
+            current_quantity=20,
+        )
+
+        payload = listing_wizard._build_listing_bundle_metadata(
+            enabled=True,
+            primary_product=product,
+            units_per_listing=10,
+            available_lots=2,
+        )
+
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["kind"], "single_product_lot")
+        self.assertEqual(payload["primary_product_id"], 42)
+        self.assertEqual(payload["units_per_listing_total"], 10)
+        self.assertEqual(payload["available_lots"], 2)
+        self.assertEqual(payload["inventory_units_committed"], 20)
+        self.assertEqual(payload["components"][0]["quantity_per_listing"], 10)
+
+    def test_build_listing_bundle_metadata_for_mixed_product_bundle(self):
+        product = types.SimpleNamespace(
+            id=42,
+            sku="COIN-42",
+            title="Copper Coin",
+            current_quantity=20,
+        )
+
+        payload = listing_wizard._build_listing_bundle_metadata(
+            enabled=True,
+            primary_product=product,
+            units_per_listing=2,
+            available_lots=3,
+            additional_components=[
+                {
+                    "product_id": 43,
+                    "sku": "ROUND-43",
+                    "title": "Copper Round",
+                    "quantity_per_listing": 4,
+                    "current_quantity": 20,
+                }
+            ],
+        )
+
+        self.assertEqual(payload["kind"], "mixed_product_bundle")
+        self.assertEqual(payload["units_per_listing_total"], 6)
+        self.assertEqual(payload["inventory_units_committed"], 18)
+        self.assertEqual([row["product_id"] for row in payload["components"]], [42, 43])
+
+    def test_bundle_expected_unit_cost_sums_components(self):
+        payload = {
+            "enabled": True,
+            "components": [
+                {"product_id": 1, "quantity_per_listing": 2},
+                {"product_id": 2, "quantity_per_listing": 3},
+            ],
+        }
+        product_by_id = {
+            1: types.SimpleNamespace(
+                acquisition_cost=5,
+                acquisition_tax_paid=1,
+                acquisition_shipping_paid=0,
+                acquisition_handling_paid=0,
+            ),
+            2: types.SimpleNamespace(
+                acquisition_cost=10,
+                acquisition_tax_paid=0,
+                acquisition_shipping_paid=2,
+                acquisition_handling_paid=0,
+            ),
+        }
+
+        self.assertEqual(listing_wizard._bundle_expected_unit_cost(payload, product_by_id), 48.0)
+
+    def test_build_listing_bundle_metadata_disabled_shape(self):
+        payload = listing_wizard._build_listing_bundle_metadata(
+            enabled=False,
+            primary_product=None,
+            units_per_listing=10,
+            available_lots=3,
+        )
+
+        self.assertFalse(payload["enabled"])
+        self.assertEqual(payload["components"], [])
+        self.assertEqual(payload["available_lots"], 3)
+
+    def test_resolve_vision_mime_normalizes_octet_stream_to_detected_jpeg(self):
+        jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
+        self.assertEqual(
+            listing_wizard._resolve_vision_mime(jpeg_bytes, "application/octet-stream"),
+            "image/jpeg",
+        )
+
+    def test_resolve_vision_mime_rejects_svg(self):
+        svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg'></svg>"
+        self.assertEqual(
+            listing_wizard._resolve_vision_mime(svg_bytes, "image/svg+xml"),
+            "",
+        )
+
     def test_ai_grading_prefill_status_messages(self):
         self.assertEqual(
             listing_wizard._ai_grading_prefill_status(current_value="", default_value=""),
@@ -96,6 +274,356 @@ class ListingWizardHelperTests(unittest.TestCase):
         )
         self.assertEqual(listing_wizard._known_unit_cost(product), 12.5)
         self.assertEqual(listing_wizard._known_unit_cost(None), 0.0)
+
+    def test_order_media_rows_for_primary_prefers_media_id_or_upload_filename(self):
+        rows = [
+            types.SimpleNamespace(id=1, original_filename="a.jpg"),
+            types.SimpleNamespace(id=2, original_filename="b.jpg"),
+            types.SimpleNamespace(id=3, original_filename="c.jpg"),
+        ]
+        by_id = listing_wizard._wizard_order_media_rows_for_primary(rows, "media:2")
+        self.assertEqual([row.id for row in by_id], [2, 1, 3])
+
+        by_upload = listing_wizard._wizard_order_media_rows_for_primary(rows, "upload:c.jpg")
+        self.assertEqual([row.id for row in by_upload], [3, 1, 2])
+
+        unchanged = listing_wizard._wizard_order_media_rows_for_primary(rows, "media:not-int")
+        self.assertEqual([row.id for row in unchanged], [1, 2, 3])
+
+    def test_primary_image_metadata_uses_first_ordered_wizard_media(self):
+        rows = [
+            types.SimpleNamespace(id=3, original_filename="c.jpg"),
+            types.SimpleNamespace(id=1, original_filename="a.jpg"),
+        ]
+        payload = listing_wizard._wizard_primary_image_metadata(rows, "upload:c.jpg")
+        self.assertEqual(payload["primary_image_ref"], "upload:c.jpg")
+        self.assertEqual(payload["primary_image_media_id"], 3)
+        self.assertEqual(payload["primary_image_filename"], "c.jpg")
+
+        empty = listing_wizard._wizard_primary_image_metadata([], "")
+        self.assertEqual(empty["primary_image_ref"], "")
+        self.assertEqual(empty["primary_image_media_id"], 0)
+        self.assertEqual(empty["primary_image_filename"], "")
+
+    def test_create_eps_image_with_retry_retries_transient_file_upload(self):
+        media = types.SimpleNamespace(id=3, original_filename="front.jpg", content_type="image/jpeg", s3_url="")
+        ebay = types.SimpleNamespace(
+            create_image_from_file=Mock(
+                side_effect=[
+                    RuntimeError("503 Server Error: Service Unavailable"),
+                    {"image": {"imageUrl": "https://i.ebayimg.com/front.jpg"}},
+                ]
+            ),
+            create_image_from_url=Mock(),
+        )
+
+        with patch.object(listing_wizard, "load_media_bytes", return_value=(b"img", "image/jpeg", "")), patch.object(
+            listing_wizard.time, "sleep", return_value=None
+        ):
+            url, meta = listing_wizard._wizard_create_eps_image_with_retry(
+                ebay=ebay,
+                access_token="tok",
+                media=media,
+                storage=None,
+            )
+
+        self.assertEqual(url, "https://i.ebayimg.com/front.jpg")
+        self.assertEqual(meta["mode"], "file_upload")
+        self.assertEqual(meta["attempts"], 2)
+        self.assertEqual(ebay.create_image_from_file.call_count, 2)
+        self.assertEqual(ebay.create_image_from_url.call_count, 0)
+
+    def test_create_eps_image_with_retry_uses_url_import_as_eps_only_fallback(self):
+        media = types.SimpleNamespace(
+            id=4,
+            original_filename="back.jpg",
+            content_type="image/jpeg",
+            s3_url="https://cdn.example/back.jpg",
+        )
+        ebay = types.SimpleNamespace(
+            create_image_from_file=Mock(side_effect=RuntimeError("400 Bad Request")),
+            create_image_from_url=Mock(return_value={"imageUrl": "https://i.ebayimg.com/back.jpg"}),
+        )
+
+        with patch.object(listing_wizard, "load_media_bytes", return_value=(b"img", "image/jpeg", "")):
+            url, meta = listing_wizard._wizard_create_eps_image_with_retry(
+                ebay=ebay,
+                access_token="tok",
+                media=media,
+                storage=None,
+            )
+
+        self.assertEqual(url, "https://i.ebayimg.com/back.jpg")
+        self.assertEqual(meta["mode"], "url_import")
+        self.assertEqual(ebay.create_image_from_url.call_count, 1)
+
+    def test_select_ebay_video_media_prefers_first_supported_video(self):
+        rows = [
+            types.SimpleNamespace(id=1, media_type="image", original_filename="front.jpg", content_type="image/jpeg"),
+            types.SimpleNamespace(id=2, media_type="video", original_filename="clip.mov", content_type="video/quicktime"),
+            types.SimpleNamespace(id=3, media_type="video", original_filename="clip.mp4", content_type="application/octet-stream"),
+            types.SimpleNamespace(id=4, media_type="video", original_filename="second.mp4", content_type="video/mp4"),
+        ]
+
+        selected = listing_wizard._wizard_select_ebay_video_media(rows)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.id, 2)
+
+    def test_video_upload_warning_notes_missing_linked_supported_video_when_enabled(self):
+        self.assertEqual(listing_wizard._wizard_video_upload_warning(False, []), "")
+        self.assertIn(
+            "no video media was linked",
+            listing_wizard._wizard_video_upload_warning(True, []),
+        )
+        self.assertIn(
+            "no supported MP4/MOV video",
+            listing_wizard._wizard_video_upload_warning(
+                True,
+                [types.SimpleNamespace(id=1, media_type="video", original_filename="clip.webm", content_type="video/webm")],
+            ),
+        )
+        self.assertEqual(
+            listing_wizard._wizard_video_upload_warning(
+                True,
+                [types.SimpleNamespace(id=2, media_type="video", original_filename="clip.mov", content_type="video/quicktime")],
+            ),
+            "",
+        )
+
+    def test_upload_ebay_video_with_retry_uploads_and_waits_for_live(self):
+        media = types.SimpleNamespace(
+            id=9,
+            media_type="video",
+            original_filename="demo.mp4",
+            content_type="video/mp4",
+        )
+        ebay = types.SimpleNamespace(
+            create_video=Mock(return_value="VID-123"),
+            upload_video=Mock(),
+            get_video=Mock(side_effect=[{"status": "PROCESSING"}, {"status": "LIVE"}]),
+        )
+
+        with patch.object(
+            listing_wizard,
+            "load_media_bytes",
+            return_value=(b"video-bytes", "video/mp4", ""),
+        ), patch.object(listing_wizard.time, "sleep", return_value=None):
+            video_id, meta = listing_wizard._wizard_upload_ebay_video_with_retry(
+                ebay=ebay,
+                access_token="tok",
+                media=media,
+                storage=None,
+                listing_title="Demo listing",
+                status_sleep_seconds=0,
+            )
+
+        self.assertEqual(video_id, "VID-123")
+        self.assertEqual(meta["media_asset_id"], 9)
+        self.assertEqual(meta["status"], "LIVE")
+        ebay.create_video.assert_called_once()
+        ebay.upload_video.assert_called_once()
+        self.assertEqual(ebay.get_video.call_count, 2)
+
+    def test_upload_ebay_video_with_retry_retries_transient_create_error(self):
+        media = types.SimpleNamespace(
+            id=10,
+            media_type="video",
+            original_filename="retry.mp4",
+            content_type="video/mp4",
+        )
+        ebay = types.SimpleNamespace(
+            create_video=Mock(side_effect=[RuntimeError("503 Service Unavailable"), "VID-456"]),
+            upload_video=Mock(),
+            get_video=Mock(return_value={"status": "LIVE"}),
+        )
+
+        with patch.object(
+            listing_wizard,
+            "load_media_bytes",
+            return_value=(b"video-bytes", "video/mp4", ""),
+        ), patch.object(listing_wizard.time, "sleep", return_value=None):
+            video_id, meta = listing_wizard._wizard_upload_ebay_video_with_retry(
+                ebay=ebay,
+                access_token="tok",
+                media=media,
+                storage=None,
+                listing_title="Retry listing",
+                status_sleep_seconds=0,
+            )
+
+        self.assertEqual(video_id, "VID-456")
+        self.assertEqual(meta["attempts"], 2)
+        self.assertEqual(ebay.create_video.call_count, 2)
+
+    def test_upload_ebay_video_with_retry_converts_mov_before_upload(self):
+        media = types.SimpleNamespace(
+            id=11,
+            media_type="video",
+            original_filename="walkaround.mov",
+            content_type="video/quicktime",
+        )
+        ebay = types.SimpleNamespace(
+            create_video=Mock(return_value="VID-MOV"),
+            upload_video=Mock(),
+            get_video=Mock(return_value={"status": "LIVE"}),
+        )
+
+        with patch.object(
+            listing_wizard,
+            "load_media_bytes",
+            return_value=(b"mov-bytes", "video/quicktime", ""),
+        ), patch.object(listing_wizard, "transcode_mov_to_mp4", return_value=b"mp4-bytes"), patch.object(
+            listing_wizard.time, "sleep", return_value=None
+        ):
+            video_id, meta = listing_wizard._wizard_upload_ebay_video_with_retry(
+                ebay=ebay,
+                access_token="tok",
+                media=media,
+                storage=None,
+                listing_title="MOV listing",
+                status_sleep_seconds=0,
+            )
+
+        self.assertEqual(video_id, "VID-MOV")
+        self.assertEqual(meta["filename"], "walkaround.mp4")
+        self.assertEqual(meta["original_filename"], "walkaround.mov")
+        self.assertEqual(meta["converted_from"], "mov")
+        ebay.create_video.assert_called_once()
+        self.assertEqual(ebay.create_video.call_args.kwargs["size_bytes"], len(b"mp4-bytes"))
+        self.assertNotIn("content_type", ebay.upload_video.call_args.kwargs)
+
+    def test_verify_inventory_video_ids_confirms_retained_video_id(self):
+        ebay = types.SimpleNamespace(
+            get_inventory_item=Mock(
+                side_effect=[
+                    {"product": {"videoIds": []}},
+                    {"product": {"videoIds": ["VID-MOV"]}},
+                ]
+            )
+        )
+
+        with patch.object(listing_wizard.time, "sleep", return_value=None):
+            result = listing_wizard._wizard_verify_inventory_video_ids(
+                ebay=ebay,
+                access_token="tok",
+                sku="SKU1",
+                expected_video_ids=["VID-MOV"],
+                sleep_seconds=0,
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["actual_video_ids"], ["VID-MOV"])
+        self.assertEqual(ebay.get_inventory_item.call_count, 2)
+
+    def test_verify_inventory_video_ids_raises_when_ebay_drops_video_id(self):
+        ebay = types.SimpleNamespace(
+            get_inventory_item=Mock(return_value={"product": {"videoIds": []}})
+        )
+
+        with patch.object(listing_wizard.time, "sleep", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "did not retain listing videoIds"):
+                listing_wizard._wizard_verify_inventory_video_ids(
+                    ebay=ebay,
+                    access_token="tok",
+                    sku="SKU1",
+                    expected_video_ids=["VID-MOV"],
+                    max_attempts=2,
+                    sleep_seconds=0,
+                )
+
+    def test_wizard_inventory_fallback_preserves_video_ids_when_requested(self):
+        payload = {
+            "product": {
+                "title": "Listing",
+                "imageUrls": ["https://i.ebayimg.com/front.jpg"],
+                "videoIds": ["VID-MOV"],
+            },
+            "packageWeightAndSize": {"weight": {"value": 1, "unit": "OUNCE"}},
+        }
+        ebay = types.SimpleNamespace(
+            create_or_replace_inventory_item=Mock(
+                side_effect=[RuntimeError('{"errorId":25001,"message":"Core Inventory Service internal error"}'), None]
+            )
+        )
+
+        with patch.object(listing_wizard.time, "sleep", return_value=None):
+            fell_back, error = listing_wizard._wizard_create_or_replace_inventory_item_with_fallback(
+                ebay=ebay,
+                access_token="tok",
+                sku="SKU1",
+                payload=payload,
+                content_language="en-US",
+                preserve_video_ids=True,
+            )
+
+        self.assertTrue(fell_back)
+        self.assertIn("25001", error)
+        fallback_payload = ebay.create_or_replace_inventory_item.call_args_list[1].kwargs["payload"]
+        self.assertEqual(fallback_payload["product"]["videoIds"], ["VID-MOV"])
+        self.assertNotIn("packageWeightAndSize", fallback_payload)
+
+    def test_wizard_inventory_fallback_can_drop_video_ids_when_not_requested(self):
+        payload = {
+            "product": {
+                "title": "Listing",
+                "imageUrls": ["https://i.ebayimg.com/front.jpg"],
+                "videoIds": ["VID-OLD"],
+            },
+            "packageWeightAndSize": {"weight": {"value": 1, "unit": "OUNCE"}},
+        }
+        ebay = types.SimpleNamespace(
+            create_or_replace_inventory_item=Mock(
+                side_effect=[RuntimeError('{"errorId":25001,"message":"Core Inventory Service internal error"}'), None]
+            )
+        )
+
+        with patch.object(listing_wizard.time, "sleep", return_value=None):
+            fell_back, _error = listing_wizard._wizard_create_or_replace_inventory_item_with_fallback(
+                ebay=ebay,
+                access_token="tok",
+                sku="SKU1",
+                payload=payload,
+                content_language="en-US",
+                preserve_video_ids=False,
+            )
+
+        self.assertTrue(fell_back)
+        fallback_payload = ebay.create_or_replace_inventory_item.call_args_list[1].kwargs["payload"]
+        self.assertNotIn("videoIds", fallback_payload["product"])
+        self.assertNotIn("packageWeightAndSize", fallback_payload)
+
+    def test_verify_trading_listing_video_ids_confirms_live_listing_video_id(self):
+        ebay = types.SimpleNamespace(
+            get_trading_item_video_ids=Mock(
+                return_value={"video_ids": ["VID-MOV"], "ack": "Success", "item_id": "123"}
+            )
+        )
+
+        result = listing_wizard._wizard_verify_trading_listing_video_ids(
+            ebay=ebay,
+            access_token="tok",
+            listing_id="123",
+            expected_video_ids=["VID-MOV"],
+            marketplace_id="EBAY_US",
+        )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["actual_video_ids"], ["VID-MOV"])
+
+    def test_verify_trading_listing_video_ids_raises_when_live_listing_missing_video_id(self):
+        ebay = types.SimpleNamespace(
+            get_trading_item_video_ids=Mock(return_value={"video_ids": [], "ack": "Success", "item_id": "123"})
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Trading GetItem did not return"):
+            listing_wizard._wizard_verify_trading_listing_video_ids(
+                ebay=ebay,
+                access_token="tok",
+                listing_id="123",
+                expected_video_ids=["VID-MOV"],
+                marketplace_id="EBAY_US",
+            )
 
     def test_expected_net_score_computes_variance_bands(self):
         score = listing_wizard._expected_net_score(

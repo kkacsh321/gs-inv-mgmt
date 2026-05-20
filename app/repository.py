@@ -8,6 +8,7 @@ from time import perf_counter
 from typing import Any
 
 from sqlalchemy import String, and_, case, cast, delete, func, inspect, literal, or_, select, text
+from sqlalchemy.orm import aliased
 
 try:
     from app.db.models import (
@@ -18,6 +19,7 @@ try:
         CoinReferenceCatalog,
         DocumentArtifact,
         DocumentTemplateProfile,
+        EbayCategoryAspect,
         EbayPublishPreset,
         EbayCategorySuggestion,
         EbayListingTemplateProfile,
@@ -62,6 +64,7 @@ except ModuleNotFoundError:
         CoinReferenceCatalog,
         DocumentArtifact,
         DocumentTemplateProfile,
+        EbayCategoryAspect,
         EbayPublishPreset,
         EbayCategorySuggestion,
         EbayListingTemplateProfile,
@@ -99,6 +102,22 @@ except ModuleNotFoundError:
 
 
 class InventoryRepository:
+    PRODUCT_METAL_TYPE_MAX_LENGTH = 64
+    PRODUCT_METAL_TYPE_MARKERS = (
+        ("copper-nickel", ("copper-nickel", "copper nickel", "cupronickel")),
+        ("silver", ("silver",)),
+        ("gold", ("gold",)),
+        ("copper", ("copper",)),
+        ("nickel", ("nickel",)),
+        ("platinum", ("platinum",)),
+        ("palladium", ("palladium",)),
+        ("bronze", ("bronze",)),
+        ("brass", ("brass",)),
+        ("zinc", ("zinc",)),
+        ("steel", ("steel",)),
+        ("clad", ("clad",)),
+    )
+
     def __init__(self, db_session):
         self.db = db_session
 
@@ -118,6 +137,147 @@ class InventoryRepository:
             if value is not None:
                 total += Decimal(value)
         return total
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            if value is None:
+                return 0.0
+            return float(value)
+        except Exception:
+            return 0.0
+
+    @classmethod
+    def _landed_unit_cost_from_assignment_row(
+        cls,
+        row: Any,
+        *,
+        lot_fallback_unit_costs: dict[int, float],
+        assignment_fallback_unit_costs: dict[int, float] | None = None,
+    ) -> float:
+        explicit_unit = cls._explicit_landed_unit_cost_from_assignment_row(row)
+        if explicit_unit > 0:
+            return explicit_unit
+        assignment_id = int(getattr(row, "assignment_id", 0) or getattr(row, "id", 0) or 0)
+        if assignment_id > 0 and assignment_fallback_unit_costs:
+            assignment_fallback = cls._safe_float(assignment_fallback_unit_costs.get(assignment_id, 0.0))
+            if assignment_fallback > 0:
+                return assignment_fallback
+        lot_id = int(getattr(row, "lot_id", 0) or 0)
+        return cls._safe_float(lot_fallback_unit_costs.get(lot_id, 0.0))
+
+    @classmethod
+    def _explicit_landed_unit_cost_from_assignment_row(cls, row: Any) -> float:
+        qty = float(max(0, int(getattr(row, "quantity_acquired", 0) or 0)))
+        unit_cost = (
+            cls._safe_float(getattr(row, "unit_cost", None))
+            + cls._safe_float(getattr(row, "unit_tax_paid", None))
+            + cls._safe_float(getattr(row, "unit_shipping_paid", None))
+            + cls._safe_float(getattr(row, "unit_handling_paid", None))
+        )
+        if unit_cost > 0:
+            return unit_cost
+
+        allocated_landed = (
+            cls._safe_float(getattr(row, "allocated_cost", None))
+            + cls._safe_float(getattr(row, "allocated_tax_paid", None))
+            + cls._safe_float(getattr(row, "allocated_shipping_paid", None))
+            + cls._safe_float(getattr(row, "allocated_handling_paid", None))
+        )
+        if allocated_landed > 0 and qty > 0:
+            return allocated_landed / qty
+        return 0.0
+
+    @classmethod
+    def _lot_landed_total_from_assignment_row(cls, row: Any) -> float:
+        return (
+            cls._safe_float(getattr(row, "lot_total_cost", None))
+            + cls._safe_float(getattr(row, "lot_total_tax_paid", None))
+            + cls._safe_float(getattr(row, "lot_total_shipping_paid", None))
+            + cls._safe_float(getattr(row, "lot_total_handling_paid", None))
+        )
+
+    @classmethod
+    def _lot_fallback_unit_costs_by_lot_from_rows(cls, rows: list[Any]) -> dict[int, float]:
+        lot_fallbacks, _assignment_fallbacks = cls._lot_fallback_unit_cost_maps_from_rows(rows)
+        return lot_fallbacks
+
+    @classmethod
+    def _lot_fallback_unit_cost_maps_from_rows(cls, rows: list[Any]) -> tuple[dict[int, float], dict[int, float]]:
+        explicit_cost_by_lot: dict[int, float] = {}
+        explicit_qty_by_lot: dict[int, float] = {}
+        blank_qty_by_lot: dict[int, float] = {}
+        lot_total_by_lot: dict[int, float] = {}
+        expected_qty_by_lot: dict[int, float] = {}
+        blank_rows_by_lot: dict[int, list[dict[str, float | int]]] = {}
+        for row in rows:
+            lot_id = int(getattr(row, "lot_id", 0) or 0)
+            if lot_id <= 0:
+                continue
+            qty = float(max(0, int(getattr(row, "quantity_acquired", 0) or 0)))
+            if qty <= 0:
+                continue
+            lot_total_by_lot[lot_id] = max(
+                lot_total_by_lot.get(lot_id, 0.0),
+                cls._lot_landed_total_from_assignment_row(row),
+            )
+            expected_qty = float(max(0, int(getattr(row, "lot_expected_total_quantity", 0) or 0)))
+            if expected_qty > 0:
+                expected_qty_by_lot[lot_id] = max(expected_qty_by_lot.get(lot_id, 0.0), expected_qty)
+            explicit_unit = cls._explicit_landed_unit_cost_from_assignment_row(row)
+            if explicit_unit > 0:
+                explicit_cost_by_lot[lot_id] = explicit_cost_by_lot.get(lot_id, 0.0) + (explicit_unit * qty)
+                explicit_qty_by_lot[lot_id] = explicit_qty_by_lot.get(lot_id, 0.0) + qty
+            else:
+                blank_qty_by_lot[lot_id] = blank_qty_by_lot.get(lot_id, 0.0) + qty
+                blank_rows_by_lot.setdefault(lot_id, []).append(
+                    {
+                        "assignment_id": int(getattr(row, "assignment_id", 0) or getattr(row, "id", 0) or 0),
+                        "qty": qty,
+                        "allocation_weight": cls._safe_float(getattr(row, "allocation_weight", None)),
+                    }
+                )
+
+        fallback: dict[int, float] = {}
+        assignment_fallback: dict[int, float] = {}
+        for lot_id, blank_qty in blank_qty_by_lot.items():
+            if blank_qty <= 0:
+                continue
+            remaining_landed = max(0.0, lot_total_by_lot.get(lot_id, 0.0) - explicit_cost_by_lot.get(lot_id, 0.0))
+            if remaining_landed > 0:
+                weighted_rows = [
+                    row
+                    for row in blank_rows_by_lot.get(lot_id, [])
+                    if cls._safe_float(row.get("allocation_weight")) > 0
+                    and int(row.get("assignment_id") or 0) > 0
+                    and cls._safe_float(row.get("qty")) > 0
+                ]
+                total_weight = sum(cls._safe_float(row.get("allocation_weight")) for row in weighted_rows)
+                if total_weight > 0:
+                    for row in weighted_rows:
+                        assignment_id = int(row.get("assignment_id") or 0)
+                        qty = cls._safe_float(row.get("qty"))
+                        weight = cls._safe_float(row.get("allocation_weight"))
+                        assignment_fallback[assignment_id] = (remaining_landed * (weight / total_weight)) / qty
+                    continue
+                expected_remaining_qty = max(
+                    0.0,
+                    expected_qty_by_lot.get(lot_id, 0.0) - explicit_qty_by_lot.get(lot_id, 0.0),
+                )
+                fallback[lot_id] = remaining_landed / max(blank_qty, expected_remaining_qty)
+        return fallback, assignment_fallback
+
+    @classmethod
+    def _product_default_landed_unit_cost(cls, row: Any) -> float:
+        landed = (
+            cls._safe_float(getattr(row, "acquisition_cost", None))
+            + cls._safe_float(getattr(row, "acquisition_tax_paid", None))
+            + cls._safe_float(getattr(row, "acquisition_shipping_paid", None))
+            + cls._safe_float(getattr(row, "acquisition_handling_paid", None))
+        )
+        if landed > 0:
+            return landed
+        return cls._safe_float(getattr(row, "product_cost", None))
 
     def _serialize_audit_value(self, value: Any) -> Any:
         if isinstance(value, Decimal):
@@ -142,6 +302,84 @@ class InventoryRepository:
         if not isinstance(lifecycle, dict):
             return False
         return bool(lifecycle.get("archived"))
+
+    @staticmethod
+    def _listing_bundle_payload_from_raw(raw_value: Any) -> dict[str, Any]:
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        bundle = parsed.get("bundle")
+        if isinstance(bundle, dict):
+            return bundle
+        ebay_publish = parsed.get("ebay_publish")
+        if isinstance(ebay_publish, dict) and isinstance(ebay_publish.get("bundle"), dict):
+            return ebay_publish["bundle"]
+        return {}
+
+    @classmethod
+    def _listing_bundle_payload(cls, listing: MarketplaceListing | None) -> dict[str, Any]:
+        return cls._listing_bundle_payload_from_raw(getattr(listing, "marketplace_details", ""))
+
+    @staticmethod
+    def _bundle_components_from_payload(
+        bundle: dict[str, Any],
+        quantity_sold: int,
+    ) -> list[dict[str, Any]]:
+        if not bool(bundle.get("enabled")):
+            return []
+        sale_qty = max(1, int(quantity_sold or 1))
+        rolled_up: dict[int, dict[str, Any]] = {}
+        for component in list(bundle.get("components") or []):
+            if not isinstance(component, dict):
+                continue
+            try:
+                product_id = int(component.get("product_id") or 0)
+                qty_per_listing = max(1, int(component.get("quantity_per_listing") or 1))
+            except Exception:
+                continue
+            if product_id <= 0:
+                continue
+            existing = rolled_up.setdefault(
+                product_id,
+                {
+                    "product_id": product_id,
+                    "quantity_per_listing": 0,
+                    "quantity_total": 0,
+                    "sku": str(component.get("sku") or "").strip(),
+                },
+            )
+            existing["quantity_per_listing"] = int(existing["quantity_per_listing"]) + qty_per_listing
+            existing["quantity_total"] = int(existing["quantity_total"]) + (qty_per_listing * sale_qty)
+        return list(rolled_up.values())
+
+    def _listing_bundle_sale_components(
+        self,
+        listing_id: int | None,
+        quantity_sold: int,
+    ) -> list[dict[str, Any]]:
+        if listing_id is None:
+            return []
+        listing = self.db.get(MarketplaceListing, int(listing_id))
+        bundle = self._listing_bundle_payload(listing)
+        return self._bundle_components_from_payload(bundle, quantity_sold)
+
+    def _return_bundle_restock_components(
+        self,
+        sale_id: int | None,
+        quantity_returned: int,
+    ) -> list[dict[str, Any]]:
+        if sale_id is None:
+            return []
+        sale = self.db.get(Sale, int(sale_id))
+        if sale is None:
+            return []
+        return self._listing_bundle_sale_components(sale.listing_id, quantity_returned)
 
     def _lot_is_archived(self, lot: PurchaseLot) -> bool:
         raw = str(getattr(lot, "notes", "") or "").strip()
@@ -250,6 +488,41 @@ class InventoryRepository:
             raise ValueError(f"Inventory class must be one of: {', '.join(sorted(allowed))}.")
         return resolved
 
+    @staticmethod
+    def _metal_marker_matches(value: str, marker: str) -> bool:
+        if re.fullmatch(r"[a-z]+", marker):
+            return re.search(rf"\b{re.escape(marker)}\b", value) is not None
+        return marker in value
+
+    @classmethod
+    def _normalize_product_metal_type(cls, value: str | None) -> tuple[str, str]:
+        raw = str(value or "").strip()
+        if len(raw) <= cls.PRODUCT_METAL_TYPE_MAX_LENGTH:
+            return raw, ""
+
+        lowered = raw.lower()
+        compact_parts: list[str] = []
+        for label, needles in cls.PRODUCT_METAL_TYPE_MARKERS:
+            if any(cls._metal_marker_matches(lowered, needle) for needle in needles) and label not in compact_parts:
+                if label in {"copper", "nickel"} and "copper-nickel" in compact_parts:
+                    continue
+                compact_parts.append(label)
+
+        compact = ", ".join(compact_parts)
+        if not compact:
+            compact = raw[: cls.PRODUCT_METAL_TYPE_MAX_LENGTH - 3].rstrip() + "..."
+        return compact[: cls.PRODUCT_METAL_TYPE_MAX_LENGTH].strip(), raw
+
+    @staticmethod
+    def _append_product_detail_once(description: str | None, *, label: str, value: str) -> str:
+        resolved_description = str(description or "").strip()
+        detail = f"{label}: {value.strip()}"
+        if not value.strip() or detail in resolved_description:
+            return resolved_description
+        if not resolved_description:
+            return detail
+        return f"{resolved_description}\n\n{detail}"
+
     def create_product(
         self,
         sku: str,
@@ -302,14 +575,22 @@ class InventoryRepository:
         if not ebay_purchase:
             ebay_purchase_item_id_value = ""
             ebay_purchase_url_value = ""
+        resolved_metal_type, original_metal_detail = self._normalize_product_metal_type(metal_type)
+        resolved_description = str(description or "").strip()
+        if original_metal_detail:
+            resolved_description = self._append_product_detail_once(
+                resolved_description,
+                label="Metal composition",
+                value=original_metal_detail,
+            )
 
         product = Product(
             sku=sku,
             title=title,
             category=category,
             inventory_class=resolved_inventory_class,
-            description=description,
-            metal_type=metal_type,
+            description=resolved_description,
+            metal_type=resolved_metal_type,
             weight_oz=weight_oz,
             package_weight_oz=package_weight_oz,
             package_length_in=package_length_in,
@@ -422,8 +703,36 @@ class InventoryRepository:
         self.db.refresh(product)
         return product
 
-    def list_products(self) -> list[Product]:
-        return self.db.scalars(select(Product).order_by(Product.created_at.desc())).all()
+    def list_products(
+        self,
+        *,
+        limit: int | None = None,
+        search_query: str | None = None,
+        product_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+    ) -> list[Product]:
+        query = select(Product)
+        ids = sorted({int(pid) for pid in (product_ids or []) if int(pid or 0) > 0})
+        raw_search = str(search_query or "").strip()
+        filters = []
+        if ids:
+            filters.append(Product.id.in_(ids))
+        if raw_search:
+            pattern = f"%{raw_search.lower()}%"
+            search_filters = [
+                func.lower(func.coalesce(Product.sku, "")).like(pattern),
+                func.lower(func.coalesce(Product.title, "")).like(pattern),
+                func.lower(func.coalesce(Product.category, "")).like(pattern),
+                func.lower(func.coalesce(Product.metal_type, "")).like(pattern),
+            ]
+            if raw_search.isdigit():
+                search_filters.append(Product.id == int(raw_search))
+            filters.append(or_(*search_filters))
+        if filters:
+            query = query.where(or_(*filters) if ids and raw_search else filters[0])
+        query = query.order_by(Product.created_at.desc(), Product.id.desc())
+        if limit is not None:
+            query = query.limit(max(1, min(1000, int(limit or 1))))
+        return self.db.scalars(query).all()
 
     def create_listing(
         self,
@@ -475,10 +784,49 @@ class InventoryRepository:
         self.db.refresh(listing)
         return listing
 
-    def list_listings(self) -> list[MarketplaceListing]:
-        return self.db.scalars(
-            select(MarketplaceListing).order_by(MarketplaceListing.created_at.desc())
-        ).all()
+    def list_listings(self, *, limit: int | None = None) -> list[MarketplaceListing]:
+        query = select(MarketplaceListing).order_by(MarketplaceListing.created_at.desc(), MarketplaceListing.id.desc())
+        if limit is not None:
+            query = query.limit(max(1, min(5000, int(limit or 1))))
+        return self.db.scalars(query).all()
+
+    def get_listing(self, listing_id: int) -> MarketplaceListing | None:
+        return self.db.get(MarketplaceListing, int(listing_id))
+
+    def list_listings_for_product(
+        self,
+        product_id: int,
+        *,
+        marketplace: str | None = None,
+        limit: int | None = None,
+    ) -> list[MarketplaceListing]:
+        query = select(MarketplaceListing).where(MarketplaceListing.product_id == int(product_id))
+        marketplace_clean = str(marketplace or "").strip().lower()
+        if marketplace_clean:
+            query = query.where(func.lower(func.coalesce(MarketplaceListing.marketplace, "")) == marketplace_clean)
+        query = query.order_by(MarketplaceListing.created_at.desc(), MarketplaceListing.id.desc())
+        if limit is not None:
+            query = query.limit(max(1, min(1000, int(limit or 1))))
+        return self.db.scalars(query).all()
+
+    def find_listing_owner_by_external_id(
+        self,
+        *,
+        marketplace: str,
+        external_listing_id: str,
+        exclude_listing_id: int | None = None,
+    ) -> int | None:
+        ext_id = str(external_listing_id or "").strip()
+        if not ext_id:
+            return None
+        query = select(MarketplaceListing.id).where(
+            func.lower(func.coalesce(MarketplaceListing.marketplace, "")) == str(marketplace or "").strip().lower(),
+            MarketplaceListing.external_listing_id == ext_id,
+        )
+        if exclude_listing_id is not None:
+            query = query.where(MarketplaceListing.id != int(exclude_listing_id))
+        listing_id = self.db.scalar(query.order_by(MarketplaceListing.id.asc()).limit(1))
+        return int(listing_id) if listing_id is not None else None
 
     def create_sale(
         self,
@@ -543,27 +891,55 @@ class InventoryRepository:
             sold_at=sold_at or utcnow_naive(),
         )
 
-        movement_payload: dict[str, Any] | None = None
-        if product_id is not None:
+        movement_payloads: list[dict[str, Any]] = []
+        bundle_components = self._listing_bundle_sale_components(listing_id, quantity_sold)
+        if bundle_components:
+            for component in bundle_components:
+                component_product = self.db.get(Product, int(component["product_id"]))
+                if component_product is None:
+                    continue
+                component_qty = max(1, int(component.get("quantity_total") or 1))
+                quantity_before = int(component_product.current_quantity)
+                quantity_after = max(0, quantity_before - component_qty)
+                component_product.current_quantity = quantity_after
+                movement_payloads.append(
+                    {
+                        "product_id": component_product.id,
+                        "movement_type": "sale_bundle_component",
+                        "quantity_before": quantity_before,
+                        "quantity_after": quantity_after,
+                        "unit_cost": component_product.acquisition_cost,
+                        "reference_type": "sale",
+                        "notes": (
+                            "Inventory reduced from bundle sale component: "
+                            f"{int(component.get('quantity_per_listing') or 1)} unit(s) per listing x "
+                            f"{int(quantity_sold or 1)} listing unit(s)."
+                        ),
+                        "occurred_at": sold_at or utcnow_naive(),
+                    }
+                )
+        elif product_id is not None:
             product = self.db.get(Product, product_id)
             if product:
                 quantity_before = int(product.current_quantity)
                 quantity_after = max(0, quantity_before - int(quantity_sold))
                 product.current_quantity = quantity_after
-                movement_payload = {
-                    "product_id": product.id,
-                    "movement_type": "sale",
-                    "quantity_before": quantity_before,
-                    "quantity_after": quantity_after,
-                    "unit_cost": product.acquisition_cost,
-                    "reference_type": "sale",
-                    "notes": "Inventory reduced from recorded sale.",
-                    "occurred_at": sold_at or utcnow_naive(),
-                }
+                movement_payloads.append(
+                    {
+                        "product_id": product.id,
+                        "movement_type": "sale",
+                        "quantity_before": quantity_before,
+                        "quantity_after": quantity_after,
+                        "unit_cost": product.acquisition_cost,
+                        "reference_type": "sale",
+                        "notes": "Inventory reduced from recorded sale.",
+                        "occurred_at": sold_at or utcnow_naive(),
+                    }
+                )
 
         self.db.add(sale)
         self.db.flush()
-        if movement_payload is not None:
+        for movement_payload in movement_payloads:
             self._record_inventory_movement(
                 **movement_payload,
                 reference_id=sale.id,
@@ -1147,6 +1523,93 @@ class InventoryRepository:
         if upserted:
             self.db.commit()
         return upserted
+
+    def get_cached_ebay_category_aspects(
+        self,
+        *,
+        environment: str,
+        marketplace_id: str,
+        category_id: str,
+    ) -> dict[str, Any] | None:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_marketplace = (marketplace_id or "EBAY_US").strip().upper()
+        resolved_category_id = str(category_id or "").strip()
+        if not resolved_category_id:
+            return None
+        row = self.db.scalar(
+            select(EbayCategoryAspect).where(
+                EbayCategoryAspect.environment == resolved_env,
+                EbayCategoryAspect.marketplace_id == resolved_marketplace,
+                EbayCategoryAspect.category_id == resolved_category_id,
+            )
+        )
+        if row is None:
+            return None
+        try:
+            aspects = json.loads(row.aspects_json or "[]")
+        except Exception:
+            aspects = []
+        if not isinstance(aspects, list):
+            aspects = []
+        return {
+            "category_id": str(row.category_id or "").strip(),
+            "marketplace_id": str(row.marketplace_id or "").strip(),
+            "aspects": aspects,
+            "required_count": int(row.required_count or 0),
+            "total_count": int(row.total_count or 0),
+            "source": "db_cache",
+            "hit_count": int(row.hit_count or 0),
+            "last_seen_at": (
+                row.last_seen_at.isoformat() if getattr(row, "last_seen_at", None) is not None else ""
+            ),
+        }
+
+    def cache_ebay_category_aspects(
+        self,
+        *,
+        environment: str,
+        marketplace_id: str,
+        category_id: str,
+        aspects: list[dict],
+        actor: str = "system",
+    ) -> bool:
+        resolved_env = (environment or "local").strip().lower()
+        resolved_marketplace = (marketplace_id or "EBAY_US").strip().upper()
+        resolved_category_id = str(category_id or "").strip()
+        if not resolved_category_id:
+            return False
+        normalized_aspects = aspects if isinstance(aspects, list) else []
+        required_count = sum(1 for row in normalized_aspects if bool((row or {}).get("required")))
+        total_count = len(normalized_aspects)
+        existing = self.db.scalar(
+            select(EbayCategoryAspect).where(
+                EbayCategoryAspect.environment == resolved_env,
+                EbayCategoryAspect.marketplace_id == resolved_marketplace,
+                EbayCategoryAspect.category_id == resolved_category_id,
+            )
+        )
+        if existing is None:
+            existing = EbayCategoryAspect(
+                environment=resolved_env,
+                marketplace_id=resolved_marketplace,
+                category_id=resolved_category_id,
+                aspects_json=json.dumps(normalized_aspects, sort_keys=True),
+                required_count=required_count,
+                total_count=total_count,
+                source="ebay_taxonomy",
+                hit_count=1,
+                last_seen_at=utcnow_naive(),
+                created_by=(actor or "system").strip() or "system",
+            )
+            self.db.add(existing)
+        else:
+            existing.aspects_json = json.dumps(normalized_aspects, sort_keys=True)
+            existing.required_count = required_count
+            existing.total_count = total_count
+            existing.hit_count = int(existing.hit_count or 0) + 1
+            existing.last_seen_at = utcnow_naive()
+        self.db.commit()
+        return True
 
     def update_ebay_listing_template_profile(
         self,
@@ -2407,6 +2870,10 @@ class InventoryRepository:
             sale = self.db.get(Sale, sale_id)
             if sale is not None:
                 resolved_product_id = sale.product_id
+                if resolved_product_id is None and sale.listing_id is not None:
+                    listing = self.db.get(MarketplaceListing, sale.listing_id)
+                    if listing is not None:
+                        resolved_product_id = listing.product_id
                 if not marketplace:
                     marketplace = sale.marketplace
                 if order_id is None:
@@ -2433,7 +2900,32 @@ class InventoryRepository:
         self.db.add(ret)
         self.db.flush()
 
-        if ret.restocked and ret.product_id is not None:
+        bundle_components = self._return_bundle_restock_components(ret.sale_id, ret.quantity)
+        if ret.restocked and bundle_components:
+            for component in bundle_components:
+                product = self.db.get(Product, int(component["product_id"]))
+                if product is None:
+                    continue
+                component_qty = max(1, int(component.get("quantity_total") or 1))
+                before = int(product.current_quantity)
+                after = before + component_qty
+                product.current_quantity = after
+                self._record_inventory_movement(
+                    product_id=product.id,
+                    movement_type="return_bundle_component_restock",
+                    quantity_before=before,
+                    quantity_after=after,
+                    unit_cost=product.acquisition_cost,
+                    reference_type="return",
+                    reference_id=ret.id,
+                    notes=(
+                        "Inventory increased from restocked bundle return component: "
+                        f"{int(component.get('quantity_per_listing') or 1)} unit(s) per returned listing x "
+                        f"{int(ret.quantity or 1)} returned listing unit(s)."
+                    ),
+                    occurred_at=ret.processed_at or ret.returned_at,
+                )
+        elif ret.restocked and ret.product_id is not None:
             product = self.db.get(Product, ret.product_id)
             if product is not None:
                 before = int(product.current_quantity)
@@ -2482,6 +2974,7 @@ class InventoryRepository:
         old_restocked = bool(ret.restocked)
         old_quantity = int(ret.quantity)
         old_product_id = ret.product_id
+        old_sale_id = ret.sale_id
         changes: dict[str, dict[str, Any]] = {}
 
         for field, new_value in updates.items():
@@ -2499,9 +2992,35 @@ class InventoryRepository:
             new_restocked = bool(ret.restocked)
             new_quantity = int(ret.quantity)
             new_product_id = ret.product_id
+            new_sale_id = ret.sale_id
 
-            if old_restocked != new_restocked or old_quantity != new_quantity or old_product_id != new_product_id:
-                if old_restocked and old_product_id is not None:
+            if (
+                old_restocked != new_restocked
+                or old_quantity != new_quantity
+                or old_product_id != new_product_id
+                or old_sale_id != new_sale_id
+            ):
+                old_bundle_components = self._return_bundle_restock_components(old_sale_id, old_quantity)
+                new_bundle_components = self._return_bundle_restock_components(new_sale_id, new_quantity)
+                if old_restocked and old_bundle_components:
+                    for component in old_bundle_components:
+                        product = self.db.get(Product, int(component["product_id"]))
+                        if product is not None:
+                            before = int(product.current_quantity)
+                            after = max(0, before - max(1, int(component.get("quantity_total") or 1)))
+                            product.current_quantity = after
+                            self._record_inventory_movement(
+                                product_id=product.id,
+                                movement_type="return_bundle_component_restock_revert",
+                                quantity_before=before,
+                                quantity_after=after,
+                                unit_cost=product.acquisition_cost,
+                                reference_type="return",
+                                reference_id=ret.id,
+                                notes=f"Reverted previous bundle restock component due to return update by {actor}.",
+                                occurred_at=utcnow_naive(),
+                            )
+                elif old_restocked and old_product_id is not None:
                     product = self.db.get(Product, old_product_id)
                     if product is not None:
                         before = int(product.current_quantity)
@@ -2519,7 +3038,25 @@ class InventoryRepository:
                             occurred_at=utcnow_naive(),
                         )
 
-                if new_restocked and new_product_id is not None:
+                if new_restocked and new_bundle_components:
+                    for component in new_bundle_components:
+                        product = self.db.get(Product, int(component["product_id"]))
+                        if product is not None:
+                            before = int(product.current_quantity)
+                            after = before + max(1, int(component.get("quantity_total") or 1))
+                            product.current_quantity = after
+                            self._record_inventory_movement(
+                                product_id=product.id,
+                                movement_type="return_bundle_component_restock_apply",
+                                quantity_before=before,
+                                quantity_after=after,
+                                unit_cost=product.acquisition_cost,
+                                reference_type="return",
+                                reference_id=ret.id,
+                                notes=f"Applied bundle restock component from updated return by {actor}.",
+                                occurred_at=utcnow_naive(),
+                            )
+                elif new_restocked and new_product_id is not None:
                     product = self.db.get(Product, new_product_id)
                     if product is not None:
                         before = int(product.current_quantity)
@@ -3063,6 +3600,7 @@ class InventoryRepository:
         total_tax_paid: Decimal | None = None,
         total_shipping_paid: Decimal | None = None,
         total_handling_paid: Decimal | None = None,
+        expected_total_quantity: int | None = None,
         notes: str = "",
         source_id: int | None = None,
         ebay_purchase: bool = False,
@@ -3085,6 +3623,12 @@ class InventoryRepository:
         ValidationService.require_non_negative_decimal("Lot total tax paid", total_tax_paid)
         ValidationService.require_non_negative_decimal("Lot total shipping paid", total_shipping_paid)
         ValidationService.require_non_negative_decimal("Lot total handling paid", total_handling_paid)
+        if expected_total_quantity is not None:
+            ValidationService.require_positive_int(
+                "Lot expected total quantity",
+                int(expected_total_quantity),
+                min_value=0,
+            )
         lot = PurchaseLot(
             source_id=source_id,
             lot_code=lot_code,
@@ -3094,6 +3638,7 @@ class InventoryRepository:
             total_tax_paid=total_tax_paid,
             total_shipping_paid=total_shipping_paid,
             total_handling_paid=total_handling_paid,
+            expected_total_quantity=expected_total_quantity,
             ebay_purchase=bool(ebay_purchase),
             ebay_purchase_item_id=ebay_purchase_item_id_value,
             ebay_purchase_url=ebay_purchase_url_value,
@@ -3114,6 +3659,7 @@ class InventoryRepository:
                     "total_tax_paid": total_tax_paid,
                     "total_shipping_paid": total_shipping_paid,
                     "total_handling_paid": total_handling_paid,
+                    "expected_total_quantity": expected_total_quantity,
                     "ebay_purchase": bool(ebay_purchase),
                     "ebay_purchase_item_id": ebay_purchase_item_id_value,
                     "ebay_purchase_url": ebay_purchase_url_value,
@@ -3222,6 +3768,12 @@ class InventoryRepository:
         for field, new_value in updates.items():
             if not hasattr(lot, field):
                 continue
+            if field == "expected_total_quantity" and new_value is not None:
+                ValidationService.require_positive_int(
+                    "Lot expected total quantity",
+                    int(new_value),
+                    min_value=0,
+                )
             old_value = getattr(lot, field)
             if old_value != new_value:
                 changes[field] = {
@@ -3369,12 +3921,17 @@ class InventoryRepository:
         unit_tax_paid: Decimal | None = None,
         unit_shipping_paid: Decimal | None = None,
         unit_handling_paid: Decimal | None = None,
+        allocated_cost: Decimal | None = None,
+        allocation_weight: Decimal | None = None,
     ) -> ProductLotAssignment:
         ValidationService.require_non_negative_decimal("Unit cost", unit_cost)
         ValidationService.require_non_negative_decimal("Unit tax paid", unit_tax_paid)
         ValidationService.require_non_negative_decimal("Unit shipping paid", unit_shipping_paid)
         ValidationService.require_non_negative_decimal("Unit handling paid", unit_handling_paid)
-        allocated_cost = ((unit_cost * quantity_acquired) if unit_cost is not None else None)
+        ValidationService.require_non_negative_decimal("Allocated lot cost", allocated_cost)
+        ValidationService.require_non_negative_decimal("Allocation weight", allocation_weight)
+        if allocated_cost is None:
+            allocated_cost = ((unit_cost * quantity_acquired) if unit_cost is not None else None)
         allocated_tax_paid = ((unit_tax_paid * quantity_acquired) if unit_tax_paid is not None else None)
         allocated_shipping_paid = (
             (unit_shipping_paid * quantity_acquired) if unit_shipping_paid is not None else None
@@ -3413,6 +3970,7 @@ class InventoryRepository:
             allocated_tax_paid=allocated_tax_paid,
             allocated_shipping_paid=allocated_shipping_paid,
             allocated_handling_paid=allocated_handling_paid,
+            allocation_weight=allocation_weight,
             acquired_at=acquired_at,
         )
         self.db.add(assignment)
@@ -3422,7 +3980,15 @@ class InventoryRepository:
             entity_id=assignment.id,
             action="create",
             actor="system",
-            changes={"after": {"product_id": product_id, "lot_id": lot_id}},
+            changes={
+                "after": {
+                    "product_id": product_id,
+                    "lot_id": lot_id,
+                    "quantity_acquired": int(quantity_acquired),
+                    "allocated_cost": self._serialize_audit_value(allocated_cost),
+                    "allocation_weight": self._serialize_audit_value(allocation_weight),
+                }
+            },
         )
         self.db.commit()
         self.db.refresh(assignment)
@@ -3589,6 +4155,73 @@ class InventoryRepository:
             select(ProductLotAssignment).order_by(ProductLotAssignment.created_at.desc())
         ).all()
 
+    def update_product_lot_assignment(
+        self,
+        assignment_id: int,
+        updates: dict[str, Any],
+        actor: str = "system",
+    ) -> ProductLotAssignment:
+        assignment = self.db.get(ProductLotAssignment, int(assignment_id))
+        if assignment is None:
+            raise ValueError(f"Product lot assignment {int(assignment_id)} not found.")
+
+        allowed_fields = {
+            "quantity_acquired",
+            "unit_cost",
+            "unit_tax_paid",
+            "unit_shipping_paid",
+            "unit_handling_paid",
+            "allocated_cost",
+            "allocated_tax_paid",
+            "allocated_shipping_paid",
+            "allocated_handling_paid",
+            "allocation_weight",
+            "acquired_at",
+        }
+        payload = {field: value for field, value in updates.items() if field in allowed_fields}
+        if "quantity_acquired" in payload:
+            ValidationService.require_positive_int(
+                "Quantity acquired",
+                int(payload.get("quantity_acquired") or 0),
+                min_value=1,
+            )
+            payload["quantity_acquired"] = int(payload["quantity_acquired"])
+        for field, label in {
+            "unit_cost": "Unit cost",
+            "unit_tax_paid": "Unit tax paid",
+            "unit_shipping_paid": "Unit shipping paid",
+            "unit_handling_paid": "Unit handling paid",
+            "allocated_cost": "Allocated lot cost",
+            "allocated_tax_paid": "Allocated tax paid",
+            "allocated_shipping_paid": "Allocated shipping paid",
+            "allocated_handling_paid": "Allocated handling paid",
+            "allocation_weight": "Allocation weight",
+        }.items():
+            if field in payload:
+                ValidationService.require_non_negative_decimal(label, payload[field])
+
+        changes: dict[str, dict[str, Any]] = {}
+        for field, new_value in payload.items():
+            old_value = getattr(assignment, field)
+            if old_value != new_value:
+                changes[field] = {
+                    "before": self._serialize_audit_value(old_value),
+                    "after": self._serialize_audit_value(new_value),
+                }
+                setattr(assignment, field, new_value)
+
+        if changes:
+            self._record_audit(
+                entity_type="product_lot_assignment",
+                entity_id=int(assignment.id),
+                action="update",
+                actor=actor,
+                changes=changes,
+            )
+            self.db.commit()
+            self.db.refresh(assignment)
+        return assignment
+
     def list_inventory_movements(self, limit: int = 500) -> list[InventoryMovement]:
         return self.db.scalars(
             select(InventoryMovement).order_by(InventoryMovement.occurred_at.desc()).limit(limit)
@@ -3684,23 +4317,76 @@ class InventoryRepository:
             .order_by(Order.sold_at.desc(), Order.id.desc())
         )
         rows = self.db.execute(query).all()
+        order_ids = sorted({int(row.order_id) for row in rows if row.order_id is not None})
+        normalized_fee_by_order: dict[int, float] = {}
+        normalized_label_by_order: dict[int, float] = {}
+        if order_ids:
+            normalized_fee_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "marketplace_fee",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
+            normalized_label_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "shipping_label",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
         output: list[dict] = []
         for row in rows:
+            order_id = int(row.order_id or 0)
+            field_fees = float(row.fees or 0)
             shipping_cost = float(row.shipping_cost or 0)
             label_cost = float(row.shipping_label_cost or 0)
+            actual_fee = normalized_fee_by_order.get(order_id, field_fees)
+            actual_label_cost = normalized_label_by_order.get(order_id, label_cost)
+            actual_net_before_cogs = float(row.subtotal_amount or 0) + shipping_cost - actual_fee - actual_label_cost
             output.append(
                 {
-                    "order_id": int(row.order_id or 0),
+                    "order_id": order_id,
                     "sold_at": row.sold_at.isoformat() if row.sold_at else None,
                     "marketplace": str(row.marketplace or "").strip(),
                     "external_order_id": str(row.external_order_id or "").strip(),
                     "status": str(row.status or "").strip(),
                     "subtotal_amount": float(row.subtotal_amount or 0),
-                    "fees": float(row.fees or 0),
+                    "fees": field_fees,
+                    "field_fees": field_fees,
                     "shipping_cost": shipping_cost,
                     "shipping_label_cost": label_cost,
+                    "field_shipping_label_cost": label_cost,
                     "shipping_label_currency": str(row.shipping_label_currency or "").strip(),
                     "shipping_delta_charged_minus_actual": round(shipping_cost - label_cost, 2),
+                    "actual_fee": round(actual_fee, 2),
+                    "actual_shipping_label_cost": round(actual_label_cost, 2),
+                    "actual_shipping_delta_charged_minus_label": round(shipping_cost - actual_label_cost, 2),
+                    "actual_net_before_cogs": round(actual_net_before_cogs, 2),
+                    "actual_fee_source": (
+                        "normalized_order_finance_entries_marketplace_fee_sum"
+                        if order_id in normalized_fee_by_order
+                        else "order_fees_field"
+                    ),
+                    "actual_shipping_source": (
+                        "normalized_order_finance_entries_shipping_label_sum"
+                        if order_id in normalized_label_by_order
+                        else "order_shipping_label_field"
+                    ),
                     "total_amount": float(row.total_amount or 0),
                     "item_count": int(row.item_count or 0),
                     "notes": str(row.notes or "").strip(),
@@ -3778,6 +4464,7 @@ class InventoryRepository:
                 Product.metal_type.label("metal_type"),
                 Product.current_quantity.label("current_quantity"),
                 Product.acquisition_cost.label("acquisition_cost"),
+                Product.product_cost.label("product_cost"),
                 Product.acquired_at.label("acquired_at"),
                 Product.acquisition_tax_paid.label("acquisition_tax_paid"),
                 Product.acquisition_shipping_paid.label("acquisition_shipping_paid"),
@@ -3813,6 +4500,7 @@ class InventoryRepository:
                     "metal_type": str(row.metal_type or "").strip(),
                     "current_quantity": int(row.current_quantity or 0),
                     "acquisition_cost": float(row.acquisition_cost) if row.acquisition_cost is not None else None,
+                    "product_cost": float(row.product_cost) if row.product_cost is not None else None,
                     "acquired_at": row.acquired_at.isoformat() if row.acquired_at else None,
                     "acquisition_tax_paid": (
                         float(row.acquisition_tax_paid) if row.acquisition_tax_paid is not None else None
@@ -3899,16 +4587,21 @@ class InventoryRepository:
         start_dt: datetime,
         end_dt: datetime,
     ) -> list[dict]:
+        ListingProduct = aliased(Product)
+        resolved_product_id_expr = func.coalesce(Sale.product_id, MarketplaceListing.product_id)
         query = (
             select(
                 Sale.id.label("sale_id"),
                 Sale.sold_at.label("sold_at"),
                 Sale.marketplace.label("marketplace"),
                 Sale.order_id.label("order_id"),
-                Sale.product_id.label("product_id"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
-                Product.acquisition_cost.label("product_acquisition_cost"),
+                resolved_product_id_expr.label("product_id"),
+                Sale.product_id.label("sale_product_id"),
+                MarketplaceListing.product_id.label("listing_product_id"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
+                func.coalesce(Product.acquisition_cost, ListingProduct.acquisition_cost).label("product_acquisition_cost"),
+                func.coalesce(Product.product_cost, ListingProduct.product_cost).label("product_cost"),
                 Sale.listing_id.label("listing_id"),
                 Sale.external_order_id.label("external_order_id"),
                 Sale.quantity_sold.label("quantity_sold"),
@@ -3929,15 +4622,40 @@ class InventoryRepository:
                 Sale.shipped_at.label("shipped_at"),
                 Sale.delivered_at.label("delivered_at"),
                 Sale.shipping_label_cost.label("shipping_label_cost"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
             )
             .select_from(Sale)
             .join(Product, Product.id == Sale.product_id, isouter=True)
+            .join(MarketplaceListing, MarketplaceListing.id == Sale.listing_id, isouter=True)
+            .join(ListingProduct, ListingProduct.id == MarketplaceListing.product_id, isouter=True)
             .where(Sale.sold_at.between(start_dt, end_dt))
             .order_by(Sale.sold_at.desc(), Sale.id.desc())
         )
         rows = self.db.execute(query).all()
+        actual_econ_by_sale_id = {
+            int(actual_row.get("sale_id") or 0): actual_row
+            for actual_row in self.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt)
+            if int(actual_row.get("sale_id") or 0) > 0
+        }
         output: list[dict] = []
         for row in rows:
+            actual = actual_econ_by_sale_id.get(int(row.sale_id or 0)) or {}
+            bundle_payload = self._listing_bundle_payload_from_raw(row.listing_marketplace_details)
+            bundle_components = self._bundle_components_from_payload(bundle_payload, int(row.quantity_sold or 0))
+            bundle_units_per_listing = sum(
+                max(1, int(component.get("quantity_per_listing") or 1))
+                for component in bundle_components
+            )
+            bundle_inventory_units_sold = sum(
+                max(1, int(component.get("quantity_total") or 1))
+                for component in bundle_components
+            )
+            field_net = (
+                float(row.sold_price or 0)
+                + float(row.shipping_cost or 0)
+                - float(row.fees or 0)
+                - float(row.shipping_label_cost or 0)
+            )
             output.append(
                 {
                     "sale_id": int(row.sale_id or 0),
@@ -3952,12 +4670,39 @@ class InventoryRepository:
                         if row.product_acquisition_cost is not None
                         else None
                     ),
+                    "product_cost": float(row.product_cost) if row.product_cost is not None else None,
                     "listing_id": int(row.listing_id) if row.listing_id is not None else None,
+                    "listing_is_bundle": bool(bundle_components),
+                    "listing_bundle_kind": str(bundle_payload.get("kind") or "").strip(),
+                    "listing_bundle_component_count": len(bundle_components),
+                    "listing_bundle_units_per_listing": int(bundle_units_per_listing or 0),
+                    "listing_bundle_inventory_units_sold": int(bundle_inventory_units_sold or 0),
                     "external_order_id": str(row.external_order_id or "").strip(),
                     "quantity_sold": int(row.quantity_sold or 0),
                     "sold_price": float(row.sold_price or 0),
                     "fees": float(row.fees or 0),
                     "shipping_cost": float(row.shipping_cost or 0),
+                    "field_net_before_cogs": round(field_net, 2),
+                    "actual_fee": round(
+                        self._safe_float(actual.get("allocated_fee_actual", float(row.fees or 0))),
+                        2,
+                    ),
+                    "actual_shipping_charged": round(
+                        self._safe_float(actual.get("allocated_shipping_charged", float(row.shipping_cost or 0))),
+                        2,
+                    ),
+                    "actual_shipping_label_cost": round(
+                        self._safe_float(
+                            actual.get("allocated_shipping_actual", float(row.shipping_label_cost or 0))
+                        ),
+                        2,
+                    ),
+                    "actual_net_before_cogs": round(
+                        self._safe_float(actual.get("net_before_cogs_actual", field_net)),
+                        2,
+                    ),
+                    "actual_fee_source": str(actual.get("actual_fee_source") or "sale_fees_field"),
+                    "actual_shipping_source": str(actual.get("actual_shipping_source") or "sale_shipping_label_field"),
                     "shipping_provider": str(row.shipping_provider or "").strip(),
                     "shipping_service": str(row.shipping_service or "").strip(),
                     "shipping_package_type": str(row.shipping_package_type or "").strip(),
@@ -3990,6 +4735,9 @@ class InventoryRepository:
         start_dt: datetime,
         end_dt: datetime,
     ) -> list[dict]:
+        ReturnProduct = aliased(Product)
+        SaleProduct = aliased(Product)
+        ListingProduct = aliased(Product)
         query = (
             select(
                 ReturnRecord.id.label("return_id"),
@@ -3999,9 +4747,12 @@ class InventoryRepository:
                 ReturnRecord.external_return_id.label("external_return_id"),
                 ReturnRecord.sale_id.label("sale_id"),
                 ReturnRecord.order_id.label("order_id"),
-                ReturnRecord.product_id.label("product_id"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(ReturnRecord.product_id, Sale.product_id, MarketplaceListing.product_id).label("product_id"),
+                ReturnRecord.product_id.label("return_product_id"),
+                Sale.product_id.label("sale_product_id"),
+                MarketplaceListing.product_id.label("listing_product_id"),
+                func.coalesce(ReturnProduct.sku, SaleProduct.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(ReturnProduct.title, SaleProduct.title, ListingProduct.title).label("product_title"),
                 ReturnRecord.return_status.label("status"),
                 ReturnRecord.reason.label("reason"),
                 ReturnRecord.disposition.label("disposition"),
@@ -4012,16 +4763,30 @@ class InventoryRepository:
                 ReturnRecord.restocked.label("restocked"),
                 ReturnRecord.notes.label("notes"),
                 Sale.external_order_id.label("source_order"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
             )
             .select_from(ReturnRecord)
-            .join(Product, Product.id == ReturnRecord.product_id, isouter=True)
             .join(Sale, Sale.id == ReturnRecord.sale_id, isouter=True)
+            .join(MarketplaceListing, MarketplaceListing.id == Sale.listing_id, isouter=True)
+            .join(ReturnProduct, ReturnProduct.id == ReturnRecord.product_id, isouter=True)
+            .join(SaleProduct, SaleProduct.id == Sale.product_id, isouter=True)
+            .join(ListingProduct, ListingProduct.id == MarketplaceListing.product_id, isouter=True)
             .where(ReturnRecord.returned_at.between(start_dt, end_dt))
             .order_by(ReturnRecord.returned_at.desc(), ReturnRecord.id.desc())
         )
         rows = self.db.execute(query).all()
         output: list[dict] = []
         for row in rows:
+            bundle_payload = self._listing_bundle_payload_from_raw(row.listing_marketplace_details)
+            bundle_components = self._bundle_components_from_payload(bundle_payload, int(row.quantity or 0))
+            bundle_units_per_return = sum(
+                max(1, int(component.get("quantity_per_listing") or 1))
+                for component in bundle_components
+            )
+            bundle_inventory_units_returned = sum(
+                max(1, int(component.get("quantity_total") or 1))
+                for component in bundle_components
+            )
             output.append(
                 {
                     "return_id": int(row.return_id or 0),
@@ -4042,6 +4807,11 @@ class InventoryRepository:
                     "refund_fees": float(row.refund_fees or 0),
                     "refund_shipping": float(row.refund_shipping or 0),
                     "restocked": bool(row.restocked),
+                    "listing_is_bundle": bool(bundle_components),
+                    "listing_bundle_kind": str(bundle_payload.get("kind") or "").strip(),
+                    "listing_bundle_component_count": len(bundle_components),
+                    "listing_bundle_units_per_return": int(bundle_units_per_return or 0),
+                    "listing_bundle_inventory_units_returned": int(bundle_inventory_units_returned or 0),
                     "notes": str(row.notes or "").strip(),
                     "source_order": str(row.source_order or "").strip(),
                 }
@@ -4062,11 +4832,24 @@ class InventoryRepository:
                 InventorySource.source_type.label("source_type"),
                 PurchaseLot.vendor.label("vendor"),
                 PurchaseLot.purchase_date.label("purchase_date"),
+                PurchaseLot.total_cost.label("lot_total_cost"),
+                PurchaseLot.total_tax_paid.label("lot_total_tax_paid"),
+                PurchaseLot.total_shipping_paid.label("lot_total_shipping_paid"),
+                PurchaseLot.total_handling_paid.label("lot_total_handling_paid"),
+                PurchaseLot.expected_total_quantity.label("lot_expected_total_quantity"),
                 Product.sku.label("sku"),
                 Product.title.label("product_title"),
+                ProductLotAssignment.lot_id.label("lot_id"),
                 ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
                 ProductLotAssignment.unit_cost.label("unit_cost"),
+                ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
+                ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
+                ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
                 ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
+                ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
+                ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                ProductLotAssignment.allocation_weight.label("allocation_weight"),
                 ProductLotAssignment.acquired_at.label("acquired_at"),
             )
             .select_from(ProductLotAssignment)
@@ -4085,21 +4868,64 @@ class InventoryRepository:
             .order_by(ProductLotAssignment.acquired_at.desc(), ProductLotAssignment.id.desc())
         )
         rows = self.db.execute(query).all()
+        lot_fallback_unit_costs, assignment_fallback_unit_costs = self._lot_fallback_unit_cost_maps_from_rows(
+            list(rows)
+        )
         output: list[dict] = []
         for row in rows:
+            resolved_unit_cost = self._landed_unit_cost_from_assignment_row(
+                row,
+                lot_fallback_unit_costs=lot_fallback_unit_costs,
+                assignment_fallback_unit_costs=assignment_fallback_unit_costs,
+            )
+            explicit_unit_cost = self._explicit_landed_unit_cost_from_assignment_row(row)
+            assignment_id = int(row.assignment_id or 0)
+            lot_id = int(row.lot_id or 0)
+            if explicit_unit_cost > 0 and row.unit_cost is not None:
+                cost_source = "assignment_unit_landed_cost"
+            elif explicit_unit_cost > 0:
+                cost_source = "assignment_allocated_landed_cost"
+            elif assignment_id in assignment_fallback_unit_costs:
+                cost_source = "lot_allocation_weight"
+            elif lot_id in lot_fallback_unit_costs and int(row.lot_expected_total_quantity or 0) > 0:
+                cost_source = "lot_expected_quantity_fallback"
+            elif lot_id in lot_fallback_unit_costs:
+                cost_source = "lot_equal_quantity_fallback"
+            else:
+                cost_source = "missing_cost_basis"
             output.append(
                 {
                     "assignment_id": int(row.assignment_id or 0),
+                    "lot_id": int(row.lot_id or 0),
                     "lot_code": str(row.lot_code or "").strip() or None,
                     "source_name": str(row.source_name or "").strip() or None,
                     "source_type": str(row.source_type or "").strip() or None,
                     "vendor": str(row.vendor or "").strip() or None,
                     "purchase_date": row.purchase_date.isoformat() if row.purchase_date else None,
+                    "lot_landed_total": round(self._lot_landed_total_from_assignment_row(row), 2),
+                    "lot_expected_total_quantity": (
+                        int(row.lot_expected_total_quantity)
+                        if row.lot_expected_total_quantity is not None
+                        else None
+                    ),
                     "sku": str(row.sku or "").strip() or None,
                     "product_title": str(row.product_title or "").strip() or None,
                     "quantity_acquired": int(row.quantity_acquired or 0),
                     "unit_cost": float(row.unit_cost) if row.unit_cost is not None else None,
+                    "unit_tax_paid": float(row.unit_tax_paid) if row.unit_tax_paid is not None else None,
+                    "unit_shipping_paid": float(row.unit_shipping_paid) if row.unit_shipping_paid is not None else None,
+                    "unit_handling_paid": float(row.unit_handling_paid) if row.unit_handling_paid is not None else None,
                     "allocated_cost": float(row.allocated_cost) if row.allocated_cost is not None else None,
+                    "allocated_tax_paid": float(row.allocated_tax_paid) if row.allocated_tax_paid is not None else None,
+                    "allocated_shipping_paid": float(row.allocated_shipping_paid) if row.allocated_shipping_paid is not None else None,
+                    "allocated_handling_paid": float(row.allocated_handling_paid) if row.allocated_handling_paid is not None else None,
+                    "allocation_weight": float(row.allocation_weight) if row.allocation_weight is not None else None,
+                    "resolved_landed_unit_cost": round(float(resolved_unit_cost), 4),
+                    "resolved_landed_total_cost": round(
+                        float(resolved_unit_cost) * float(max(0, int(row.quantity_acquired or 0))),
+                        2,
+                    ),
+                    "cost_source": cost_source,
                     "acquired_at": row.acquired_at.isoformat() if row.acquired_at else None,
                 }
             )
@@ -4111,20 +4937,30 @@ class InventoryRepository:
             raise ValueError(f"Purchase lot {int(lot_id)} not found.")
         assignment_rows = self.db.execute(
             select(
+                ProductLotAssignment.id.label("assignment_id"),
+                ProductLotAssignment.lot_id.label("lot_id"),
                 ProductLotAssignment.product_id.label("product_id"),
                 ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
                 ProductLotAssignment.allocated_cost.label("allocated_cost"),
                 ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
                 ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
                 ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                ProductLotAssignment.allocation_weight.label("allocation_weight"),
                 ProductLotAssignment.unit_cost.label("unit_cost"),
                 ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
                 ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
                 ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
+                ProductLotAssignment.acquired_at.label("acquired_at"),
+                PurchaseLot.total_cost.label("lot_total_cost"),
+                PurchaseLot.total_tax_paid.label("lot_total_tax_paid"),
+                PurchaseLot.total_shipping_paid.label("lot_total_shipping_paid"),
+                PurchaseLot.total_handling_paid.label("lot_total_handling_paid"),
+                PurchaseLot.expected_total_quantity.label("lot_expected_total_quantity"),
                 Product.sku.label("sku"),
                 Product.title.label("product_title"),
             )
             .select_from(ProductLotAssignment)
+            .join(PurchaseLot, PurchaseLot.id == ProductLotAssignment.lot_id, isouter=True)
             .join(Product, Product.id == ProductLotAssignment.product_id, isouter=True)
             .where(ProductLotAssignment.lot_id == int(lot_id))
         ).all()
@@ -4146,26 +4982,37 @@ class InventoryRepository:
                 "rows": [],
             }
 
+        lot_fallback_unit_costs, assignment_fallback_unit_costs = self._lot_fallback_unit_cost_maps_from_rows(
+            list(assignment_rows)
+        )
+
         product_rollup: dict[int, dict[str, Any]] = {}
         for row in assignment_rows:
             product_id = int(row.product_id or 0)
             if product_id <= 0:
                 continue
             qty = max(0, int(row.quantity_acquired or 0))
-            allocated_landed = (
-                float(row.allocated_cost or 0)
-                + float(row.allocated_tax_paid or 0)
-                + float(row.allocated_shipping_paid or 0)
-                + float(row.allocated_handling_paid or 0)
+            unit_landed = self._landed_unit_cost_from_assignment_row(
+                row,
+                lot_fallback_unit_costs=lot_fallback_unit_costs,
+                assignment_fallback_unit_costs=assignment_fallback_unit_costs,
             )
-            unit_landed = (
-                float(row.unit_cost or 0)
-                + float(row.unit_tax_paid or 0)
-                + float(row.unit_shipping_paid or 0)
-                + float(row.unit_handling_paid or 0)
-            )
-            if unit_landed <= 0 and qty > 0 and allocated_landed > 0:
-                unit_landed = allocated_landed / float(qty)
+            explicit_unit_cost = self._explicit_landed_unit_cost_from_assignment_row(row)
+            assignment_id = int(row.assignment_id or 0)
+            row_lot_id = int(row.lot_id or 0)
+            if explicit_unit_cost > 0 and row.unit_cost is not None:
+                cost_source = "assignment_unit_landed_cost"
+            elif explicit_unit_cost > 0:
+                cost_source = "assignment_allocated_landed_cost"
+            elif assignment_id in assignment_fallback_unit_costs:
+                cost_source = "lot_allocation_weight"
+            elif row_lot_id in lot_fallback_unit_costs and int(row.lot_expected_total_quantity or 0) > 0:
+                cost_source = "lot_expected_quantity_fallback"
+            elif row_lot_id in lot_fallback_unit_costs:
+                cost_source = "lot_equal_quantity_fallback"
+            else:
+                cost_source = "missing_cost_basis"
+            allocated_landed = unit_landed * float(qty)
             current = product_rollup.setdefault(
                 product_id,
                 {
@@ -4175,10 +5022,15 @@ class InventoryRepository:
                     "assigned_qty": 0,
                     "allocated_landed_cost": 0.0,
                     "unit_landed_cost": 0.0,
+                    "cost_source_totals": {},
                 },
             )
             current["assigned_qty"] += int(qty)
             current["allocated_landed_cost"] += float(allocated_landed or 0.0)
+            source_totals = current.setdefault("cost_source_totals", {})
+            source_totals[cost_source] = float(source_totals.get(cost_source, 0.0) or 0.0) + float(
+                allocated_landed or 0.0
+            )
             if current["assigned_qty"] > 0:
                 current["unit_landed_cost"] = (
                     float(current["allocated_landed_cost"]) / float(current["assigned_qty"])
@@ -4187,37 +5039,329 @@ class InventoryRepository:
                 current["unit_landed_cost"] = float(unit_landed)
 
         product_ids = [int(pid) for pid in product_rollup.keys()]
-        sales_rows = []
+        sale_rows = []
         if product_ids:
-            sales_rows = self.db.execute(
+            sale_rows = self.db.execute(
                 select(
+                    Sale.id.label("sale_id"),
                     Sale.product_id.label("product_id"),
-                    func.coalesce(func.sum(Sale.quantity_sold), 0).label("qty_sold"),
-                    func.coalesce(func.sum(Sale.sold_price), 0).label("gross_sales"),
-                    func.coalesce(func.sum(Sale.fees), 0).label("fees"),
-                    func.coalesce(func.sum(Sale.shipping_cost), 0).label("shipping_cost"),
+                    Sale.sold_at.label("sold_at"),
+                    func.coalesce(Sale.quantity_sold, 0).label("qty_sold"),
+                    func.coalesce(Sale.sold_price, 0).label("gross_sales"),
+                    func.coalesce(Sale.fees, 0).label("fees"),
+                    func.coalesce(Sale.shipping_cost, 0).label("shipping_cost"),
+                    func.coalesce(Sale.shipping_label_cost, 0).label("shipping_label_cost"),
+                    MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
                 )
                 .select_from(Sale)
-                .where(Sale.product_id.in_(product_ids))
-                .group_by(Sale.product_id)
+                .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+                .where(
+                    or_(
+                        Sale.product_id.in_(product_ids),
+                        MarketplaceListing.marketplace_details.is_not(None),
+                    )
+                )
+                .order_by(Sale.sold_at.asc(), Sale.id.asc())
             ).all()
-        sales_map = {
-            int(row.product_id): {
-                "qty_sold": int(row.qty_sold or 0),
-                "gross_sales": float(row.gross_sales or 0),
-                "fees": float(row.fees or 0),
-                "shipping_cost": float(row.shipping_cost or 0),
+        actual_econ_by_sale_id: dict[int, dict[str, Any]] = {}
+        sale_dates = [row.sold_at for row in sale_rows if row.sold_at is not None]
+        if sale_dates:
+            actual_econ_by_sale_id = {
+                int(actual_row.get("sale_id") or 0): actual_row
+                for actual_row in self.report_sales_actual_econ_rows(
+                    start_dt=min(sale_dates),
+                    end_dt=max(sale_dates),
+                )
+                if int(actual_row.get("sale_id") or 0) > 0
             }
-            for row in sales_rows
-            if int(row.product_id or 0) > 0
+        all_assignment_rows = []
+        if product_ids:
+            all_assignment_rows = self.db.execute(
+                select(
+                    ProductLotAssignment.id.label("assignment_id"),
+                    ProductLotAssignment.lot_id.label("lot_id"),
+                    ProductLotAssignment.product_id.label("product_id"),
+                    ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                    ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                    ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
+                    ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
+                    ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                    ProductLotAssignment.allocation_weight.label("allocation_weight"),
+                    ProductLotAssignment.unit_cost.label("unit_cost"),
+                    ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
+                    ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
+                    ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
+                    ProductLotAssignment.acquired_at.label("acquired_at"),
+                    PurchaseLot.total_cost.label("lot_total_cost"),
+                    PurchaseLot.total_tax_paid.label("lot_total_tax_paid"),
+                    PurchaseLot.total_shipping_paid.label("lot_total_shipping_paid"),
+                    PurchaseLot.total_handling_paid.label("lot_total_handling_paid"),
+                    PurchaseLot.expected_total_quantity.label("lot_expected_total_quantity"),
+                )
+                .select_from(ProductLotAssignment)
+                .join(PurchaseLot, PurchaseLot.id == ProductLotAssignment.lot_id, isouter=True)
+                .where(ProductLotAssignment.product_id.in_(product_ids))
+            ).all()
+        all_lot_fallback_unit_costs, all_assignment_fallback_unit_costs = (
+            self._lot_fallback_unit_cost_maps_from_rows(list(all_assignment_rows))
+        )
+        lots_by_product: dict[int, list[dict[str, Any]]] = {}
+        for assignment_row in all_assignment_rows:
+            product_id = int(assignment_row.product_id or 0)
+            assignment_qty = max(0, int(assignment_row.quantity_acquired or 0))
+            if product_id <= 0 or assignment_qty <= 0:
+                continue
+            unit_landed = self._landed_unit_cost_from_assignment_row(
+                assignment_row,
+                lot_fallback_unit_costs=all_lot_fallback_unit_costs,
+                assignment_fallback_unit_costs=all_assignment_fallback_unit_costs,
+            )
+            explicit_unit_cost = self._explicit_landed_unit_cost_from_assignment_row(assignment_row)
+            assignment_id = int(assignment_row.assignment_id or 0)
+            row_lot_id = int(assignment_row.lot_id or 0)
+            if explicit_unit_cost > 0 and assignment_row.unit_cost is not None:
+                cost_source = "assignment_unit_landed_cost"
+            elif explicit_unit_cost > 0:
+                cost_source = "assignment_allocated_landed_cost"
+            elif assignment_id in all_assignment_fallback_unit_costs:
+                cost_source = "lot_allocation_weight"
+            elif row_lot_id in all_lot_fallback_unit_costs and int(assignment_row.lot_expected_total_quantity or 0) > 0:
+                cost_source = "lot_expected_quantity_fallback"
+            elif row_lot_id in all_lot_fallback_unit_costs:
+                cost_source = "lot_equal_quantity_fallback"
+            else:
+                cost_source = "missing_cost_basis"
+            lots_by_product.setdefault(product_id, []).append(
+                {
+                    "lot_id": row_lot_id,
+                    "remaining_qty": int(assignment_qty),
+                    "unit_cost": float(unit_landed),
+                    "cost_source": cost_source,
+                    "acquired_at": assignment_row.acquired_at,
+                    "assignment_id": assignment_id,
+                }
+            )
+        lot_sources = {
+            product_id: sorted(
+                rows,
+                key=lambda item: (
+                    item.get("acquired_at") or datetime.min,
+                    int(item.get("assignment_id") or 0),
+                ),
+            )
+            for product_id, rows in lots_by_product.items()
         }
+        source_index_by_product = {product_id: 0 for product_id in lot_sources}
+        from collections import deque
+
+        queues = {product_id: deque() for product_id in lot_sources}
+
+        def _queue_available_lots(product_id: int, cutoff: datetime) -> None:
+            rows = lot_sources.get(product_id) or []
+            idx = int(source_index_by_product.get(product_id, 0))
+            queue = queues.setdefault(product_id, deque())
+            while idx < len(rows):
+                acquired_at = rows[idx].get("acquired_at") or datetime.min
+                if acquired_at > cutoff:
+                    break
+                queue.append(dict(rows[idx]))
+                idx += 1
+            source_index_by_product[product_id] = idx
+
+        sales_map: dict[int, dict[str, Any]] = {}
+        sale_lot_allocations: dict[int, list[dict[str, Any]]] = {}
+        for row in sale_rows:
+            sale_id = int(row.sale_id or 0)
+            actual = actual_econ_by_sale_id.get(sale_id) or {}
+            gross_sales = self._safe_float(row.gross_sales)
+            fees = self._safe_float(actual.get("allocated_fee_actual", row.fees))
+            shipping_cost = self._safe_float(actual.get("allocated_shipping_charged", row.shipping_cost))
+            shipping_label_cost = self._safe_float(
+                actual.get("allocated_shipping_actual", row.shipping_label_cost)
+            )
+            net_before_cogs = self._safe_float(
+                actual.get(
+                    "net_before_cogs_actual",
+                    gross_sales + shipping_cost - fees - shipping_label_cost,
+                )
+            )
+            listing_qty = max(1, int(row.qty_sold or 1))
+            component_events: list[dict[str, Any]] = []
+            bundle_components = self._bundle_components_from_payload(
+                self._listing_bundle_payload_from_raw(row.listing_marketplace_details),
+                listing_qty,
+            )
+            if bundle_components:
+                bundle_units_per_listing = sum(
+                    max(1, int(component.get("quantity_per_listing") or 1))
+                    for component in bundle_components
+                )
+                bundle_units_total = sum(
+                    max(1, int(component.get("quantity_total") or 1))
+                    for component in bundle_components
+                )
+                for component in bundle_components:
+                    component_product_id = int(component.get("product_id") or 0)
+                    if component_product_id not in product_ids:
+                        continue
+                    component_qty = max(1, int(component.get("quantity_total") or 1))
+                    portion = float(component_qty) / float(max(1, bundle_units_total))
+                    component_events.append(
+                        {
+                            "product_id": component_product_id,
+                            "quantity": component_qty,
+                            "quantity_per_listing": max(1, int(component.get("quantity_per_listing") or 1)),
+                            "bundle_units_per_listing": max(1, int(bundle_units_per_listing or 1)),
+                            "gross_sales": gross_sales * portion,
+                            "fees": fees * portion,
+                            "shipping_cost": shipping_cost * portion,
+                            "shipping_label_cost": shipping_label_cost * portion,
+                            "net_before_cogs": net_before_cogs * portion,
+                        }
+                    )
+            else:
+                product_id = int(row.product_id or 0)
+                if product_id in product_ids:
+                    component_events.append(
+                        {
+                            "product_id": product_id,
+                            "quantity": listing_qty,
+                            "quantity_per_listing": 1,
+                            "bundle_units_per_listing": 1,
+                            "gross_sales": gross_sales,
+                            "fees": fees,
+                            "shipping_cost": shipping_cost,
+                            "shipping_label_cost": shipping_label_cost,
+                            "net_before_cogs": net_before_cogs,
+                        }
+                    )
+            for event in component_events:
+                product_id = int(event.get("product_id") or 0)
+                sale_qty = max(1, int(event.get("quantity") or 1))
+                _queue_available_lots(product_id, row.sold_at or datetime.min)
+                queue = queues.setdefault(product_id, deque())
+                qty_remaining = sale_qty
+                while qty_remaining > 0 and queue:
+                    if int(queue[0].get("remaining_qty") or 0) <= 0:
+                        queue.popleft()
+                        continue
+                    use_qty = min(qty_remaining, int(queue[0].get("remaining_qty") or 0))
+                    consumed_lot_id = int(queue[0].get("lot_id") or 0)
+                    if consumed_lot_id == int(lot_id):
+                        portion = float(use_qty) / float(sale_qty)
+                        bucket = sales_map.setdefault(
+                            product_id,
+                            {
+                                "qty_sold": 0,
+                                "gross_sales": 0.0,
+                                "fees": 0.0,
+                                "shipping_cost": 0.0,
+                                "shipping_label_cost": 0.0,
+                                "net_before_cogs": 0.0,
+                                "lot_cogs": 0.0,
+                                "cost_source_totals": {},
+                            },
+                        )
+                        bucket["qty_sold"] = int(bucket.get("qty_sold") or 0) + int(use_qty)
+                        bucket["gross_sales"] = float(bucket.get("gross_sales") or 0.0) + (
+                            self._safe_float(event.get("gross_sales")) * portion
+                        )
+                        bucket["fees"] = float(bucket.get("fees") or 0.0) + (
+                            self._safe_float(event.get("fees")) * portion
+                        )
+                        bucket["shipping_cost"] = float(bucket.get("shipping_cost") or 0.0) + (
+                            self._safe_float(event.get("shipping_cost")) * portion
+                        )
+                        bucket["shipping_label_cost"] = float(bucket.get("shipping_label_cost") or 0.0) + (
+                            self._safe_float(event.get("shipping_label_cost")) * portion
+                        )
+                        bucket["net_before_cogs"] = float(bucket.get("net_before_cogs") or 0.0) + (
+                            self._safe_float(event.get("net_before_cogs")) * portion
+                        )
+                        consumed_cost = float(use_qty) * self._safe_float(queue[0].get("unit_cost"))
+                        bucket["lot_cogs"] = float(bucket.get("lot_cogs") or 0.0) + consumed_cost
+                        source = str(queue[0].get("cost_source") or "missing_cost_basis")
+                        source_totals = bucket.setdefault("cost_source_totals", {})
+                        source_totals[source] = float(source_totals.get(source, 0.0) or 0.0) + consumed_cost
+                        if sale_id > 0:
+                            sale_lot_allocations.setdefault(sale_id, []).append(
+                                {
+                                    "product_id": product_id,
+                                    "quantity": int(use_qty),
+                                    "quantity_per_listing": max(1, int(event.get("quantity_per_listing") or 1)),
+                                    "bundle_units_per_listing": max(
+                                        1,
+                                        int(event.get("bundle_units_per_listing") or 1),
+                                    ),
+                                    "unit_cost": self._safe_float(queue[0].get("unit_cost")),
+                                }
+                            )
+                    queue[0]["remaining_qty"] = int(queue[0].get("remaining_qty") or 0) - use_qty
+                    qty_remaining -= use_qty
+                    if int(queue[0].get("remaining_qty") or 0) <= 0:
+                        queue.popleft()
+
+        return_adjustments_by_product: dict[int, dict[str, float]] = {}
+        if sale_lot_allocations:
+            return_rows = self.db.execute(
+                select(
+                    ReturnRecord.sale_id.label("sale_id"),
+                    ReturnRecord.quantity.label("quantity"),
+                    ReturnRecord.refund_amount.label("refund_amount"),
+                    ReturnRecord.refund_fees.label("refund_fees"),
+                    ReturnRecord.refund_shipping.label("refund_shipping"),
+                )
+                .where(ReturnRecord.sale_id.in_(sorted(sale_lot_allocations.keys())))
+                .order_by(ReturnRecord.returned_at.asc(), ReturnRecord.id.asc())
+            ).all()
+            for return_row in return_rows:
+                sale_id = int(return_row.sale_id or 0)
+                allocations = sale_lot_allocations.get(sale_id) or []
+                if not allocations:
+                    continue
+                return_listing_qty = max(1, int(return_row.quantity or 1))
+                refund_total = (
+                    self._safe_float(return_row.refund_amount)
+                    + self._safe_float(return_row.refund_fees)
+                    + self._safe_float(return_row.refund_shipping)
+                )
+                for allocation in allocations:
+                    allocation_qty = max(0, int(allocation.get("quantity") or 0))
+                    if allocation_qty <= 0:
+                        continue
+                    returned_qty = min(
+                        allocation_qty,
+                        max(1, int(allocation.get("quantity_per_listing") or 1)) * return_listing_qty,
+                    )
+                    refund_portion = float(returned_qty) / float(
+                        max(1, int(allocation.get("bundle_units_per_listing") or 1)) * return_listing_qty
+                    )
+                    product_id = int(allocation.get("product_id") or 0)
+                    if product_id <= 0:
+                        continue
+                    adjustment = return_adjustments_by_product.setdefault(
+                        product_id,
+                        {
+                            "qty_returned": 0.0,
+                            "refund_total": 0.0,
+                            "cogs_reversal": 0.0,
+                        },
+                    )
+                    adjustment["qty_returned"] += float(returned_qty)
+                    adjustment["refund_total"] += refund_total * refund_portion
+                    adjustment["cogs_reversal"] += returned_qty * self._safe_float(allocation.get("unit_cost"))
 
         rows: list[dict[str, Any]] = []
         summary_assigned_qty = 0
         summary_allocated_cost = 0.0
         summary_est_gross = 0.0
+        summary_est_net_before_cogs_before_returns = 0.0
+        summary_est_cogs_before_returns = 0.0
         summary_est_net_before_cogs = 0.0
         summary_est_cogs = 0.0
+        summary_returns_refund_total = 0.0
+        summary_returns_cogs_reversal = 0.0
+        summary_cost_source_totals: dict[str, float] = {}
         for product_id, data in product_rollup.items():
             assigned_qty = int(data.get("assigned_qty") or 0)
             unit_landed = float(data.get("unit_landed_cost") or 0)
@@ -4227,23 +5371,55 @@ class InventoryRepository:
             gross_sales_total = float(sold.get("gross_sales") or 0.0)
             fees_total = float(sold.get("fees") or 0.0)
             shipping_total = float(sold.get("shipping_cost") or 0.0)
+            shipping_label_total = float(sold.get("shipping_label_cost") or 0.0)
+            net_before_cogs_total = float(sold.get("net_before_cogs") or 0.0)
 
-            qty_sold_est_from_lot = min(max(0, assigned_qty), max(0, qty_sold_total))
-            alloc_ratio = (
-                float(qty_sold_est_from_lot) / float(qty_sold_total)
-                if qty_sold_total > 0
-                else 0.0
-            )
-            est_gross_sales = gross_sales_total * alloc_ratio
-            est_net_before_cogs = (gross_sales_total - fees_total - shipping_total) * alloc_ratio
-            est_lot_cogs = unit_landed * float(qty_sold_est_from_lot)
+            qty_sold_est_from_lot = qty_sold_total
+            est_gross_sales = gross_sales_total
+            est_net_before_cogs = net_before_cogs_total
+            est_lot_cogs = float(sold.get("lot_cogs") or 0.0)
+            est_net_before_cogs_before_returns = est_net_before_cogs
+            est_lot_cogs_before_returns = est_lot_cogs
+            est_lot_profit_before_returns = est_net_before_cogs_before_returns - est_lot_cogs_before_returns
+            return_adjustment = return_adjustments_by_product.get(product_id) or {}
+            qty_returned_from_lot = int(return_adjustment.get("qty_returned") or 0)
+            returns_refund_total = float(return_adjustment.get("refund_total") or 0.0)
+            returns_cogs_reversal = float(return_adjustment.get("cogs_reversal") or 0.0)
+            returns_profit_impact = -returns_refund_total + returns_cogs_reversal
+            est_net_before_cogs -= returns_refund_total
+            est_lot_cogs = max(0.0, est_lot_cogs - returns_cogs_reversal)
             est_lot_profit = est_net_before_cogs - est_lot_cogs
+            sold_source_totals = {
+                str(source): float(total or 0.0)
+                for source, total in dict(sold.get("cost_source_totals") or {}).items()
+                if float(total or 0.0) > 0
+            }
+            row_basis_source_totals = sold_source_totals or {
+                str(source): float(total or 0.0)
+                for source, total in dict(data.get("cost_source_totals") or {}).items()
+                if float(total or 0.0) > 0
+            }
+            row_sources = {
+                source
+                for source, total in row_basis_source_totals.items()
+                if float(total or 0.0) > 0
+            }
+            if row_sources:
+                row_cost_source = sorted(row_sources)[0] if len(row_sources) == 1 else "mixed_lot_cost"
+            else:
+                row_cost_source = "missing_cost_basis"
 
             summary_assigned_qty += assigned_qty
             summary_allocated_cost += allocated_landed
             summary_est_gross += est_gross_sales
+            summary_est_net_before_cogs_before_returns += est_net_before_cogs_before_returns
+            summary_est_cogs_before_returns += est_lot_cogs_before_returns
             summary_est_net_before_cogs += est_net_before_cogs
             summary_est_cogs += est_lot_cogs
+            summary_returns_refund_total += returns_refund_total
+            summary_returns_cogs_reversal += returns_cogs_reversal
+            for source, total in sold_source_totals.items():
+                summary_cost_source_totals[source] = summary_cost_source_totals.get(source, 0.0) + float(total)
             rows.append(
                 {
                     "product_id": int(product_id),
@@ -4252,14 +5428,27 @@ class InventoryRepository:
                     "assigned_qty": assigned_qty,
                     "qty_sold_total": qty_sold_total,
                     "qty_sold_est_from_lot": int(qty_sold_est_from_lot),
+                    "qty_returned_from_lot": int(qty_returned_from_lot),
                     "unit_landed_cost": round(unit_landed, 4),
                     "allocated_landed_cost": round(allocated_landed, 2),
                     "estimated_gross_sales_from_lot": round(est_gross_sales, 2),
+                    "estimated_net_before_cogs_before_returns": round(est_net_before_cogs_before_returns, 2),
+                    "estimated_lot_cogs_before_returns": round(est_lot_cogs_before_returns, 2),
+                    "estimated_lot_profit_before_returns": round(est_lot_profit_before_returns, 2),
                     "estimated_net_before_cogs_from_lot": round(est_net_before_cogs, 2),
                     "estimated_lot_cogs": round(est_lot_cogs, 2),
                     "estimated_lot_profit": round(est_lot_profit, 2),
+                    "returns_refund_total": round(returns_refund_total, 2),
+                    "returns_cogs_reversal": round(returns_cogs_reversal, 2),
+                    "returns_profit_impact": round(returns_profit_impact, 2),
+                    "cost_source": row_cost_source,
                 }
             )
+        summary_cost_sources = {
+            source
+            for source, total in summary_cost_source_totals.items()
+            if float(total or 0.0) > 0
+        }
 
         return {
             "lot_id": int(lot.id),
@@ -4271,9 +5460,33 @@ class InventoryRepository:
                 "assigned_qty": int(summary_assigned_qty),
                 "allocated_landed_cost": round(float(summary_allocated_cost), 2),
                 "estimated_gross_sales": round(float(summary_est_gross), 2),
+                "estimated_net_before_cogs_before_returns": round(
+                    float(summary_est_net_before_cogs_before_returns),
+                    2,
+                ),
+                "estimated_lot_cogs_before_returns": round(float(summary_est_cogs_before_returns), 2),
+                "estimated_lot_profit_before_returns": round(
+                    float(summary_est_net_before_cogs_before_returns - summary_est_cogs_before_returns),
+                    2,
+                ),
                 "estimated_net_before_cogs": round(float(summary_est_net_before_cogs), 2),
                 "estimated_lot_cogs": round(float(summary_est_cogs), 2),
                 "estimated_lot_profit": round(float(summary_est_net_before_cogs - summary_est_cogs), 2),
+                "returns_refund_total": round(float(summary_returns_refund_total), 2),
+                "returns_cogs_reversal": round(float(summary_returns_cogs_reversal), 2),
+                "returns_profit_impact": round(
+                    float(-summary_returns_refund_total + summary_returns_cogs_reversal),
+                    2,
+                ),
+                "cost_source": (
+                    sorted(summary_cost_sources)[0] if len(summary_cost_sources) == 1 else "mixed_lot_cost"
+                )
+                if summary_cost_sources
+                else "missing_cost_basis",
+                "cost_source_totals": {
+                    source: round(float(total), 2)
+                    for source, total in sorted(summary_cost_source_totals.items())
+                },
             },
             "rows": sorted(rows, key=lambda x: str(x.get("sku") or "")),
         }
@@ -4283,7 +5496,7 @@ class InventoryRepository:
         *,
         end_dt: datetime,
         default_unit_cost_by_product: dict[int, float] | None = None,
-    ) -> dict[str, dict[int, float]]:
+    ) -> dict[str, Any]:
         def _safe_float(value: Any) -> float:
             try:
                 if value is None:
@@ -4302,6 +5515,7 @@ class InventoryRepository:
             select(
                 ProductLotAssignment.id.label("assignment_id"),
                 ProductLotAssignment.product_id.label("product_id"),
+                ProductLotAssignment.lot_id.label("lot_id"),
                 ProductLotAssignment.acquired_at.label("acquired_at"),
                 ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
                 ProductLotAssignment.unit_cost.label("unit_cost"),
@@ -4312,8 +5526,15 @@ class InventoryRepository:
                 ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
                 ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
                 ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                ProductLotAssignment.allocation_weight.label("allocation_weight"),
+                PurchaseLot.total_cost.label("lot_total_cost"),
+                PurchaseLot.total_tax_paid.label("lot_total_tax_paid"),
+                PurchaseLot.total_shipping_paid.label("lot_total_shipping_paid"),
+                PurchaseLot.total_handling_paid.label("lot_total_handling_paid"),
+                PurchaseLot.expected_total_quantity.label("lot_expected_total_quantity"),
             )
             .select_from(ProductLotAssignment)
+            .join(PurchaseLot, PurchaseLot.id == ProductLotAssignment.lot_id, isouter=True)
             .where(
                 ProductLotAssignment.product_id.is_not(None),
                 ProductLotAssignment.acquired_at <= end_dt,
@@ -4325,97 +5546,257 @@ class InventoryRepository:
             select(
                 Sale.id.label("sale_id"),
                 Sale.product_id.label("product_id"),
+                Sale.listing_id.label("listing_id"),
                 Sale.sold_at.label("sold_at"),
                 Sale.quantity_sold.label("quantity_sold"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
             )
             .select_from(Sale)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
             .where(
-                Sale.product_id.is_not(None),
                 Sale.sold_at.is_not(None),
                 Sale.sold_at <= end_dt,
             )
             .order_by(Sale.sold_at.asc(), Sale.id.asc())
         ).all()
 
-        lots_by_product: dict[int, list[dict[str, float | int]]] = {}
+        lots_by_product: dict[int, list[dict[str, float | int | datetime | None]]] = {}
         totals: dict[int, dict[str, float]] = {}
+        source_totals: dict[int, dict[str, float]] = {}
+        lot_fallback_unit_costs, assignment_fallback_unit_costs = self._lot_fallback_unit_cost_maps_from_rows(
+            list(assignment_rows)
+        )
+
         for row in assignment_rows:
             pid = int(row.product_id or 0)
             qty = float(max(0, int(row.quantity_acquired or 0)))
             if pid <= 0 or qty <= 0:
                 continue
-            base_cost = _safe_float(row.unit_cost)
-            tax_cost = _safe_float(row.unit_tax_paid)
-            shipping_cost = _safe_float(row.unit_shipping_paid)
-            handling_cost = _safe_float(row.unit_handling_paid)
-            unit_cost = base_cost + tax_cost + shipping_cost + handling_cost
-            if unit_cost <= 0:
-                allocated_landed = (
-                    _safe_float(row.allocated_cost)
-                    + _safe_float(row.allocated_tax_paid)
-                    + _safe_float(row.allocated_shipping_paid)
-                    + _safe_float(row.allocated_handling_paid)
-                )
-                if allocated_landed > 0:
-                    unit_cost = allocated_landed / qty
+            unit_cost = self._landed_unit_cost_from_assignment_row(
+                row,
+                lot_fallback_unit_costs=lot_fallback_unit_costs,
+                assignment_fallback_unit_costs=assignment_fallback_unit_costs,
+            )
+            explicit_unit_cost = self._explicit_landed_unit_cost_from_assignment_row(row)
+            assignment_id = int(row.assignment_id or 0)
+            lot_id = int(row.lot_id or 0)
+            if explicit_unit_cost > 0 and row.unit_cost is not None:
+                cost_source = "assignment_unit_landed_cost"
+            elif explicit_unit_cost > 0:
+                cost_source = "assignment_allocated_landed_cost"
+            elif assignment_id in assignment_fallback_unit_costs:
+                cost_source = "lot_allocation_weight"
+            elif lot_id in lot_fallback_unit_costs and int(row.lot_expected_total_quantity or 0) > 0:
+                cost_source = "lot_expected_quantity_fallback"
+            elif lot_id in lot_fallback_unit_costs:
+                cost_source = "lot_equal_quantity_fallback"
+            else:
+                cost_source = "missing_cost_basis"
             lots_by_product.setdefault(pid, []).append(
                 {
+                    "product_id": pid,
                     "remaining_qty": int(qty),
                     "unit_cost": float(unit_cost),
+                    "cost_source": cost_source,
+                    "acquired_at": row.acquired_at,
+                    "assignment_id": int(row.assignment_id or 0),
+                    "lot_id": int(row.lot_id or 0),
                 }
             )
             totals.setdefault(pid, {"qty": 0.0, "cost": 0.0})
             totals[pid]["qty"] += qty
             totals[pid]["cost"] += float(unit_cost) * qty
+            source_totals.setdefault(pid, {})
+            source_totals[pid][cost_source] = source_totals[pid].get(cost_source, 0.0) + qty
 
         lot_weighted_unit_cost_by_product: dict[int, float] = {}
+        lot_weighted_unit_cost_source_by_product: dict[int, str] = {}
         for pid, agg in totals.items():
             if float(agg["qty"] or 0) > 0:
                 lot_weighted_unit_cost_by_product[pid] = float(agg["cost"] / agg["qty"])
+                sources = {
+                    source
+                    for source, qty in source_totals.get(pid, {}).items()
+                    if float(qty or 0.0) > 0
+                }
+                lot_weighted_unit_cost_source_by_product[pid] = (
+                    sorted(sources)[0] if len(sources) == 1 else "mixed_lot_cost"
+                )
         for pid, default_cost in defaults.items():
             lot_weighted_unit_cost_by_product.setdefault(pid, max(0.0, _safe_float(default_cost)))
+            lot_weighted_unit_cost_source_by_product.setdefault(
+                pid,
+                "product_default_landed_cost" if _safe_float(default_cost) > 0 else "missing_cost_basis",
+            )
 
         from collections import deque
 
-        queues = {pid: deque(rows) for pid, rows in lots_by_product.items()}
+        lot_sources = {
+            pid: sorted(
+                rows,
+                key=lambda item: (
+                    item.get("acquired_at") or datetime.min,
+                    int(item.get("assignment_id") or 0),
+                ),
+            )
+            for pid, rows in lots_by_product.items()
+        }
+        source_index_by_product = {pid: 0 for pid in lot_sources}
+        queues = {pid: deque() for pid in set(lot_sources) | set(defaults)}
+
+        def _queue_available_lots(pid: int, cutoff: datetime) -> None:
+            rows = lot_sources.get(pid) or []
+            idx = int(source_index_by_product.get(pid, 0))
+            queue = queues.setdefault(pid, deque())
+            while idx < len(rows):
+                acquired_at = rows[idx].get("acquired_at") or datetime.min
+                if acquired_at > cutoff:
+                    break
+                queue.append(dict(rows[idx]))
+                idx += 1
+            source_index_by_product[pid] = idx
+
         fifo_unit_cost_by_sale: dict[int, float] = {}
+        fifo_total_cost_by_sale: dict[int, float] = {}
+        fifo_unit_cost_source_by_sale: dict[int, str] = {}
+        fifo_cogs_evidence_by_sale: dict[int, list[dict[str, Any]]] = {}
         for row in sale_rows:
             sale_id = int(row.sale_id or 0)
             pid = int(row.product_id or 0)
             qty = max(1, int(row.quantity_sold or 1))
-            if sale_id <= 0 or pid <= 0:
+            if sale_id <= 0:
                 continue
 
-            queue = queues.get(pid)
-            if queue is None:
-                queue = deque()
-                queues[pid] = queue
-            default_cost = max(0.0, _safe_float(defaults.get(pid)))
-
-            qty_remaining = qty
             total_cost = 0.0
-            while qty_remaining > 0:
-                if queue and int(queue[0]["remaining_qty"]) > 0:
-                    use_qty = min(qty_remaining, int(queue[0]["remaining_qty"]))
-                    total_cost += float(use_qty) * _safe_float(queue[0]["unit_cost"])
-                    queue[0]["remaining_qty"] = int(queue[0]["remaining_qty"]) - use_qty
-                    qty_remaining -= use_qty
-                    if int(queue[0]["remaining_qty"]) <= 0:
-                        queue.popleft()
-                else:
-                    total_cost += float(qty_remaining) * default_cost
-                    qty_remaining = 0
+            consumed_sources: set[str] = set()
+            bundle_components = self._bundle_components_from_payload(
+                self._listing_bundle_payload_from_raw(row.listing_marketplace_details),
+                qty,
+            )
+            consumption_rows = (
+                [
+                    {
+                        "product_id": int(component["product_id"]),
+                        "quantity_total": max(1, int(component.get("quantity_total") or 1)),
+                    }
+                    for component in bundle_components
+                    if int(component.get("product_id") or 0) > 0
+                ]
+                if bundle_components
+                else ([{"product_id": pid, "quantity_total": qty}] if pid > 0 else [])
+            )
+            if not consumption_rows:
+                continue
+            sale_evidence: list[dict[str, Any]] = []
+            for consumption in consumption_rows:
+                consume_pid = int(consumption["product_id"])
+                qty_remaining = max(1, int(consumption["quantity_total"]))
+                _queue_available_lots(consume_pid, row.sold_at or datetime.min)
+                queue = queues.setdefault(consume_pid, deque())
+                default_cost = max(0.0, _safe_float(defaults.get(consume_pid)))
+                while qty_remaining > 0:
+                    if queue and int(queue[0]["remaining_qty"]) > 0:
+                        use_qty = min(qty_remaining, int(queue[0]["remaining_qty"]))
+                        unit_cost = _safe_float(queue[0]["unit_cost"])
+                        source = str(queue[0].get("cost_source") or "missing_cost_basis")
+                        allocation_total = float(use_qty) * unit_cost
+                        total_cost += allocation_total
+                        consumed_sources.add(source)
+                        sale_evidence.append(
+                            {
+                                "product_id": consume_pid,
+                                "lot_id": int(queue[0].get("lot_id") or 0) or None,
+                                "assignment_id": int(queue[0].get("assignment_id") or 0) or None,
+                                "quantity": int(use_qty),
+                                "unit_cost": round(float(unit_cost), 6),
+                                "total_cost": round(float(allocation_total), 6),
+                                "cost_source": source,
+                            }
+                        )
+                        queue[0]["remaining_qty"] = int(queue[0]["remaining_qty"]) - use_qty
+                        qty_remaining -= use_qty
+                        if int(queue[0]["remaining_qty"]) <= 0:
+                            queue.popleft()
+                    else:
+                        source = "product_default_landed_cost" if default_cost > 0 else "missing_cost_basis"
+                        allocation_total = float(qty_remaining) * default_cost
+                        total_cost += allocation_total
+                        consumed_sources.add(source)
+                        sale_evidence.append(
+                            {
+                                "product_id": consume_pid,
+                                "lot_id": None,
+                                "assignment_id": None,
+                                "quantity": int(qty_remaining),
+                                "unit_cost": round(float(default_cost), 6),
+                                "total_cost": round(float(allocation_total), 6),
+                                "cost_source": source,
+                            }
+                        )
+                        qty_remaining = 0
+            fifo_total_cost_by_sale[sale_id] = round(float(total_cost), 6)
             fifo_unit_cost_by_sale[sale_id] = (total_cost / float(qty)) if qty > 0 else 0.0
+            fifo_unit_cost_source_by_sale[sale_id] = (
+                sorted(consumed_sources)[0] if len(consumed_sources) == 1 else "mixed_fifo_cost"
+            )
+            fifo_cogs_evidence_by_sale[sale_id] = sale_evidence
+
+        for pid in lot_sources:
+            _queue_available_lots(pid, end_dt)
+
+        fifo_remaining_unit_cost_by_product: dict[int, float] = {}
+        fifo_remaining_unit_cost_source_by_product: dict[int, str] = {}
+        for pid, queue in queues.items():
+            remaining_qty = 0.0
+            remaining_cost = 0.0
+            remaining_sources: set[str] = set()
+            for item in list(queue):
+                qty = float(max(0, int(item.get("remaining_qty") or 0)))
+                if qty <= 0:
+                    continue
+                remaining_qty += qty
+                remaining_cost += qty * _safe_float(item.get("unit_cost"))
+                remaining_sources.add(str(item.get("cost_source") or "missing_cost_basis"))
+            if remaining_qty > 0:
+                fifo_remaining_unit_cost_by_product[int(pid)] = remaining_cost / remaining_qty
+                fifo_remaining_unit_cost_source_by_product[int(pid)] = (
+                    sorted(remaining_sources)[0] if len(remaining_sources) == 1 else "mixed_fifo_cost"
+                )
+        for pid, default_cost in defaults.items():
+            fifo_remaining_unit_cost_by_product.setdefault(pid, max(0.0, _safe_float(default_cost)))
+            fifo_remaining_unit_cost_source_by_product.setdefault(
+                pid,
+                "product_default_landed_cost" if _safe_float(default_cost) > 0 else "missing_cost_basis",
+            )
 
         return {
             "fifo_unit_cost_by_sale": fifo_unit_cost_by_sale,
+            "fifo_total_cost_by_sale": fifo_total_cost_by_sale,
+            "fifo_unit_cost_source_by_sale": fifo_unit_cost_source_by_sale,
+            "fifo_cogs_evidence_by_sale": fifo_cogs_evidence_by_sale,
             "lot_weighted_unit_cost_by_product": lot_weighted_unit_cost_by_product,
+            "lot_weighted_unit_cost_source_by_product": lot_weighted_unit_cost_source_by_product,
+            "fifo_remaining_unit_cost_by_product": fifo_remaining_unit_cost_by_product,
+            "fifo_remaining_unit_cost_source_by_product": fifo_remaining_unit_cost_source_by_product,
         }
 
     def update_product(self, product_id: int, updates: dict[str, Any], actor: str = "system") -> Product:
         product = self.db.get(Product, product_id)
         if product is None:
             raise ValueError(f"Product {product_id} not found.")
+
+        updates = dict(updates)
+        if "metal_type" in updates:
+            resolved_metal_type, original_metal_detail = self._normalize_product_metal_type(
+                str(updates.get("metal_type") or "")
+            )
+            updates["metal_type"] = resolved_metal_type
+            if original_metal_detail:
+                updates["description"] = self._append_product_detail_once(
+                    str(updates.get("description", product.description) or ""),
+                    label="Metal composition",
+                    value=original_metal_detail,
+                )
 
         new_title = updates.get("title", product.title)
         new_quantity = updates.get("current_quantity", product.current_quantity)
@@ -5158,6 +6539,8 @@ class InventoryRepository:
         old_quantity = sale.quantity_sold
         new_product_id = updates.get("product_id", old_product_id)
         new_quantity = updates.get("quantity_sold", old_quantity)
+        old_listing_id = sale.listing_id
+        new_listing_id = updates.get("listing_id", old_listing_id)
 
         changes: dict[str, dict[str, Any]] = {}
         for field, new_value in updates.items():
@@ -5172,10 +6555,30 @@ class InventoryRepository:
                 setattr(sale, field, new_value)
 
         if changes:
-            inventory_fields = {"product_id", "quantity_sold"}
+            inventory_fields = {"product_id", "quantity_sold", "listing_id"}
             inventory_changed = any(field in changes for field in inventory_fields)
             if inventory_changed:
-                if old_product_id is not None:
+                old_bundle_components = self._listing_bundle_sale_components(old_listing_id, old_quantity)
+                new_bundle_components = self._listing_bundle_sale_components(new_listing_id, new_quantity)
+                if old_bundle_components:
+                    for component in old_bundle_components:
+                        old_product = self.db.get(Product, int(component["product_id"]))
+                        if old_product:
+                            before = int(old_product.current_quantity)
+                            after = before + max(1, int(component.get("quantity_total") or 1))
+                            old_product.current_quantity = after
+                            self._record_inventory_movement(
+                                product_id=old_product.id,
+                                movement_type="sale_bundle_component_adjustment_revert",
+                                quantity_before=before,
+                                quantity_after=after,
+                                unit_cost=old_product.acquisition_cost,
+                                reference_type="sale",
+                                reference_id=sale.id,
+                                notes=f"Reverted prior bundle sale component quantity due to sale update by {actor}.",
+                                occurred_at=utcnow_naive(),
+                            )
+                elif old_product_id is not None:
                     old_product = self.db.get(Product, old_product_id)
                     if old_product:
                         before = int(old_product.current_quantity)
@@ -5193,7 +6596,25 @@ class InventoryRepository:
                             occurred_at=utcnow_naive(),
                         )
 
-                if new_product_id is not None:
+                if new_bundle_components:
+                    for component in new_bundle_components:
+                        new_product = self.db.get(Product, int(component["product_id"]))
+                        if new_product:
+                            before = int(new_product.current_quantity)
+                            after = max(0, before - max(1, int(component.get("quantity_total") or 1)))
+                            new_product.current_quantity = after
+                            self._record_inventory_movement(
+                                product_id=new_product.id,
+                                movement_type="sale_bundle_component_adjustment_apply",
+                                quantity_before=before,
+                                quantity_after=after,
+                                unit_cost=new_product.acquisition_cost,
+                                reference_type="sale",
+                                reference_id=sale.id,
+                                notes=f"Applied updated bundle sale component quantity due to sale update by {actor}.",
+                                occurred_at=utcnow_naive(),
+                            )
+                elif new_product_id is not None:
                     new_product = self.db.get(Product, int(new_product_id))
                     if new_product:
                         before = int(new_product.current_quantity)
@@ -6705,20 +8126,75 @@ class InventoryRepository:
         )
         sale_count = self.db.scalar(select(func.count()).select_from(Sale)) or 0
 
-        inventory_cost = (
-            self.db.scalar(
-                select(func.coalesce(func.sum(landed_unit_cost_expr * Product.current_quantity), 0))
+        product_cost_rows = self.db.execute(
+            select(
+                Product.id,
+                Product.current_quantity,
+                Product.acquisition_cost,
+                Product.acquisition_tax_paid,
+                Product.acquisition_shipping_paid,
+                Product.acquisition_handling_paid,
+                Product.product_cost,
             )
-            or 0
+        ).all()
+        default_unit_cost_by_product = {
+            int(row.id): self._product_default_landed_unit_cost(row)
+            for row in product_cost_rows
+            if row.id is not None
+        }
+        lot_cost_maps = self.report_sale_unit_cost_maps(
+            end_dt=utcnow_naive(),
+            default_unit_cost_by_product=default_unit_cost_by_product,
+        )
+        fifo_remaining_unit_cost_by_product = dict(
+            lot_cost_maps.get("fifo_remaining_unit_cost_by_product") or {}
+        )
+        lot_weighted_unit_cost_by_product = dict(lot_cost_maps.get("lot_weighted_unit_cost_by_product") or {})
+        inventory_cost = sum(
+            max(0, int(row.current_quantity or 0))
+            * self._safe_float(
+                fifo_remaining_unit_cost_by_product.get(
+                    int(row.id),
+                    lot_weighted_unit_cost_by_product.get(
+                        int(row.id),
+                        default_unit_cost_by_product.get(int(row.id), 0.0),
+                    ),
+                )
+            )
+            for row in product_cost_rows
+            if row.id is not None
         )
 
         gross_sales = self.db.scalar(select(func.coalesce(func.sum(Sale.sold_price), 0))) or 0
-        net_sales = (
+        raw_net_sales = (
             self.db.scalar(
-                select(func.coalesce(func.sum(Sale.sold_price - Sale.fees - Sale.shipping_cost), 0))
+                select(
+                    func.coalesce(
+                        func.sum(
+                            Sale.sold_price
+                            + Sale.shipping_cost
+                            - Sale.fees
+                            - func.coalesce(Sale.shipping_label_cost, 0)
+                        ),
+                        0,
+                    )
+                )
             )
             or 0
         )
+        net_sales = raw_net_sales
+        if int(sale_count or 0) > 0:
+            sale_window = self.db.execute(select(func.min(Sale.sold_at), func.max(Sale.sold_at))).one()
+            if sale_window[0] is not None and sale_window[1] is not None:
+                actual_rows = self.report_sales_actual_econ_rows(
+                    start_dt=sale_window[0] - timedelta(seconds=1),
+                    end_dt=sale_window[1] + timedelta(seconds=1),
+                )
+                if actual_rows:
+                    net_sales = sum(
+                        self._safe_float(row.get("net_before_cogs_actual"))
+                        for row in actual_rows
+                    )
 
         return {
             "product_count": int(product_count),
@@ -6750,7 +8226,7 @@ class InventoryRepository:
                 func.coalesce(
                     func.sum(
                         case(
-                            (Sale.sold_at >= window_7d, 1),
+                            (and_(Sale.sold_at >= window_7d, Sale.sold_at <= snapshot), 1),
                             else_=0,
                         )
                     ),
@@ -6759,7 +8235,10 @@ class InventoryRepository:
                 func.coalesce(
                     func.sum(
                         case(
-                            (Sale.sold_at >= window_7d, func.coalesce(Sale.sold_price, 0)),
+                            (
+                                and_(Sale.sold_at >= window_7d, Sale.sold_at <= snapshot),
+                                func.coalesce(Sale.sold_price, 0),
+                            ),
                             else_=0,
                         )
                     ),
@@ -6768,7 +8247,10 @@ class InventoryRepository:
                 func.coalesce(
                     func.sum(
                         case(
-                            (Sale.sold_at >= window_7d, func.coalesce(Sale.fees, 0)),
+                            (
+                                and_(Sale.sold_at >= window_7d, Sale.sold_at <= snapshot),
+                                func.coalesce(Sale.fees, 0),
+                            ),
                             else_=0,
                         )
                     ),
@@ -6777,12 +8259,27 @@ class InventoryRepository:
                 func.coalesce(
                     func.sum(
                         case(
-                            (Sale.sold_at >= window_7d, func.coalesce(Sale.shipping_cost, 0)),
+                            (
+                                and_(Sale.sold_at >= window_7d, Sale.sold_at <= snapshot),
+                                func.coalesce(Sale.shipping_cost, 0),
+                            ),
                             else_=0,
                         )
                     ),
                     0,
                 ).label("sales_7d_shipping"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                and_(Sale.sold_at >= window_7d, Sale.sold_at <= snapshot),
+                                func.coalesce(Sale.shipping_label_cost, 0),
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ).label("sales_7d_label_spend"),
                 func.coalesce(func.sum(func.coalesce(Sale.sold_price, 0)), 0).label("sales_30d_gross"),
                 func.coalesce(func.sum(func.coalesce(Sale.fees, 0)), 0).label("sales_30d_fees"),
                 func.coalesce(func.sum(func.coalesce(Sale.shipping_cost, 0)), 0).label("sales_30d_shipping"),
@@ -6795,7 +8292,7 @@ class InventoryRepository:
             )
             .select_from(Sale)
             .outerjoin(Product, Product.id == Sale.product_id)
-            .where(Sale.sold_at >= window_30d)
+            .where(Sale.sold_at >= window_30d, Sale.sold_at <= snapshot)
         ).one()
 
         order_metrics_30d = self.db.execute(
@@ -6831,87 +8328,226 @@ class InventoryRepository:
                 ),
                 func.coalesce(func.sum(func.coalesce(Order.shipping_cost, 0)), 0),
                 func.coalesce(func.sum(func.coalesce(Order.shipping_label_cost, 0)), 0),
-            ).where(Order.sold_at >= window_30d)
+            ).where(Order.sold_at >= window_30d, Order.sold_at <= snapshot)
         ).one()
-        normalized_label_spend_30d = self.db.scalar(
-            select(func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0)).where(
-                OrderFinanceEntry.entry_kind == "shipping_label",
-                or_(
-                    OrderFinanceEntry.transaction_date >= window_30d,
-                    and_(
-                        OrderFinanceEntry.transaction_date.is_(None),
-                        OrderFinanceEntry.created_at >= window_30d,
-                    ),
-                ),
-            )
-        ) or 0
-        normalized_fee_type_rows = []
-        if include_fee_type_breakdown:
-            normalized_fee_type_rows = self.db.execute(
-                select(
-                    OrderFinanceEntry.fee_type,
-                    func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
-                )
-                .where(
-                    OrderFinanceEntry.entry_kind == "marketplace_fee",
-                    or_(
-                        OrderFinanceEntry.transaction_date >= window_30d,
-                        and_(
-                            OrderFinanceEntry.transaction_date.is_(None),
-                            OrderFinanceEntry.created_at >= window_30d,
-                        ),
-                    ),
-                )
-                .group_by(OrderFinanceEntry.fee_type)
-            ).all()
-
         orders_7d_count = self.db.scalar(
-            select(func.count(Order.id)).where(Order.sold_at >= window_7d)
+            select(func.count(Order.id)).where(Order.sold_at >= window_7d, Order.sold_at <= snapshot)
         ) or 0
 
         sales_7d_count = int(sales_windows[0] or 0)
         sales_7d_gross = float(sales_windows[1] or 0)
         sales_7d_fees = float(sales_windows[2] or 0)
         sales_7d_shipping = float(sales_windows[3] or 0)
-        sales_7d_net = sales_7d_gross - sales_7d_fees - sales_7d_shipping
+        sales_7d_label_spend = float(sales_windows[4] or 0)
+        sales_7d_net = sales_7d_gross + sales_7d_shipping - sales_7d_fees - sales_7d_label_spend
 
-        sales_30d_count = int(sales_windows[8] or 0)
-        sales_30d_gross = float(sales_windows[4] or 0)
-        sales_30d_fees = float(sales_windows[5] or 0)
-        sales_30d_shipping = float(sales_windows[6] or 0)
-        sales_30d_label_spend = float(sales_windows[7] or 0)
-        sales_30d_est_cogs = float(sales_windows[9] or 0)
-        sales_30d_net = sales_30d_gross - sales_30d_fees - sales_30d_shipping
+        sales_30d_count = int(sales_windows[9] or 0)
+        sales_30d_gross = float(sales_windows[5] or 0)
+        sales_30d_fees = float(sales_windows[6] or 0)
+        sales_30d_shipping = float(sales_windows[7] or 0)
+        sales_30d_label_spend = float(sales_windows[8] or 0)
+        sales_30d_est_cogs = float(sales_windows[10] or 0)
+        sales_30d_cogs_source_counts: dict[str, int] = {}
+        return_rows_30d = self.db.execute(
+            select(
+                ReturnRecord.id,
+                ReturnRecord.sale_id,
+                ReturnRecord.product_id,
+                ReturnRecord.quantity,
+                ReturnRecord.refund_amount,
+                ReturnRecord.refund_fees,
+                ReturnRecord.refund_shipping,
+            )
+            .where(ReturnRecord.returned_at >= window_30d, ReturnRecord.returned_at <= snapshot)
+        ).all()
+        returns_30d_count = len(return_rows_30d)
+        returns_30d_refund_total = round(
+            sum(
+                self._safe_float(row.refund_amount)
+                + self._safe_float(row.refund_fees)
+                + self._safe_float(row.refund_shipping)
+                for row in return_rows_30d
+            ),
+            2,
+        )
+        returns_30d_cogs_reversal = 0.0
+        returns_30d_profit_impact = -returns_30d_refund_total
+        if sales_30d_count > 0 or returns_30d_count > 0:
+            product_default_rows = self.db.execute(
+                select(
+                    Product.id,
+                    Product.acquisition_cost,
+                    Product.acquisition_tax_paid,
+                    Product.acquisition_shipping_paid,
+                    Product.acquisition_handling_paid,
+                    Product.product_cost,
+                )
+            ).all()
+            default_unit_cost_by_product = {
+                int(row.id): self._product_default_landed_unit_cost(row)
+                for row in product_default_rows
+                if row.id is not None
+            }
+            cost_maps = self.report_sale_unit_cost_maps(
+                end_dt=snapshot,
+                default_unit_cost_by_product=default_unit_cost_by_product,
+            )
+            fifo_unit_cost_by_sale = dict(cost_maps.get("fifo_unit_cost_by_sale") or {})
+            fifo_unit_cost_source_by_sale = dict(cost_maps.get("fifo_unit_cost_source_by_sale") or {})
+            if return_rows_30d:
+                for row in return_rows_30d:
+                    return_qty = max(1, int(row.quantity or 1))
+                    if row.sale_id is not None and int(row.sale_id) in fifo_unit_cost_by_sale:
+                        returns_30d_cogs_reversal += (
+                            self._safe_float(fifo_unit_cost_by_sale.get(int(row.sale_id))) * return_qty
+                        )
+                    elif row.product_id is not None:
+                        returns_30d_cogs_reversal += (
+                            self._safe_float(default_unit_cost_by_product.get(int(row.product_id))) * return_qty
+                        )
+                returns_30d_cogs_reversal = round(float(returns_30d_cogs_reversal), 2)
+                returns_30d_profit_impact = round(
+                    -returns_30d_refund_total + returns_30d_cogs_reversal,
+                    2,
+                )
+            if sales_30d_count > 0:
+                sale_qty_rows = self.db.execute(
+                    select(
+                        Sale.id,
+                        Sale.quantity_sold,
+                        MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
+                    )
+                    .select_from(Sale)
+                    .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+                    .where(Sale.sold_at >= window_30d, Sale.sold_at <= snapshot)
+                ).all()
+                sales_30d_est_cogs = sum(
+                    self._safe_float(fifo_unit_cost_by_sale.get(int(row.id)))
+                    * max(1, int(row.quantity_sold or 1))
+                    for row in sale_qty_rows
+                    if row.id is not None
+                )
+                sales_30d_bundle_sale_count = 0
+                sales_30d_bundle_inventory_units_sold = 0
+                for row in sale_qty_rows:
+                    if row.id is None:
+                        continue
+                    bundle_components = self._bundle_components_from_payload(
+                        self._listing_bundle_payload_from_raw(row.listing_marketplace_details),
+                        int(row.quantity_sold or 0),
+                    )
+                    if bundle_components:
+                        sales_30d_bundle_sale_count += 1
+                        sales_30d_bundle_inventory_units_sold += sum(
+                            max(1, int(component.get("quantity_total") or 1))
+                            for component in bundle_components
+                        )
+                    source = str(fifo_unit_cost_source_by_sale.get(int(row.id)) or "missing_cost_basis")
+                    sales_30d_cogs_source_counts[source] = sales_30d_cogs_source_counts.get(source, 0) + 1
+            else:
+                sales_30d_bundle_sale_count = 0
+                sales_30d_bundle_inventory_units_sold = 0
+        else:
+            sales_30d_bundle_sale_count = 0
+            sales_30d_bundle_inventory_units_sold = 0
+        cogs_review_sources = {
+            "lot_equal_quantity_fallback",
+            "missing_cost_basis",
+            "mixed_fifo_cost",
+        }
+        sales_30d_cogs_review_count = sum(
+            int(count or 0)
+            for source, count in sales_30d_cogs_source_counts.items()
+            if str(source or "") in cogs_review_sources
+        )
+        if sales_30d_cogs_review_count > 0:
+            sales_30d_profit_basis_status = "review_needed"
+        elif int(sales_30d_cogs_source_counts.get("lot_expected_quantity_fallback", 0) or 0) > 0:
+            sales_30d_profit_basis_status = "partial_lot_estimate"
+        else:
+            sales_30d_profit_basis_status = "ok"
 
         orders_30d_count = int(order_metrics_30d[0] or 0)
         orders_30d_shipped = int(order_metrics_30d[1] or 0)
         orders_30d_not_shipped = int(order_metrics_30d[2] or 0)
         orders_30d_shipping_charged = float(order_metrics_30d[3] or 0)
         orders_30d_label_spend = float(order_metrics_30d[4] or 0)
-        normalized_label_spend_30d_value = float(normalized_label_spend_30d or 0)
+
+        actual_econ_rows = (
+            self.report_sales_actual_econ_rows(start_dt=window_30d, end_dt=snapshot)
+            if sales_30d_count > 0
+            else []
+        )
+        if actual_econ_rows:
+            actual_7d_rows = []
+            for row in actual_econ_rows:
+                sold_at_raw = row.get("sold_at")
+                sold_at_value = sold_at_raw
+                if isinstance(sold_at_raw, str):
+                    try:
+                        sold_at_value = datetime.fromisoformat(sold_at_raw)
+                    except ValueError:
+                        sold_at_value = None
+                if isinstance(sold_at_value, datetime) and sold_at_value >= window_7d:
+                    actual_7d_rows.append(row)
+            if actual_7d_rows:
+                sales_7d_net = round(
+                    sum(float(row.get("net_before_cogs_actual") or 0.0) for row in actual_7d_rows),
+                    2,
+                )
+        actual_fee_30d = round(
+            sum(float(row.get("allocated_fee_actual") or 0.0) for row in actual_econ_rows),
+            2,
+        )
         normalized_fee_type_totals: dict[str, float] = {}
-        for fee_type, fee_total in normalized_fee_type_rows:
-            key = str(fee_type or "").strip().upper()
-            if not key:
-                key = "UNKNOWN"
-            normalized_fee_type_totals[key] = round(float(fee_total or 0), 2)
-        normalized_fee_total_30d = round(sum(normalized_fee_type_totals.values()), 2)
-        if normalized_fee_total_30d <= 0:
-            normalized_fee_total_30d = round(float(sales_30d_fees or 0), 2)
-        if orders_30d_shipping_charged > 0 or orders_30d_label_spend > 0:
-            shipping_charged_30d = orders_30d_shipping_charged
-            shipping_label_spend_30d = (
-                normalized_label_spend_30d_value
-                if normalized_label_spend_30d_value > 0
-                else orders_30d_label_spend
+        linked_order_ids = sorted(
+            {
+                int(row.get("order_id") or 0)
+                for row in actual_econ_rows
+                if int(row.get("order_id") or 0) > 0
+            }
+        )
+        if include_fee_type_breakdown and linked_order_ids:
+            for fee_type, fee_total in self.db.execute(
+                select(
+                    OrderFinanceEntry.fee_type,
+                    func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                )
+                .where(
+                    OrderFinanceEntry.order_id.in_(linked_order_ids),
+                    OrderFinanceEntry.entry_kind == "marketplace_fee",
+                )
+                .group_by(OrderFinanceEntry.fee_type)
+            ).all():
+                key = str(fee_type or "").strip().upper()
+                if not key:
+                    key = "UNKNOWN"
+                normalized_fee_type_totals[key] = round(float(fee_total or 0), 2)
+        normalized_fee_total_30d = round(actual_fee_30d if actual_econ_rows else float(sales_30d_fees or 0), 2)
+        if actual_econ_rows:
+            shipping_charged_30d = round(
+                sum(float(row.get("allocated_shipping_charged") or 0.0) for row in actual_econ_rows),
+                2,
             )
+            shipping_label_spend_30d = round(
+                sum(float(row.get("allocated_shipping_actual") or 0.0) for row in actual_econ_rows),
+                2,
+            )
+        elif orders_30d_shipping_charged > 0 or orders_30d_label_spend > 0:
+            shipping_charged_30d = orders_30d_shipping_charged
+            shipping_label_spend_30d = orders_30d_label_spend
         else:
             shipping_charged_30d = sales_30d_shipping
-            shipping_label_spend_30d = (
-                normalized_label_spend_30d_value
-                if normalized_label_spend_30d_value > 0
-                else sales_30d_label_spend
-            )
+            shipping_label_spend_30d = sales_30d_label_spend
+        sales_30d_net = (
+            sales_30d_gross
+            + shipping_charged_30d
+            - normalized_fee_total_30d
+            - shipping_label_spend_30d
+        )
+        sales_30d_profit_before_returns = round(sales_30d_net - sales_30d_est_cogs, 2)
+        sales_30d_net_after_returns = round(sales_30d_net - returns_30d_refund_total, 2)
+        sales_30d_est_profit = round(sales_30d_profit_before_returns + returns_30d_profit_impact, 2)
 
         return {
             "orders_7d_count": int(orders_7d_count),
@@ -6928,10 +8564,140 @@ class InventoryRepository:
             "sales_30d_shipping_label_spend": shipping_label_spend_30d,
             "sales_30d_shipping_delta": shipping_charged_30d - shipping_label_spend_30d,
             "sales_30d_est_cogs": sales_30d_est_cogs,
-            "sales_30d_est_profit": sales_30d_net - sales_30d_est_cogs,
+            "sales_30d_profit_before_returns": sales_30d_profit_before_returns,
+            "returns_30d_count": returns_30d_count,
+            "returns_30d_refund_total": returns_30d_refund_total,
+            "returns_30d_cogs_reversal": returns_30d_cogs_reversal,
+            "returns_30d_profit_impact": returns_30d_profit_impact,
+            "sales_30d_net_after_returns": sales_30d_net_after_returns,
+            "sales_30d_cogs_source_counts": sales_30d_cogs_source_counts,
+            "sales_30d_cogs_review_count": sales_30d_cogs_review_count,
+            "sales_30d_profit_basis_status": sales_30d_profit_basis_status,
+            "sales_30d_est_profit": sales_30d_est_profit,
+            "sales_30d_bundle_sale_count": sales_30d_bundle_sale_count,
+            "sales_30d_bundle_inventory_units_sold": sales_30d_bundle_inventory_units_sold,
             "ebay_fees_30d_total": normalized_fee_total_30d,
             "ebay_fee_type_breakdown_30d": normalized_fee_type_totals,
         }
+
+    def dashboard_profit_basis_rows(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        snapshot = now or utcnow_naive()
+        window_30d = snapshot - timedelta(days=30)
+        sale_rows = self.db.execute(
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.marketplace.label("marketplace"),
+                Sale.product_id.label("product_id"),
+                Sale.listing_id.label("listing_id"),
+                Sale.quantity_sold.label("quantity_sold"),
+                Sale.sold_price.label("sold_price"),
+                Sale.fees.label("fees"),
+                Sale.shipping_cost.label("shipping_cost"),
+                Sale.shipping_label_cost.label("shipping_label_cost"),
+                Product.sku.label("sku"),
+                Product.title.label("product_title"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .where(Sale.sold_at >= window_30d, Sale.sold_at <= snapshot)
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+            .limit(max(1, int(limit or 50)))
+        ).all()
+        if not sale_rows:
+            return []
+
+        product_default_rows = self.db.execute(
+            select(
+                Product.id,
+                Product.acquisition_cost,
+                Product.acquisition_tax_paid,
+                Product.acquisition_shipping_paid,
+                Product.acquisition_handling_paid,
+                Product.product_cost,
+            )
+        ).all()
+        default_unit_cost_by_product = {
+            int(row.id): self._product_default_landed_unit_cost(row)
+            for row in product_default_rows
+            if row.id is not None
+        }
+        cost_maps = self.report_sale_unit_cost_maps(
+            end_dt=snapshot,
+            default_unit_cost_by_product=default_unit_cost_by_product,
+        )
+        fifo_unit_cost_by_sale = dict(cost_maps.get("fifo_unit_cost_by_sale") or {})
+        fifo_total_cost_by_sale = dict(cost_maps.get("fifo_total_cost_by_sale") or {})
+        fifo_unit_cost_source_by_sale = dict(cost_maps.get("fifo_unit_cost_source_by_sale") or {})
+        fifo_cogs_evidence_by_sale = dict(cost_maps.get("fifo_cogs_evidence_by_sale") or {})
+        actual_econ_by_sale_id = {
+            int(row.get("sale_id") or 0): row
+            for row in self.report_sales_actual_econ_rows(start_dt=window_30d, end_dt=snapshot)
+            if int(row.get("sale_id") or 0) > 0
+        }
+
+        output: list[dict[str, Any]] = []
+        for row in sale_rows:
+            sale_id = int(row.sale_id or 0)
+            qty = max(1, int(row.quantity_sold or 1))
+            actual = actual_econ_by_sale_id.get(sale_id) or {}
+            gross = self._safe_float(row.sold_price)
+            fees = self._safe_float(actual.get("allocated_fee_actual", row.fees))
+            shipping_charged = self._safe_float(
+                actual.get("allocated_shipping_charged", row.shipping_cost)
+            )
+            label_spend = self._safe_float(
+                actual.get("allocated_shipping_actual", row.shipping_label_cost)
+            )
+            net_before_cogs = self._safe_float(
+                actual.get(
+                    "net_before_cogs_actual",
+                    gross + shipping_charged - fees - label_spend,
+                )
+            )
+            fifo_total = self._safe_float(fifo_total_cost_by_sale.get(sale_id))
+            if fifo_total <= 0:
+                fifo_total = self._safe_float(fifo_unit_cost_by_sale.get(sale_id)) * qty
+            unit_cogs = (fifo_total / float(qty)) if qty > 0 else 0.0
+            profit_before_returns = net_before_cogs - fifo_total
+            evidence_rows = list(fifo_cogs_evidence_by_sale.get(sale_id) or [])
+            bundle_components = self._bundle_components_from_payload(
+                self._listing_bundle_payload_from_raw(row.listing_marketplace_details),
+                qty,
+            )
+            output.append(
+                {
+                    "sale_id": sale_id,
+                    "sold_at": row.sold_at.isoformat() if row.sold_at else None,
+                    "marketplace": str(row.marketplace or "").strip().lower(),
+                    "product_id": int(row.product_id or 0) or None,
+                    "sku": str(row.sku or "").strip() or None,
+                    "product_title": str(row.product_title or "").strip() or None,
+                    "quantity_sold": int(qty),
+                    "gross_sales": round(float(gross), 2),
+                    "shipping_charged": round(float(shipping_charged), 2),
+                    "fees": round(float(fees), 2),
+                    "label_spend": round(float(label_spend), 2),
+                    "net_before_cogs": round(float(net_before_cogs), 2),
+                    "fifo_unit_cogs": round(float(unit_cogs), 4),
+                    "fifo_cogs": round(float(fifo_total), 2),
+                    "profit_before_returns": round(float(profit_before_returns), 2),
+                    "fifo_cost_source": str(
+                        fifo_unit_cost_source_by_sale.get(sale_id) or "missing_cost_basis"
+                    ),
+                    "fifo_cogs_evidence_rows": int(len(evidence_rows)),
+                    "listing_is_bundle": bool(bundle_components),
+                    "listing_bundle_component_count": int(len(bundle_components)),
+                }
+            )
+        return output
 
     def report_shipping_economics_rows(
         self,
@@ -6940,6 +8706,7 @@ class InventoryRepository:
         end_dt: datetime,
         marketplaces: set[str] | None = None,
     ) -> list[dict]:
+        ListingProduct = aliased(Product)
         marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
         marketplace_expr = func.lower(func.coalesce(Sale.marketplace, ""))
         order_sale_count_expr = case(
@@ -6966,8 +8733,8 @@ class InventoryRepository:
                 marketplace_expr.label("marketplace"),
                 Sale.external_order_id.label("external_order_id"),
                 Sale.order_id.label("order_id"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
                 Sale.quantity_sold.label("qty"),
                 effective_shipping_charged_expr.label("shipping_charged_to_buyer"),
                 effective_label_spend_expr.label("shipping_label_spend"),
@@ -6983,6 +8750,8 @@ class InventoryRepository:
             )
             .select_from(Sale)
             .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
             .outerjoin(Order, Order.id == Sale.order_id)
             .where(Sale.sold_at.is_not(None), Sale.sold_at >= start_dt, Sale.sold_at <= end_dt)
             .order_by(Sale.sold_at.desc(), Sale.id.desc())
@@ -6990,21 +8759,37 @@ class InventoryRepository:
         if marketplace_filter:
             query = query.where(marketplace_expr.in_(sorted(marketplace_filter)))
         rows = self.db.execute(query).all()
+        actual_econ_by_sale_id = {
+            int(actual_row.get("sale_id") or 0): actual_row
+            for actual_row in self.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt)
+            if int(actual_row.get("sale_id") or 0) > 0
+        }
         result: list[dict] = []
         for row in rows:
+            order_id = int(row.order_id) if row.order_id is not None else None
+            actual = actual_econ_by_sale_id.get(int(row.sale_id or 0)) or {}
+            shipping_charged = self._safe_float(
+                actual.get("allocated_shipping_charged", row.shipping_charged_to_buyer)
+            )
+            label_spend = self._safe_float(actual.get("allocated_shipping_actual", row.shipping_label_spend))
+            label_source = str(actual.get("actual_shipping_source") or "order_or_sale_shipping_label_field")
             result.append(
                 {
                     "sale_id": int(row.sale_id),
                     "sold_at": row.sold_at,
                     "marketplace": str(row.marketplace or "").strip().lower(),
                     "external_order_id": str(row.external_order_id or "").strip(),
-                    "order_id": int(row.order_id) if row.order_id is not None else None,
+                    "order_id": order_id,
                     "sku": str(row.sku or "").strip() or None,
                     "product_title": str(row.product_title or "").strip() or None,
                     "qty": int(row.qty or 0),
-                    "shipping_charged_to_buyer": round(float(row.shipping_charged_to_buyer or 0), 2),
-                    "shipping_label_spend": round(float(row.shipping_label_spend or 0), 2),
-                    "shipping_delta_charged_minus_spend": round(float(row.shipping_delta_charged_minus_spend or 0), 2),
+                    "shipping_charged_to_buyer": round(shipping_charged, 2),
+                    "shipping_label_spend": round(label_spend, 2),
+                    "shipping_delta_charged_minus_spend": round(
+                        shipping_charged - label_spend,
+                        2,
+                    ),
+                    "shipping_label_spend_source": label_source,
                     "shipping_label_currency": str(row.shipping_label_currency or "").strip(),
                     "shipping_label_id": str(row.shipping_label_id or "").strip(),
                     "shipping_label_purchased_at": row.shipping_label_purchased_at,
@@ -7084,7 +8869,8 @@ class InventoryRepository:
             str(v).strip().lower() for v in (tax_exempt_categories or set()) if str(v).strip()
         }
         marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
-        category_expr = func.lower(func.coalesce(Product.category, ""))
+        ListingProduct = aliased(Product)
+        category_expr = func.lower(func.coalesce(Product.category, ListingProduct.category, ""))
         marketplace_expr = func.lower(func.coalesce(Sale.marketplace, ""))
         is_exempt_expr = (
             category_expr.in_(sorted(exempt_categories)) if exempt_categories else literal(False)
@@ -7105,8 +8891,8 @@ class InventoryRepository:
                 Sale.id.label("sale_id"),
                 Sale.sold_at.label("sold_at"),
                 marketplace_expr.label("marketplace"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
                 category_expr.label("category"),
                 func.coalesce(Sale.sold_price, 0).label("gross_sales"),
                 func.coalesce(Sale.shipping_cost, 0).label("shipping_cost"),
@@ -7118,14 +8904,29 @@ class InventoryRepository:
             )
             .select_from(Sale)
             .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
             .where(Sale.sold_at.is_not(None), Sale.sold_at >= start_dt, Sale.sold_at <= end_dt)
             .order_by(Sale.sold_at.desc(), Sale.id.desc())
         )
         if marketplace_filter:
             query = query.where(marketplace_expr.in_(sorted(marketplace_filter)))
         rows = self.db.execute(query).all()
+        actual_econ_by_sale_id = {
+            int(actual_row.get("sale_id") or 0): actual_row
+            for actual_row in self.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt)
+            if int(actual_row.get("sale_id") or 0) > 0
+        }
         result: list[dict] = []
         for row in rows:
+            actual = actual_econ_by_sale_id.get(int(row.sale_id or 0)) or {}
+            field_shipping_cost = float(row.shipping_cost or 0)
+            shipping_charged = self._safe_float(
+                actual.get("allocated_shipping_charged", field_shipping_cost)
+            )
+            taxable_shipping = shipping_charged if bool(shipping_taxable) else 0.0
+            taxable_subtotal = float(row.taxable_item_subtotal or 0) + taxable_shipping
+            estimated_tax = taxable_subtotal * tax_rate_multiplier
             result.append(
                 {
                     "sale_id": int(row.sale_id),
@@ -7135,15 +8936,630 @@ class InventoryRepository:
                     "product_title": str(row.product_title or "").strip() or None,
                     "category": str(row.category or "").strip().lower(),
                     "gross_sales": round(float(row.gross_sales or 0), 2),
-                    "shipping_cost": round(float(row.shipping_cost or 0), 2),
+                    "shipping_cost": round(shipping_charged, 2),
+                    "field_shipping_cost": round(field_shipping_cost, 2),
+                    "shipping_cost_source": (
+                        "actual_economics_allocated_shipping_charged"
+                        if actual
+                        else "sale_shipping_cost_field"
+                    ),
                     "is_tax_exempt_category": bool(row.is_tax_exempt_category),
                     "taxable_item_subtotal": round(float(row.taxable_item_subtotal or 0), 2),
-                    "taxable_shipping_subtotal": round(float(row.taxable_shipping_subtotal or 0), 2),
-                    "taxable_subtotal": round(float(row.taxable_subtotal or 0), 2),
-                    "estimated_tax_collected": round(float(row.estimated_tax_collected or 0), 2),
+                    "taxable_shipping_subtotal": round(taxable_shipping, 2),
+                    "taxable_subtotal": round(taxable_subtotal, 2),
+                    "estimated_tax_collected": round(estimated_tax, 2),
                 }
             )
         return result
+
+    def report_accounting_exception_rows(
+        self,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
+        product_cost_rows = self.db.execute(
+            select(
+                Product.id,
+                Product.acquisition_cost,
+                Product.acquisition_tax_paid,
+                Product.acquisition_shipping_paid,
+                Product.acquisition_handling_paid,
+                Product.product_cost,
+            )
+        ).all()
+        default_unit_cost_by_product = {
+            int(row.id): self._product_default_landed_unit_cost(row)
+            for row in product_cost_rows
+            if row.id is not None
+        }
+        cost_maps = self.report_sale_unit_cost_maps(
+            end_dt=end_dt,
+            default_unit_cost_by_product=default_unit_cost_by_product,
+        )
+        fifo_unit_cost_by_sale = {
+            int(k): self._safe_float(v)
+            for k, v in dict(cost_maps.get("fifo_unit_cost_by_sale") or {}).items()
+            if k is not None
+        }
+        fifo_unit_cost_source_by_sale = {
+            int(k): str(v or "missing_cost_basis")
+            for k, v in dict(cost_maps.get("fifo_unit_cost_source_by_sale") or {}).items()
+            if k is not None
+        }
+        fifo_cogs_evidence_by_sale = {
+            int(k): list(v or [])
+            for k, v in dict(cost_maps.get("fifo_cogs_evidence_by_sale") or {}).items()
+            if k is not None
+        }
+        shipping_rows = self.report_shipping_economics_rows(start_dt=start_dt, end_dt=end_dt)
+        shipping_by_sale_id = {
+            int(row.get("sale_id") or 0): row
+            for row in shipping_rows
+            if int(row.get("sale_id") or 0) > 0
+        }
+        actual_econ_by_sale_id = {
+            int(row.get("sale_id") or 0): row
+            for row in self.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt)
+            if int(row.get("sale_id") or 0) > 0
+        }
+
+        rows: list[dict] = []
+
+        def add_exception(
+            *,
+            severity: str,
+            exception_type: str,
+            entity_type: str,
+            entity_id: int,
+            sku: str | None = None,
+            marketplace: str = "",
+            reference: str = "",
+            amount: float | None = None,
+            details: str = "",
+            occurred_at: datetime | str | None = None,
+        ) -> None:
+            rows.append(
+                {
+                    "severity": severity,
+                    "exception_type": exception_type,
+                    "entity_type": entity_type,
+                    "entity_id": int(entity_id or 0),
+                    "sku": str(sku or "").strip() or None,
+                    "marketplace": str(marketplace or "").strip().lower(),
+                    "reference": str(reference or "").strip(),
+                    "amount": round(float(amount), 2) if amount is not None else None,
+                    "details": str(details or "").strip(),
+                    "occurred_at": occurred_at.isoformat() if isinstance(occurred_at, datetime) else occurred_at,
+                }
+            )
+
+        def _cogs_evidence_summary(sale_id: int) -> str:
+            evidence = fifo_cogs_evidence_by_sale.get(int(sale_id or 0)) or []
+            if not evidence:
+                return "No FIFO COGS evidence rows were available for this sale."
+            parts: list[str] = []
+            for item in evidence[:4]:
+                qty = self._safe_float(item.get("quantity"))
+                unit_cost = self._safe_float(item.get("unit_cost"))
+                total_cost = self._safe_float(item.get("total_cost"))
+                source = str(item.get("cost_source") or "missing_cost_basis")
+                product_id = int(item.get("product_id") or 0)
+                lot_id = int(item.get("lot_id") or 0)
+                assignment_id = int(item.get("assignment_id") or 0)
+                origin = f"product#{product_id}" if product_id > 0 else "product#?"
+                if lot_id > 0:
+                    origin += f"/lot#{lot_id}"
+                if assignment_id > 0:
+                    origin += f"/assignment#{assignment_id}"
+                parts.append(f"{qty:g} unit(s) from {source} at {unit_cost:.2f} = {total_cost:.2f} ({origin})")
+            if len(evidence) > 4:
+                parts.append(f"plus {len(evidence) - 4} more COGS allocation row(s)")
+            return "; ".join(parts)
+
+        ListingProduct = aliased(Product)
+        sale_rows = self.db.execute(
+            select(
+                Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
+                Sale.marketplace.label("marketplace"),
+                Sale.external_order_id.label("external_order_id"),
+                Sale.order_id.label("order_id"),
+                Sale.product_id.label("product_id"),
+                Sale.listing_id.label("listing_id"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
+                Sale.quantity_sold.label("quantity_sold"),
+                Sale.sold_price.label("sold_price"),
+                Sale.fees.label("fees"),
+                Sale.shipping_cost.label("shipping_cost"),
+                Sale.shipping_label_cost.label("shipping_label_cost"),
+            )
+            .select_from(Sale)
+            .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
+            .where(Sale.sold_at.is_not(None), Sale.sold_at >= start_dt, Sale.sold_at <= end_dt)
+            .order_by(Sale.sold_at.desc(), Sale.id.desc())
+        ).all()
+
+        shippable_marketplaces = {"ebay", "facebook", "craigslist", "local", "in_person", "pos"}
+        for sale in sale_rows:
+            sale_id = int(sale.sale_id or 0)
+            marketplace = str(sale.marketplace or "").strip().lower()
+            qty = max(1, int(sale.quantity_sold or 1))
+            sold_price = self._safe_float(sale.sold_price)
+            actual_detail = actual_econ_by_sale_id.get(sale_id) or {}
+            fees = self._safe_float(actual_detail.get("allocated_fee_actual", sale.fees))
+            fee_source = str(actual_detail.get("actual_fee_source") or "sale_fees_field")
+            shipping_detail = shipping_by_sale_id.get(sale_id) or {}
+            shipping_charged = self._safe_float(
+                shipping_detail.get("shipping_charged_to_buyer", sale.shipping_cost)
+            )
+            label_spend = self._safe_float(shipping_detail.get("shipping_label_spend", sale.shipping_label_cost))
+            unit_cogs = self._safe_float(fifo_unit_cost_by_sale.get(sale_id))
+            cogs = unit_cogs * qty
+            cost_source = str(fifo_unit_cost_source_by_sale.get(sale_id) or "missing_cost_basis")
+            cogs_evidence = _cogs_evidence_summary(sale_id)
+            net_before_cogs = sold_price + shipping_charged - fees - label_spend
+            margin = net_before_cogs - cogs
+            bundle_components = self._bundle_components_from_payload(
+                self._listing_bundle_payload_from_raw(sale.listing_marketplace_details),
+                qty,
+            )
+            has_bundle_cost_basis = bool(bundle_components)
+
+            if int(sale.product_id or 0) <= 0 and not has_bundle_cost_basis:
+                add_exception(
+                    severity="P0",
+                    exception_type="missing_product_link",
+                    entity_type="sale",
+                    entity_id=sale_id,
+                    marketplace=marketplace,
+                    reference=sale.external_order_id,
+                    amount=sold_price,
+                    details="Sale has no product link, so COGS cannot be proven.",
+                    occurred_at=sale.sold_at,
+                )
+            if unit_cogs <= 0:
+                add_exception(
+                    severity="P0",
+                    exception_type="missing_cost_basis",
+                    entity_type="sale",
+                    entity_id=sale_id,
+                    sku=sale.sku,
+                    marketplace=marketplace,
+                    reference=sale.external_order_id,
+                    amount=cogs,
+                    details=(
+                        "FIFO COGS resolved to zero from lot assignments, product landed cost, and product_cost "
+                        f"fallback. Source={cost_source}. Evidence: {cogs_evidence}"
+                    ),
+                    occurred_at=sale.sold_at,
+                )
+            if marketplace in shippable_marketplaces and shipping_charged > 0 and label_spend <= 0:
+                add_exception(
+                    severity="P1",
+                    exception_type="missing_shipping_label_spend",
+                    entity_type="sale",
+                    entity_id=sale_id,
+                    sku=sale.sku,
+                    marketplace=marketplace,
+                    reference=sale.external_order_id,
+                    amount=shipping_charged,
+                    details="Buyer shipping was recorded, but no sale/order label spend was available.",
+                    occurred_at=sale.sold_at,
+                )
+            if marketplace == "ebay" and fees <= 0:
+                add_exception(
+                    severity="P1",
+                    exception_type="missing_fee_evidence",
+                    entity_type="sale",
+                    entity_id=sale_id,
+                    sku=sale.sku,
+                    marketplace=marketplace,
+                    reference=sale.external_order_id,
+                    amount=fees,
+                    details=f"eBay sale has no marketplace fee evidence from actual-economics source `{fee_source}`.",
+                    occurred_at=sale.sold_at,
+                )
+            if margin <= 0:
+                add_exception(
+                    severity="P1",
+                    exception_type="nonpositive_margin",
+                    entity_type="sale",
+                    entity_id=sale_id,
+                    sku=sale.sku,
+                    marketplace=marketplace,
+                    reference=sale.external_order_id,
+                    amount=margin,
+                    details=(
+                        f"Net before COGS {net_before_cogs:.2f} minus COGS {cogs:.2f} "
+                        f"produced margin {margin:.2f}. COGS source={cost_source}. Evidence: {cogs_evidence}"
+                    ),
+                    occurred_at=sale.sold_at,
+                )
+
+        for fee_row in self.report_ebay_fee_reconciliation_rows(start_dt=start_dt, end_dt=end_dt):
+            if str(fee_row.get("actual_fee_source") or "").strip() != "sale_fees_field":
+                continue
+            add_exception(
+                severity="P2",
+                exception_type="fee_source_fallback",
+                entity_type="sale",
+                entity_id=int(fee_row.get("sale_id") or 0),
+                sku=fee_row.get("sku"),
+                marketplace="ebay",
+                reference=fee_row.get("external_order_id"),
+                amount=self._safe_float(fee_row.get("actual_fee")),
+                details="Actual fee is using the sale.fees fallback instead of normalized finance entries or order fee breakdown.",
+                occurred_at=fee_row.get("sold_at"),
+            )
+
+        active_bundle_listing_rows = self.db.execute(
+            select(
+                MarketplaceListing.id.label("listing_id"),
+                MarketplaceListing.marketplace.label("marketplace"),
+                MarketplaceListing.external_listing_id.label("external_listing_id"),
+                MarketplaceListing.listing_title.label("listing_title"),
+                MarketplaceListing.quantity_listed.label("quantity_listed"),
+                MarketplaceListing.marketplace_details.label("marketplace_details"),
+                MarketplaceListing.updated_at.label("updated_at"),
+            )
+            .where(
+                func.lower(func.coalesce(cast(MarketplaceListing.listing_status, String), "")) == "active",
+                MarketplaceListing.marketplace_details.is_not(None),
+                func.length(func.trim(func.coalesce(MarketplaceListing.marketplace_details, ""))) > 0,
+            )
+            .order_by(MarketplaceListing.updated_at.desc(), MarketplaceListing.id.desc())
+        ).all()
+        bundle_component_product_ids: set[int] = set()
+        parsed_bundle_listings: list[dict[str, Any]] = []
+        for listing_row in active_bundle_listing_rows:
+            bundle = self._listing_bundle_payload_from_raw(listing_row.marketplace_details)
+            components = self._bundle_components_from_payload(bundle, 1)
+            if not components:
+                continue
+            parsed_bundle_listings.append({"row": listing_row, "components": components})
+            for component in components:
+                product_id = int(component.get("product_id") or 0)
+                if product_id > 0:
+                    bundle_component_product_ids.add(product_id)
+        bundle_component_stock: dict[int, int] = {}
+        if bundle_component_product_ids:
+            stock_rows = self.db.execute(
+                select(Product.id, Product.current_quantity).where(Product.id.in_(sorted(bundle_component_product_ids)))
+            ).all()
+            bundle_component_stock = {
+                int(row.id): max(0, int(row.current_quantity or 0))
+                for row in stock_rows
+                if row.id is not None
+            }
+        active_bundle_listing_ids = [
+            int(parsed["row"].listing_id)
+            for parsed in parsed_bundle_listings
+            if int(parsed["row"].listing_id or 0) > 0
+        ]
+        sold_qty_by_bundle_listing: dict[int, int] = {}
+        if active_bundle_listing_ids:
+            sold_qty_rows = self.db.execute(
+                select(
+                    Sale.listing_id.label("listing_id"),
+                    func.coalesce(func.sum(Sale.quantity_sold), 0).label("sold_qty"),
+                )
+                .where(Sale.listing_id.in_(active_bundle_listing_ids))
+                .group_by(Sale.listing_id)
+            ).all()
+            sold_qty_by_bundle_listing = {
+                int(row.listing_id): max(0, int(row.sold_qty or 0))
+                for row in sold_qty_rows
+                if row.listing_id is not None
+            }
+        for parsed in parsed_bundle_listings:
+            listing_row = parsed["row"]
+            listing_qty = max(
+                0,
+                int(listing_row.quantity_listed or 0)
+                - int(sold_qty_by_bundle_listing.get(int(listing_row.listing_id or 0), 0)),
+            )
+            if listing_qty <= 0:
+                continue
+            shortages: list[str] = []
+            available_lots_by_component: list[int] = []
+            for component in list(parsed.get("components") or []):
+                product_id = int(component.get("product_id") or 0)
+                qty_per_listing = max(1, int(component.get("quantity_per_listing") or 1))
+                stock_qty = max(0, int(bundle_component_stock.get(product_id, 0)))
+                required_qty = qty_per_listing * listing_qty
+                available_lots_by_component.append(stock_qty // qty_per_listing)
+                if stock_qty < required_qty:
+                    shortages.append(
+                        f"{component.get('sku') or product_id}: needs {required_qty}, stock {stock_qty}"
+                    )
+            if shortages:
+                max_available_lots = min(available_lots_by_component) if available_lots_by_component else 0
+                add_exception(
+                    severity="P1",
+                    exception_type="active_bundle_listing_stock_shortage",
+                    entity_type="listing",
+                    entity_id=int(listing_row.listing_id or 0),
+                    marketplace=str(listing_row.marketplace or "").strip().lower(),
+                    reference=str(listing_row.external_listing_id or "").strip(),
+                    amount=float(listing_qty - max_available_lots),
+                    details=(
+                        f"Active bundle listing remaining quantity {listing_qty} exceeds component stock. "
+                        f"Available complete bundle listings from current stock: {max_available_lots}. "
+                        + " | ".join(shortages)
+                    ),
+                    occurred_at=listing_row.updated_at,
+                )
+
+        committed_by_component_product: dict[int, dict[str, Any]] = {}
+        for parsed in parsed_bundle_listings:
+            listing_row = parsed["row"]
+            listing_qty = max(
+                0,
+                int(listing_row.quantity_listed or 0)
+                - int(sold_qty_by_bundle_listing.get(int(listing_row.listing_id or 0), 0)),
+            )
+            if listing_qty <= 0:
+                continue
+            listing_ref = str(listing_row.external_listing_id or "").strip() or f"listing#{listing_row.listing_id}"
+            for component in list(parsed.get("components") or []):
+                product_id = int(component.get("product_id") or 0)
+                if product_id <= 0:
+                    continue
+                qty_per_listing = max(1, int(component.get("quantity_per_listing") or 1))
+                required_qty = qty_per_listing * listing_qty
+                bucket = committed_by_component_product.setdefault(
+                    product_id,
+                    {
+                        "sku": str(component.get("sku") or product_id).strip(),
+                        "required_qty": 0,
+                        "stock_qty": max(0, int(bundle_component_stock.get(product_id, 0))),
+                        "listing_count": 0,
+                        "references": [],
+                        "latest_updated_at": listing_row.updated_at,
+                    },
+                )
+                bucket["required_qty"] = int(bucket.get("required_qty") or 0) + required_qty
+                bucket["listing_count"] = int(bucket.get("listing_count") or 0) + 1
+                references = bucket.get("references")
+                if isinstance(references, list) and listing_ref not in references:
+                    references.append(listing_ref)
+                latest_updated_at = bucket.get("latest_updated_at")
+                if latest_updated_at is None or (
+                    listing_row.updated_at is not None and listing_row.updated_at > latest_updated_at
+                ):
+                    bucket["latest_updated_at"] = listing_row.updated_at
+        for product_id, bucket in committed_by_component_product.items():
+            required_qty = int(bucket.get("required_qty") or 0)
+            stock_qty = int(bucket.get("stock_qty") or 0)
+            if required_qty <= stock_qty:
+                continue
+            references = [str(value) for value in list(bucket.get("references") or []) if str(value).strip()]
+            add_exception(
+                severity="P1",
+                exception_type="active_bundle_component_overcommitted",
+                entity_type="product",
+                entity_id=int(product_id),
+                sku=str(bucket.get("sku") or product_id).strip(),
+                reference=", ".join(references[:5]),
+                amount=float(required_qty - stock_qty),
+                details=(
+                    f"Active bundle listings collectively require {required_qty} unit(s), "
+                    f"but current stock is {stock_qty}. "
+                    f"Active bundle listing references: {', '.join(references[:5])}."
+                ),
+                occurred_at=bucket.get("latest_updated_at"),
+            )
+
+        matched_sale_order_ids = {
+            int(row.order_id)
+            for row in sale_rows
+            if row.order_id is not None and int(row.order_id or 0) > 0
+        }
+        finance_label_rows = self.db.execute(
+            select(
+                OrderFinanceEntry.id.label("finance_entry_id"),
+                OrderFinanceEntry.order_id.label("order_id"),
+                OrderFinanceEntry.external_order_id.label("external_order_id"),
+                OrderFinanceEntry.amount.label("amount"),
+                OrderFinanceEntry.transaction_date.label("transaction_date"),
+                OrderFinanceEntry.created_at.label("created_at"),
+            )
+            .where(
+                OrderFinanceEntry.entry_kind == "shipping_label",
+                or_(
+                    and_(
+                        OrderFinanceEntry.transaction_date.is_not(None),
+                        OrderFinanceEntry.transaction_date >= start_dt,
+                        OrderFinanceEntry.transaction_date <= end_dt,
+                    ),
+                    and_(
+                        OrderFinanceEntry.transaction_date.is_(None),
+                        OrderFinanceEntry.created_at >= start_dt,
+                        OrderFinanceEntry.created_at <= end_dt,
+                    ),
+                ),
+            )
+            .order_by(OrderFinanceEntry.transaction_date.desc(), OrderFinanceEntry.id.desc())
+        ).all()
+        for finance_row in finance_label_rows:
+            order_id = int(finance_row.order_id or 0)
+            if order_id > 0 and order_id in matched_sale_order_ids:
+                continue
+            occurred = finance_row.transaction_date or finance_row.created_at
+            add_exception(
+                severity="P2",
+                exception_type="unmatched_shipping_label_finance_entry",
+                entity_type="order_finance_entry",
+                entity_id=int(finance_row.finance_entry_id or 0),
+                marketplace="ebay",
+                reference=finance_row.external_order_id,
+                amount=self._safe_float(finance_row.amount),
+                details=(
+                    "Shipping-label finance entry is in the reporting window but is not linked to any sale row "
+                    "in the same window, so dashboard/Reports shipping delta ignores it until sale/order linkage is reconciled."
+                ),
+                occurred_at=occurred,
+            )
+
+        lot_rows = self.db.execute(
+            select(
+                PurchaseLot.id.label("lot_id"),
+                PurchaseLot.lot_code.label("lot_code"),
+                PurchaseLot.purchase_date.label("purchase_date"),
+                PurchaseLot.total_cost.label("lot_total_cost"),
+                PurchaseLot.total_tax_paid.label("lot_total_tax_paid"),
+                PurchaseLot.total_shipping_paid.label("lot_total_shipping_paid"),
+                PurchaseLot.total_handling_paid.label("lot_total_handling_paid"),
+                PurchaseLot.expected_total_quantity.label("lot_expected_total_quantity"),
+                ProductLotAssignment.id.label("assignment_id"),
+                ProductLotAssignment.product_id.label("product_id"),
+                ProductLotAssignment.quantity_acquired.label("quantity_acquired"),
+                ProductLotAssignment.unit_cost.label("unit_cost"),
+                ProductLotAssignment.unit_tax_paid.label("unit_tax_paid"),
+                ProductLotAssignment.unit_shipping_paid.label("unit_shipping_paid"),
+                ProductLotAssignment.unit_handling_paid.label("unit_handling_paid"),
+                ProductLotAssignment.allocated_cost.label("allocated_cost"),
+                ProductLotAssignment.allocated_tax_paid.label("allocated_tax_paid"),
+                ProductLotAssignment.allocated_shipping_paid.label("allocated_shipping_paid"),
+                ProductLotAssignment.allocated_handling_paid.label("allocated_handling_paid"),
+                ProductLotAssignment.allocation_weight.label("allocation_weight"),
+            )
+            .select_from(PurchaseLot)
+            .outerjoin(ProductLotAssignment, ProductLotAssignment.lot_id == PurchaseLot.id)
+            .where(PurchaseLot.purchase_date <= end_dt)
+            .order_by(PurchaseLot.purchase_date.desc(), PurchaseLot.id.desc())
+        ).all()
+        lot_buckets: dict[int, dict[str, Any]] = {}
+        for row in lot_rows:
+            lot_id = int(row.lot_id or 0)
+            if lot_id <= 0:
+                continue
+            bucket = lot_buckets.setdefault(
+                lot_id,
+                {
+                    "lot_code": str(row.lot_code or "").strip(),
+                    "purchase_date": row.purchase_date,
+                    "lot_total": self._lot_landed_total_from_assignment_row(row),
+                    "expected_total_quantity": int(row.lot_expected_total_quantity or 0),
+                    "explicit_total": 0.0,
+                    "blank_qty": 0,
+                    "blank_assignment_count": 0,
+                    "blank_product_ids": set(),
+                    "weighted_blank_assignment_count": 0,
+                    "assigned_qty": 0,
+                    "assignment_count": 0,
+                },
+            )
+            if int(row.assignment_id or 0) <= 0:
+                continue
+            bucket["assignment_count"] = int(bucket["assignment_count"] or 0) + 1
+            qty = max(0, int(row.quantity_acquired or 0))
+            bucket["assigned_qty"] = int(bucket["assigned_qty"] or 0) + qty
+            explicit_unit = self._explicit_landed_unit_cost_from_assignment_row(row)
+            if explicit_unit > 0:
+                bucket["explicit_total"] = self._safe_float(bucket["explicit_total"]) + (explicit_unit * qty)
+            else:
+                bucket["blank_qty"] = int(bucket["blank_qty"] or 0) + qty
+                bucket["blank_assignment_count"] = int(bucket["blank_assignment_count"] or 0) + 1
+                blank_product_ids = bucket.get("blank_product_ids")
+                if isinstance(blank_product_ids, set) and int(row.product_id or 0) > 0:
+                    blank_product_ids.add(int(row.product_id or 0))
+                if self._safe_float(row.allocation_weight) > 0:
+                    bucket["weighted_blank_assignment_count"] = int(bucket["weighted_blank_assignment_count"] or 0) + 1
+
+        for lot_id, bucket in lot_buckets.items():
+            lot_total = self._safe_float(bucket.get("lot_total"))
+            explicit_total = self._safe_float(bucket.get("explicit_total"))
+            blank_qty = int(bucket.get("blank_qty") or 0)
+            assigned_qty = int(bucket.get("assigned_qty") or 0)
+            expected_total_quantity = int(bucket.get("expected_total_quantity") or 0)
+            assignment_count = int(bucket.get("assignment_count") or 0)
+            blank_assignment_count = int(bucket.get("blank_assignment_count") or 0)
+            blank_product_count = len(bucket.get("blank_product_ids") or set())
+            weighted_blank_assignment_count = int(bucket.get("weighted_blank_assignment_count") or 0)
+            if expected_total_quantity > assigned_qty and lot_total > 0:
+                add_exception(
+                    severity="P2",
+                    exception_type="lot_allocation_pending_check_in",
+                    entity_type="purchase_lot",
+                    entity_id=lot_id,
+                    reference=bucket.get("lot_code"),
+                    amount=lot_total,
+                    details=(
+                        f"Lot expects {expected_total_quantity} total units/items but only {assigned_qty} are assigned. "
+                        "Whole-lot fallback costs are using the expected quantity until check-in is complete."
+                    ),
+                    occurred_at=bucket.get("purchase_date"),
+                )
+            if (
+                lot_total > 0
+                and blank_assignment_count > 1
+                and blank_product_count > 1
+                and weighted_blank_assignment_count <= 0
+                and expected_total_quantity <= 0
+            ):
+                add_exception(
+                    severity="P2",
+                    exception_type="lot_equal_fallback_review_needed",
+                    entity_type="purchase_lot",
+                    entity_id=lot_id,
+                    reference=bucket.get("lot_code"),
+                    amount=lot_total,
+                    details=(
+                        f"Lot has {blank_assignment_count} blank-cost assignments across {blank_product_count} products "
+                        "with no allocation weights or expected quantity. COGS is using equal quantity fallback; review mixed-lot cost allocation."
+                    ),
+                    occurred_at=bucket.get("purchase_date"),
+                )
+            if lot_total <= 0 and assignment_count > 0 and blank_qty > 0:
+                add_exception(
+                    severity="P1",
+                    exception_type="blank_lot_assignment_without_lot_total",
+                    entity_type="purchase_lot",
+                    entity_id=lot_id,
+                    reference=bucket.get("lot_code"),
+                    amount=lot_total,
+                    details="Lot has blank-cost assignments but no positive landed lot total to allocate.",
+                    occurred_at=bucket.get("purchase_date"),
+                )
+            if lot_total > 0 and explicit_total - lot_total > 0.01:
+                add_exception(
+                    severity="P0",
+                    exception_type="lot_overallocated",
+                    entity_type="purchase_lot",
+                    entity_id=lot_id,
+                    reference=bucket.get("lot_code"),
+                    amount=explicit_total - lot_total,
+                    details=f"Explicit assignment landed total {explicit_total:.2f} exceeds lot landed total {lot_total:.2f}.",
+                    occurred_at=bucket.get("purchase_date"),
+                )
+            if lot_total > 0 and blank_qty <= 0 and assignment_count > 0 and lot_total - explicit_total > 0.01:
+                add_exception(
+                    severity="P1",
+                    exception_type="lot_underallocated",
+                    entity_type="purchase_lot",
+                    entity_id=lot_id,
+                    reference=bucket.get("lot_code"),
+                    amount=lot_total - explicit_total,
+                    details=f"Lot landed total {lot_total:.2f} exceeds explicit assignment landed total {explicit_total:.2f}.",
+                    occurred_at=bucket.get("purchase_date"),
+                )
+
+        severity_rank = {"P0": 0, "P1": 1, "P2": 2}
+        return sorted(
+            rows,
+            key=lambda row: (
+                severity_rank.get(str(row.get("severity") or ""), 99),
+                str(row.get("exception_type") or ""),
+                str(row.get("occurred_at") or ""),
+                int(row.get("entity_id") or 0),
+            ),
+        )
 
     def report_sales_actual_econ_rows(
         self,
@@ -7151,8 +9567,15 @@ class InventoryRepository:
         start_dt: datetime,
         end_dt: datetime,
     ) -> list[dict]:
+        ListingProduct = aliased(Product)
         sold_price_expr = func.coalesce(Sale.sold_price, 0)
+        sale_fee_expr = func.coalesce(Sale.fees, 0)
+        sale_shipping_charged_expr = func.coalesce(Sale.shipping_cost, 0)
+        sale_shipping_label_expr = func.coalesce(Sale.shipping_label_cost, 0)
         sibling_gross_total_expr = func.sum(sold_price_expr).over(partition_by=Sale.order_id)
+        sibling_fee_total_expr = func.sum(sale_fee_expr).over(partition_by=Sale.order_id)
+        sibling_shipping_charged_total_expr = func.sum(sale_shipping_charged_expr).over(partition_by=Sale.order_id)
+        sibling_shipping_label_total_expr = func.sum(sale_shipping_label_expr).over(partition_by=Sale.order_id)
         sibling_count_expr = func.count(Sale.id).over(partition_by=Sale.order_id)
         weight_expr = case(
             (Sale.order_id.is_(None), literal(1.0)),
@@ -7161,30 +9584,45 @@ class InventoryRepository:
             else_=literal(1.0),
         )
         order_fee_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.fees, 0)),
-            else_=func.coalesce(Sale.fees, 0),
+            (and_(Sale.order_id.is_not(None), func.coalesce(Order.fees, 0) > 0), func.coalesce(Order.fees, 0)),
+            (and_(Sale.order_id.is_not(None), sibling_fee_total_expr > 0), sibling_fee_total_expr),
+            else_=sale_fee_expr,
         )
         order_shipping_charged_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0)),
-            else_=func.coalesce(Sale.shipping_cost, 0),
+            (
+                and_(Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0) > 0),
+                func.coalesce(Order.shipping_cost, 0),
+            ),
+            (and_(Sale.order_id.is_not(None), sibling_shipping_charged_total_expr > 0), sibling_shipping_charged_total_expr),
+            else_=sale_shipping_charged_expr,
         )
         order_shipping_actual_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0)),
-            else_=func.coalesce(Sale.shipping_label_cost, 0),
+            (
+                and_(Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0) > 0),
+                func.coalesce(Order.shipping_label_cost, 0),
+            ),
+            (and_(Sale.order_id.is_not(None), sibling_shipping_label_total_expr > 0), sibling_shipping_label_total_expr),
+            else_=sale_shipping_label_expr,
         )
         allocated_fee_expr = order_fee_total_expr * weight_expr
         allocated_shipping_charged_expr = order_shipping_charged_total_expr * weight_expr
         allocated_shipping_actual_expr = order_shipping_actual_total_expr * weight_expr
-        net_before_cogs_actual_expr = sold_price_expr - allocated_fee_expr - allocated_shipping_actual_expr
+        net_before_cogs_actual_expr = (
+            sold_price_expr
+            + allocated_shipping_charged_expr
+            - allocated_fee_expr
+            - allocated_shipping_actual_expr
+        )
 
         rows = self.db.execute(
             select(
                 Sale.id.label("sale_id"),
+                Sale.sold_at.label("sold_at"),
                 Sale.order_id.label("order_id"),
                 func.lower(func.coalesce(cast(Sale.marketplace, String), "")).label("marketplace"),
                 Sale.external_order_id.label("external_order_id"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
                 func.coalesce(Sale.quantity_sold, 0).label("qty"),
                 sold_price_expr.label("sold_price"),
                 weight_expr.label("allocation_weight"),
@@ -7202,6 +9640,8 @@ class InventoryRepository:
             .select_from(Sale)
             .outerjoin(Order, Order.id == Sale.order_id)
             .outerjoin(Product, Product.id == Sale.product_id)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
             .where(
                 Sale.sold_at.is_not(None),
                 Sale.sold_at >= start_dt,
@@ -7209,27 +9649,88 @@ class InventoryRepository:
             )
             .order_by(Sale.sold_at.desc(), Sale.id.desc())
         ).all()
+        order_ids = sorted({int(row.order_id) for row in rows if row.order_id is not None})
+        normalized_fee_by_order: dict[int, float] = {}
+        normalized_label_by_order: dict[int, float] = {}
+        if order_ids:
+            normalized_fee_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "marketplace_fee",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
+            normalized_label_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "shipping_label",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
         result: list[dict] = []
         for row in rows:
+            order_id = int(row.order_id) if row.order_id is not None else None
+            weight = float(row.allocation_weight or 0)
+            sold_price = float(row.sold_price or 0)
+            fee_total_actual = (
+                normalized_fee_by_order[order_id]
+                if order_id is not None and order_id in normalized_fee_by_order
+                else float(row.order_fee_total_actual or 0)
+            )
+            shipping_actual_total = (
+                normalized_label_by_order[order_id]
+                if order_id is not None and order_id in normalized_label_by_order
+                else float(row.order_shipping_actual_total or 0)
+            )
+            shipping_charged_total = float(row.order_shipping_charged_total or 0)
+            allocated_fee = fee_total_actual * weight
+            allocated_shipping_charged = shipping_charged_total * weight
+            allocated_shipping_actual = shipping_actual_total * weight
+            net_before_cogs_actual = sold_price + allocated_shipping_charged - allocated_fee - allocated_shipping_actual
             result.append(
                 {
                     "sale_id": int(row.sale_id or 0),
-                    "order_id": int(row.order_id or 0) if row.order_id is not None else None,
+                    "sold_at": row.sold_at.isoformat() if row.sold_at else None,
+                    "order_id": order_id,
                     "marketplace": str(row.marketplace or "").strip().lower(),
                     "external_order_id": str(row.external_order_id or "").strip(),
                     "sku": str(row.sku or "").strip() or None,
                     "product_title": str(row.product_title or "").strip() or None,
                     "qty": int(row.qty or 0),
-                    "sold_price": round(float(row.sold_price or 0), 2),
-                    "allocation_weight": round(float(row.allocation_weight or 0), 6),
-                    "order_fee_total_actual": round(float(row.order_fee_total_actual or 0), 2),
-                    "order_shipping_charged_total": round(float(row.order_shipping_charged_total or 0), 2),
-                    "order_shipping_actual_total": round(float(row.order_shipping_actual_total or 0), 2),
-                    "allocated_fee_actual": round(float(row.allocated_fee_actual or 0), 2),
-                    "allocated_shipping_charged": round(float(row.allocated_shipping_charged or 0), 2),
-                    "allocated_shipping_actual": round(float(row.allocated_shipping_actual or 0), 2),
-                    "shipping_delta_charged_minus_actual": round(float(row.shipping_delta_charged_minus_actual or 0), 2),
-                    "net_before_cogs_actual": round(float(row.net_before_cogs_actual or 0), 2),
+                    "sold_price": round(sold_price, 2),
+                    "allocation_weight": round(weight, 6),
+                    "order_fee_total_actual": round(fee_total_actual, 2),
+                    "order_shipping_charged_total": round(shipping_charged_total, 2),
+                    "order_shipping_actual_total": round(shipping_actual_total, 2),
+                    "actual_fee_source": (
+                        "normalized_order_finance_entries_marketplace_fee_sum"
+                        if order_id is not None and order_id in normalized_fee_by_order
+                        else "order_or_sale_fee_field"
+                    ),
+                    "actual_shipping_source": (
+                        "normalized_order_finance_entries_shipping_label_sum"
+                        if order_id is not None and order_id in normalized_label_by_order
+                        else "order_or_sale_shipping_label_field"
+                    ),
+                    "allocated_fee_actual": round(allocated_fee, 2),
+                    "allocated_shipping_charged": round(allocated_shipping_charged, 2),
+                    "allocated_shipping_actual": round(allocated_shipping_actual, 2),
+                    "shipping_delta_charged_minus_actual": round(allocated_shipping_charged - allocated_shipping_actual, 2),
+                    "net_before_cogs_actual": round(net_before_cogs_actual, 2),
                 }
             )
         return result
@@ -7241,6 +9742,7 @@ class InventoryRepository:
         end_dt: datetime,
         marketplaces: set[str] | None = None,
     ) -> list[dict]:
+        ListingProduct = aliased(Product)
         def _safe_float(value: Any) -> float:
             try:
                 return float(value or 0)
@@ -7266,7 +9768,13 @@ class InventoryRepository:
         marketplace_filter = {str(v).strip().lower() for v in (marketplaces or set()) if str(v).strip()}
 
         sold_price_expr = func.coalesce(Sale.sold_price, 0)
+        sale_fee_expr = func.coalesce(Sale.fees, 0)
+        sale_shipping_charged_expr = func.coalesce(Sale.shipping_cost, 0)
+        sale_shipping_label_expr = func.coalesce(Sale.shipping_label_cost, 0)
         sibling_gross_total_expr = func.sum(sold_price_expr).over(partition_by=Sale.order_id)
+        sibling_fee_total_expr = func.sum(sale_fee_expr).over(partition_by=Sale.order_id)
+        sibling_shipping_charged_total_expr = func.sum(sale_shipping_charged_expr).over(partition_by=Sale.order_id)
+        sibling_shipping_label_total_expr = func.sum(sale_shipping_label_expr).over(partition_by=Sale.order_id)
         sibling_count_expr = func.count(Sale.id).over(partition_by=Sale.order_id)
         weight_expr = case(
             (Sale.order_id.is_(None), literal(1.0)),
@@ -7275,21 +9783,35 @@ class InventoryRepository:
             else_=literal(1.0),
         )
         order_fee_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.fees, 0)),
-            else_=func.coalesce(Sale.fees, 0),
+            (and_(Sale.order_id.is_not(None), func.coalesce(Order.fees, 0) > 0), func.coalesce(Order.fees, 0)),
+            (and_(Sale.order_id.is_not(None), sibling_fee_total_expr > 0), sibling_fee_total_expr),
+            else_=sale_fee_expr,
         )
         order_shipping_charged_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0)),
-            else_=func.coalesce(Sale.shipping_cost, 0),
+            (
+                and_(Sale.order_id.is_not(None), func.coalesce(Order.shipping_cost, 0) > 0),
+                func.coalesce(Order.shipping_cost, 0),
+            ),
+            (and_(Sale.order_id.is_not(None), sibling_shipping_charged_total_expr > 0), sibling_shipping_charged_total_expr),
+            else_=sale_shipping_charged_expr,
         )
         order_shipping_actual_total_expr = case(
-            (Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0)),
-            else_=func.coalesce(Sale.shipping_label_cost, 0),
+            (
+                and_(Sale.order_id.is_not(None), func.coalesce(Order.shipping_label_cost, 0) > 0),
+                func.coalesce(Order.shipping_label_cost, 0),
+            ),
+            (and_(Sale.order_id.is_not(None), sibling_shipping_label_total_expr > 0), sibling_shipping_label_total_expr),
+            else_=sale_shipping_label_expr,
         )
         allocated_fee_expr = order_fee_total_expr * weight_expr
         allocated_shipping_charged_expr = order_shipping_charged_total_expr * weight_expr
         allocated_shipping_actual_expr = order_shipping_actual_total_expr * weight_expr
-        net_before_cogs_actual_expr = sold_price_expr - allocated_fee_expr - allocated_shipping_actual_expr
+        net_before_cogs_actual_expr = (
+            sold_price_expr
+            + allocated_shipping_charged_expr
+            - allocated_fee_expr
+            - allocated_shipping_actual_expr
+        )
 
         query = (
             select(
@@ -7299,9 +9821,9 @@ class InventoryRepository:
                 Sale.listing_id.label("listing_id"),
                 func.lower(func.coalesce(cast(Sale.marketplace, String), "")).label("marketplace"),
                 Sale.external_order_id.label("external_order_id"),
-                Product.id.label("product_id"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(Product.id, ListingProduct.id).label("product_id"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
                 func.coalesce(Sale.quantity_sold, 0).label("qty"),
                 sold_price_expr.label("sold_price"),
                 weight_expr.label("allocation_weight"),
@@ -7319,6 +9841,7 @@ class InventoryRepository:
             .outerjoin(Order, Order.id == Sale.order_id)
             .outerjoin(Product, Product.id == Sale.product_id)
             .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
             .where(
                 Sale.sold_at.is_not(None),
                 Sale.sold_at >= start_dt,
@@ -7329,15 +9852,59 @@ class InventoryRepository:
         if marketplace_filter:
             query = query.where(func.lower(func.coalesce(cast(Sale.marketplace, String), "")).in_(sorted(marketplace_filter)))
         rows = self.db.execute(query).all()
+        order_ids = sorted({int(row.order_id) for row in rows if row.order_id is not None})
+        normalized_fee_by_order: dict[int, float] = {}
+        normalized_label_by_order: dict[int, float] = {}
+        if order_ids:
+            normalized_fee_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "marketplace_fee",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
+            normalized_label_by_order = {
+                int(order_id): float(total or 0)
+                for order_id, total in self.db.execute(
+                    select(
+                        OrderFinanceEntry.order_id,
+                        func.coalesce(func.sum(func.coalesce(OrderFinanceEntry.amount, 0)), 0),
+                    )
+                    .where(
+                        OrderFinanceEntry.order_id.in_(order_ids),
+                        OrderFinanceEntry.entry_kind == "shipping_label",
+                    )
+                    .group_by(OrderFinanceEntry.order_id)
+                ).all()
+            }
 
         result: list[dict] = []
         for row in rows:
             qty = max(1, int(row.qty or 0))
+            order_id = int(row.order_id) if row.order_id is not None else None
+            weight = float(row.allocation_weight or 0)
             sold_price = round(float(row.sold_price or 0), 2)
-            actual_fee_alloc = round(float(row.allocated_fee_actual or 0), 2)
-            expected_shipping_alloc = round(float(row.allocated_shipping_charged or 0), 2)
-            actual_shipping_alloc = round(float(row.allocated_shipping_actual or 0), 2)
-            actual_net_before_cogs = round(float(row.net_before_cogs_actual or 0), 2)
+            actual_fee_total = (
+                normalized_fee_by_order[order_id]
+                if order_id is not None and order_id in normalized_fee_by_order
+                else float(row.order_fee_total_actual or 0)
+            )
+            actual_shipping_total = (
+                normalized_label_by_order[order_id]
+                if order_id is not None and order_id in normalized_label_by_order
+                else float(row.order_shipping_actual_total or 0)
+            )
+            actual_fee_alloc = round(actual_fee_total * weight, 2)
+            expected_shipping_alloc = round(float(row.order_shipping_charged_total or 0) * weight, 2)
+            actual_shipping_alloc = round(actual_shipping_total * weight, 2)
+            actual_net_before_cogs = round(sold_price + expected_shipping_alloc - actual_fee_alloc - actual_shipping_alloc, 2)
 
             fee_estimate = _extract_listing_fee_estimate(getattr(row, "listing_marketplace_details", None))
             fee_estimate_total = _safe_float(fee_estimate.get("estimated_total_fees"))
@@ -7351,7 +9918,10 @@ class InventoryRepository:
             net_variance_actual_minus_estimated: float | None = None
             if estimate_available:
                 estimated_fee_alloc = round((fee_estimate_total / max(1, fee_estimate_qty)) * qty, 2)
-                estimated_net_before_cogs = round(sold_price - estimated_fee_alloc - expected_shipping_alloc, 2)
+                estimated_net_before_cogs = round(
+                    sold_price + expected_shipping_alloc - estimated_fee_alloc - actual_shipping_alloc,
+                    2,
+                )
                 fee_variance_actual_minus_estimated = round(actual_fee_alloc - estimated_fee_alloc, 2)
                 net_variance_actual_minus_estimated = round(actual_net_before_cogs - estimated_net_before_cogs, 2)
 
@@ -7360,7 +9930,7 @@ class InventoryRepository:
                     "sale_id": int(row.sale_id or 0),
                     "sold_at": row.sold_at,
                     "marketplace": str(row.marketplace or "").strip().lower(),
-                    "order_id": int(row.order_id or 0) if row.order_id is not None else None,
+                    "order_id": order_id,
                     "listing_id": int(row.listing_id or 0) if row.listing_id is not None else None,
                     "external_order_id": str(row.external_order_id or "").strip(),
                     "product_id": int(row.product_id or 0) if row.product_id is not None else None,
@@ -7368,12 +9938,22 @@ class InventoryRepository:
                     "product_title": str(row.product_title or "").strip() or None,
                     "qty": qty,
                     "sold_price": sold_price,
-                    "allocation_weight": round(float(row.allocation_weight or 0), 6),
+                    "allocation_weight": round(weight, 6),
                     "estimated_fee_alloc": estimated_fee_alloc,
                     "expected_shipping_alloc": expected_shipping_alloc,
                     "estimated_net_before_cogs": estimated_net_before_cogs,
                     "actual_fee_alloc": actual_fee_alloc,
+                    "actual_fee_source": (
+                        "normalized_order_finance_entries_marketplace_fee_sum"
+                        if order_id is not None and order_id in normalized_fee_by_order
+                        else "order_or_sale_fee_field"
+                    ),
                     "actual_shipping_alloc": actual_shipping_alloc,
+                    "actual_shipping_source": (
+                        "normalized_order_finance_entries_shipping_label_sum"
+                        if order_id is not None and order_id in normalized_label_by_order
+                        else "order_or_sale_shipping_label_field"
+                    ),
                     "actual_net_before_cogs": actual_net_before_cogs,
                     "fee_variance_actual_minus_estimated": fee_variance_actual_minus_estimated,
                     "shipping_delta_expected_minus_actual": round(expected_shipping_alloc - actual_shipping_alloc, 2),
@@ -7725,15 +10305,18 @@ class InventoryRepository:
             select(
                 Sale.id.label("sale_id"),
                 Sale.product_id.label("product_id"),
+                Sale.listing_id.label("listing_id"),
                 Sale.sold_at.label("sold_at"),
                 Sale.quantity_sold.label("quantity_sold"),
                 Sale.sold_price.label("sold_price"),
                 Sale.fees.label("fees"),
                 Sale.shipping_cost.label("shipping_cost"),
+                Sale.shipping_label_cost.label("shipping_label_cost"),
+                MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
             )
             .select_from(Sale)
+            .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
             .where(
-                Sale.product_id.is_not(None),
                 Sale.sold_at.is_not(None),
                 Sale.sold_at <= cutoff,
             )
@@ -7746,19 +10329,112 @@ class InventoryRepository:
             if pid <= 0:
                 continue
             movements_by_product.setdefault(pid, []).append(row)
+        actual_econ_by_sale_id = {
+            int(row.get("sale_id") or 0): row
+            for row in self.report_sales_actual_econ_rows(
+                start_dt=datetime.min,
+                end_dt=cutoff,
+            )
+            if int(row.get("sale_id") or 0) > 0
+        }
         sales_by_product: dict[int, list[Any]] = {}
         for row in sales_rows:
+            sale_id = int(row.sale_id or 0)
+            sale_qty = max(1, int(row.quantity_sold or 1))
+            bundle_components = self._bundle_components_from_payload(
+                self._listing_bundle_payload_from_raw(row.listing_marketplace_details),
+                sale_qty,
+            )
+            component_rows = [
+                {
+                    "product_id": int(component.get("product_id") or 0),
+                    "quantity_total": max(1, int(component.get("quantity_total") or 1)),
+                }
+                for component in bundle_components
+                if int(component.get("product_id") or 0) > 0
+            ]
+            if component_rows:
+                total_component_units = sum(int(component["quantity_total"]) for component in component_rows)
+                actual = actual_econ_by_sale_id.get(sale_id) or {}
+                gross_total = self._safe_float(row.sold_price)
+                fee_total = self._safe_float(actual.get("allocated_fee_actual", row.fees))
+                shipping_total = self._safe_float(actual.get("allocated_shipping_charged", row.shipping_cost))
+                label_total = self._safe_float(
+                    actual.get("allocated_shipping_actual", getattr(row, "shipping_label_cost", None))
+                )
+                for component in component_rows:
+                    pid = int(component["product_id"])
+                    component_qty = int(component["quantity_total"])
+                    weight = (
+                        float(component_qty) / float(total_component_units)
+                        if total_component_units > 0
+                        else 0.0
+                    )
+                    sales_by_product.setdefault(pid, []).append(
+                        {
+                            "sale_id": sale_id,
+                            "sold_at": row.sold_at,
+                            "quantity_sold": component_qty,
+                            "sold_price": gross_total * weight,
+                            "fees": fee_total * weight,
+                            "shipping_cost": shipping_total * weight,
+                            "shipping_label_cost": label_total * weight,
+                            "actual_allocated": True,
+                        }
+                    )
+                continue
+
             pid = int(row.product_id or 0)
             if pid <= 0:
                 continue
             sales_by_product.setdefault(pid, []).append(row)
+
+        def _apply_cycle_sale(current_cycle: dict, sale: Any) -> None:
+            is_allocated_proxy = isinstance(sale, dict) and bool(sale.get("actual_allocated"))
+            sale_id = int((sale.get("sale_id") if isinstance(sale, dict) else sale.sale_id) or 0)
+            actual = {} if is_allocated_proxy else actual_econ_by_sale_id.get(sale_id) or {}
+            fees_field = sale.get("fees") if isinstance(sale, dict) else sale.fees
+            shipping_field = sale.get("shipping_cost") if isinstance(sale, dict) else sale.shipping_cost
+            label_field = sale.get("shipping_label_cost") if isinstance(sale, dict) else getattr(sale, "shipping_label_cost", None)
+            sold_price = sale.get("sold_price") if isinstance(sale, dict) else sale.sold_price
+            quantity_sold = sale.get("quantity_sold") if isinstance(sale, dict) else sale.quantity_sold
+            fee = (
+                self._safe_float(actual.get("allocated_fee_actual"))
+                if actual
+                else self._safe_float(fees_field)
+            )
+            shipping_charged = (
+                self._safe_float(actual.get("allocated_shipping_charged"))
+                if actual
+                else self._safe_float(shipping_field)
+            )
+            label_spend = (
+                self._safe_float(actual.get("allocated_shipping_actual"))
+                if actual
+                else self._safe_float(label_field)
+            )
+            net_before_cogs = (
+                self._safe_float(actual.get("net_before_cogs_actual"))
+                if actual
+                else self._safe_float(sold_price) + shipping_charged - fee - label_spend
+            )
+            current_cycle["sale_count"] += 1
+            current_cycle["qty_sold_sales"] += int(quantity_sold or 0)
+            current_cycle["gross_sales"] += self._safe_float(sold_price)
+            current_cycle["fees"] += fee
+            current_cycle["shipping_cost"] += shipping_charged
+            current_cycle["shipping_label_cost"] += label_spend
+            current_cycle["net_sales"] += net_before_cogs
 
         rows: list[dict] = []
         for product_id, product_movements in movements_by_product.items():
             product_meta = product_by_id.get(product_id) or {}
             product_sales = sorted(
                 sales_by_product.get(product_id, []),
-                key=lambda x: (x.sold_at or datetime.min, int(x.sale_id or 0)),
+                key=lambda x: (
+                    (x.get("sold_at") if isinstance(x, dict) else x.sold_at) or datetime.min,
+                    int((x.get("sale_id") if isinstance(x, dict) else x.sale_id) or 0),
+                ),
             )
             sales_idx = 0
             sorted_movements = sorted(
@@ -7795,6 +10471,7 @@ class InventoryRepository:
                         "gross_sales": 0.0,
                         "fees": 0.0,
                         "shipping_cost": 0.0,
+                        "shipping_label_cost": 0.0,
                         "net_sales": 0.0,
                     }
                 if current_cycle is None:
@@ -7813,22 +10490,13 @@ class InventoryRepository:
                 cycle_end_candidate = mv.occurred_at or datetime.min
                 while sales_idx < len(product_sales):
                     sale = product_sales[sales_idx]
-                    sold_at = sale.sold_at or datetime.min
+                    sold_at = (sale.get("sold_at") if isinstance(sale, dict) else sale.sold_at) or datetime.min
                     if sold_at < cycle_start:
                         sales_idx += 1
                         continue
                     if sold_at > cycle_end_candidate:
                         break
-                    current_cycle["sale_count"] += 1
-                    current_cycle["qty_sold_sales"] += int(sale.quantity_sold or 0)
-                    current_cycle["gross_sales"] += float(sale.sold_price or 0)
-                    current_cycle["fees"] += float(sale.fees or 0)
-                    current_cycle["shipping_cost"] += float(sale.shipping_cost or 0)
-                    current_cycle["net_sales"] += (
-                        float(sale.sold_price or 0)
-                        - float(sale.fees or 0)
-                        - float(sale.shipping_cost or 0)
-                    )
+                    _apply_cycle_sale(current_cycle, sale)
                     sales_idx += 1
 
                 if after_qty <= 0:
@@ -7842,20 +10510,11 @@ class InventoryRepository:
             if current_cycle is not None:
                 while sales_idx < len(product_sales):
                     sale = product_sales[sales_idx]
-                    sold_at = sale.sold_at or datetime.min
+                    sold_at = (sale.get("sold_at") if isinstance(sale, dict) else sale.sold_at) or datetime.min
                     if sold_at < (current_cycle["cycle_start"] or datetime.min):
                         sales_idx += 1
                         continue
-                    current_cycle["sale_count"] += 1
-                    current_cycle["qty_sold_sales"] += int(sale.quantity_sold or 0)
-                    current_cycle["gross_sales"] += float(sale.sold_price or 0)
-                    current_cycle["fees"] += float(sale.fees or 0)
-                    current_cycle["shipping_cost"] += float(sale.shipping_cost or 0)
-                    current_cycle["net_sales"] += (
-                        float(sale.sold_price or 0)
-                        - float(sale.fees or 0)
-                        - float(sale.shipping_cost or 0)
-                    )
+                    _apply_cycle_sale(current_cycle, sale)
                     sales_idx += 1
                 current_cycle["cycle_status"] = "open"
                 known_cost = float(current_cycle.get("acquisition_cost_known") or 0.0)
@@ -7885,6 +10544,7 @@ class InventoryRepository:
                     "gross_sales": round(float(row["gross_sales"] or 0), 2),
                     "fees": round(float(row["fees"] or 0), 2),
                     "shipping_cost": round(float(row["shipping_cost"] or 0), 2),
+                    "shipping_label_cost": round(float(row.get("shipping_label_cost") or 0), 2),
                     "net_sales": round(float(row["net_sales"] or 0), 2),
                     "estimated_margin_vs_known_cost": round(float(row["estimated_margin_vs_known_cost"] or 0), 2),
                 }
@@ -7897,6 +10557,7 @@ class InventoryRepository:
         start_dt: datetime,
         end_dt: datetime,
     ) -> list[dict]:
+        ListingProduct = aliased(Product)
         def _safe_float(value: Any) -> float:
             try:
                 if value is None:
@@ -7950,8 +10611,8 @@ class InventoryRepository:
                 Sale.quantity_sold.label("quantity_sold"),
                 Sale.sold_price.label("sale_gross"),
                 Sale.fees.label("sale_fee_field"),
-                Product.sku.label("sku"),
-                Product.title.label("product_title"),
+                func.coalesce(Product.sku, ListingProduct.sku).label("sku"),
+                func.coalesce(Product.title, ListingProduct.title).label("product_title"),
                 MarketplaceListing.external_listing_id.label("external_listing_id"),
                 MarketplaceListing.marketplace_details.label("listing_marketplace_details"),
                 Order.notes.label("order_notes"),
@@ -7959,6 +10620,7 @@ class InventoryRepository:
             .select_from(Sale)
             .outerjoin(Product, Product.id == Sale.product_id)
             .outerjoin(MarketplaceListing, MarketplaceListing.id == Sale.listing_id)
+            .outerjoin(ListingProduct, ListingProduct.id == MarketplaceListing.product_id)
             .outerjoin(Order, Order.id == Sale.order_id)
             .where(
                 func.lower(func.coalesce(Sale.marketplace, "")) == "ebay",
@@ -8139,9 +10801,16 @@ class InventoryRepository:
                 func.coalesce(func.sum(Sale.sold_price), 0).label("sales_gross"),
                 func.coalesce(func.sum(Sale.fees), 0).label("sales_fees"),
                 func.coalesce(func.sum(Sale.shipping_cost), 0).label("sales_shipping_cost"),
-                func.coalesce(func.sum(Sale.sold_price - Sale.fees - Sale.shipping_cost), 0).label(
-                    "sales_net_before_returns"
-                ),
+                func.coalesce(func.sum(Sale.shipping_label_cost), 0).label("sales_shipping_label_cost"),
+                func.coalesce(
+                    func.sum(
+                        Sale.sold_price
+                        + Sale.shipping_cost
+                        - Sale.fees
+                        - func.coalesce(Sale.shipping_label_cost, 0)
+                    ),
+                    0,
+                ).label("sales_net_before_returns"),
             )
             .where(
                 Sale.sold_at.is_not(None),
@@ -8202,6 +10871,7 @@ class InventoryRepository:
                     "sales_gross": 0.0,
                     "sales_fees": 0.0,
                     "sales_shipping_cost": 0.0,
+                    "sales_shipping_label_cost": 0.0,
                     "sales_net_before_returns": 0.0,
                     "returns_refund_total": 0.0,
                     "net_after_returns": 0.0,
@@ -8211,13 +10881,33 @@ class InventoryRepository:
                 }
             return by_marketplace[key]
 
-        for row in sales_rows:
-            bucket = _bucket(str(row.marketplace or ""))
-            bucket["sales_count"] = int(row.sales_count or 0)
-            bucket["sales_gross"] = float(row.sales_gross or 0.0)
-            bucket["sales_fees"] = float(row.sales_fees or 0.0)
-            bucket["sales_shipping_cost"] = float(row.sales_shipping_cost or 0.0)
-            bucket["sales_net_before_returns"] = float(row.sales_net_before_returns or 0.0)
+        actual_sales_rows = self.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt)
+        if actual_sales_rows:
+            for row in actual_sales_rows:
+                bucket = _bucket(str(row.get("marketplace") or ""))
+                bucket["sales_count"] = int(bucket.get("sales_count") or 0) + 1
+                bucket["sales_gross"] = float(bucket.get("sales_gross") or 0.0) + self._safe_float(row.get("sold_price"))
+                bucket["sales_fees"] = float(bucket.get("sales_fees") or 0.0) + self._safe_float(
+                    row.get("allocated_fee_actual")
+                )
+                bucket["sales_shipping_cost"] = float(bucket.get("sales_shipping_cost") or 0.0) + self._safe_float(
+                    row.get("allocated_shipping_charged")
+                )
+                bucket["sales_shipping_label_cost"] = float(
+                    bucket.get("sales_shipping_label_cost") or 0.0
+                ) + self._safe_float(row.get("allocated_shipping_actual"))
+                bucket["sales_net_before_returns"] = float(
+                    bucket.get("sales_net_before_returns") or 0.0
+                ) + self._safe_float(row.get("net_before_cogs_actual"))
+        else:
+            for row in sales_rows:
+                bucket = _bucket(str(row.marketplace or ""))
+                bucket["sales_count"] = int(row.sales_count or 0)
+                bucket["sales_gross"] = float(row.sales_gross or 0.0)
+                bucket["sales_fees"] = float(row.sales_fees or 0.0)
+                bucket["sales_shipping_cost"] = float(row.sales_shipping_cost or 0.0)
+                bucket["sales_shipping_label_cost"] = float(row.sales_shipping_label_cost or 0.0)
+                bucket["sales_net_before_returns"] = float(row.sales_net_before_returns or 0.0)
 
         for row in order_rows:
             bucket = _bucket(str(row.marketplace or ""))
@@ -8247,6 +10937,7 @@ class InventoryRepository:
                     "sales_gross": round(sales_gross, 2),
                     "sales_fees": round(float(bucket.get("sales_fees") or 0.0), 2),
                     "sales_shipping_cost": round(float(bucket.get("sales_shipping_cost") or 0.0), 2),
+                    "sales_shipping_label_cost": round(float(bucket.get("sales_shipping_label_cost") or 0.0), 2),
                     "sales_net_before_returns": round(sales_net_before_returns, 2),
                     "returns_refund_total": round(returns_refund_total, 2),
                     "net_after_returns": round(net_after_returns, 2),
@@ -8431,46 +11122,72 @@ class InventoryRepository:
             "dashboard_live_metrics",
             """
             WITH sales_30d AS (
-                SELECT sold_at, sold_price
-                FROM sales
-                WHERE sold_at >= :window_30d
+                SELECT
+                    s.id,
+                    s.sold_at,
+                    s.sold_price,
+                    s.fees,
+                    s.shipping_cost,
+                    s.shipping_label_cost,
+                    s.order_id,
+                    CASE
+                        WHEN s.order_id IS NULL THEN 1
+                        ELSE COUNT(s.id) OVER (PARTITION BY s.order_id)
+                    END AS order_sale_count
+                FROM sales s
+                WHERE s.sold_at >= :window_30d
+                  AND s.sold_at <= :end_dt
+            ),
+            linked_fee_rollup AS (
+                SELECT order_id, COALESCE(SUM(COALESCE(amount, 0)), 0) AS fee_total
+                FROM order_finance_entries
+                WHERE entry_kind = 'marketplace_fee'
+                  AND order_id IN (SELECT DISTINCT order_id FROM sales_30d WHERE order_id IS NOT NULL)
+                GROUP BY order_id
+            ),
+            linked_label_rollup AS (
+                SELECT order_id, COALESCE(SUM(COALESCE(amount, 0)), 0) AS label_total
+                FROM order_finance_entries
+                WHERE entry_kind = 'shipping_label'
+                  AND order_id IN (SELECT DISTINCT order_id FROM sales_30d WHERE order_id IS NOT NULL)
+                GROUP BY order_id
             ),
             sales_rollup AS (
                 SELECT
-                    COALESCE(SUM(CASE WHEN sold_at >= :window_7d THEN 1 ELSE 0 END), 0) AS sales_7d_count,
-                    COALESCE(SUM(CASE WHEN sold_at >= :window_7d THEN COALESCE(sold_price, 0) ELSE 0 END), 0) AS sales_7d_gross,
+                    COALESCE(SUM(CASE WHEN s.sold_at >= :window_7d AND s.sold_at <= :end_dt THEN 1 ELSE 0 END), 0) AS sales_7d_count,
+                    COALESCE(SUM(CASE WHEN s.sold_at >= :window_7d AND s.sold_at <= :end_dt THEN COALESCE(s.sold_price, 0) ELSE 0 END), 0) AS sales_7d_gross,
                     COUNT(*) AS sales_30d_count,
-                    COALESCE(SUM(COALESCE(sold_price, 0)), 0) AS sales_30d_gross
-                FROM sales_30d
+                    COALESCE(SUM(COALESCE(s.sold_price, 0)), 0) AS sales_30d_gross,
+                    COALESCE(SUM(COALESCE(s.shipping_cost, 0)), 0) AS sales_30d_shipping_charged,
+                    COALESCE(SUM(COALESCE(f.fee_total / NULLIF(s.order_sale_count, 0), s.fees, 0)), 0) AS sales_30d_fee_actual,
+                    COALESCE(SUM(COALESCE(l.label_total / NULLIF(s.order_sale_count, 0), s.shipping_label_cost, 0)), 0) AS sales_30d_label_spend
+                FROM sales_30d s
+                LEFT JOIN linked_fee_rollup f ON f.order_id = s.order_id
+                LEFT JOIN linked_label_rollup l ON l.order_id = s.order_id
             ),
             orders_rollup AS (
                 SELECT COUNT(*) AS orders_30d_count
                 FROM orders
                 WHERE sold_at >= :window_30d
-            ),
-            label_spend_rollup AS (
-                SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) AS normalized_label_spend_30d
-                FROM order_finance_entries
-                WHERE entry_kind = 'shipping_label'
-                  AND (
-                    transaction_date >= :window_30d
-                    OR (transaction_date IS NULL AND created_at >= :window_30d)
-                  )
+                  AND sold_at <= :end_dt
             )
             SELECT
                 sales_rollup.sales_7d_count,
                 sales_rollup.sales_7d_gross,
                 sales_rollup.sales_30d_count,
                 sales_rollup.sales_30d_gross,
+                sales_rollup.sales_30d_shipping_charged,
+                sales_rollup.sales_30d_fee_actual,
+                sales_rollup.sales_30d_label_spend,
                 orders_rollup.orders_30d_count,
-                label_spend_rollup.normalized_label_spend_30d
+                sales_rollup.sales_30d_gross + sales_rollup.sales_30d_shipping_charged - sales_rollup.sales_30d_fee_actual - sales_rollup.sales_30d_label_spend AS sales_30d_net
             FROM sales_rollup
             CROSS JOIN orders_rollup
-            CROSS JOIN label_spend_rollup
             """,
             {
                 "window_7d": window_7d,
                 "window_30d": window_30d,
+                "end_dt": end_dt,
             },
         )
 
@@ -8483,13 +11200,15 @@ class InventoryRepository:
                 LOWER(COALESCE(s.marketplace, '')) AS marketplace,
                 s.external_order_id,
                 s.order_id,
-                p.sku,
-                p.title,
+                COALESCE(p.sku, lp.sku) AS sku,
+                COALESCE(p.title, lp.title) AS product_title,
                 s.quantity_sold,
                 COALESCE(s.shipping_cost, 0) AS shipping_charged_to_buyer,
                 COALESCE(s.shipping_label_cost, 0) AS shipping_label_spend
             FROM sales s
             LEFT JOIN products p ON p.id = s.product_id
+            LEFT JOIN marketplace_listings l ON l.id = s.listing_id
+            LEFT JOIN products lp ON lp.id = l.product_id
             WHERE s.sold_at IS NOT NULL
               AND s.sold_at >= :start_dt
               AND s.sold_at <= :end_dt
@@ -8533,9 +11252,11 @@ class InventoryRepository:
                 LOWER(COALESCE(s.marketplace, '')) AS marketplace,
                 COALESCE(s.sold_price, 0) AS sold_price,
                 COALESCE(s.shipping_cost, 0) AS shipping_cost,
-                LOWER(COALESCE(p.category, '')) AS product_category
+                LOWER(COALESCE(p.category, lp.category, '')) AS product_category
             FROM sales s
             LEFT JOIN products p ON p.id = s.product_id
+            LEFT JOIN marketplace_listings l ON l.id = s.listing_id
+            LEFT JOIN products lp ON lp.id = l.product_id
             WHERE s.sold_at IS NOT NULL
               AND s.sold_at >= :start_dt
               AND s.sold_at <= :end_dt
@@ -8801,7 +11522,8 @@ class InventoryRepository:
                 s.quantity_sold,
                 COALESCE(s.sold_price, 0) AS sold_price,
                 COALESCE(s.fees, 0) AS fees,
-                COALESCE(s.shipping_cost, 0) AS shipping_cost
+                COALESCE(s.shipping_cost, 0) AS shipping_cost,
+                COALESCE(s.shipping_label_cost, 0) AS shipping_label_cost
             FROM sales s
             WHERE s.sold_at >= :start_dt
               AND s.sold_at <= :end_dt
@@ -8877,7 +11599,8 @@ class InventoryRepository:
                 LOWER(COALESCE(p.category, '')) AS category,
                 LOWER(COALESCE(p.metal_type, '')) AS metal_type,
                 COALESCE(p.current_quantity, 0) AS current_quantity,
-                COALESCE(p.acquisition_cost, 0) AS acquisition_cost
+                COALESCE(p.acquisition_cost, 0) AS acquisition_cost,
+                COALESCE(p.product_cost, 0) AS product_cost
             FROM products p
             WHERE (p.acquired_at >= :start_dt AND p.acquired_at <= :end_dt)
                OR (p.acquired_at IS NULL AND p.created_at >= :start_dt AND p.created_at <= :end_dt)
@@ -8901,6 +11624,7 @@ class InventoryRepository:
                 COALESCE(pla.quantity_acquired, 0) AS quantity_acquired,
                 COALESCE(pla.unit_cost, 0) AS unit_cost,
                 COALESCE(pla.allocated_cost, 0) AS allocated_cost,
+                COALESCE(pla.allocation_weight, 0) AS allocation_weight,
                 pl.id AS lot_id,
                 pl.lot_code,
                 p.id AS product_id,

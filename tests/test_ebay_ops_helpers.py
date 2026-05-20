@@ -237,6 +237,58 @@ class EbayOpsHelpersTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "boom"):
             ebay_ops._resolve_offer_id(_ErrorClient(), "tok", listing_error, "SKU6", {})
 
+    def test_publish_blockers_for_offer_flags_immediate_pay_auction_without_bin(self):
+        class _Client:
+            @staticmethod
+            def get_payment_policy(access_token, payment_policy_id, marketplace_id):
+                return {"paymentPolicyId": payment_policy_id, "immediatePay": True}
+
+            @staticmethod
+            def payment_policy_requires_immediate_payment(payload):
+                return bool(payload.get("immediatePay"))
+
+        blockers = ebay_ops._publish_blockers_for_offer(
+            _Client(),
+            "tok",
+            {
+                "format": "AUCTION",
+                "marketplaceId": "EBAY_US",
+                "listingPolicies": {"paymentPolicyId": "PAY1"},
+                "pricingSummary": {"auctionStartPrice": {"value": "9.99"}},
+            },
+        )
+
+        self.assertEqual(
+            blockers,
+            ["Immediate-payment payment policy requires an Auction Buy It Now price before live publish."],
+        )
+
+    def test_publish_blockers_for_offer_allows_auction_with_bin(self):
+        class _Client:
+            @staticmethod
+            def get_payment_policy(access_token, payment_policy_id, marketplace_id):
+                raise AssertionError("BIN auction should not need payment-policy lookup")
+
+            @staticmethod
+            def payment_policy_requires_immediate_payment(payload):
+                return True
+
+        blockers = ebay_ops._publish_blockers_for_offer(
+            _Client(),
+            "tok",
+            {
+                "format": "AUCTION",
+                "marketplaceId": "EBAY_US",
+                "listingPolicies": {"paymentPolicyId": "PAY1"},
+                "pricingSummary": {
+                    "auctionStartPrice": {"value": "9.99"},
+                    "price": {"value": "19.99"},
+                },
+            },
+        )
+
+        self.assertEqual(blockers, [])
+
     def test_frame_and_labels(self):
         frame = ebay_ops._listings_frame([])
         self.assertIn("listing_id", frame.columns)

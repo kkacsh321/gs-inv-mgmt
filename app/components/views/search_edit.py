@@ -43,6 +43,7 @@ def _build_lot_assignment_rows(assignments: list, product_index: dict[int, objec
                 "unit_shipping_paid": float(assignment.unit_shipping_paid) if assignment.unit_shipping_paid is not None else None,
                 "unit_handling_paid": float(assignment.unit_handling_paid) if assignment.unit_handling_paid is not None else None,
                 "allocated_cost": float(assignment.allocated_cost) if assignment.allocated_cost is not None else None,
+                "allocation_weight": float(assignment.allocation_weight) if getattr(assignment, "allocation_weight", None) is not None else None,
                 "allocated_tax_paid": float(assignment.allocated_tax_paid) if assignment.allocated_tax_paid is not None else None,
                 "allocated_shipping_paid": float(assignment.allocated_shipping_paid) if assignment.allocated_shipping_paid is not None else None,
                 "allocated_handling_paid": float(assignment.allocated_handling_paid) if assignment.allocated_handling_paid is not None else None,
@@ -71,6 +72,7 @@ def _build_lot_table_rows(filtered_lots: list, lot_assignment_rows: dict[int, li
             "total_handling_paid": float(getattr(lot, "total_handling_paid", None))
             if getattr(lot, "total_handling_paid", None) is not None
             else None,
+            "expected_total_quantity": int(getattr(lot, "expected_total_quantity", 0) or 0) or None,
             "ebay_purchase": bool(getattr(lot, "ebay_purchase", False)),
             "ebay_purchase_item_id": str(getattr(lot, "ebay_purchase_item_id", "") or ""),
             "ebay_purchase_url": str(getattr(lot, "ebay_purchase_url", "") or ""),
@@ -140,6 +142,7 @@ def _build_lot_update_payload(
     total_tax_paid: float,
     total_shipping_paid: float,
     total_handling_paid: float,
+    expected_total_quantity: int,
     ebay_purchase: bool,
     ebay_purchase_item_id: str,
     ebay_purchase_url: str,
@@ -154,6 +157,7 @@ def _build_lot_update_payload(
         "total_tax_paid": to_decimal_or_none(total_tax_paid),
         "total_shipping_paid": to_decimal_or_none(total_shipping_paid),
         "total_handling_paid": to_decimal_or_none(total_handling_paid),
+        "expected_total_quantity": int(expected_total_quantity or 0) or None,
         "ebay_purchase": bool(ebay_purchase),
         "ebay_purchase_item_id": str(ebay_purchase_item_id or "").strip(),
         "ebay_purchase_url": str(ebay_purchase_url or "").strip(),
@@ -1013,6 +1017,13 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     value=float(getattr(selected, "total_handling_paid", 0.0) or 0.0),
                     step=1.0,
                 )
+                expected_total_quantity = st.number_input(
+                    "Expected Total Lot Quantity",
+                    min_value=0,
+                    value=int(getattr(selected, "expected_total_quantity", 0) or 0),
+                    step=1,
+                    help="Optional. Use when whole-lot cost should account for items not checked in yet.",
+                )
                 ebay_purchase = st.checkbox(
                     "Purchased On eBay",
                     value=bool(getattr(selected, "ebay_purchase", False)),
@@ -1051,6 +1062,7 @@ def render_search_edit(repo: InventoryRepository) -> None:
                             total_tax_paid=total_tax_paid,
                             total_shipping_paid=total_shipping_paid,
                             total_handling_paid=total_handling_paid,
+                            expected_total_quantity=int(expected_total_quantity or 0),
                             ebay_purchase=bool(ebay_purchase),
                             ebay_purchase_item_id=ebay_purchase_item_id,
                             ebay_purchase_url=ebay_purchase_url,

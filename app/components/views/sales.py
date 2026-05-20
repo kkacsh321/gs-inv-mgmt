@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -26,6 +26,37 @@ from app.repository import InventoryRepository
 from app.services.ai_orchestration import execute_comp_summary
 from app.services.runtime_settings import get_runtime_str
 from app.utils.time import utc_today
+
+
+def _sale_net_before_cogs(sale) -> float:
+    return (
+        float(getattr(sale, "sold_price", 0.0) or 0.0)
+        + float(getattr(sale, "shipping_cost", 0.0) or 0.0)
+        - float(getattr(sale, "fees", 0.0) or 0.0)
+        - float(getattr(sale, "shipping_label_cost", 0.0) or 0.0)
+    )
+
+
+def _actual_economics_by_sale(repo: InventoryRepository, sales: list) -> dict[int, dict]:
+    dated_sales = [s for s in sales if getattr(s, "sold_at", None) is not None]
+    if not dated_sales or not hasattr(repo, "report_sales_actual_econ_rows"):
+        return {}
+    start_dt = min(s.sold_at for s in dated_sales) - timedelta(seconds=1)
+    end_dt = max(s.sold_at for s in dated_sales) + timedelta(seconds=1)
+    try:
+        rows = repo.report_sales_actual_econ_rows(start_dt=start_dt, end_dt=end_dt) or []
+    except Exception:
+        return {}
+    actuals: dict[int, dict] = {}
+    for row in rows:
+        try:
+            sale_id = int((row or {}).get("sale_id") or 0)
+        except Exception:
+            sale_id = 0
+        if sale_id > 0:
+            actuals[sale_id] = dict(row or {})
+    return actuals
+
 
 def render_sales(repo: InventoryRepository) -> None:
     user = current_user()
@@ -120,6 +151,7 @@ def render_sales(repo: InventoryRepository) -> None:
                 st.error(str(exc))
 
     sales = repo.list_sales()
+    actual_econ_by_sale_id = _actual_economics_by_sale(repo, sales)
     sale_rows = [
         {
             "id": s.id,
@@ -138,11 +170,34 @@ def render_sales(repo: InventoryRepository) -> None:
             "sold_price": float(s.sold_price),
             "fees": float(s.fees),
             "shipping_cost": float(s.shipping_cost),
+            "shipping_label_cost": float(getattr(s, "shipping_label_cost", 0.0) or 0.0),
+            "actual_fee": float(
+                actual_econ_by_sale_id.get(int(s.id), {}).get("allocated_fee_actual", float(s.fees or 0.0))
+            ),
+            "actual_shipping_label_cost": float(
+                actual_econ_by_sale_id.get(int(s.id), {}).get(
+                    "allocated_shipping_actual",
+                    float(getattr(s, "shipping_label_cost", 0.0) or 0.0),
+                )
+            ),
+            "actual_fee_source": str(
+                actual_econ_by_sale_id.get(int(s.id), {}).get("actual_fee_source") or "sale_fees_field"
+            ),
+            "actual_shipping_source": str(
+                actual_econ_by_sale_id.get(int(s.id), {}).get("actual_shipping_source") or "sale_shipping_label_field"
+            ),
             "qty": s.quantity_sold,
             "sold_at": iso_or_none(s.sold_at),
             "shipped_at": iso_or_none(s.shipped_at),
             "delivered_at": iso_or_none(s.delivered_at),
-            "net": float(s.sold_price - s.fees - s.shipping_cost),
+            "net": float(
+                actual_econ_by_sale_id.get(int(s.id), {}).get("net_before_cogs_actual", _sale_net_before_cogs(s))
+            ),
+            "net_source": (
+                "actual_economics"
+                if int(s.id) in actual_econ_by_sale_id
+                else "sale_fields"
+            ),
         }
         for s in sales
     ]
@@ -273,6 +328,32 @@ def render_sales(repo: InventoryRepository) -> None:
                         "sold_price": float(selected_sale.sold_price or 0),
                         "fees": float(selected_sale.fees or 0),
                         "shipping_cost": float(selected_sale.shipping_cost or 0),
+                        "actual_fee": float(
+                            actual_econ_by_sale_id.get(int(selected_sale.id), {}).get(
+                                "allocated_fee_actual",
+                                float(selected_sale.fees or 0),
+                            )
+                        ),
+                        "actual_shipping_label_cost": float(
+                            actual_econ_by_sale_id.get(int(selected_sale.id), {}).get(
+                                "allocated_shipping_actual",
+                                float(getattr(selected_sale, "shipping_label_cost", 0.0) or 0.0),
+                            )
+                        ),
+                        "actual_net_before_cogs": float(
+                            actual_econ_by_sale_id.get(int(selected_sale.id), {}).get(
+                                "net_before_cogs_actual",
+                                _sale_net_before_cogs(selected_sale),
+                            )
+                        ),
+                        "actual_fee_source": str(
+                            actual_econ_by_sale_id.get(int(selected_sale.id), {}).get("actual_fee_source")
+                            or "sale_fees_field"
+                        ),
+                        "actual_shipping_source": str(
+                            actual_econ_by_sale_id.get(int(selected_sale.id), {}).get("actual_shipping_source")
+                            or "sale_shipping_label_field"
+                        ),
                         "quantity_sold": int(selected_sale.quantity_sold or 0),
                         "tracking_number": str(selected_sale.tracking_number or ""),
                         "tracking_status": str(selected_sale.tracking_status or ""),

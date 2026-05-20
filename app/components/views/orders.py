@@ -42,6 +42,72 @@ ORDER_STATUS_OPTIONS = [
 ]
 
 
+def _order_actuals_by_id(repo: InventoryRepository, orders: list) -> dict[int, dict]:
+    sold_dates = [o.sold_at for o in orders if getattr(o, "sold_at", None) is not None]
+    if not sold_dates or not hasattr(repo, "report_orders_rows"):
+        return {}
+    try:
+        rows = repo.report_orders_rows(start_dt=min(sold_dates), end_dt=max(sold_dates))
+    except Exception:
+        db = getattr(repo, "db", None)
+        if db is not None and hasattr(db, "rollback"):
+            db.rollback()
+        return {}
+    return {
+        int(row.get("order_id") or row.get("id") or 0): row
+        for row in rows
+        if int(row.get("order_id") or row.get("id") or 0) > 0
+    }
+
+
+def _order_field_shipping_delta(order) -> float:
+    return float(getattr(order, "shipping_cost", 0.0) or 0.0) - float(
+        getattr(order, "shipping_label_cost", 0.0) or 0.0
+    )
+
+
+def _order_field_net_before_cogs(order) -> float:
+    return (
+        float(getattr(order, "subtotal_amount", 0.0) or 0.0)
+        + float(getattr(order, "shipping_cost", 0.0) or 0.0)
+        - float(getattr(order, "fees", 0.0) or 0.0)
+        - float(getattr(order, "shipping_label_cost", 0.0) or 0.0)
+    )
+
+
+def _order_actual_context(order, actuals: dict | None = None) -> dict[str, object]:
+    actual = actuals or {}
+    return {
+        "actual_fee": float(actual.get("actual_fee", float(getattr(order, "fees", 0.0) or 0.0)) or 0.0),
+        "actual_fee_source": str(actual.get("actual_fee_source", "order_fees_field") or ""),
+        "actual_shipping_label_cost": float(
+            actual.get(
+                "actual_shipping_label_cost",
+                float(getattr(order, "shipping_label_cost", 0.0) or 0.0),
+            )
+            or 0.0
+        ),
+        "actual_shipping_delta": float(
+            actual.get(
+                "actual_shipping_delta_charged_minus_label",
+                _order_field_shipping_delta(order),
+            )
+            or 0.0
+        ),
+        "actual_shipping_source": str(
+            actual.get("actual_shipping_source", "order_shipping_label_field") or ""
+        ),
+        "actual_net_before_cogs": float(
+            actual.get(
+                "actual_net_before_cogs",
+                _order_field_net_before_cogs(order),
+            )
+            or 0.0
+        ),
+        "actual_net_source": "order_actuals_rollup" if actual else "order_fields_fallback",
+    }
+
+
 def render_orders(repo: InventoryRepository) -> None:
     user = current_user()
     st.subheader("Orders")
@@ -186,6 +252,7 @@ def render_orders(repo: InventoryRepository) -> None:
         st.info("No orders yet.")
         return
 
+    actuals_by_order_id = _order_actuals_by_id(repo, orders)
     order_rows = [
         {
             "id": o.id,
@@ -195,9 +262,26 @@ def render_orders(repo: InventoryRepository) -> None:
             "sold_at": iso_or_none(o.sold_at),
             "subtotal_amount": float(o.subtotal_amount),
             "fees": float(o.fees),
+            "actual_fee": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))["actual_fee"],
+            "actual_fee_source": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))["actual_fee_source"],
             "shipping_cost": float(o.shipping_cost),
             "shipping_label_cost": float(getattr(o, "shipping_label_cost", 0) or 0),
-            "shipping_delta": float(o.shipping_cost or 0) - float(getattr(o, "shipping_label_cost", 0) or 0),
+            "actual_shipping_label_cost": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))[
+                "actual_shipping_label_cost"
+            ],
+            "shipping_delta": _order_field_shipping_delta(o),
+            "actual_shipping_delta": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))[
+                "actual_shipping_delta"
+            ],
+            "actual_shipping_source": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))[
+                "actual_shipping_source"
+            ],
+            "actual_net_before_cogs": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))[
+                "actual_net_before_cogs"
+            ],
+            "actual_net_source": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))[
+                "actual_net_source"
+            ],
             "shipping_label_currency": str(getattr(o, "shipping_label_currency", "") or "USD"),
             "shipping_provider": str(getattr(o, "shipping_provider", "") or ""),
             "shipping_service": str(getattr(o, "shipping_service", "") or ""),
@@ -306,6 +390,7 @@ def render_orders(repo: InventoryRepository) -> None:
                 key="orders_side_panel_select",
             )
             selected_order = orders_by_id[select_options[selected_label]]
+            selected_actuals = actuals_by_order_id.get(int(selected_order.id), {})
             st.markdown("##### Sales/Orders Copilot")
             st.caption("AI triage for order mismatches, fulfillment risk, and refund/return guidance.")
             if st.button("Analyze Selected Order", key=f"orders_copilot_analyze_{selected_order.id}"):
@@ -313,6 +398,7 @@ def render_orders(repo: InventoryRepository) -> None:
                     st.stop()
                 try:
                     order_items = list(selected_order.items or [])
+                    selected_actual_context = _order_actual_context(selected_order, selected_actuals)
                     order_context = {
                         "order_id": int(selected_order.id),
                         "marketplace": str(selected_order.marketplace or ""),
@@ -320,10 +406,20 @@ def render_orders(repo: InventoryRepository) -> None:
                         "order_status": str(selected_order.order_status or ""),
                         "subtotal_amount": float(selected_order.subtotal_amount or 0),
                         "fees": float(selected_order.fees or 0),
+                        "actual_fee": float(selected_actual_context.get("actual_fee") or 0),
+                        "actual_fee_source": str(selected_actual_context.get("actual_fee_source") or ""),
                         "shipping_cost": float(selected_order.shipping_cost or 0),
                         "shipping_label_cost": float(getattr(selected_order, "shipping_label_cost", 0) or 0),
-                        "shipping_delta": float(selected_order.shipping_cost or 0)
-                        - float(getattr(selected_order, "shipping_label_cost", 0) or 0),
+                        "actual_shipping_label_cost": float(
+                            selected_actual_context.get("actual_shipping_label_cost") or 0
+                        ),
+                        "shipping_delta": _order_field_shipping_delta(selected_order),
+                        "actual_shipping_delta": float(selected_actual_context.get("actual_shipping_delta") or 0),
+                        "actual_shipping_source": str(selected_actual_context.get("actual_shipping_source") or ""),
+                        "actual_net_before_cogs": float(
+                            selected_actual_context.get("actual_net_before_cogs") or 0
+                        ),
+                        "actual_net_source": str(selected_actual_context.get("actual_net_source") or ""),
                         "total_amount": float(selected_order.total_amount or 0),
                         "notes": str(selected_order.notes or ""),
                         "item_count": len(order_items),

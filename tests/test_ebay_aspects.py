@@ -6,8 +6,12 @@ from app.services.ebay_aspects import (
     _norm_key,
     _shape_from_title,
     _weight_label_oz,
+    aspects_have_approved_grader_evidence,
     is_bullion_like_product,
     merge_ebay_aspects_defaults,
+    missing_required_ebay_aspects,
+    normalize_ebay_category_aspect_rows,
+    title_has_numerical_coin_grade,
 )
 
 
@@ -108,6 +112,60 @@ class EbayAspectsTests(unittest.TestCase):
         self.assertNotIn("Certification", added)
         self.assertNotIn("Unit Type", added)
 
+    def test_merge_defaults_infers_approved_grader_and_grade_from_title(self) -> None:
+        payload, added = merge_ebay_aspects_defaults(
+            category="coins",
+            metal_type="silver",
+            title="Bradford exchange 2021 Silver Eagle PCGS MS69 First Year Type 2 in box",
+            weight_oz=1,
+            existing_aspects={},
+        )
+
+        self.assertEqual(payload["Certification"], ["PCGS"])
+        self.assertEqual(payload["Grade"], ["MS 69"])
+        self.assertEqual(payload["Professional Grader"], ["Professional Coin Grading Service (PCGS)"])
+        self.assertIn("Grade", added)
+        self.assertIn("Professional Grader", added)
+
+    def test_grader_policy_helpers_detect_grade_and_evidence(self) -> None:
+        self.assertTrue(title_has_numerical_coin_grade("2021 Silver Eagle PCGS MS69"))
+        self.assertTrue(title_has_numerical_coin_grade("Proof coin PF-70"))
+        self.assertFalse(title_has_numerical_coin_grade("2021 Silver Eagle Type 2"))
+        self.assertTrue(aspects_have_approved_grader_evidence({"Certification": ["PCGS"]}))
+        self.assertTrue(
+            aspects_have_approved_grader_evidence(
+                {"Professional Grader": ["Professional Coin Grading Service (PCGS)"]}
+            )
+        )
+        self.assertFalse(aspects_have_approved_grader_evidence({"Certification": ["Uncertified"]}))
+
+    def test_merge_defaults_repairs_uncertified_when_title_has_approved_grader(self) -> None:
+        payload, added = merge_ebay_aspects_defaults(
+            category="coins",
+            metal_type="silver",
+            title="2021 Silver Eagle PCGS MS69 Type 2",
+            weight_oz=1,
+            existing_aspects={"Certification": ["Uncertified"]},
+        )
+
+        self.assertEqual(payload["Certification"], ["PCGS"])
+        self.assertEqual(payload["Grade"], ["MS 69"])
+        self.assertIn("Certification", added)
+
+    def test_merge_defaults_preserves_existing_certified_grader(self) -> None:
+        payload, added = merge_ebay_aspects_defaults(
+            category="coins",
+            metal_type="silver",
+            title="2021 Silver Eagle PCGS MS69 Type 2",
+            weight_oz=1,
+            existing_aspects={"Certification": ["NGC"], "Grade": ["MS 68"]},
+        )
+
+        self.assertEqual(payload["Certification"], ["NGC"])
+        self.assertEqual(payload["Grade"], ["MS 68"])
+        self.assertNotIn("Certification", added)
+        self.assertNotIn("Grade", added)
+
     def test_merge_defaults_fineness_default_and_weight_branch(self) -> None:
         payload, added = merge_ebay_aspects_defaults(
             category="bullion",
@@ -119,6 +177,52 @@ class EbayAspectsTests(unittest.TestCase):
         self.assertEqual(payload["Fineness"], ["0.999"])
         self.assertNotIn("Precious Metal Content per Unit", payload)
         self.assertIn("Fineness", added)
+
+    def test_normalize_category_aspect_rows_extracts_constraints_and_values(self) -> None:
+        rows = normalize_ebay_category_aspect_rows(
+            [
+                {
+                    "localizedAspectName": "Brand",
+                    "aspectConstraint": {
+                        "aspectRequired": True,
+                        "aspectUsage": "RECOMMENDED",
+                        "aspectMode": "FREE_TEXT",
+                        "itemToAspectCardinality": "SINGLE",
+                    },
+                    "aspectValues": [{"localizedValue": "US Mint"}, {"localizedValue": "US Mint"}],
+                },
+                {"localizedAspectName": ""},
+                "bad",
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Brand")
+        self.assertTrue(rows[0]["required"])
+        self.assertEqual(rows[0]["usage"], "RECOMMENDED")
+        self.assertEqual(rows[0]["values"], ["US Mint"])
+
+    def test_missing_required_ebay_aspects_uses_filled_existing_values(self) -> None:
+        rows = normalize_ebay_category_aspect_rows(
+            [
+                {
+                    "localizedAspectName": "Brand",
+                    "aspectConstraint": {"aspectRequired": "true"},
+                    "aspectValues": [],
+                },
+                {
+                    "localizedAspectName": "Color",
+                    "aspectConstraint": {"aspectRequired": True},
+                    "aspectValues": [{"localizedValue": "Red"}],
+                },
+                {
+                    "localizedAspectName": "Size",
+                    "aspectConstraint": {"aspectRequired": False},
+                    "aspectValues": [],
+                },
+            ]
+        )
+        missing = missing_required_ebay_aspects(rows, {" brand ": ["US Mint"], "Color": []})
+        self.assertEqual([row["name"] for row in missing], ["Color"])
 
 
 if __name__ == "__main__":

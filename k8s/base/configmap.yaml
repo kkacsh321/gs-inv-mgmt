@@ -9,7 +9,7 @@ data:
   POSTGRES_DB: goldenstackers
   STORAGE_PROVIDER: s3
   AWS_REGION: us-east-1
-  SYNC_RUNNER_ENABLED: "false"
+  SYNC_RUNNER_ENABLED: "true"
   SYNC_RUNNER_INTERVAL_SECONDS: "900"
   SYNC_RUNNER_ACTOR: sync-worker
   SYNC_RUNNER_RUN_ONCE: "false"

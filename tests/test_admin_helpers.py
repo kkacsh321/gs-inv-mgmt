@@ -158,6 +158,15 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertIn("Lifecycle Retention Policy Sign-Off Tracker", admin_source)
         self.assertIn("economics_threshold_signoffs.csv", admin_source)
         self.assertIn("Economics Threshold Sign-Off Tracker", admin_source)
+        self.assertIn("accounting_close_signoffs.csv", admin_source)
+        self.assertIn("Accounting Close Sign-Off Tracker", admin_source)
+        self.assertIn("period_drift_warn_count", admin_source)
+        self.assertIn("Period Drift Warning Count", admin_source)
+        self.assertIn("tax_profiles.csv", admin_source)
+        self.assertIn("tax_reporting_signoffs.csv", admin_source)
+        self.assertIn("Tax Profile + Sign-Off Tracker", admin_source)
+        self.assertIn("tax_profile", admin_source)
+        self.assertIn("tax_reporting_signoff", admin_source)
 
     def test_audit_changes_parsing(self):
         row_ok = SimpleNamespace(changes_json='{"a":1}')
@@ -283,6 +292,82 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertEqual(by_key["ebay_user_access_token_refresh_last_error"]["value"], "")
         self.assertEqual(by_key["ebay_user_access_token_refresh_failed_at"]["environment"], "prod")
         self.assertEqual(by_key["ebay_user_access_token_refresh_last_error"]["actor"], "qa")
+
+    def test_build_business_status_context_uses_actual_economics_rows(self):
+        now = datetime(2026, 4, 28, 12, 0, 0)
+
+        class _Repo:
+            def dashboard_metrics(self):
+                return {}
+
+            def list_products(self):
+                return [
+                    SimpleNamespace(
+                        id=7,
+                        current_quantity=1,
+                        listing_id=None,
+                        product_cost=0.0,
+                        landed_unit_cost=0.0,
+                    )
+                ]
+
+            def list_listings(self):
+                return [SimpleNamespace(listing_status="active")]
+
+            def list_sales(self):
+                return [
+                    SimpleNamespace(
+                        id=11,
+                        product_id=7,
+                        quantity_sold=2,
+                        sold_at=datetime(2026, 4, 28, 10, 0, 0),
+                        sold_price=100.0,
+                        shipping_cost=0.0,
+                        shipping_label_cost=0.0,
+                        fees=0.0,
+                    )
+                ]
+
+            def list_orders(self):
+                return [SimpleNamespace(order_date=datetime(2026, 4, 28, 11, 0, 0))]
+
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "sold_price": 100.0,
+                        "allocated_shipping_charged": 5.0,
+                        "allocated_fee_actual": 12.5,
+                        "allocated_shipping_actual": 4.25,
+                        "net_before_cogs_actual": 88.25,
+                    }
+                ]
+
+            def report_sale_unit_cost_maps(self, *, end_dt, default_unit_cost_by_product):
+                self.default_unit_cost_by_product = default_unit_cost_by_product
+                return {
+                    "fifo_unit_cost_by_sale": {11: 12.5},
+                    "fifo_unit_cost_source_by_sale": {11: "lot_expected_quantity_fallback"},
+                }
+
+        with patch.object(admin, "utcnow_naive", return_value=now), patch.object(
+            admin, "settings", SimpleNamespace(app_env="test")
+        ):
+            out = admin._build_business_status_context(_Repo(), days=1)
+
+        self.assertEqual(out["gross_window"], "100.00")
+        self.assertEqual(out["fees_window"], "12.50")
+        self.assertEqual(out["shipping_window"], "5.00")
+        self.assertEqual(out["label_window"], "4.25")
+        self.assertEqual(out["net_window"], "88.25")
+        self.assertEqual(out["cogs_window"], "25.00")
+        self.assertEqual(
+            out["cogs_source_mix"],
+            "lot_expected_quantity_fallback $25.00/1 sale(s)",
+        )
+        self.assertEqual(
+            out["cogs_source_mix_line"],
+            "- COGS source mix: lot_expected_quantity_fallback $25.00/1 sale(s)\n",
+        )
 
     def test_build_env_coverage_rows_statuses(self):
         env_values = {"A": "", "B": "x", "C": "custom"}
@@ -466,10 +551,53 @@ class AdminHelpersTests(unittest.TestCase):
     def test_runtime_setting_seed_defaults_shape(self):
         defaults = admin._runtime_setting_seed_defaults()
         self.assertTrue(defaults)
-        keys = {row.get("key") for row in defaults}
+        by_key = {row.get("key"): row for row in defaults}
+        keys = set(by_key)
         self.assertIn("app_build_version", keys)
         self.assertIn("app_build_sha", keys)
         self.assertIn("ebay_finding_rate_limit_probe_interval_seconds", keys)
+        self.assertEqual(by_key["slack_notifications_enabled"]["value"], "true")
+        self.assertEqual(by_key["slack_notifications_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["slack_notify_system_health_critical"]["value"], "true")
+        self.assertEqual(by_key["slack_notify_system_health_critical"]["value_type"], "bool")
+        self.assertEqual(by_key["health_auto_alert_critical_enabled"]["value"], "true")
+        self.assertEqual(by_key["health_auto_alert_critical_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["notification_route_system_health_critical"]["value"], "slack")
+        self.assertEqual(by_key["notification_route_system_health_critical"]["value_type"], "str")
+        self.assertEqual(by_key["ai_accountant_monitor_enabled"]["value"], "true")
+        self.assertEqual(by_key["ai_accountant_monitor_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["ai_accountant_monitor_timezone"]["value"], "America/Denver")
+        self.assertEqual(by_key["ai_accountant_monitor_timezone"]["value_type"], "str")
+        self.assertEqual(by_key["ai_accountant_monitor_local_time"]["value"], "08:30")
+        self.assertEqual(by_key["ai_accountant_monitor_local_time"]["value_type"], "str")
+        self.assertEqual(by_key["ai_accountant_monitor_lookback_days"]["value"], "30")
+        self.assertEqual(by_key["ai_accountant_monitor_lookback_days"]["value_type"], "int")
+        self.assertEqual(by_key["ai_accountant_monitor_slack_enabled"]["value"], "true")
+        self.assertEqual(by_key["ai_accountant_monitor_slack_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["ai_accountant_monitor_llm_review_enabled"]["value"], "true")
+        self.assertEqual(by_key["ai_accountant_monitor_llm_review_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["ai_workflow_profile_accounting"]["value"], "")
+        self.assertEqual(by_key["ai_workflow_profile_accounting"]["value_type"], "str")
+        self.assertEqual(by_key["ai_accountant_monitor_review_max_rows"]["value"], "25")
+        self.assertEqual(by_key["ai_accountant_monitor_review_max_rows"]["value_type"], "int")
+        self.assertEqual(by_key["ai_accountant_monitor_review_max_exception_rows"]["value"], "25")
+        self.assertEqual(by_key["ai_accountant_monitor_review_max_exception_rows"]["value_type"], "int")
+        self.assertEqual(by_key["notification_route_ai_accountant_monitor"]["value"], "slack")
+        self.assertEqual(by_key["notification_route_ai_accountant_monitor"]["value_type"], "str")
+        self.assertEqual(by_key["notification_outbox_runner_enabled"]["value"], "true")
+        self.assertEqual(by_key["notification_outbox_runner_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["notification_outbox_runner_limit"]["value"], "50")
+        self.assertEqual(by_key["notification_outbox_runner_limit"]["value_type"], "int")
+        self.assertEqual(by_key["notification_outbox_cleanup_enabled"]["value"], "true")
+        self.assertEqual(by_key["notification_outbox_cleanup_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["ai_accountant_web_research_enabled"]["value"], "true")
+        self.assertEqual(by_key["ai_accountant_web_research_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["ai_accountant_web_research_limit"]["value"], "5")
+        self.assertEqual(by_key["ai_accountant_web_research_limit"]["value_type"], "int")
+        self.assertEqual(by_key["ai_accountant_web_research_timeout_seconds"]["value"], "10")
+        self.assertEqual(by_key["ai_accountant_web_research_timeout_seconds"]["value_type"], "int")
+        self.assertEqual(by_key["listing_wizard_recent_product_limit"]["value"], "75")
+        self.assertEqual(by_key["listing_wizard_recent_product_limit"]["value_type"], "int")
         self.assertTrue(all("value_type" in row for row in defaults))
 
 

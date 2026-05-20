@@ -1,14 +1,133 @@
 import base64
 import json
 import re
+import time
+import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from html import unescape
+from xml.sax.saxutils import escape as xml_escape
 from urllib.parse import quote_plus, urlencode
 
 import requests
 
 from app.config import settings
+
+
+EBAY_CONDITION_ID_TO_INVENTORY_CONDITION = {
+    "1000": "NEW",
+    "1500": "NEW_OTHER",
+    "1750": "NEW_WITH_DEFECTS",
+    "2000": "CERTIFIED_REFURBISHED",
+    "2010": "EXCELLENT_REFURBISHED",
+    "2020": "VERY_GOOD_REFURBISHED",
+    "2030": "GOOD_REFURBISHED",
+    "2500": "SELLER_REFURBISHED",
+    "2750": "LIKE_NEW",
+    "3000": "USED_EXCELLENT",
+    "4000": "USED_VERY_GOOD",
+    "5000": "USED_GOOD",
+    "6000": "USED_ACCEPTABLE",
+    "7000": "FOR_PARTS_OR_NOT_WORKING",
+}
+
+EBAY_INVENTORY_CONDITION_LABELS = {
+    "NEW": "New",
+    "NEW_OTHER": "New other",
+    "NEW_WITH_DEFECTS": "New with defects",
+    "CERTIFIED_REFURBISHED": "Certified refurbished",
+    "EXCELLENT_REFURBISHED": "Excellent refurbished",
+    "VERY_GOOD_REFURBISHED": "Very good refurbished",
+    "GOOD_REFURBISHED": "Good refurbished",
+    "SELLER_REFURBISHED": "Seller refurbished",
+    "LIKE_NEW": "Like new",
+    "USED_EXCELLENT": "Used excellent",
+    "USED_VERY_GOOD": "Used very good",
+    "USED_GOOD": "Used good",
+    "USED_ACCEPTABLE": "Used acceptable",
+    "FOR_PARTS_OR_NOT_WORKING": "For parts or not working",
+}
+
+EBAY_DEFAULT_INVENTORY_CONDITIONS = [
+    "NEW",
+    "NEW_OTHER",
+    "LIKE_NEW",
+    "USED_EXCELLENT",
+    "USED_VERY_GOOD",
+    "USED_GOOD",
+    "USED_ACCEPTABLE",
+    "FOR_PARTS_OR_NOT_WORKING",
+]
+EBAY_MAX_CONDITION_DESCRIPTION_CHARS = 1000
+
+
+def ebay_condition_label(condition: str) -> str:
+    normalized = str(condition or "").strip().upper()
+    return EBAY_INVENTORY_CONDITION_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def validate_inventory_item_condition_description(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        return
+    condition_description = str(payload.get("conditionDescription") or "")
+    if len(condition_description) > EBAY_MAX_CONDITION_DESCRIPTION_CHARS:
+        raise ValueError(
+            "eBay condition description must be "
+            f"{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {len(condition_description)})."
+        )
+
+
+def normalize_ebay_condition_policy_rows(
+    policies: list[dict] | dict | None,
+    *,
+    category_id: str = "",
+) -> list[dict]:
+    if isinstance(policies, dict):
+        raw_policies = policies.get("itemConditionPolicies") or []
+    else:
+        raw_policies = policies or []
+    if not isinstance(raw_policies, list):
+        return []
+    preferred_category_id = str(category_id or "").strip()
+    selected_policy: dict | None = None
+    for policy in raw_policies:
+        if not isinstance(policy, dict):
+            continue
+        if preferred_category_id and str(policy.get("categoryId") or "").strip() == preferred_category_id:
+            selected_policy = policy
+            break
+        if selected_policy is None:
+            selected_policy = policy
+    if not selected_policy:
+        return []
+    required = bool(selected_policy.get("itemConditionRequired"))
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for condition in selected_policy.get("itemConditions") or []:
+        if not isinstance(condition, dict):
+            continue
+        condition_id = str(condition.get("conditionId") or "").strip()
+        inventory_condition = EBAY_CONDITION_ID_TO_INVENTORY_CONDITION.get(condition_id, "")
+        if not inventory_condition:
+            continue
+        if inventory_condition in seen:
+            continue
+        seen.add(inventory_condition)
+        label = str(condition.get("conditionDescription") or "").strip() or ebay_condition_label(inventory_condition)
+        rows.append(
+            {
+                "condition": inventory_condition,
+                "label": label,
+                "condition_id": condition_id,
+                "category_id": str(selected_policy.get("categoryId") or "").strip(),
+                "required": required,
+                "usage": str(condition.get("usage") or "").strip(),
+                "help_text": str(condition.get("conditionHelpText") or "").strip(),
+                "descriptor_count": len(condition.get("conditionDescriptors") or []),
+            }
+        )
+    return rows
 
 
 class EbayClient:
@@ -82,6 +201,25 @@ class EbayClient:
                 f"{exc}. eBay response body: {body_preview}",
                 response=response,
             ) from exc
+
+    @staticmethod
+    def payment_policy_requires_immediate_payment(payload: object) -> bool:
+        immediate_keys = {
+            "immediatepay",
+            "immediatepayment",
+            "immediatepaymentrequired",
+            "requiresimmediatepayment",
+        }
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                normalized_key = str(key or "").strip().lower().replace("_", "").replace("-", "")
+                if normalized_key in immediate_keys and bool(value):
+                    return True
+                if isinstance(value, (dict, list)) and EbayClient.payment_policy_requires_immediate_payment(value):
+                    return True
+        if isinstance(payload, list):
+            return any(EbayClient.payment_policy_requires_immediate_payment(item) for item in payload)
+        return False
 
     def authorize_url(self, state: str = "goldenstackers") -> str:
         params = {
@@ -230,6 +368,59 @@ class EbayClient:
                 }
             )
         return suggestions
+
+    def get_item_aspects_for_category(
+        self,
+        *,
+        access_token: str,
+        category_id: str,
+        marketplace_id: str = "EBAY_US",
+    ) -> list[dict]:
+        resolved_category_id = str(category_id or "").strip()
+        if not resolved_category_id:
+            return []
+        category_tree_id = self.get_default_category_tree_id(
+            access_token=access_token,
+            marketplace_id=marketplace_id,
+        )
+        if not category_tree_id:
+            return []
+        endpoint = (
+            f"{self.api_host}/commerce/taxonomy/v1/category_tree/"
+            f"{category_tree_id}/get_item_aspects_for_category"
+        )
+        headers = {"Authorization": f"Bearer {access_token.strip()}"}
+        params = {"category_id": resolved_category_id}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        aspects = payload.get("aspects") if isinstance(payload, dict) else []
+        return aspects if isinstance(aspects, list) else []
+
+    def get_item_condition_policies(
+        self,
+        *,
+        access_token: str,
+        category_id: str,
+        marketplace_id: str = "EBAY_US",
+    ) -> list[dict]:
+        resolved_category_id = str(category_id or "").strip()
+        if not resolved_category_id:
+            return []
+        endpoint = (
+            f"{self.api_host}/sell/metadata/v1/marketplace/"
+            f"{str(marketplace_id or 'EBAY_US').strip().upper()}/get_item_condition_policies"
+        )
+        headers = {
+            "Authorization": f"Bearer {access_token.strip()}",
+            "Accept-Encoding": "gzip",
+        }
+        params = {"filter": f"categoryIds:{{{resolved_category_id}}}"}
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        payload = response.json() if response.text else {}
+        policies = payload.get("itemConditionPolicies") if isinstance(payload, dict) else []
+        return policies if isinstance(policies, list) else []
 
     def get_identity_user(self, access_token: str) -> dict:
         endpoint = f"{self.identity_host}/commerce/identity/v1/user/"
@@ -384,10 +575,18 @@ class EbayClient:
         payload: dict,
         content_language: str = "en-US",
     ) -> None:
+        validate_inventory_item_condition_description(payload)
         endpoint = f"{self.api_host}/sell/inventory/v1/inventory_item/{sku}"
         headers = self._rest_headers(access_token, content_language=content_language)
         response = requests.put(endpoint, headers=headers, json=payload, timeout=45)
         self._raise_for_status_with_body(response)
+
+    def get_inventory_item(self, *, access_token: str, sku: str, content_language: str = "en-US") -> dict:
+        endpoint = f"{self.api_host}/sell/inventory/v1/inventory_item/{sku}"
+        headers = self._rest_headers(access_token, content_language=content_language)
+        response = requests.get(endpoint, headers=headers, timeout=45)
+        self._raise_for_status_with_body(response)
+        return response.json() if response.text else {}
 
     def create_offer(self, *, access_token: str, payload: dict, content_language: str = "en-US") -> dict:
         endpoint = f"{self.api_host}/sell/inventory/v1/offer"
@@ -424,12 +623,54 @@ class EbayClient:
         self._raise_for_status_with_body(response)
         return response.json() if response.text else {}
 
-    def publish_offer(self, *, access_token: str, offer_id: str) -> dict:
+    @staticmethod
+    def is_inventory_product_not_found_publish_error(exc: Exception) -> bool:
+        message = str(exc or "").lower()
+        return (
+            "25604" in message
+            or "product not found" in message
+            or "seller inventory service can not publish the data" in message
+        )
+
+    def publish_offer(
+        self,
+        *,
+        access_token: str,
+        offer_id: str,
+        inventory_sku: str = "",
+        content_language: str = "en-US",
+        retry_product_not_found_attempts: int = 3,
+        retry_product_not_found_delay_seconds: float = 1.0,
+    ) -> dict:
         endpoint = f"{self.api_host}/sell/inventory/v1/offer/{offer_id}/publish"
         headers = self._rest_headers(access_token)
-        response = requests.post(endpoint, headers=headers, timeout=45)
-        self._raise_for_status_with_body(response)
-        return response.json()
+        attempts = max(1, int(retry_product_not_found_attempts or 1))
+        delay_seconds = max(0.0, float(retry_product_not_found_delay_seconds or 0.0))
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            response = requests.post(endpoint, headers=headers, timeout=45)
+            try:
+                self._raise_for_status_with_body(response)
+                return response.json()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts or not self.is_inventory_product_not_found_publish_error(exc):
+                    raise
+                sku = str(inventory_sku or "").strip()
+                if sku:
+                    try:
+                        self.get_inventory_item(
+                            access_token=access_token,
+                            sku=sku,
+                            content_language=content_language,
+                        )
+                    except Exception:
+                        pass
+                if delay_seconds > 0:
+                    time.sleep(delay_seconds)
+        if last_exc is not None:
+            raise last_exc
+        return {}
 
     def withdraw_offer(self, *, access_token: str, offer_id: str) -> dict:
         endpoint = f"{self.api_host}/sell/inventory/v1/offer/{offer_id}/withdraw"
@@ -627,6 +868,9 @@ class EbayClient:
         payment_policy_id: str,
         fulfillment_policy_id: str,
         return_policy_id: str,
+        format_type: str | None = None,
+        auction_buy_now_price: float | None = None,
+        condition: str | None = None,
     ) -> dict:
         blockers: list[str] = []
         warnings: list[str] = []
@@ -704,11 +948,23 @@ class EbayClient:
                     payment_policy_id=payment_policy_id,
                     marketplace_id=marketplace_id,
                 )
+                immediate_pay_required = self.payment_policy_requires_immediate_payment(payload)
                 _record(
                     "payment_policy",
                     True,
-                    str(payload.get("paymentPolicyId") or payment_policy_id).strip(),
+                    (
+                        f"{str(payload.get('paymentPolicyId') or payment_policy_id).strip()}; "
+                        f"immediate_pay_required={str(bool(immediate_pay_required)).lower()}"
+                    ),
                 )
+                if (
+                    immediate_pay_required
+                    and str(format_type or "").strip().upper() == "AUCTION"
+                    and float(auction_buy_now_price or 0.0) <= 0
+                ):
+                    blockers.append(
+                        "payment_policy: immediate payment requires an Auction Buy It Now price for live auction publish"
+                    )
             except Exception as exc:
                 _handle_exc("payment_policy", exc)
         else:
@@ -778,6 +1034,48 @@ class EbayClient:
             blockers.append("category_id: missing value")
             _record("category_id", False, "missing value")
 
+        selected_condition = str(condition or "").strip().upper()
+        if category_id.strip() and selected_condition:
+            try:
+                payload = self.get_item_condition_policies(
+                    access_token=access_token,
+                    category_id=category_id,
+                    marketplace_id=marketplace_id,
+                )
+                condition_rows = normalize_ebay_condition_policy_rows(payload, category_id=category_id)
+                allowed_conditions = {
+                    str((row or {}).get("condition") or "").strip().upper()
+                    for row in condition_rows
+                    if str((row or {}).get("condition") or "").strip()
+                }
+                if not allowed_conditions:
+                    warnings.append(
+                        f"category_condition: eBay returned no condition policy rows for category `{category_id}`."
+                    )
+                    _record("category_condition", True, "no condition policy rows returned")
+                elif selected_condition in allowed_conditions:
+                    _record(
+                        "category_condition",
+                        True,
+                        f"{selected_condition} valid for category {str(category_id).strip()}",
+                    )
+                else:
+                    allowed_preview = ", ".join(sorted(allowed_conditions))
+                    blockers.append(
+                        f"category_condition: selected condition `{selected_condition}` is not valid for "
+                        f"category `{str(category_id).strip()}`. Allowed: {allowed_preview}"
+                    )
+                    _record(
+                        "category_condition",
+                        False,
+                        f"{selected_condition} not in allowed conditions: {allowed_preview}",
+                    )
+            except Exception as exc:
+                _handle_exc("category_condition", exc)
+        elif category_id.strip():
+            warnings.append("category_condition: no selected condition supplied for category policy validation.")
+            _record("category_condition", True, "condition not supplied")
+
         return {
             "blockers": blockers,
             "warnings": warnings,
@@ -820,7 +1118,7 @@ class EbayClient:
         access_token: str,
         video_id: str,
         file_bytes: bytes,
-        content_type: str = "video/mp4",
+        content_type: str = "application/octet-stream",
     ) -> None:
         endpoint = f"{self.media_host}/commerce/media/v1_beta/video/{video_id}/upload"
         headers = {
@@ -836,6 +1134,85 @@ class EbayClient:
         response = requests.get(endpoint, headers=headers, timeout=30)
         self._raise_for_status_with_body(response)
         return response.json()
+
+    @staticmethod
+    def trading_site_id_for_marketplace(marketplace_id: str) -> str:
+        marketplace = str(marketplace_id or "").strip().upper()
+        return {
+            "EBAY_US": "0",
+            "EBAY_MOTORS_US": "100",
+            "EBAY_GB": "3",
+            "EBAY_UK": "3",
+            "EBAY_CA": "2",
+            "EBAY_AU": "15",
+            "EBAY_DE": "77",
+            "EBAY_FR": "71",
+            "EBAY_IT": "101",
+            "EBAY_ES": "186",
+        }.get(marketplace, "0")
+
+    def get_trading_item_video_ids(
+        self,
+        *,
+        access_token: str,
+        item_id: str,
+        marketplace_id: str = "EBAY_US",
+        compatibility_level: str = "1193",
+    ) -> dict:
+        resolved_item_id = str(item_id or "").strip()
+        if not resolved_item_id:
+            raise RuntimeError("Trading GetItem requires an item/listing ID.")
+        site_id = self.trading_site_id_for_marketplace(marketplace_id)
+        endpoint = f"{self.api_host}/ws/api.dll"
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "X-EBAY-API-IAF-TOKEN": str(access_token or "").strip(),
+            "X-EBAY-API-CALL-NAME": "GetItem",
+            "X-EBAY-API-SITEID": site_id,
+            "X-EBAY-API-COMPATIBILITY-LEVEL": str(compatibility_level or "1193").strip() or "1193",
+        }
+        payload = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+            "<ErrorLanguage>en_US</ErrorLanguage>"
+            "<WarningLevel>High</WarningLevel>"
+            "<DetailLevel>ReturnAll</DetailLevel>"
+            f"<ItemID>{xml_escape(resolved_item_id)}</ItemID>"
+            "</GetItemRequest>"
+        )
+        response = requests.post(endpoint, headers=headers, data=payload.encode("utf-8"), timeout=45)
+        self._raise_for_status_with_body(response)
+        raw_xml = response.text or ""
+        root = ET.fromstring(raw_xml.encode("utf-8"))
+        ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+        ack = (root.findtext("e:Ack", default="", namespaces=ns) or "").strip()
+        errors = [
+            {
+                "code": (err.findtext("e:ErrorCode", default="", namespaces=ns) or "").strip(),
+                "short": (err.findtext("e:ShortMessage", default="", namespaces=ns) or "").strip(),
+                "long": (err.findtext("e:LongMessage", default="", namespaces=ns) or "").strip(),
+                "severity": (err.findtext("e:SeverityCode", default="", namespaces=ns) or "").strip(),
+            }
+            for err in root.findall("e:Errors", ns)
+        ]
+        if ack.upper() == "FAILURE":
+            summary = "; ".join(
+                f"{err.get('code')}: {err.get('short') or err.get('long')}" for err in errors if err
+            )
+            raise RuntimeError(f"Trading GetItem failed for item {resolved_item_id}: {summary or raw_xml[:500]}")
+        video_ids = [
+            (node.text or "").strip()
+            for node in root.findall(".//e:Item/e:VideoDetails/e:VideoID", ns)
+            if (node.text or "").strip()
+        ]
+        return {
+            "ack": ack,
+            "item_id": resolved_item_id,
+            "marketplace_id": str(marketplace_id or "").strip() or "EBAY_US",
+            "site_id": site_id,
+            "video_ids": video_ids,
+            "errors": errors,
+        }
 
     def _finding_global_id(self) -> str:
         raw = (settings.ebay_marketplace_id or "EBAY_US").strip().upper()

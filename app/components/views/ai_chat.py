@@ -9,7 +9,10 @@ from app.components.views.shared import render_help_panel
 from app.config import settings
 from app.repository import InventoryRepository
 from app.services.ai_orchestration import execute_comp_summary
+from app.services.ai_accountant_monitor import record_ai_accountant_answer
+from app.services.ai_accountant_web import search_ai_accountant_web, should_run_ai_accountant_web_research
 from app.services.chat_context_builders import (
+    build_accounting_snapshot,
     build_admin_snapshot,
     build_fallback_help,
     build_inventory_snapshot,
@@ -39,8 +42,8 @@ def _contains_any(text: str, terms: list[str]) -> bool:
 
 DEFAULT_CHAT_ALLOWED_DOMAINS_BY_ROLE: dict[str, set[str]] = {
     "viewer": {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports"},
-    "ops": {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports"},
-    "admin": {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports", "admin"},
+    "ops": {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports", "accounting", "tax"},
+    "admin": {"inventory", "listings", "sales", "shipping", "sync", "orders", "reports", "accounting", "tax", "admin"},
 }
 
 GOLDY_AGENT_DOMAIN_SCOPE: dict[str, set[str]] = {
@@ -49,6 +52,7 @@ GOLDY_AGENT_DOMAIN_SCOPE: dict[str, set[str]] = {
     "listings_agent": {"listings", "inventory", "sync", "reports"},
     "inventory_agent": {"inventory", "orders", "shipping", "reports"},
     "finance_agent": {"sales", "orders", "reports", "inventory"},
+    "accountant_agent": {"accounting", "reports", "sales", "orders", "inventory", "tax"},
     "integrations_agent": {"sync", "shipping", "listings", "orders", "admin"},
 }
 
@@ -58,8 +62,24 @@ GOLDY_AGENT_LABELS: dict[str, str] = {
     "listings_agent": "Listings Agent",
     "inventory_agent": "Inventory Agent",
     "finance_agent": "Finance Agent",
+    "accountant_agent": "AI Accountant",
     "integrations_agent": "Integrations Agent",
 }
+
+DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE = (
+    "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller for a coin, bullion, "
+    "collectibles, and resale business. You continuously watch cost basis, lot allocation, COGS, gross/net sales, "
+    "marketplace fees, shipping label spend, returns, tax evidence, close readiness, and sign-off evidence. "
+    "Be precise, cite provided evidence, label estimates versus actuals, and identify concrete corrections. "
+    "You may summarize local/state/federal tax research for planning, but never give filing, legal, or tax-advisor "
+    "replacement conclusions. Route unsupported tax/legal determinations to human advisor review."
+)
+
+DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION = (
+    "Answer as the AI Accountant identity. Use the app snapshot as the source of truth for business data, and use "
+    "web research only as external context that requires verification. Return concise markdown with: direct answer, "
+    "evidence checked, risks/corrections, and tax/advisor-review notes when relevant. Do not propose direct writes."
+)
 
 
 def _parse_csv_tokens(value: str) -> set[str]:
@@ -101,6 +121,45 @@ def _is_write_intent(prompt: str) -> bool:
         "relist",
     ]
     return any(term in normalized for term in write_terms)
+
+
+def _is_accounting_intent(prompt: str) -> bool:
+    normalized = _normalize(prompt)
+    return _contains_any(
+        normalized,
+        [
+            "accountant",
+            "accounting",
+            "close",
+            "cogs",
+            "cost basis",
+            "gross margin",
+            "profit",
+            "pnl",
+            "p&l",
+            "qbo",
+            "quickbooks",
+            "lot allocation",
+            "tax",
+        ],
+    )
+
+
+def _is_ai_accountant_request(prompt: str, selected_agent: str) -> bool:
+    return _is_accounting_intent(prompt) or str(selected_agent or "").strip().lower() == "accountant_agent"
+
+
+def _should_attach_ai_accountant_web_research(
+    repo: InventoryRepository,
+    prompt: str,
+    *,
+    is_ai_accountant_request: bool,
+) -> bool:
+    return (
+        bool(is_ai_accountant_request)
+        and get_runtime_bool(repo, "ai_accountant_web_research_enabled", True)
+        and should_run_ai_accountant_web_research(prompt)
+    )
 
 
 def _mask_tail(value: str, *, keep: int = 4, mask_char: str = "*") -> str:
@@ -155,6 +214,11 @@ def _answer_query(
     max_scan_rows: int,
 ) -> tuple[str, list[dict], str]:
     normalized = _normalize(prompt)
+    if _is_accounting_intent(prompt):
+        if "accounting" not in allowed_domains:
+            return "Your role is not allowed to access `accounting` chat domain.", [], "denied_accounting"
+        answer, citations = build_accounting_snapshot(repo, max_scan_rows=max_scan_rows)
+        return answer, citations, "accounting_snapshot"
     if _contains_any(normalized, ["inventory", "stock", "on hand", "qty"]):
         if "inventory" not in allowed_domains:
             return "Your role is not allowed to access `inventory` chat domain.", [], "denied_inventory"
@@ -395,6 +459,8 @@ def render_ai_chat(repo: InventoryRepository) -> None:
         "inventory snapshot",
         "listing draft and review status",
         "sales last 30 days",
+        "AI accountant close review",
+        "AI accountant questions to answer",
         "shipping exceptions",
         "sync failures",
         "orders status",
@@ -556,12 +622,20 @@ def render_ai_chat(repo: InventoryRepository) -> None:
             pass
         st.rerun()
 
+    selected_goldy_agent_for_permission = str(
+        st.session_state.get(scoped_goldy_agent_key) or "auto_router"
+    ).strip().lower()
+    if _is_ai_accountant_request(prompt, selected_goldy_agent_for_permission):
+        if not ensure_permission(user, "ai_accountant_use", "Use AI Accountant"):
+            st.stop()
+
     st.session_state[scoped_messages_key].append({"role": "user", "content": prompt})
     started = time.perf_counter()
     ai_refine_applied = False
     ai_refine_citation: dict = {}
     selected_goldy_mode = str(st.session_state.get(scoped_goldy_mode_key) or "single").strip().lower()
     selected_goldy_agent = str(st.session_state.get(scoped_goldy_agent_key) or "auto_router").strip().lower()
+    is_ai_accountant_request = _is_ai_accountant_request(prompt, selected_goldy_agent)
     goldy_allowed_domains = _resolve_goldy_domains(allowed_domains, selected_goldy_agent)
     goldy_plan = _build_goldy_plan(
         prompt=prompt,
@@ -569,6 +643,14 @@ def render_ai_chat(repo: InventoryRepository) -> None:
         selected_agent=selected_goldy_agent,
         allowed_domains=goldy_allowed_domains,
     )
+    ai_accountant_answer_record: dict | None = None
+    if is_ai_accountant_request:
+        ai_accountant_answer_record = record_ai_accountant_answer(
+            repo,
+            actor=user.username,
+            prompt=prompt,
+            source="ask",
+        )
     try:
         answer, citations, intent_key = _answer_query(
             repo,
@@ -576,36 +658,81 @@ def render_ai_chat(repo: InventoryRepository) -> None:
             allowed_domains=goldy_allowed_domains,
             max_scan_rows=max_scan_rows,
         )
-        if bool(st.session_state.get(scoped_ai_refine_override_key)) and not str(intent_key).startswith("denied_"):
-            chat_refine_system_message = get_runtime_str(
-                repo,
-                "chat_ai_refine_system_message",
-                (
-                    "You are GoldenStackers' read-only operations copilot. "
-                    "Preserve factual values from the provided draft answer and citations."
-                ),
-            ).strip()
-            chat_refine_instruction = get_runtime_str(
-                repo,
-                "chat_ai_refine_instruction",
-                (
-                    "Rewrite the draft answer for clarity and operator usefulness. "
-                    "Do not invent values. Keep output concise markdown with short bullets."
-                ),
-            ).strip()
+        web_rows: list[dict] = []
+        web_research_error = ""
+        if _should_attach_ai_accountant_web_research(
+            repo,
+            prompt,
+            is_ai_accountant_request=is_ai_accountant_request,
+        ):
+            try:
+                web_rows = search_ai_accountant_web(
+                    prompt,
+                    limit=max(1, min(10, get_runtime_int(repo, "ai_accountant_web_research_limit", 5))),
+                    timeout_seconds=max(2, min(30, get_runtime_int(repo, "ai_accountant_web_research_timeout_seconds", 10))),
+                )
+            except Exception as exc:
+                web_research_error = str(exc)
+            citations.append(
+                {
+                    "table": "external_web_research",
+                    "filters": f"query={prompt[:180]}",
+                    "rows_considered": len(web_rows),
+                    "as_of_utc": utcnow_naive().isoformat(),
+                    "error": web_research_error,
+                    "guardrail": "External results are context only; verify tax/legal treatment with advisor.",
+                }
+            )
+        should_ai_refine = bool(st.session_state.get(scoped_ai_refine_override_key)) or (
+            is_ai_accountant_request and get_runtime_bool(repo, "ai_accountant_chat_ai_enabled", True)
+        )
+        if should_ai_refine and not str(intent_key).startswith("denied_"):
+            if is_ai_accountant_request:
+                chat_refine_system_message = get_runtime_str(
+                    repo,
+                    "accountant_llm_system_message",
+                    DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
+                ).strip()
+                chat_refine_instruction = get_runtime_str(
+                    repo,
+                    "ai_accountant_chat_instruction",
+                    DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION,
+                ).strip()
+                workflow = "accounting"
+            else:
+                chat_refine_system_message = get_runtime_str(
+                    repo,
+                    "chat_ai_refine_system_message",
+                    (
+                        "You are GoldenStackers' read-only operations copilot. "
+                        "Preserve factual values from the provided draft answer and citations."
+                    ),
+                ).strip()
+                chat_refine_instruction = get_runtime_str(
+                    repo,
+                    "chat_ai_refine_instruction",
+                    (
+                        "Rewrite the draft answer for clarity and operator usefulness. "
+                        "Do not invent values. Keep output concise markdown with short bullets."
+                    ),
+                ).strip()
+                workflow = "chat"
             refine_result = execute_comp_summary(
                 repo,
                 query=prompt,
                 ebay_rows=[],
-                web_rows=[],
+                web_rows=web_rows,
                 spot_context={
                     "chat_intent": intent_key,
                     "draft_answer": answer,
                     "citations": citations,
                     "allowed_domains": sorted(allowed_domains),
+                    "ai_accountant_identity": bool(is_ai_accountant_request),
+                    "web_research_error": web_research_error,
                 },
                 system_message=chat_refine_system_message,
                 instruction=chat_refine_instruction,
+                workflow=workflow,
             )
             answer = refine_result.text
             ai_refine_applied = True
@@ -657,6 +784,13 @@ def render_ai_chat(repo: InventoryRepository) -> None:
             f"\n\nNote: query response time was `{elapsed_ms}ms`, above soft limit `{soft_timeout_ms}ms`. "
             "Consider asking a narrower question."
         )
+    if ai_accountant_answer_record:
+        answer += (
+            "\n\nRecorded AI Accountant answer evidence for "
+            f"`{ai_accountant_answer_record.get('task_type')}` "
+            f"`{ai_accountant_answer_record.get('reference')}`. "
+            "This preserves your answer for review; any correction still needs the normal edit workflow."
+        )
     answer, masking_rules = _apply_sensitive_masking(repo, answer)
     if masking_rules:
         answer += (
@@ -703,6 +837,10 @@ def render_ai_chat(repo: InventoryRepository) -> None:
                 "ai_refine_endpoint_type": str(ai_refine_citation.get("endpoint_type") or ""),
                 "ai_refine_fallback_attempts": int(ai_refine_citation.get("fallback_attempts") or 0),
                 "masking_rules": sorted(set(masking_rules)),
+                "ai_accountant_answer_recorded": bool(ai_accountant_answer_record),
+                "ai_accountant_answer_reference": (
+                    str(ai_accountant_answer_record.get("reference") or "") if ai_accountant_answer_record else ""
+                ),
                 **prompt_meta,
             },
         )

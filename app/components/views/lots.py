@@ -151,6 +151,7 @@ def _lot_create_defaults(source_labels: list[str]) -> dict:
         "lots_create_total_tax_paid": 0.0,
         "lots_create_total_shipping_paid": 0.0,
         "lots_create_total_handling_paid": 0.0,
+        "lots_create_expected_total_quantity": 0,
         "lots_create_ebay_purchase": False,
         "lots_create_ebay_purchase_item_id": "",
         "lots_create_ebay_purchase_url": "",
@@ -239,6 +240,13 @@ def render_lots(repo: InventoryRepository) -> None:
     st.number_input("Total Lot Tax Paid", min_value=0.0, step=1.0, key="lots_create_total_tax_paid")
     st.number_input("Total Lot Shipping Paid", min_value=0.0, step=1.0, key="lots_create_total_shipping_paid")
     st.number_input("Total Lot Handling Paid", min_value=0.0, step=1.0, key="lots_create_total_handling_paid")
+    st.number_input(
+        "Expected Total Lot Quantity",
+        min_value=0,
+        step=1,
+        key="lots_create_expected_total_quantity",
+        help="Optional. Use when a whole-lot cost should be spread across items that have not all been checked in yet.",
+    )
     st.checkbox(
         "Purchased On eBay",
         key="lots_create_ebay_purchase",
@@ -270,6 +278,7 @@ def render_lots(repo: InventoryRepository) -> None:
         total_tax_paid = float(st.session_state.get("lots_create_total_tax_paid") or 0.0)
         total_shipping_paid = float(st.session_state.get("lots_create_total_shipping_paid") or 0.0)
         total_handling_paid = float(st.session_state.get("lots_create_total_handling_paid") or 0.0)
+        expected_total_quantity = int(st.session_state.get("lots_create_expected_total_quantity") or 0)
         ebay_purchase = bool(st.session_state.get("lots_create_ebay_purchase"))
         ebay_purchase_item_id = str(st.session_state.get("lots_create_ebay_purchase_item_id") or "").strip()
         ebay_purchase_url = str(st.session_state.get("lots_create_ebay_purchase_url") or "").strip()
@@ -287,6 +296,7 @@ def render_lots(repo: InventoryRepository) -> None:
                     total_tax_paid=to_decimal_or_none(total_tax_paid),
                     total_shipping_paid=to_decimal_or_none(total_shipping_paid),
                     total_handling_paid=to_decimal_or_none(total_handling_paid),
+                    expected_total_quantity=expected_total_quantity or None,
                     ebay_purchase=ebay_purchase,
                     ebay_purchase_item_id=ebay_purchase_item_id,
                     ebay_purchase_url=ebay_purchase_url,
@@ -326,6 +336,9 @@ def render_lots(repo: InventoryRepository) -> None:
                         "total_tax_paid": float(lot.total_tax_paid) if lot.total_tax_paid is not None else None,
                         "total_shipping_paid": float(lot.total_shipping_paid) if lot.total_shipping_paid is not None else None,
                         "total_handling_paid": float(lot.total_handling_paid) if lot.total_handling_paid is not None else None,
+                        "expected_total_quantity": int(lot.expected_total_quantity)
+                        if lot.expected_total_quantity is not None
+                        else None,
                         "ebay_purchase": bool(getattr(lot, "ebay_purchase", False)),
                         "ebay_purchase_item_id": str(getattr(lot, "ebay_purchase_item_id", "") or ""),
                         "ebay_purchase_url": str(getattr(lot, "ebay_purchase_url", "") or ""),
@@ -412,8 +425,39 @@ def render_lots(repo: InventoryRepository) -> None:
                 s1, s2, s3, s4 = st.columns(4)
                 s1.metric("Assigned Qty", int(summary.get("assigned_qty") or 0))
                 s2.metric("Allocated Landed Cost", f"${float(summary.get('allocated_landed_cost') or 0):,.2f}")
-                s3.metric("Estimated Net (pre-COGS)", f"${float(summary.get('estimated_net_before_cogs') or 0):,.2f}")
-                s4.metric("Estimated Profit", f"${float(summary.get('estimated_lot_profit') or 0):,.2f}")
+                s3.metric(
+                    "Est. Net Before COGS After Returns",
+                    f"${float(summary.get('estimated_net_before_cogs') or 0):,.2f}",
+                )
+                s4.metric(
+                    "Est. Profit After Returns",
+                    f"${float(summary.get('estimated_lot_profit') or 0):,.2f}",
+                )
+                returns_refund_total = float(summary.get("returns_refund_total") or 0.0)
+                returns_cogs_reversal = float(summary.get("returns_cogs_reversal") or 0.0)
+                returns_profit_impact = float(summary.get("returns_profit_impact") or 0.0)
+                if returns_refund_total or returns_cogs_reversal:
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric(
+                        "Profit Before Returns",
+                        f"${float(summary.get('estimated_lot_profit_before_returns') or 0):,.2f}",
+                    )
+                    r2.metric("Return Refunds", f"${returns_refund_total:,.2f}")
+                    r3.metric("Return COGS Reversal", f"${returns_cogs_reversal:,.2f}")
+                    r4.metric("Return Profit Impact", f"${returns_profit_impact:,.2f}")
+                    st.caption(
+                        "Lot profit after returns = profit before returns - return refunds + returned COGS reversal."
+                    )
+                cost_source = str(summary.get("cost_source") or "").strip()
+                source_totals = dict(summary.get("cost_source_totals") or {})
+                if source_totals:
+                    source_text = "; ".join(
+                        f"{source} ${float(total or 0.0):,.2f}"
+                        for source, total in sorted(source_totals.items())
+                    )
+                    st.caption(f"Sold COGS source mix for this lot: {source_text}.")
+                elif cost_source:
+                    st.caption(f"Lot cost basis source: {cost_source}. No sold COGS has been attributed yet.")
                 lot_rows = list(snapshot.get("rows") or [])
                 if lot_rows:
                     st.dataframe(pd.DataFrame(lot_rows), use_container_width=True)
@@ -978,6 +1022,13 @@ def render_lots(repo: InventoryRepository) -> None:
                                 value=float(ai_handling_for_create or 0.0),
                                 step=1.0,
                             )
+                            create_lot_expected_total_quantity = st.number_input(
+                                "Expected Total Lot Quantity",
+                                min_value=0,
+                                value=0,
+                                step=1,
+                                help="Optional. Use when this document covers items that have not all been checked in yet.",
+                            )
                             create_lot_source_key = st.selectbox(
                                 "Source (optional)",
                                 options=list(source_options_for_docs.keys()),
@@ -1009,6 +1060,7 @@ def render_lots(repo: InventoryRepository) -> None:
                                 total_tax_paid=to_decimal_or_none(create_lot_tax),
                                 total_shipping_paid=to_decimal_or_none(create_lot_shipping),
                                 total_handling_paid=to_decimal_or_none(create_lot_handling),
+                                expected_total_quantity=int(create_lot_expected_total_quantity or 0) or None,
                                 notes=str(create_lot_notes or "").strip(),
                                 source_id=source_options_for_docs.get(create_lot_source_key),
                             )
@@ -1102,6 +1154,20 @@ def render_lots(repo: InventoryRepository) -> None:
         product_key = st.selectbox("Product", list(product_map.keys()))
         quantity = st.number_input("Quantity Acquired", min_value=1, value=1, step=1)
         unit_cost = st.number_input("Unit Cost (Optional)", min_value=0.0, value=0.0, step=1.0)
+        allocated_cost = st.number_input(
+            "Allocated Lot Cost Total (Optional)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Use for mixed lots when this product/quantity should receive a known dollar share of the whole lot cost.",
+        )
+        allocation_weight = st.number_input(
+            "Allocation Weight (Optional)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Use for mixed lots when whole-lot cost should be split proportionally by estimated value/share.",
+        )
         unit_tax_paid = st.number_input("Unit Tax Paid (Optional)", min_value=0.0, value=0.0, step=1.0)
         unit_shipping_paid = st.number_input("Unit Shipping Paid (Optional)", min_value=0.0, value=0.0, step=1.0)
         unit_handling_paid = st.number_input("Unit Handling Paid (Optional)", min_value=0.0, value=0.0, step=1.0)
@@ -1113,6 +1179,8 @@ def render_lots(repo: InventoryRepository) -> None:
                     lot_id=lot_map[lot_key],
                     quantity_acquired=int(quantity),
                     unit_cost=to_decimal_or_none(unit_cost),
+                    allocated_cost=to_decimal_or_none(allocated_cost),
+                    allocation_weight=to_decimal_or_none(allocation_weight),
                     unit_tax_paid=to_decimal_or_none(unit_tax_paid),
                     unit_shipping_paid=to_decimal_or_none(unit_shipping_paid),
                     unit_handling_paid=to_decimal_or_none(unit_handling_paid),
@@ -1125,6 +1193,90 @@ def render_lots(repo: InventoryRepository) -> None:
 
     assignments = repo.list_product_lot_assignments()
     if assignments:
+        assignment_lookup = {
+            f"#{int(a.id)} | product {int(a.product_id)} | lot {int(a.lot_id)} | qty {int(a.quantity_acquired or 0)}": a
+            for a in assignments
+        }
+        with st.expander("Edit Lot Assignment Cost Allocation", expanded=False):
+            selected_assignment_key = st.selectbox(
+                "Assignment",
+                options=list(assignment_lookup.keys()),
+                key="lots_edit_assignment_key",
+            )
+            selected_assignment = assignment_lookup[selected_assignment_key]
+            with st.form("lots_edit_assignment_form"):
+                ea1, ea2, ea3 = st.columns(3)
+                with ea1:
+                    edit_quantity = st.number_input(
+                        "Quantity Acquired",
+                        min_value=1,
+                        value=int(selected_assignment.quantity_acquired or 1),
+                        step=1,
+                    )
+                    edit_unit_cost = st.number_input(
+                        "Unit Cost",
+                        min_value=0.0,
+                        value=float(selected_assignment.unit_cost or 0.0),
+                        step=0.01,
+                    )
+                    edit_allocated_cost = st.number_input(
+                        "Allocated Lot Cost Total",
+                        min_value=0.0,
+                        value=float(selected_assignment.allocated_cost or 0.0),
+                        step=0.01,
+                    )
+                with ea2:
+                    edit_unit_tax = st.number_input(
+                        "Unit Tax Paid",
+                        min_value=0.0,
+                        value=float(selected_assignment.unit_tax_paid or 0.0),
+                        step=0.01,
+                    )
+                    edit_unit_shipping = st.number_input(
+                        "Unit Shipping Paid",
+                        min_value=0.0,
+                        value=float(selected_assignment.unit_shipping_paid or 0.0),
+                        step=0.01,
+                    )
+                    edit_unit_handling = st.number_input(
+                        "Unit Handling Paid",
+                        min_value=0.0,
+                        value=float(selected_assignment.unit_handling_paid or 0.0),
+                        step=0.01,
+                    )
+                with ea3:
+                    edit_allocation_weight = st.number_input(
+                        "Allocation Weight",
+                        min_value=0.0,
+                        value=float(selected_assignment.allocation_weight or 0.0),
+                        step=0.01,
+                    )
+                    edit_acquired_date = st.date_input(
+                        "Acquired Date",
+                        value=(selected_assignment.acquired_at.date() if selected_assignment.acquired_at else utc_today()),
+                        key=f"lots_edit_assignment_acquired_date_{int(selected_assignment.id)}",
+                    )
+                if st.form_submit_button("Save Assignment Allocation"):
+                    try:
+                        repo.update_product_lot_assignment(
+                            int(selected_assignment.id),
+                            {
+                                "quantity_acquired": int(edit_quantity),
+                                "unit_cost": to_decimal_or_none(edit_unit_cost),
+                                "unit_tax_paid": to_decimal_or_none(edit_unit_tax),
+                                "unit_shipping_paid": to_decimal_or_none(edit_unit_shipping),
+                                "unit_handling_paid": to_decimal_or_none(edit_unit_handling),
+                                "allocated_cost": to_decimal_or_none(edit_allocated_cost),
+                                "allocation_weight": to_decimal_or_none(edit_allocation_weight),
+                                "acquired_at": datetime.combine(edit_acquired_date, datetime.min.time()),
+                            },
+                            actor="employee",
+                        )
+                        st.success("Lot assignment allocation updated.")
+                        st.rerun()
+                    except Exception as exc:
+                        repo.db.rollback()
+                        st.error(f"Unable to update assignment allocation: {exc}")
         st.dataframe(
             pd.DataFrame(
                 [
@@ -1138,6 +1290,7 @@ def render_lots(repo: InventoryRepository) -> None:
                         "unit_shipping_paid": float(a.unit_shipping_paid) if a.unit_shipping_paid is not None else None,
                         "unit_handling_paid": float(a.unit_handling_paid) if a.unit_handling_paid is not None else None,
                         "allocated_cost": float(a.allocated_cost) if a.allocated_cost is not None else None,
+                        "allocation_weight": float(a.allocation_weight) if a.allocation_weight is not None else None,
                         "allocated_tax_paid": float(a.allocated_tax_paid) if a.allocated_tax_paid is not None else None,
                         "allocated_shipping_paid": float(a.allocated_shipping_paid) if a.allocated_shipping_paid is not None else None,
                         "allocated_handling_paid": float(a.allocated_handling_paid) if a.allocated_handling_paid is not None else None,

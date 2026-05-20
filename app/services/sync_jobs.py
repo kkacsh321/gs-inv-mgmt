@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 
+import requests
 from sqlalchemy import func, select
 
 from app.db.models import MarketplaceListing, Order, Product, Sale
@@ -24,6 +25,26 @@ def _is_ebay_auth_error(exc: Exception) -> bool:
     if "token" in message and ("expired" in message or "invalid" in message):
         return True
     return False
+
+
+def _is_transient_ebay_network_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    message = str(exc or "").lower()
+    transient_markers = [
+        "nameresolutionerror",
+        "failed to resolve",
+        "temporary failure in name resolution",
+        "no address associated with hostname",
+        "name or service not known",
+        "nodename nor servname",
+        "network is unreachable",
+        "max retries exceeded",
+        "connection aborted",
+        "connection reset",
+        "read timed out",
+    ]
+    return any(marker in message for marker in transient_markers)
 
 
 def _resolve_ebay_tokens(
@@ -273,6 +294,7 @@ def maybe_auto_refresh_ebay_user_token(
             refresh_token=str(refresh_token).strip(),
         )
     except Exception as exc:
+        reason = "transient_network_unavailable" if _is_transient_ebay_network_error(exc) else "refresh_failed"
         _persist_ebay_refresh_failure_state(
             repo,
             actor=actor,
@@ -280,7 +302,7 @@ def maybe_auto_refresh_ebay_user_token(
         )
         return {
             "status": "failed",
-            "reason": "refresh_failed",
+            "reason": reason,
             "error": str(exc)[:500],
         }
     _clear_ebay_refresh_failure_state(repo, actor=actor)
@@ -752,8 +774,12 @@ def execute_ebay_connection_health_check(
                     checks.append({"name": "token_refresh", "status": "failed", "details": failures[-1]})
                     privileges = {}
             else:
-                failures.append(f"Privileges check failed: {exc}")
-                checks.append({"name": "privileges_api", "status": "failed", "details": failures[-1]})
+                if _is_transient_ebay_network_error(exc):
+                    warnings.append(f"Transient eBay network check failed: {exc}")
+                    checks.append({"name": "privileges_api", "status": "warn", "details": warnings[-1]})
+                else:
+                    failures.append(f"Privileges check failed: {exc}")
+                    checks.append({"name": "privileges_api", "status": "failed", "details": failures[-1]})
                 privileges = {}
 
         if privileges:
@@ -2486,6 +2512,51 @@ def execute_ebay_orders_pull_import(
                     refresh_token=refresh_token,
                 )
                 payload = ebay_client.pull_recent_orders(current_access_token, limit=int(limit), offset=int(offset))
+            elif _is_transient_ebay_network_error(pull_exc):
+                repo.add_sync_error(
+                    sync_run_id=run_id,
+                    code="EBAY_NETWORK_UNAVAILABLE",
+                    message=str(pull_exc),
+                    severity="warning",
+                )
+                repo.add_sync_event(
+                    sync_run_id=run_id,
+                    entity_type="ebay_orders",
+                    entity_id="pull",
+                    action="pull_orders",
+                    status="warning",
+                    message=f"Transient eBay network failure; import skipped: {pull_exc}",
+                    payload_json="{}",
+                )
+                repo.update_sync_run(
+                    run_id,
+                    {
+                        "status": "skipped",
+                        "records_processed": 0,
+                        "records_created": 0,
+                        "records_updated": 0,
+                        "records_failed": 0,
+                        "line_items_with_listing_link": 0,
+                        "line_items_unmapped_sku": 0,
+                        "auto_listings_created": 0,
+                        "completed_at": utcnow_naive(),
+                        "notes": "eBay pull import skipped due to transient network/DNS failure.",
+                    },
+                    actor=actor,
+                )
+                return {
+                    "run_id": run_id,
+                    "status": "skipped",
+                    "pulled": 0,
+                    "processed": 0,
+                    "created": 0,
+                    "updated": 0,
+                    "failed": 0,
+                    "line_items_with_listing_link": 0,
+                    "line_items_unmapped_sku": 0,
+                    "auto_listings_created": 0,
+                    "reason": "transient_network_unavailable",
+                }
             else:
                 raise
         orders = _extract_orders(payload)

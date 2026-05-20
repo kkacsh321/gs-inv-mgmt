@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import requests
 
-from app.services.ebay import EbayClient
+from app.services.ebay import EbayClient, normalize_ebay_condition_policy_rows
 
 
 class _FakeResponse:
@@ -120,6 +120,80 @@ class EbayClientTests(unittest.TestCase):
         ):
             out = client.get_identity_user("tok")
         self.assertEqual(out.get("username"), "sandbox-user-1")
+
+    def test_get_item_aspects_for_category_fetches_default_tree_then_aspects(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        tree = _FakeResponse(payload={"categoryTreeId": "0"}, text="tree")
+        aspects = _FakeResponse(
+            payload={
+                "aspects": [
+                    {
+                        "localizedAspectName": "Brand",
+                        "aspectConstraint": {"aspectRequired": True},
+                    }
+                ]
+            },
+            text="aspects",
+        )
+        with patch("app.services.ebay.requests.get", side_effect=[tree, aspects]) as req_get:
+            rows = client.get_item_aspects_for_category(
+                access_token="tok",
+                category_id="111",
+                marketplace_id="EBAY_US",
+            )
+        self.assertEqual(rows[0]["localizedAspectName"], "Brand")
+        self.assertEqual(req_get.call_count, 2)
+        self.assertIn("get_default_category_tree_id", req_get.call_args_list[0].args[0])
+        self.assertIn("get_item_aspects_for_category", req_get.call_args_list[1].args[0])
+        self.assertEqual(req_get.call_args_list[1].kwargs["params"]["category_id"], "111")
+
+    def test_get_item_condition_policies_filters_by_category(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        response = _FakeResponse(
+            payload={
+                "itemConditionPolicies": [
+                    {
+                        "categoryId": "111",
+                        "itemConditionRequired": True,
+                        "itemConditions": [
+                            {"conditionId": "3000", "conditionDescription": "Used"},
+                        ],
+                    }
+                ]
+            },
+            text="conditions",
+        )
+        with patch("app.services.ebay.requests.get", return_value=response) as req_get:
+            policies = client.get_item_condition_policies(
+                access_token="tok",
+                category_id="111",
+                marketplace_id="EBAY_US",
+            )
+        self.assertEqual(policies[0]["categoryId"], "111")
+        self.assertIn("get_item_condition_policies", req_get.call_args.args[0])
+        self.assertEqual(req_get.call_args.kwargs["params"]["filter"], "categoryIds:{111}")
+
+    def test_normalize_condition_policy_rows_maps_condition_ids_to_inventory_enums(self) -> None:
+        rows = normalize_ebay_condition_policy_rows(
+            [
+                {
+                    "categoryId": "111",
+                    "itemConditionRequired": True,
+                    "itemConditions": [
+                        {"conditionId": "1000", "conditionDescription": "Brand New"},
+                        {"conditionId": "3000", "conditionDescription": "Used"},
+                        {"conditionId": "999999", "conditionDescription": "Unsupported"},
+                    ],
+                }
+            ],
+            category_id="111",
+        )
+        self.assertEqual([row["condition"] for row in rows], ["NEW", "USED_EXCELLENT"])
+        self.assertEqual(rows[0]["label"], "Brand New")
+        self.assertTrue(rows[0]["required"])
+        self.assertEqual(rows[1]["condition_id"], "3000")
 
     def test_decode_access_token_claims(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
@@ -401,6 +475,9 @@ class EbayClientTests(unittest.TestCase):
         with patch("app.services.ebay.requests.post", return_value=_FakeResponse(payload={"listingId": "123"})):
             out = client.publish_offer(access_token="tok", offer_id="off1")
         self.assertEqual(out["listingId"], "123")
+        with patch("app.services.ebay.requests.get", return_value=_FakeResponse(payload={"sku": "SKU1"}, text='{"sku":"SKU1"}')):
+            out = client.get_inventory_item(access_token="tok", sku="SKU1")
+        self.assertEqual(out["sku"], "SKU1")
         with patch("app.services.ebay.requests.post", return_value=_FakeResponse(payload={}, text="")):
             out = client.withdraw_offer(access_token="tok", offer_id="off1")
         self.assertEqual(out, {})
@@ -412,11 +489,270 @@ class EbayClientTests(unittest.TestCase):
             out = client.create_image_from_url(access_token="tok", image_url="http://img")
         self.assertIn("image", out)
 
-        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(status_code=200, payload={}, text="")):
+    def test_publish_offer_retries_product_not_found_after_inventory_probe(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        product_not_found = _FakeResponse(
+            status_code=500,
+            payload={
+                "errors": [
+                    {
+                        "errorId": 25604,
+                        "message": "Input error. Seller Inventory Service can not publish the data. Product not found.",
+                    }
+                ]
+            },
+            text='{"errors":[{"errorId":25604,"message":"Product not found"}]}',
+        )
+        success = _FakeResponse(payload={"listingId": "123"}, text='{"listingId":"123"}')
+        with patch("app.services.ebay.time.sleep") as sleep, patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(payload={"sku": "SKU1"}, text='{"sku":"SKU1"}'),
+        ) as get, patch("app.services.ebay.requests.post", side_effect=[product_not_found, success]) as post:
+            out = client.publish_offer(
+                access_token="tok",
+                offer_id="off1",
+                inventory_sku="SKU1",
+                retry_product_not_found_delay_seconds=0.01,
+            )
+
+        self.assertEqual(out["listingId"], "123")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(get.call_count, 1)
+        sleep.assert_called_once()
+
+    def test_publish_offer_does_not_retry_non_product_not_found_error(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        response = _FakeResponse(status_code=500, text='{"errors":[{"errorId":999,"message":"boom"}]}')
+        with patch("app.services.ebay.requests.post", return_value=response) as post:
+            with self.assertRaises(requests.HTTPError):
+                client.publish_offer(access_token="tok", offer_id="off1", inventory_sku="SKU1")
+        self.assertEqual(post.call_count, 1)
+
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(status_code=200, payload={}, text="")) as post:
             client.upload_video(access_token="tok", video_id="VID1", file_bytes=b"abc")
+        self.assertEqual(post.call_args.kwargs["headers"]["Content-Type"], "application/octet-stream")
         with patch("app.services.ebay.requests.get", return_value=_FakeResponse(payload={"videoId": "VID1"})):
             out = client.get_video(access_token="tok", video_id="VID1")
         self.assertEqual(out["videoId"], "VID1")
+
+    def test_get_trading_item_video_ids_parses_video_details(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production")):
+            client = EbayClient()
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+          <Ack>Success</Ack>
+          <Item>
+            <ItemID>123</ItemID>
+            <VideoDetails>
+              <VideoID>VID-MOV</VideoID>
+            </VideoDetails>
+          </Item>
+        </GetItemResponse>"""
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(text=xml)) as post:
+            out = client.get_trading_item_video_ids(
+                access_token="tok",
+                item_id="123",
+                marketplace_id="EBAY_US",
+            )
+
+        self.assertEqual(out["video_ids"], ["VID-MOV"])
+        self.assertEqual(out["site_id"], "0")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-EBAY-API-CALL-NAME"], "GetItem")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-EBAY-API-IAF-TOKEN"], "tok")
+
+    def test_get_trading_item_video_ids_raises_on_failure_ack(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production")):
+            client = EbayClient()
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+          <Ack>Failure</Ack>
+          <Errors>
+            <ShortMessage>Invalid item.</ShortMessage>
+            <ErrorCode>17</ErrorCode>
+          </Errors>
+        </GetItemResponse>"""
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(text=xml)):
+            with self.assertRaisesRegex(RuntimeError, "Trading GetItem failed"):
+                client.get_trading_item_video_ids(access_token="tok", item_id="123")
+
+    def test_create_inventory_item_blocks_overlong_condition_description_before_api_call(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        with patch("app.services.ebay.requests.put") as put:
+            with self.assertRaisesRegex(ValueError, "1000 characters or fewer"):
+                client.create_or_replace_inventory_item(
+                    access_token="tok",
+                    sku="SKU1",
+                    payload={
+                        "availability": {},
+                        "condition": "USED_EXCELLENT",
+                        "conditionDescription": "x" * 1001,
+                        "product": {"title": "Test"},
+                    },
+                )
+        put.assert_not_called()
+
+    def test_verify_publish_dependencies_blocks_immediate_pay_auction_without_bin(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        with patch.object(client, "resolve_merchant_location_key", return_value="loc"), patch.object(
+            client,
+            "get_inventory_location",
+            return_value={"merchantLocationKey": "loc"},
+        ), patch.object(
+            client,
+            "get_payment_policy",
+            return_value={"paymentPolicyId": "pay-1", "immediatePay": True},
+        ), patch.object(
+            client,
+            "get_fulfillment_policy",
+            return_value={"fulfillmentPolicyId": "ful-1"},
+        ), patch.object(
+            client,
+            "get_return_policy",
+            return_value={"returnPolicyId": "ret-1"},
+        ), patch.object(
+            client,
+            "get_category_subtree",
+            return_value={"categoryTreeNode": {"category": {"categoryId": "166679"}}},
+        ):
+            result = client.verify_publish_dependencies(
+                access_token="tok",
+                marketplace_id="EBAY_US",
+                category_id="166679",
+                merchant_location_key="loc",
+                payment_policy_id="pay-1",
+                fulfillment_policy_id="ful-1",
+                return_policy_id="ret-1",
+                format_type="AUCTION",
+                auction_buy_now_price=0.0,
+            )
+
+        self.assertIn(
+            "payment_policy: immediate payment requires an Auction Buy It Now price for live auction publish",
+            result["blockers"],
+        )
+        payment_check = next(row for row in result["checks"] if row["check"] == "payment_policy")
+        self.assertIn("immediate_pay_required=true", payment_check["detail"])
+
+    def test_verify_publish_dependencies_blocks_invalid_category_condition(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        condition_policy = {
+            "itemConditionPolicies": [
+                {
+                    "categoryId": "166679",
+                    "itemConditions": [
+                        {"conditionId": "3000", "conditionDescription": "Used"},
+                    ],
+                }
+            ]
+        }
+        with patch.object(client, "resolve_merchant_location_key", return_value="loc"), patch.object(
+            client,
+            "get_inventory_location",
+            return_value={"merchantLocationKey": "loc"},
+        ), patch.object(
+            client,
+            "get_payment_policy",
+            return_value={"paymentPolicyId": "pay-1", "immediatePay": False},
+        ), patch.object(
+            client,
+            "get_fulfillment_policy",
+            return_value={"fulfillmentPolicyId": "ful-1"},
+        ), patch.object(
+            client,
+            "get_return_policy",
+            return_value={"returnPolicyId": "ret-1"},
+        ), patch.object(
+            client,
+            "get_category_subtree",
+            return_value={"categoryTreeNode": {"category": {"categoryId": "166679"}}},
+        ), patch.object(
+            client,
+            "get_item_condition_policies",
+            return_value=condition_policy,
+        ):
+            result = client.verify_publish_dependencies(
+                access_token="tok",
+                marketplace_id="EBAY_US",
+                category_id="166679",
+                merchant_location_key="loc",
+                payment_policy_id="pay-1",
+                fulfillment_policy_id="ful-1",
+                return_policy_id="ret-1",
+                condition="NEW",
+            )
+
+        self.assertTrue(
+            any("category_condition: selected condition `NEW` is not valid" in row for row in result["blockers"])
+        )
+        condition_check = next(row for row in result["checks"] if row["check"] == "category_condition")
+        self.assertFalse(condition_check["ok"])
+
+    def test_verify_publish_dependencies_accepts_valid_category_condition(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        condition_policy = {
+            "itemConditionPolicies": [
+                {
+                    "categoryId": "166679",
+                    "itemConditions": [
+                        {"conditionId": "3000", "conditionDescription": "Used"},
+                    ],
+                }
+            ]
+        }
+        with patch.object(client, "resolve_merchant_location_key", return_value="loc"), patch.object(
+            client,
+            "get_inventory_location",
+            return_value={"merchantLocationKey": "loc"},
+        ), patch.object(
+            client,
+            "get_payment_policy",
+            return_value={"paymentPolicyId": "pay-1", "immediatePay": False},
+        ), patch.object(
+            client,
+            "get_fulfillment_policy",
+            return_value={"fulfillmentPolicyId": "ful-1"},
+        ), patch.object(
+            client,
+            "get_return_policy",
+            return_value={"returnPolicyId": "ret-1"},
+        ), patch.object(
+            client,
+            "get_category_subtree",
+            return_value={"categoryTreeNode": {"category": {"categoryId": "166679"}}},
+        ), patch.object(
+            client,
+            "get_item_condition_policies",
+            return_value=condition_policy,
+        ):
+            result = client.verify_publish_dependencies(
+                access_token="tok",
+                marketplace_id="EBAY_US",
+                category_id="166679",
+                merchant_location_key="loc",
+                payment_policy_id="pay-1",
+                fulfillment_policy_id="ful-1",
+                return_policy_id="ret-1",
+                condition="USED_EXCELLENT",
+            )
+
+        self.assertEqual([], result["blockers"])
+        condition_check = next(row for row in result["checks"] if row["check"] == "category_condition")
+        self.assertTrue(condition_check["ok"])
+        self.assertIn("USED_EXCELLENT valid", condition_check["detail"])
 
     def test_find_completed_items_returns_empty_on_blank_keywords(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):

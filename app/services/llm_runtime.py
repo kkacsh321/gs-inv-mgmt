@@ -142,7 +142,7 @@ def _build_llm_runtime_config_from_row(row: Any) -> LLMRuntimeConfig:
 
 def _workflow_profile_selector(repo: Any, workflow: str) -> tuple[int | None, str]:
     normalized = str(workflow or "").strip().lower()
-    if normalized not in {"listing", "intake", "comp", "risk"}:
+    if normalized not in {"listing", "intake", "comp", "risk", "accounting"}:
         return None, ""
     selector_raw = _runtime_str_from_repo(repo, f"ai_workflow_profile_{normalized}", "").strip()
     selector_id: int | None = None
@@ -211,6 +211,55 @@ def resolve_comp_llm_runtime_chain(repo: Any, workflow: str = "comp") -> list[LL
         if len(chain) >= max_profiles:
             break
     return chain or [primary]
+
+
+def describe_llm_runtime_chain(repo: Any, workflow: str = "comp") -> list[dict[str, Any]]:
+    normalized_workflow = str(workflow or "comp").strip().lower() or "comp"
+    selected_profile = ""
+    if normalized_workflow in {"listing", "intake", "comp", "risk", "accounting"}:
+        selected_profile = _runtime_str_from_repo(repo, f"ai_workflow_profile_{normalized_workflow}", "").strip()
+    try:
+        chain = resolve_comp_llm_runtime_chain(repo, workflow=normalized_workflow)
+    except Exception as exc:
+        return [
+            {
+                "order": 1,
+                "workflow": normalized_workflow,
+                "status": "error",
+                "source": "",
+                "provider": "",
+                "model": "",
+                "endpoint_type": "",
+                "base_url": "",
+                "enabled": False,
+                "api_key": "",
+                "max_output_tokens": "",
+                "timeout_seconds": "",
+                "profile_selector": selected_profile or "(default chain)",
+                "error": str(exc)[:300],
+            }
+        ]
+    rows: list[dict[str, Any]] = []
+    for idx, cfg in enumerate(chain, start=1):
+        rows.append(
+            {
+                "order": idx,
+                "workflow": normalized_workflow,
+                "status": "ready" if bool(cfg.enabled) else "disabled",
+                "source": str(cfg.source or "").strip(),
+                "provider": str(cfg.provider or "").strip(),
+                "model": str(cfg.model or "").strip(),
+                "endpoint_type": str(cfg.endpoint_type or "").strip(),
+                "base_url": str(cfg.base_url or "").strip(),
+                "enabled": bool(cfg.enabled),
+                "api_key": "present" if str(cfg.api_key or "").strip() else "missing",
+                "max_output_tokens": int(cfg.max_output_tokens),
+                "timeout_seconds": int(cfg.timeout_seconds),
+                "profile_selector": selected_profile or "(default chain)",
+                "error": "",
+            }
+        )
+    return rows
 
 
 def generate_comp_ai_summary(

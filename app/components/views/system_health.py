@@ -14,15 +14,19 @@ from sqlalchemy import text
 from app.auth import current_user, ensure_permission
 from app.components.views.shared import render_help_panel
 from app.config import settings
+from app.db.models import IntegrationQueueJob
 from app.services.config_health import health_state, required_env_keys, required_runtime_keys
 from app.services.ebay import EbayClient
 from app.services.env_manager import read_env_file
+from app.services.integration_queue import process_integration_queue_job
 from app.services.media_storage import MediaStorageService
+from app.services.llm_runtime import describe_llm_runtime_chain
 from app.services.runtime_settings import get_runtime_bool, get_runtime_float, get_runtime_int, get_runtime_str
 from app.services.slack_notify import (
     build_slack_alert_text,
     check_slack_connectivity,
     dispatch_slack_alert,
+    resolve_slack_channel,
     resolve_slack_notify_config,
 )
 from app.services.spot_price import SpotPriceService
@@ -156,6 +160,368 @@ def _fmt_gb_from_kb(kb: int | None) -> str:
 
 def _status_row(name: str, status: str, details: str) -> dict:
     return {"component": name, "status": status, "details": details}
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _service_critical_signals(rows: list[dict[str, Any]] | None) -> list[str]:
+    signals: list[str] = []
+    for row in rows or []:
+        if str((row or {}).get("status") or "").strip().lower() != "error":
+            continue
+        component = str((row or {}).get("component") or "service").strip().lower()
+        signal = "service_" + "".join(ch if ch.isalnum() else "_" for ch in component).strip("_")
+        if signal and signal not in signals:
+            signals.append(signal)
+    return signals
+
+
+def _parse_optional_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _notification_route_allows_slack_value(route: Any) -> bool:
+    normalized = str(route or "slack").strip().lower()
+    if normalized in {"disabled", "off", "none", "email"}:
+        return False
+    return normalized in {"", "slack", "both", "all"}
+
+
+def _ai_accountant_monitor_health_row(repo: Any, *, now: datetime) -> dict:
+    enabled = get_runtime_bool(repo, "ai_accountant_monitor_enabled", True)
+    schedule_mode = str(get_runtime_str(repo, "ai_accountant_monitor_schedule_mode", "interval") or "interval").strip().lower()
+    if schedule_mode not in {"interval", "daily"}:
+        schedule_mode = "interval"
+    slack_enabled = get_runtime_bool(repo, "ai_accountant_monitor_slack_enabled", True)
+    route = str(get_runtime_str(repo, "notification_route_ai_accountant_monitor", "slack") or "slack").strip().lower()
+    route_allows_slack = _notification_route_allows_slack_value(route)
+    last_attempt_at = _parse_optional_datetime(get_runtime_str(repo, "ai_accountant_monitor_last_attempt_at", ""))
+    last_success_at = _parse_optional_datetime(get_runtime_str(repo, "ai_accountant_monitor_last_success_at", ""))
+    last_attempt_local_date = str(get_runtime_str(repo, "ai_accountant_monitor_last_attempt_local_date", "") or "").strip()
+    last_success_local_date = str(get_runtime_str(repo, "ai_accountant_monitor_last_success_local_date", "") or "").strip()
+    now_naive = now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo is not None else now
+    now_local_date = now.date().isoformat()
+    status = "ok"
+    due_status = "scheduled"
+    next_due = ""
+    if not enabled:
+        status = "warn"
+        due_status = "disabled"
+    elif slack_enabled and not route_allows_slack:
+        status = "warn"
+        due_status = "route_disabled"
+    elif schedule_mode == "daily":
+        local_time = str(get_runtime_str(repo, "ai_accountant_monitor_local_time", "08:30") or "08:30").strip()
+        try:
+            hour, minute = [int(part) for part in local_time.split(":", 1)]
+            scheduled_today = now.replace(
+                hour=max(0, min(23, hour)),
+                minute=max(0, min(59, minute)),
+                second=0,
+                microsecond=0,
+            )
+        except Exception:
+            scheduled_today = now.replace(hour=8, minute=30, second=0, microsecond=0)
+        next_due = scheduled_today.isoformat(timespec="seconds")
+        if last_attempt_local_date == now_local_date:
+            due_status = "attempted_today"
+        elif now >= scheduled_today:
+            status = "warn"
+            due_status = "overdue"
+    else:
+        interval_hours = max(1, min(24, int(get_runtime_int(repo, "ai_accountant_monitor_interval_hours", 6))))
+        if last_attempt_at is None:
+            status = "warn"
+            due_status = "pending_first_run"
+        else:
+            next_due_dt = last_attempt_at + timedelta(hours=interval_hours)
+            next_due = next_due_dt.isoformat(timespec="seconds")
+            if next_due_dt <= now_naive:
+                status = "warn"
+                due_status = "overdue"
+
+    details = (
+        f"enabled={enabled} mode={schedule_mode} due={due_status} route={route or 'slack'} "
+        f"slack={slack_enabled} "
+        f"last_attempt={last_attempt_at.isoformat(timespec='seconds') if last_attempt_at else (last_attempt_local_date or 'none')} "
+        f"last_success={last_success_at.isoformat(timespec='seconds') if last_success_at else (last_success_local_date or 'none')}"
+    )
+    if next_due:
+        details = f"{details} next_due={next_due}"
+    return _status_row("AI Accountant Monitor", status, details)
+
+
+def _ai_accountant_runtime_route_health_row(repo: Any) -> dict:
+    try:
+        rows = describe_llm_runtime_chain(repo, workflow="accounting")
+    except Exception as exc:
+        return _status_row("AI Accountant LLM Route", "error", f"runtime_chain_error={str(exc)[:240]}")
+    if not rows:
+        return _status_row("AI Accountant LLM Route", "error", "runtime_chain=empty workflow=accounting")
+    error_rows = [row for row in rows if str(row.get("status") or "").strip().lower() == "error"]
+    ready_rows = [
+        row
+        for row in rows
+        if bool(row.get("enabled")) and str(row.get("status") or "").strip().lower() == "ready"
+    ]
+    first = rows[0]
+    selector = str(first.get("profile_selector") or "(default chain)").strip()
+    route_parts = []
+    for row in rows[:3]:
+        provider = str(row.get("provider") or "unknown").strip()
+        model = str(row.get("model") or "unknown").strip()
+        endpoint = str(row.get("endpoint_type") or "endpoint").strip()
+        source = str(row.get("source") or "source").strip()
+        status = str(row.get("status") or "unknown").strip()
+        api_key_state = str(row.get("api_key") or "").strip()
+        token_suffix = f", token={api_key_state}" if api_key_state else ""
+        route_parts.append(f"{provider}/{model} ({endpoint}, {source}, {status}{token_suffix})")
+    if len(rows) > 3:
+        route_parts.append(f"+{len(rows) - 3} more")
+    if error_rows:
+        status = "error"
+    elif not ready_rows:
+        status = "warn"
+    else:
+        status = "ok"
+    details = (
+        f"workflow=accounting selector={selector} profiles={len(rows)} "
+        f"ready={len(ready_rows)} route={' ; '.join(route_parts)}"
+    )
+    if error_rows:
+        details = f"{details} error={str(error_rows[0].get('error') or '')[:240]}"
+    return _status_row("AI Accountant LLM Route", status, details)
+
+
+def _ai_accountant_latest_review_health_row(repo: Any) -> dict:
+    rows = _safe_select_all(
+        repo,
+        """
+        SELECT created_at, changes_json
+        FROM audit_logs
+        WHERE entity_type = 'integration_event'
+          AND action = 'monitor'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 10
+        """,
+        label="AI Accountant monitor review event",
+    )
+    latest_payload: dict[str, Any] = {}
+    latest_created_at = ""
+    for created_at, changes_json in rows:
+        try:
+            parsed = json.loads(str(changes_json or "{}"))
+        except Exception:
+            parsed = {}
+        after = parsed.get("after", {}) if isinstance(parsed, dict) else {}
+        if not isinstance(after, dict):
+            continue
+        if str(after.get("integration") or "").strip().lower() != "ai_accountant":
+            continue
+        latest_payload = after
+        latest_created_at = str(created_at or "")
+        break
+    if not latest_payload:
+        return _status_row(
+            "AI Accountant Review Evidence",
+            "warn",
+            "no recent ai_accountant monitor integration event found",
+        )
+    details_payload = latest_payload.get("details", {})
+    if not isinstance(details_payload, dict):
+        details_payload = {}
+    review_status = str(details_payload.get("review_status") or "not_recorded").strip().lower()
+    review_enabled = bool(details_payload.get("review_enabled"))
+    actionable_count = _safe_int(details_payload.get("actionable_count"))
+    review_error = str(details_payload.get("review_error") or "").strip()
+    review_route = str(details_payload.get("review_runtime_route") or "").strip()
+    if review_status == "unavailable":
+        status = "warn"
+    elif actionable_count > 0 and review_enabled and review_status not in {"completed", "not_run"}:
+        status = "warn"
+    elif actionable_count > 0 and review_enabled and review_status == "not_run":
+        status = "warn"
+    else:
+        status = "ok"
+    details = (
+        f"latest={latest_created_at or 'unknown'} review_status={review_status} "
+        f"review_enabled={review_enabled} actionable={actionable_count} "
+        f"hash={str(details_payload.get('review_hash') or '')[:12] or 'none'} "
+        f"compact_retry={bool(details_payload.get('review_compact_retry'))}"
+    )
+    if review_route:
+        details = f"{details} route={review_route[:180]}"
+    if review_error:
+        details = f"{details} error={review_error[:220]}"
+    return _status_row("AI Accountant Review Evidence", status, details)
+
+
+def _system_health_critical_slack_policy(repo: Any) -> dict[str, Any]:
+    route = str(get_runtime_str(repo, "notification_route_system_health_critical", "slack") or "slack").strip().lower()
+    notify_enabled = get_runtime_bool(repo, "slack_notify_system_health_critical", True)
+    route_allows_slack = _notification_route_allows_slack_value(route)
+    slack_cfg = resolve_slack_notify_config(repo)
+    target_channel = resolve_slack_channel(repo, event_type="system_health_critical", severity="critical")
+    delivery_ready = bool(slack_cfg.enabled and slack_cfg.bot_token and target_channel)
+    return {
+        "notify_enabled": bool(notify_enabled),
+        "route": route or "slack",
+        "route_allows_slack": bool(route_allows_slack),
+        "slack_allowed": bool(notify_enabled and route_allows_slack),
+        "slack_notifications_enabled": bool(slack_cfg.enabled),
+        "bot_token_present": bool(slack_cfg.bot_token),
+        "target_channel_present": bool(target_channel),
+        "target_channel": target_channel,
+        "delivery_ready": delivery_ready,
+    }
+
+
+def _system_health_critical_alert_policy_row(repo: Any) -> dict:
+    auto_enabled = get_runtime_bool(repo, "health_auto_alert_critical_enabled", True)
+    cooldown_minutes = max(
+        5,
+        min(24 * 60, int(get_runtime_int(repo, "health_auto_alert_cooldown_minutes", 60))),
+    )
+    policy = _system_health_critical_slack_policy(repo)
+    notify_enabled = bool(policy.get("notify_enabled"))
+    route = str(policy.get("route") or "slack")
+    route_allows_slack = bool(policy.get("route_allows_slack"))
+    slack_allowed = bool(policy.get("slack_allowed"))
+    delivery_ready = bool(policy.get("delivery_ready"))
+    status = "ok" if auto_enabled and slack_allowed and delivery_ready else "warn"
+    details = (
+        f"auto_alert={auto_enabled} slack_notify={notify_enabled} route={route} "
+        f"route_allows_slack={route_allows_slack} slack_allowed={slack_allowed} "
+        f"slack_enabled={bool(policy.get('slack_notifications_enabled'))} "
+        f"token_present={bool(policy.get('bot_token_present'))} "
+        f"target_channel_present={bool(policy.get('target_channel_present'))} "
+        f"delivery_ready={delivery_ready} "
+        f"cooldown_minutes={cooldown_minutes}"
+    )
+    return _status_row("System Health Critical Alerts", status, details)
+
+
+def _system_health_critical_slack_delivery_rows(repo: Any, *, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        rows = repo.list_integration_queue_jobs(
+            environment=settings.app_env,
+            integration="slack",
+            statuses={"queued", "running", "blocked", "failed", "success"},
+            limit=max(10, int(limit or 10) * 5),
+        )
+    except Exception:
+        return []
+    delivery_rows: list[dict[str, Any]] = []
+    for row in rows or []:
+        payload: dict[str, Any] = {}
+        try:
+            parsed = json.loads(str(getattr(row, "payload_json", "") or "{}"))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+        if str(payload.get("event_type") or "").strip().lower() != "system_health_critical":
+            continue
+        delivery_rows.append(
+            {
+                "id": int(getattr(row, "id", 0) or 0),
+                "status": str(getattr(row, "status", "") or ""),
+                "channel": str(payload.get("channel") or ""),
+                "attempt_count": int(getattr(row, "attempt_count", 0) or 0),
+                "max_attempts": int(getattr(row, "max_attempts", 0) or 0),
+                "next_attempt_at": str(getattr(row, "next_attempt_at", "") or ""),
+                "requested_by": str(getattr(row, "requested_by", "") or ""),
+                "last_error": str(getattr(row, "last_error", "") or "")[:240],
+            }
+        )
+        if len(delivery_rows) >= max(1, int(limit or 10)):
+            break
+    return delivery_rows
+
+
+def _system_health_critical_slack_delivery_summary(rows: list[dict[str, Any]] | None) -> dict[str, int]:
+    summary = {"total": 0, "queued": 0, "running": 0, "blocked": 0, "failed": 0, "success": 0}
+    for row in rows or []:
+        summary["total"] += 1
+        status = str((row or {}).get("status") or "").strip().lower()
+        if status in summary:
+            summary[status] += 1
+    return summary
+
+
+def _process_due_system_health_critical_slack_jobs(
+    repo: Any,
+    *,
+    actor: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    try:
+        jobs = repo.list_integration_queue_jobs(
+            environment=settings.app_env,
+            integration="slack",
+            statuses={"queued"},
+            limit=max(10, min(100, int(limit or 10) * 5)),
+        )
+    except Exception as exc:
+        return {"processed": 0, "success": 0, "queued": 0, "failed": 0, "skipped": 0, "messages": [str(exc)[:300]]}
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    due_job_ids: list[int] = []
+    skipped = 0
+    for job in jobs or []:
+        payload: dict[str, Any] = {}
+        try:
+            parsed = json.loads(str(getattr(job, "payload_json", "") or "{}"))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+        if str(payload.get("event_type") or "").strip().lower() != "system_health_critical":
+            skipped += 1
+            continue
+        next_attempt_at = getattr(job, "next_attempt_at", None)
+        if next_attempt_at is not None and next_attempt_at > now:
+            skipped += 1
+            continue
+        due_job_ids.append(int(getattr(job, "id", 0) or 0))
+        if len(due_job_ids) >= max(1, int(limit or 10)):
+            break
+
+    summary = {"processed": 0, "success": 0, "queued": 0, "failed": 0, "skipped": skipped, "messages": []}
+    for job_id in due_job_ids:
+        try:
+            ok, message = process_integration_queue_job(repo, job_id=int(job_id), actor=actor)
+        except Exception as exc:
+            ok, message = False, str(exc)
+        summary["processed"] += 1
+        summary["messages"].append(f"#{job_id}: {str(message or '')[:220]}")
+        if ok:
+            summary["success"] += 1
+            continue
+        try:
+            refreshed = repo.db.get(IntegrationQueueJob, int(job_id))
+        except Exception:
+            refreshed = None
+        status = str(getattr(refreshed, "status", "") or "").strip().lower()
+        if status == "queued":
+            summary["queued"] += 1
+        else:
+            summary["failed"] += 1
+    summary["messages"] = summary["messages"][:5]
+    return summary
 
 
 def _slack_ops_health_snapshot(
@@ -530,6 +896,10 @@ def render_system_health(repo) -> None:
             ),
         )
     )
+    service_rows.append(_ai_accountant_monitor_health_row(repo, now=local_now))
+    service_rows.append(_ai_accountant_runtime_route_health_row(repo))
+    service_rows.append(_ai_accountant_latest_review_health_row(repo))
+    service_rows.append(_system_health_critical_alert_policy_row(repo))
 
     st.dataframe(pd.DataFrame(service_rows), use_container_width=True)
 
@@ -1413,6 +1783,10 @@ def render_system_health(repo) -> None:
         critical_signals.append("terminal_queue_failures")
     if integration_warning_state == "error":
         critical_signals.append("integration_warnings")
+    service_critical_signals = _service_critical_signals(service_rows)
+    for signal in service_critical_signals:
+        if signal not in critical_signals:
+            critical_signals.append(signal)
 
     st.markdown("#### Critical Alert Validation")
     st.caption(
@@ -1430,7 +1804,8 @@ def render_system_health(repo) -> None:
                     "- Critical Signals: `{critical_signals}`\n"
                     "- Queue Execute Exceptions: `{queue_execute_exceptions}`\n"
                     "- Terminal Queue Failures: `{terminal_queue_failures}`\n"
-                    "- Integration Warnings: `{integration_warnings}`"
+                    "- Integration Warnings: `{integration_warnings}`\n"
+                    "- Service Signals: `{service_signals}`"
                 ),
                 context={
                     "env": settings.app_env,
@@ -1438,6 +1813,7 @@ def render_system_health(repo) -> None:
                     "queue_execute_exceptions": queue_exec_exceptions,
                     "terminal_queue_failures": terminal_failures,
                     "integration_warnings": warnings,
+                    "service_signals": ", ".join(service_critical_signals) or "none",
                 },
             )
             result = dispatch_slack_alert(
@@ -1457,6 +1833,13 @@ def render_system_health(repo) -> None:
                     "queue_execute_exceptions": int(queue_exec_exceptions),
                     "terminal_queue_failures": int(terminal_failures),
                     "integration_warnings": int(warnings),
+                    "service_signals": service_critical_signals,
+                    "notification_route": get_runtime_str(
+                        repo,
+                        "notification_route_system_health_critical",
+                        "slack",
+                    ).strip()
+                    or "slack",
                     "dispatch_result": result,
                 },
             )
@@ -1467,13 +1850,44 @@ def render_system_health(repo) -> None:
         except Exception as exc:
             st.error(f"Unable to send critical health alert: {exc}")
 
+    critical_delivery_rows = _system_health_critical_slack_delivery_rows(repo, limit=10)
+    critical_delivery_summary = _system_health_critical_slack_delivery_summary(critical_delivery_rows)
+    cd1, cd2, cd3, cd4 = st.columns(4)
+    cd1.metric("Critical Slack Jobs", int(critical_delivery_summary["total"]))
+    cd2.metric("Queued/Running", int(critical_delivery_summary["queued"] + critical_delivery_summary["running"]))
+    cd3.metric("Failed/Blocked", int(critical_delivery_summary["failed"] + critical_delivery_summary["blocked"]))
+    cd4.metric("Successful", int(critical_delivery_summary["success"]))
+    if critical_delivery_rows:
+        with st.expander("Recent System Health Critical Slack Delivery", expanded=bool(critical_delivery_summary["failed"])):
+            st.dataframe(pd.DataFrame(critical_delivery_rows), use_container_width=True, hide_index=True)
+            if st.button(
+                "Process Due System Health Critical Slack Jobs",
+                key="system_health_process_due_critical_slack_jobs_btn",
+            ):
+                result = _process_due_system_health_critical_slack_jobs(
+                    repo,
+                    actor=user.username,
+                    limit=10,
+                )
+                st.success(
+                    "Processed due System Health critical Slack jobs: "
+                    f"processed={result['processed']} success={result['success']} "
+                    f"queued={result['queued']} failed={result['failed']} skipped={result['skipped']}"
+                )
+                if result.get("messages"):
+                    st.caption("Recent delivery results: " + " | ".join(str(v) for v in result["messages"][:3]))
+                st.rerun()
+    else:
+        st.caption("No System Health critical Slack delivery jobs found in the recent Slack queue window.")
+
     auto_alert_enabled = get_runtime_bool(repo, "health_auto_alert_critical_enabled", False)
     auto_alert_cooldown_minutes = max(
         5,
         min(24 * 60, get_runtime_int(repo, "health_auto_alert_cooldown_minutes", 60)),
     )
-    notify_health_critical = get_runtime_bool(repo, "slack_notify_system_health_critical", False)
-    if critical_signals and auto_alert_enabled and notify_health_critical:
+    health_critical_policy = _system_health_critical_slack_policy(repo)
+    health_critical_route = str(health_critical_policy.get("route") or "slack")
+    if critical_signals and auto_alert_enabled and bool(health_critical_policy.get("slack_allowed")):
         cooldown_since = now_utc_naive - timedelta(
             minutes=int(auto_alert_cooldown_minutes)
         )
@@ -1512,7 +1926,8 @@ def render_system_health(repo) -> None:
                         "- Critical Signals: `{critical_signals}`\n"
                         "- Queue Execute Exceptions: `{queue_execute_exceptions}`\n"
                         "- Terminal Queue Failures: `{terminal_queue_failures}`\n"
-                        "- Integration Warnings: `{integration_warnings}`"
+                        "- Integration Warnings: `{integration_warnings}`\n"
+                        "- Service Signals: `{service_signals}`"
                     ),
                     context={
                         "env": settings.app_env,
@@ -1520,6 +1935,7 @@ def render_system_health(repo) -> None:
                         "queue_execute_exceptions": queue_exec_exceptions,
                         "terminal_queue_failures": terminal_failures,
                         "integration_warnings": warnings,
+                        "service_signals": ", ".join(service_critical_signals) or "none",
                     },
                 )
                 dispatch_slack_alert(
@@ -1540,6 +1956,8 @@ def render_system_health(repo) -> None:
                         "queue_execute_exceptions": int(queue_exec_exceptions),
                         "terminal_queue_failures": int(terminal_failures),
                         "integration_warnings": int(warnings),
+                        "service_signals": service_critical_signals,
+                        "notification_route": health_critical_route or "slack",
                     },
                 )
             except Exception:
@@ -2218,17 +2636,39 @@ def render_system_health(repo) -> None:
         )
         or 0
     )
+    ebay_network_unavailable_rows = _safe_select_all(
+        repo,
+        """
+        SELECT
+            se.id,
+            sr.id AS run_id,
+            sr.job_name,
+            sr.status AS run_status,
+            se.severity,
+            se.message,
+            se.occurred_at
+        FROM sync_errors se
+        JOIN sync_runs sr ON sr.id = se.sync_run_id
+        WHERE sr.provider = 'ebay'
+          AND se.code = 'EBAY_NETWORK_UNAVAILABLE'
+          AND se.resolved_at IS NULL
+        ORDER BY se.occurred_at DESC, se.id DESC
+        LIMIT 10
+        """,
+        label="Unresolved eBay network sync errors",
+    )
 
     latest_run = sync_runs[0] if sync_runs else None
     latest_run_started = latest_run.started_at if latest_run is not None else None
     latest_run_status = (latest_run.status or "n/a") if latest_run is not None else "n/a"
 
-    q1, q2, q3, q4, q5 = st.columns(5)
+    q1, q2, q3, q4, q5, q6 = st.columns(6)
     q1.metric("Queued Runs", len(queued_runs))
     q2.metric("Running Runs", len(running_runs))
     q3.metric("Failed/Partial Runs", len(failed_runs))
     q4.metric("Unresolved Sync Errors", unresolved_errors_count)
     q5.metric("Stale Running Runs", len(stale_running_runs))
+    q6.metric("eBay Network Holds", len(ebay_network_unavailable_rows))
 
     worker_rows: list[dict] = []
     worker_rows.append(
@@ -2273,7 +2713,51 @@ def render_system_health(repo) -> None:
                 f"none detected (threshold={stale_running_seconds}s)",
             )
         )
+    if ebay_network_unavailable_rows:
+        latest_network_row = ebay_network_unavailable_rows[0]
+        worker_rows.append(
+            _status_row(
+                "eBay Network/DNS",
+                "warn",
+                (
+                    f"unresolved={len(ebay_network_unavailable_rows)} "
+                    f"latest_error_id={latest_network_row[0]} latest_run_id={latest_network_row[1]} "
+                    f"job={latest_network_row[2]} occurred_at={latest_network_row[6]}"
+                ),
+            )
+        )
+    else:
+        worker_rows.append(
+            _status_row(
+                "eBay Network/DNS",
+                "ok",
+                "no unresolved EBAY_NETWORK_UNAVAILABLE sync errors",
+            )
+        )
     st.dataframe(pd.DataFrame(worker_rows), use_container_width=True)
+    if ebay_network_unavailable_rows:
+        st.warning(
+            "eBay API connectivity is currently classified as a transient network/DNS hold. "
+            "Check container DNS and HTTPS egress before rotating eBay credentials."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "error_id": row[0],
+                        "run_id": row[1],
+                        "job_name": row[2],
+                        "run_status": row[3],
+                        "severity": row[4],
+                        "message": str(row[5] or "")[:240],
+                        "occurred_at": row[6],
+                    }
+                    for row in ebay_network_unavailable_rows
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if sync_runs:
         st.caption("Recent Sync Runs")

@@ -79,20 +79,22 @@ def execute_comp_summary(
     instruction: str,
     workflow: str = "comp",
 ) -> AIExecutionResult:
-    comp_rules_context = get_runtime_str(
-        repo,
-        "comp_reference_rules_context",
-        "",
-    ).strip()
-    if not comp_rules_context:
-        comp_rules_context = build_comp_rules_context_from_web()
-    if not comp_rules_context:
-        comp_rules_context = DEFAULT_COMP_REFERENCE_RULES_CONTEXT
-    instruction = _append_prompt_context(
-        instruction,
-        label="Comp Rules Context",
-        context_text=comp_rules_context,
-    )
+    normalized_workflow = str(workflow or "comp").strip().lower()
+    if normalized_workflow in {"comp", "listing", "intake", "shipping", "sync"}:
+        comp_rules_context = get_runtime_str(
+            repo,
+            "comp_reference_rules_context",
+            "",
+        ).strip()
+        if not comp_rules_context:
+            comp_rules_context = build_comp_rules_context_from_web()
+        if not comp_rules_context:
+            comp_rules_context = DEFAULT_COMP_REFERENCE_RULES_CONTEXT
+        instruction = _append_prompt_context(
+            instruction,
+            label="Comp Rules Context",
+            context_text=comp_rules_context,
+        )
     chain = resolve_comp_llm_runtime_chain(repo, workflow=workflow)
     text, used_cfg, fallback_errors = generate_comp_ai_summary_with_fallback(
         chain,
@@ -111,7 +113,7 @@ def execute_comp_summary(
             "query": query,
             "ebay_rows": len(ebay_rows or []),
             "web_rows": len(web_rows or []),
-            "workflow": str(workflow or "comp").strip().lower(),
+            "workflow": normalized_workflow or "comp",
         },
     )
     return AIExecutionResult(text=text, used_config=used_cfg, fallback_errors=fallback_errors, citation=citation)

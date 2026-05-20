@@ -96,6 +96,21 @@ class SlackOpsBotTests(unittest.TestCase):
         self.assertEqual(e1.args, ["coin", "image"])
         self.assertEqual(e1.environment, "prod")
 
+    def test_build_envelope_normalizes_ai_accountant_aliases(self) -> None:
+        aliases = ["accountant", "accounting", "tax", "ai-accountant", "ai_accountant", "aiaccountant"]
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                env = slack_ops_bot.build_slack_command_envelope(
+                    {
+                        "text": f"{alias} review local tax and profit",
+                        "message_ts": f"1.{len(alias)}",
+                        "app_role": "ops",
+                    },
+                    default_env="prod",
+                )
+                self.assertEqual(env.intent, "accountant")
+                self.assertEqual(env.args, ["review", "local", "tax", "and", "profit"])
+
     def test_route_rejects_unsupported_intent(self) -> None:
         repo = _FakeRepo()
         env = slack_ops_bot.build_slack_command_envelope(
@@ -187,6 +202,61 @@ class SlackOpsBotTests(unittest.TestCase):
         self.assertEqual(payload["request_context"]["app_role"], "ops")
         self.assertEqual(payload["command"]["intent"], "comp")
         self.assertEqual(payload["idempotency_key"], result["idempotency_key"])
+
+    def test_ingest_queues_ai_accountant_read_intent_for_ops(self) -> None:
+        repo = _FakeRepo()
+        result = slack_ops_bot.ingest_slack_command_request(
+            repo,
+            payload={
+                "environment": "prod",
+                "team_id": "T1",
+                "channel_id": "C1",
+                "channel_name": "ops",
+                "thread_ts": "101.2",
+                "message_ts": "101.2",
+                "user_id": "U1",
+                "user_name": "ops-user",
+                "app_username": "ops-user",
+                "app_role": "ops",
+                "text": "accountant why did profit drop today",
+            },
+            actor="slack-bot",
+            default_env="local",
+        )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["intent"], "accountant")
+        payload = json.loads(repo.queue_jobs[0].payload_json)
+        self.assertEqual(payload["command"]["intent"], "accountant")
+
+    def test_ingest_records_ai_accountant_answer_metadata(self) -> None:
+        repo = _FakeRepo()
+        result = slack_ops_bot.ingest_slack_command_request(
+            repo,
+            payload={
+                "environment": "prod",
+                "team_id": "T1",
+                "channel_id": "C1",
+                "channel_name": "ops",
+                "thread_ts": "101.3",
+                "message_ts": "101.3",
+                "user_id": "U1",
+                "user_name": "ops-user",
+                "app_username": "ops-user",
+                "app_role": "ops",
+                "text": "accountant answer missing_cost_basis sale#3: use lot 39 landed cost",
+            },
+            actor="slack-bot",
+            default_env="local",
+        )
+
+        self.assertEqual(result["status"], "queued")
+        payload = json.loads(repo.queue_jobs[0].payload_json)
+        self.assertEqual(payload["command"]["ai_accountant_answer"]["reference"], "sale#3")
+        answer_events = [row for row in repo.audit_events if row.get("entity_type") == "ai_accountant_answer"]
+        self.assertEqual(len(answer_events), 1)
+        self.assertEqual(answer_events[0]["entity_id"], 3)
+        self.assertIn("lot 39", answer_events[0]["changes"]["answer_text"])
 
     def test_ingest_dedupes_by_idempotency_key(self) -> None:
         repo = _FakeRepo()

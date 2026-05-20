@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import sys
 import types
 import unittest
@@ -51,6 +52,7 @@ class ViewImportCoverageTests(unittest.TestCase):
             "search_edit",
             "system_health",
             "ai_chat",
+            "ai_accountant",
             "lots",
             "ebay",
             "ebay_ops",
@@ -73,6 +75,7 @@ class ViewImportCoverageTests(unittest.TestCase):
             "search_edit": "render_search_edit",
             "system_health": "render_system_health",
             "ai_chat": "render_ai_chat",
+            "ai_accountant": "render_ai_accountant",
             "lots": "render_lots",
             "ebay": "render_ebay",
             "ebay_ops": "render_ebay_ops",
@@ -94,6 +97,23 @@ class ViewImportCoverageTests(unittest.TestCase):
                 hasattr(loaded[module_name], attr),
                 f"{module_name} missing expected callable {attr}",
             )
+
+    def test_render_help_panel_calls_include_roadmap_phase(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        missing: list[str] = []
+        for path in sorted((root / "app" / "components" / "views").glob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func_name = getattr(node.func, "id", "")
+                if func_name != "render_help_panel":
+                    continue
+                keyword_names = {kw.arg for kw in node.keywords if kw.arg}
+                if "roadmap_phase" not in keyword_names and len(node.args) < 4:
+                    missing.append(f"{path.relative_to(root)}:{node.lineno}")
+
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

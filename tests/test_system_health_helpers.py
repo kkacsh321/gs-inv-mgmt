@@ -170,6 +170,384 @@ class SystemHealthHelpersTests(unittest.TestCase):
         self.assertEqual(row["component"], "DB")
         self.assertEqual(row["status"], "ok")
 
+    def test_service_critical_signals_promotes_error_rows(self):
+        signals = system_health._service_critical_signals(
+            [
+                {"component": "AI Accountant LLM Route", "status": "error"},
+                {"component": "Sync Runner", "status": "warn"},
+                {"component": "Database", "status": "ok"},
+                {"component": "AI Accountant LLM Route", "status": "error"},
+            ]
+        )
+
+        self.assertEqual(signals, ["service_ai_accountant_llm_route"])
+
+    def test_ai_accountant_latest_review_health_row_completed(self):
+        class Result:
+            def all(self):
+                return [
+                    (
+                        "2026-05-11T12:00:00",
+                        (
+                            '{"after":{"integration":"ai_accountant","action":"monitor","status":"success",'
+                            '"details":{"actionable_count":2,"review_enabled":true,'
+                            '"review_status":"completed","review_hash":"aaaaaaaaaaaaaaaa",'
+                            '"review_runtime_route":"localai/Qwen (chat, db, ready)"}}}'
+                        ),
+                    )
+                ]
+
+        class DB:
+            def execute(self, *_args, **_kwargs):
+                return Result()
+
+        row = system_health._ai_accountant_latest_review_health_row(types.SimpleNamespace(db=DB()))
+
+        self.assertEqual(row["component"], "AI Accountant Review Evidence")
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("review_status=completed", row["details"])
+        self.assertIn("hash=aaaaaaaaaaaa", row["details"])
+        self.assertIn("localai/Qwen", row["details"])
+
+    def test_ai_accountant_latest_review_health_row_flags_unavailable(self):
+        class Result:
+            def all(self):
+                return [
+                    (
+                        "2026-05-11T12:00:00",
+                        (
+                            '{"after":{"integration":"ai_accountant","action":"monitor","status":"success",'
+                            '"details":{"actionable_count":4,"review_enabled":true,'
+                            '"review_status":"unavailable","review_error":"localai 500",'
+                            '"review_runtime_route":"localai/Qwen (chat, db, error)"}}}'
+                        ),
+                    )
+                ]
+
+        class DB:
+            def execute(self, *_args, **_kwargs):
+                return Result()
+
+        row = system_health._ai_accountant_latest_review_health_row(types.SimpleNamespace(db=DB()))
+
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("review_status=unavailable", row["details"])
+        self.assertIn("localai 500", row["details"])
+
+    def test_system_health_critical_slack_policy_respects_route(self):
+        values = {
+            "slack_notify_system_health_critical": True,
+            "notification_route_system_health_critical": "disabled",
+        }
+        slack_cfg = types.SimpleNamespace(enabled=True, bot_token="xoxb-test", default_channel="#ops")
+
+        with patch.object(system_health, "get_runtime_bool", side_effect=lambda _r, key, default=False: bool(values.get(key, default))), patch.object(
+            system_health, "get_runtime_str", side_effect=lambda _r, key, default="": str(values.get(key, default) or "")
+        ), patch.object(system_health, "resolve_slack_notify_config", return_value=slack_cfg), patch.object(
+            system_health, "resolve_slack_channel", return_value="#ops"
+        ):
+            disabled = system_health._system_health_critical_slack_policy(types.SimpleNamespace())
+
+        self.assertFalse(disabled["route_allows_slack"])
+        self.assertFalse(disabled["slack_allowed"])
+        self.assertTrue(disabled["delivery_ready"])
+
+        values["notification_route_system_health_critical"] = "both"
+        with patch.object(system_health, "get_runtime_bool", side_effect=lambda _r, key, default=False: bool(values.get(key, default))), patch.object(
+            system_health, "get_runtime_str", side_effect=lambda _r, key, default="": str(values.get(key, default) or "")
+        ), patch.object(system_health, "resolve_slack_notify_config", return_value=slack_cfg), patch.object(
+            system_health, "resolve_slack_channel", return_value="#ops"
+        ):
+            both = system_health._system_health_critical_slack_policy(types.SimpleNamespace())
+
+        self.assertTrue(both["route_allows_slack"])
+        self.assertTrue(both["slack_allowed"])
+        self.assertTrue(both["delivery_ready"])
+
+    def test_system_health_critical_alert_policy_row(self):
+        values = {
+            "health_auto_alert_critical_enabled": True,
+            "health_auto_alert_cooldown_minutes": 60,
+            "slack_notify_system_health_critical": True,
+            "notification_route_system_health_critical": "slack",
+        }
+        slack_cfg = types.SimpleNamespace(enabled=True, bot_token="xoxb-test", default_channel="#ops")
+
+        def runtime_bool(_repo, key, default=False):
+            return bool(values.get(key, default))
+
+        def runtime_int(_repo, key, default=0):
+            return int(values.get(key, default))
+
+        def runtime_str(_repo, key, default=""):
+            return str(values.get(key, default) or "")
+
+        with patch.object(system_health, "get_runtime_bool", side_effect=runtime_bool), patch.object(
+            system_health, "get_runtime_int", side_effect=runtime_int
+        ), patch.object(system_health, "get_runtime_str", side_effect=runtime_str), patch.object(
+            system_health, "resolve_slack_notify_config", return_value=slack_cfg
+        ), patch.object(system_health, "resolve_slack_channel", return_value="#ops"):
+            row = system_health._system_health_critical_alert_policy_row(types.SimpleNamespace())
+
+        self.assertEqual(row["component"], "System Health Critical Alerts")
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("slack_allowed=True", row["details"])
+        self.assertIn("delivery_ready=True", row["details"])
+
+        values["notification_route_system_health_critical"] = "email"
+        with patch.object(system_health, "get_runtime_bool", side_effect=runtime_bool), patch.object(
+            system_health, "get_runtime_int", side_effect=runtime_int
+        ), patch.object(system_health, "get_runtime_str", side_effect=runtime_str), patch.object(
+            system_health, "resolve_slack_notify_config", return_value=slack_cfg
+        ), patch.object(system_health, "resolve_slack_channel", return_value="#ops"):
+            route_blocked = system_health._system_health_critical_alert_policy_row(types.SimpleNamespace())
+
+        self.assertEqual(route_blocked["status"], "warn")
+        self.assertIn("route=email", route_blocked["details"])
+        self.assertIn("slack_allowed=False", route_blocked["details"])
+
+        values["notification_route_system_health_critical"] = "slack"
+        missing_token_cfg = types.SimpleNamespace(enabled=True, bot_token="", default_channel="#ops")
+        with patch.object(system_health, "get_runtime_bool", side_effect=runtime_bool), patch.object(
+            system_health, "get_runtime_int", side_effect=runtime_int
+        ), patch.object(system_health, "get_runtime_str", side_effect=runtime_str), patch.object(
+            system_health, "resolve_slack_notify_config", return_value=missing_token_cfg
+        ), patch.object(system_health, "resolve_slack_channel", return_value="#ops"):
+            delivery_blocked = system_health._system_health_critical_alert_policy_row(types.SimpleNamespace())
+
+        self.assertEqual(delivery_blocked["status"], "warn")
+        self.assertIn("token_present=False", delivery_blocked["details"])
+        self.assertIn("delivery_ready=False", delivery_blocked["details"])
+
+    def test_system_health_critical_slack_delivery_rows_filter_event_type(self):
+        class Repo:
+            def list_integration_queue_jobs(self, *, environment, integration, statuses, limit):
+                self.args = {
+                    "environment": environment,
+                    "integration": integration,
+                    "statuses": statuses,
+                    "limit": limit,
+                }
+                return [
+                    types.SimpleNamespace(
+                        id=1,
+                        status="queued",
+                        payload_json='{"event_type":"system_health_critical","channel":"#ops"}',
+                        attempt_count=1,
+                        max_attempts=5,
+                        next_attempt_at="2026-05-10T12:00:00",
+                        requested_by="system",
+                        last_error="",
+                    ),
+                    types.SimpleNamespace(
+                        id=2,
+                        status="failed",
+                        payload_json='{"event_type":"other","channel":"#ops"}',
+                        attempt_count=5,
+                        max_attempts=5,
+                        next_attempt_at="",
+                        requested_by="system",
+                        last_error="boom",
+                    ),
+                    types.SimpleNamespace(
+                        id=3,
+                        status="failed",
+                        payload_json='{"event_type":"system_health_critical","channel":"#ops"}',
+                        attempt_count=5,
+                        max_attempts=5,
+                        next_attempt_at="",
+                        requested_by="system",
+                        last_error="token missing",
+                    ),
+                ]
+
+        repo = Repo()
+        with patch.object(system_health, "settings", types.SimpleNamespace(app_env="local")):
+            rows = system_health._system_health_critical_slack_delivery_rows(repo, limit=10)
+        summary = system_health._system_health_critical_slack_delivery_summary(rows)
+
+        self.assertEqual(repo.args["integration"], "slack")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], 1)
+        self.assertEqual(rows[1]["last_error"], "token missing")
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["queued"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_process_due_system_health_critical_slack_jobs_only_processes_due_matching_jobs(self):
+        now = datetime(2026, 5, 11, 12, 0, 0)
+        processed: list[int] = []
+
+        class DB:
+            def __init__(self):
+                self.rows = {
+                    1: types.SimpleNamespace(id=1, status="success"),
+                    3: types.SimpleNamespace(id=3, status="queued"),
+                }
+
+            def get(self, _model, row_id):
+                return self.rows.get(int(row_id))
+
+        class Repo:
+            def __init__(self):
+                self.db = DB()
+
+            def list_integration_queue_jobs(self, *, environment, integration, statuses, limit):
+                return [
+                    types.SimpleNamespace(
+                        id=1,
+                        next_attempt_at=now,
+                        payload_json='{"event_type":"system_health_critical"}',
+                    ),
+                    types.SimpleNamespace(
+                        id=2,
+                        next_attempt_at=now,
+                        payload_json='{"event_type":"other"}',
+                    ),
+                    types.SimpleNamespace(
+                        id=3,
+                        next_attempt_at=now.replace(hour=13),
+                        payload_json='{"event_type":"system_health_critical"}',
+                    ),
+                ]
+
+        def fake_process(_repo, *, job_id, actor):
+            processed.append(int(job_id))
+            return True, "sent"
+
+        with patch.object(system_health, "settings", types.SimpleNamespace(app_env="local")), patch.object(
+            system_health, "datetime"
+        ) as dt_mock, patch.object(system_health, "process_integration_queue_job", side_effect=fake_process):
+            dt_mock.now.return_value = now
+            dt_mock.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+            result = system_health._process_due_system_health_critical_slack_jobs(
+                Repo(),
+                actor="admin",
+                limit=10,
+            )
+
+        self.assertEqual(processed, [1])
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["success"], 1)
+        self.assertEqual(result["skipped"], 2)
+
+    def test_ai_accountant_monitor_health_row_flags_interval_overdue(self):
+        values = {
+            "ai_accountant_monitor_enabled": True,
+            "ai_accountant_monitor_slack_enabled": True,
+            "ai_accountant_monitor_schedule_mode": "interval",
+            "notification_route_ai_accountant_monitor": "slack",
+            "ai_accountant_monitor_last_attempt_at": "2026-05-08T00:00:00",
+            "ai_accountant_monitor_last_success_at": "2026-05-08T00:00:00",
+        }
+
+        with patch.object(system_health, "get_runtime_bool", side_effect=lambda _r, key, default=False: bool(values.get(key, default))), patch.object(
+            system_health, "get_runtime_str", side_effect=lambda _r, key, default="": str(values.get(key, default) or "")
+        ), patch.object(system_health, "get_runtime_int", return_value=6):
+            row = system_health._ai_accountant_monitor_health_row(
+                types.SimpleNamespace(),
+                now=datetime(2026, 5, 8, 7, 0, 0),
+            )
+
+        self.assertEqual(row["component"], "AI Accountant Monitor")
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("due=overdue", row["details"])
+        self.assertIn("next_due=2026-05-08T06:00:00", row["details"])
+
+    def test_ai_accountant_monitor_health_row_flags_disabled_route(self):
+        values = {
+            "ai_accountant_monitor_enabled": True,
+            "ai_accountant_monitor_slack_enabled": True,
+            "ai_accountant_monitor_schedule_mode": "interval",
+            "notification_route_ai_accountant_monitor": "disabled",
+            "ai_accountant_monitor_last_attempt_at": "2026-05-08T06:30:00",
+            "ai_accountant_monitor_last_success_at": "2026-05-08T06:30:00",
+        }
+
+        with patch.object(system_health, "get_runtime_bool", side_effect=lambda _r, key, default=False: bool(values.get(key, default))), patch.object(
+            system_health, "get_runtime_str", side_effect=lambda _r, key, default="": str(values.get(key, default) or "")
+        ), patch.object(system_health, "get_runtime_int", return_value=6):
+            row = system_health._ai_accountant_monitor_health_row(
+                types.SimpleNamespace(),
+                now=datetime(2026, 5, 8, 7, 0, 0),
+            )
+
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("due=route_disabled", row["details"])
+        self.assertIn("route=disabled", row["details"])
+
+    def test_ai_accountant_monitor_health_row_daily_attempted_today(self):
+        values = {
+            "ai_accountant_monitor_enabled": True,
+            "ai_accountant_monitor_slack_enabled": False,
+            "ai_accountant_monitor_schedule_mode": "daily",
+            "notification_route_ai_accountant_monitor": "slack",
+            "ai_accountant_monitor_local_time": "08:30",
+            "ai_accountant_monitor_last_attempt_local_date": "2026-05-08",
+            "ai_accountant_monitor_last_success_local_date": "2026-05-08",
+        }
+
+        with patch.object(system_health, "get_runtime_bool", side_effect=lambda _r, key, default=False: bool(values.get(key, default))), patch.object(
+            system_health, "get_runtime_str", side_effect=lambda _r, key, default="": str(values.get(key, default) or "")
+        ), patch.object(system_health, "get_runtime_int", return_value=6):
+            row = system_health._ai_accountant_monitor_health_row(
+                types.SimpleNamespace(),
+                now=datetime(2026, 5, 8, 9, 0, 0),
+            )
+
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("mode=daily", row["details"])
+        self.assertIn("due=attempted_today", row["details"])
+
+    def test_ai_accountant_runtime_route_health_row_summarizes_route(self):
+        rows = [
+            {
+                "order": 1,
+                "workflow": "accounting",
+                "status": "ready",
+                "source": "db",
+                "provider": "localai",
+                "model": "Qwen",
+                "endpoint_type": "chat",
+                "enabled": True,
+                "api_key": "present",
+                "profile_selector": "Accounting",
+                "error": "",
+            }
+        ]
+
+        with patch.object(system_health, "describe_llm_runtime_chain", return_value=rows):
+            row = system_health._ai_accountant_runtime_route_health_row(types.SimpleNamespace())
+
+        self.assertEqual(row["component"], "AI Accountant LLM Route")
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("workflow=accounting", row["details"])
+        self.assertIn("localai/Qwen", row["details"])
+        self.assertIn("selector=Accounting", row["details"])
+
+    def test_ai_accountant_runtime_route_health_row_flags_error(self):
+        rows = [
+            {
+                "order": 1,
+                "workflow": "accounting",
+                "status": "error",
+                "source": "",
+                "provider": "",
+                "model": "",
+                "endpoint_type": "",
+                "enabled": False,
+                "api_key": "",
+                "profile_selector": "(default chain)",
+                "error": "db down",
+            }
+        ]
+
+        with patch.object(system_health, "describe_llm_runtime_chain", return_value=rows):
+            row = system_health._ai_accountant_runtime_route_health_row(types.SimpleNamespace())
+
+        self.assertEqual(row["status"], "error")
+        self.assertIn("db down", row["details"])
+
     def test_read_proc_meminfo(self):
         content = "MemTotal:       1000000 kB\nMemAvailable:   400000 kB\n"
         with patch("builtins.open", mock_open(read_data=content)):

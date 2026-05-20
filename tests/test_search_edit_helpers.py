@@ -67,6 +67,7 @@ class SearchEditHelpersTests(unittest.TestCase):
                 unit_shipping_paid=0.1,
                 unit_handling_paid=0.05,
                 allocated_cost=11.0,
+                allocation_weight=3.0,
                 allocated_tax_paid=0.4,
                 allocated_shipping_paid=0.2,
                 allocated_handling_paid=0.1,
@@ -84,6 +85,7 @@ class SearchEditHelpersTests(unittest.TestCase):
         self.assertEqual(first["product_title"], "Standing Liberty Round")
         self.assertEqual(first["quantity_acquired"], 2)
         self.assertEqual(first["allocated_cost"], 11.0)
+        self.assertEqual(first["allocation_weight"], 3.0)
 
     def test_build_lot_table_rows_with_attached_products(self):
         lot = SimpleNamespace(
@@ -97,6 +99,7 @@ class SearchEditHelpersTests(unittest.TestCase):
             total_tax_paid=5.0,
             total_shipping_paid=3.0,
             total_handling_paid=2.0,
+            expected_total_quantity=10,
             ebay_purchase=True,
             ebay_purchase_item_id="12345",
             ebay_purchase_url="https://ebay.com/itm/12345",
@@ -114,6 +117,7 @@ class SearchEditHelpersTests(unittest.TestCase):
         self.assertEqual(row["lot_code"], "LOT-001")
         self.assertEqual(row["source_name"], "Dealer A")
         self.assertEqual(row["attached_products_count"], 2)
+        self.assertEqual(row["expected_total_quantity"], 10)
         self.assertIn("SKU-A", row["attached_products"])
         self.assertIn("SKU-B", row["attached_products"])
         self.assertTrue(row["ebay_purchase"])
@@ -140,6 +144,7 @@ class SearchEditHelpersTests(unittest.TestCase):
             total_tax_paid=5.0,
             total_shipping_paid=3.0,
             total_handling_paid=1.0,
+            expected_total_quantity=12,
             ebay_purchase=True,
             ebay_purchase_item_id=" 12345 ",
             ebay_purchase_url=" https://ebay.com/itm/12345 ",
@@ -153,6 +158,7 @@ class SearchEditHelpersTests(unittest.TestCase):
         self.assertEqual(payload["total_tax_paid"], Decimal("5.0"))
         self.assertEqual(payload["total_shipping_paid"], Decimal("3.0"))
         self.assertEqual(payload["total_handling_paid"], Decimal("1.0"))
+        self.assertEqual(payload["expected_total_quantity"], 12)
         self.assertTrue(payload["ebay_purchase"])
         self.assertEqual(payload["ebay_purchase_item_id"], "12345")
         self.assertEqual(payload["ebay_purchase_url"], "https://ebay.com/itm/12345")

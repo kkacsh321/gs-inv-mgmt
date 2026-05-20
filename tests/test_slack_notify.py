@@ -38,6 +38,19 @@ class SlackNotifyTests(unittest.TestCase):
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.default_channel, "#ops")
 
+    def test_resolve_config_defaults_enabled_when_setting_missing(self) -> None:
+        def runtime_bool(_repo, key, default=False):
+            if key == "slack_notifications_enabled":
+                self.assertTrue(default)
+            return default
+
+        with patch("app.services.slack_notify.get_runtime_bool", side_effect=runtime_bool), patch(
+            "app.services.slack_notify.get_runtime_str", side_effect=["", ""]
+        ), patch("app.services.slack_notify.get_runtime_int", return_value=15):
+            cfg = slack_notify.resolve_slack_notify_config(object())
+
+        self.assertTrue(cfg.enabled)
+
     def test_send_slack_message_validation_errors(self) -> None:
         with patch(
             "app.services.slack_notify.resolve_slack_notify_config",

@@ -1,5 +1,12 @@
 from dataclasses import dataclass
 
+from app.services.ebay_aspects import (
+    aspects_have_approved_grader_evidence,
+    missing_required_ebay_aspects,
+    title_has_numerical_coin_grade,
+)
+from app.services.ebay import EBAY_MAX_CONDITION_DESCRIPTION_CHARS
+
 
 @dataclass(frozen=True)
 class ReadinessResult:
@@ -26,6 +33,11 @@ def evaluate_ebay_readiness(
     payment_policy_id: str,
     fulfillment_policy_id: str,
     return_policy_id: str,
+    aspects: dict[str, list[str]] | None = None,
+    category_aspects: list[dict] | None = None,
+    condition: str | None = None,
+    condition_description: str | None = None,
+    category_conditions: list[dict] | None = None,
 ) -> ReadinessResult:
     blockers: list[str] = []
     warnings: list[str] = []
@@ -73,6 +85,34 @@ def evaluate_ebay_readiness(
         blockers.append("Missing fulfillment policy ID")
     if not (return_policy_id or "").strip():
         blockers.append("Missing return policy ID")
+    missing_required_aspects = missing_required_ebay_aspects(category_aspects or [], aspects or {})
+    for row in missing_required_aspects:
+        name = str((row or {}).get("name") or "").strip()
+        if name:
+            blockers.append(f"Missing required eBay item specific: {name}")
+    if category_conditions:
+        selected_condition = str(condition or "").strip().upper()
+        allowed_conditions = {
+            str((row or {}).get("condition") or "").strip().upper()
+            for row in category_conditions
+            if str((row or {}).get("condition") or "").strip()
+        }
+        if selected_condition and selected_condition not in allowed_conditions:
+            blockers.append(f"Selected eBay condition is not valid for this category: {selected_condition}")
+        elif not selected_condition and allowed_conditions:
+            blockers.append("Missing eBay condition for selected category")
+    condition_description_text = str(condition_description or "")
+    if len(condition_description_text) > EBAY_MAX_CONDITION_DESCRIPTION_CHARS:
+        blockers.append(
+            "eBay condition description must be "
+            f"{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {len(condition_description_text)})"
+        )
+    if title_has_numerical_coin_grade(title) and not aspects_have_approved_grader_evidence(aspects or {}):
+        blockers.append(
+            "Numerical coin grade requires an approved grading company item specific "
+            "(Certification or Professional Grader)."
+        )
 
     if publish_format == "AUCTION" and int(quantity_listed or 0) > 1:
         warnings.append("Auction quantity > 1; verify intended multi-quantity auction behavior")

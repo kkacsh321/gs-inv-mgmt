@@ -311,6 +311,106 @@ class IntegrationQueueTests(unittest.TestCase):
         self.assertIn("Product #46", payload["ai_response"]["links"])
         self.assertIn("eBay rows: 0", payload["ai_response"]["links"])
 
+    def test_execute_integration_queue_job_slack_ops_accountant_ai_summary_persisted(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=78,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "accountant",
+                        "command_text": "accountant why did profit drop",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[78] = job
+        captured = {"workflow": "", "spot_context": {}}
+
+        def fake_execute_comp_summary(*_args, **kwargs):
+            captured["workflow"] = str(kwargs.get("workflow") or "")
+            captured["spot_context"] = dict(kwargs.get("spot_context") or {})
+            return SimpleNamespace(text="Profit dropped because COGS review is needed.", citation={})
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=fake_execute_comp_summary,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+        with patch.dict(sys.modules, {"app.services.ai_orchestration": fake_ai_module}), patch(
+            "app.services.chat_context_builders.build_accounting_snapshot",
+            return_value=("AI Accountant snapshot", [{"table": "reports"}]),
+        ):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        self.assertEqual(captured["workflow"], "accounting")
+        self.assertEqual(captured["spot_context"]["intent"], "accountant")
+        payload = json.loads(str(job.payload_json))
+        self.assertEqual(payload["ai_response"]["intent"], "accountant")
+        self.assertIn("Profit dropped", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_accountant_web_research_defaults_on(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=79,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "accountant",
+                        "command_text": "accountant research Colorado bullion sales tax",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[79] = job
+        captured = {"web_rows": [], "runtime_defaults": {}}
+
+        def fake_execute_comp_summary(*_args, **kwargs):
+            captured["web_rows"] = list(kwargs.get("web_rows") or [])
+            return SimpleNamespace(text="Tax treatment needs advisor validation.", citation={})
+
+        def fake_runtime_bool(_repo, key, default=True):
+            captured["runtime_defaults"][str(key)] = default
+            return default
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=fake_execute_comp_summary,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+        with patch.dict(sys.modules, {"app.services.ai_orchestration": fake_ai_module}), patch(
+            "app.services.chat_context_builders.build_accounting_snapshot",
+            return_value=("AI Accountant snapshot", [{"table": "reports"}]),
+        ), patch(
+            "app.services.integration_queue.get_runtime_bool",
+            side_effect=fake_runtime_bool,
+        ), patch(
+            "app.services.ai_accountant_web.search_ai_accountant_web",
+            return_value=[
+                {
+                    "title": "Colorado Sales Tax",
+                    "url": "https://tax.colorado.gov/",
+                    "snippet": "State tax guidance",
+                }
+            ],
+        ) as web_search:
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        self.assertEqual(
+            captured["runtime_defaults"]["ai_accountant_web_research_enabled"],
+            True,
+        )
+        web_search.assert_called_once()
+        self.assertEqual(captured["web_rows"][0]["title"], "Colorado Sales Tax")
+
     def test_execute_integration_queue_job_slack_ops_comp_fetches_ebay_rows_when_configured(self) -> None:
         repo = _FakeRepo()
         captured = {"ebay_rows": [], "query": ""}
@@ -2079,6 +2179,32 @@ class IntegrationQueueTests(unittest.TestCase):
         self.assertIn("status summary", message.lower())
         payload = json.loads(str(job.payload_json))
         self.assertIn("GoldenStackers Status", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_operations_help_mentions_accountant(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=890,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "operations",
+                        "args": ["help"],
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[890] = job
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("operations help", message.lower())
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("accountant <question>", payload["ai_response"]["summary"])
+        self.assertIn("aliases", payload["ai_response"]["summary"])
 
     def test_execute_integration_queue_job_slack_ops_operations_run_due_alias(self) -> None:
         repo = _FakeRepo()

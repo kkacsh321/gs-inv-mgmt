@@ -84,6 +84,38 @@ def _resolve_offer_id(
     return ""
 
 
+def _publish_blockers_for_offer(client: EbayClient, access_token: str, offer: dict) -> list[str]:
+    fmt = str((offer or {}).get("format") or "").strip().upper()
+    if fmt != "AUCTION":
+        return []
+    pricing = (offer or {}).get("pricingSummary") or {}
+    if not isinstance(pricing, dict):
+        pricing = {}
+    try:
+        auction_buy_now = float(((pricing.get("price") or {}).get("value")) or 0.0)
+    except (TypeError, ValueError):
+        auction_buy_now = 0.0
+    if auction_buy_now > 0:
+        return []
+    policies = (offer or {}).get("listingPolicies") or {}
+    if not isinstance(policies, dict):
+        policies = {}
+    payment_policy_id = str(policies.get("paymentPolicyId") or "").strip()
+    marketplace_id = str((offer or {}).get("marketplaceId") or settings.ebay_marketplace_id or "EBAY_US").strip()
+    if not payment_policy_id:
+        return []
+    payment_policy = client.get_payment_policy(
+        access_token=access_token,
+        payment_policy_id=payment_policy_id,
+        marketplace_id=marketplace_id,
+    )
+    if client.payment_policy_requires_immediate_payment(payment_policy):
+        return [
+            "Immediate-payment payment policy requires an Auction Buy It Now price before live publish."
+        ]
+    return []
+
+
 def _listings_frame(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(
@@ -586,7 +618,15 @@ def render_ebay_ops(repo: InventoryRepository) -> None:
                         client.withdraw_offer(access_token=token, offer_id=offer_id)
                         repo.update_listing(listing.id, {"listing_status": "ended"}, actor=user.username)
                     else:
-                        result = client.publish_offer(access_token=token, offer_id=offer_id)
+                        current_offer = client.get_offer(access_token=token, offer_id=offer_id)
+                        publish_blockers = _publish_blockers_for_offer(client, token, current_offer)
+                        if publish_blockers:
+                            raise RuntimeError(" ".join(publish_blockers))
+                        result = client.publish_offer(
+                            access_token=token,
+                            offer_id=offer_id,
+                            inventory_sku=str(sku or "").strip(),
+                        )
                         listing_id = str(result.get("listingId") or "").strip()
                         updates = {"listing_status": "active"}
                         if listing_id:

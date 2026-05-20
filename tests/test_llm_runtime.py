@@ -52,6 +52,7 @@ class LLMRuntimeTests(unittest.TestCase):
                 mapping = {
                     "ai_workflow_profile_listing": SimpleNamespace(value="42"),
                     "ai_workflow_profile_intake": SimpleNamespace(value="LocalAI Intake"),
+                    "ai_workflow_profile_accounting": SimpleNamespace(value="Accounting"),
                 }
                 return mapping.get(key)
 
@@ -61,7 +62,50 @@ class LLMRuntimeTests(unittest.TestCase):
             llm_runtime._workflow_profile_selector(repo, "intake"),
             (None, "localai intake"),
         )
+        self.assertEqual(
+            llm_runtime._workflow_profile_selector(repo, "accounting"),
+            (None, "accounting"),
+        )
         self.assertEqual(llm_runtime._workflow_profile_selector(repo, "unknown"), (None, ""))
+
+    def test_describe_llm_runtime_chain_sanitizes_api_key(self) -> None:
+        selected = SimpleNamespace(
+            id=2,
+            name="Accounting",
+            is_default=False,
+            is_active=True,
+            provider="localai",
+            model="Qwen",
+            multimodal_model="",
+            base_url="https://localai.example/v1",
+            endpoint_type="chat",
+            api_key="secret-token",
+            temperature=0.2,
+            max_output_tokens=16000,
+            timeout_seconds=60,
+        )
+
+        class Repo:
+            def get_default_ai_provider_config(self, *, environment: str):
+                return selected
+
+            def list_ai_provider_configs(self, *, environment: str, active_only: bool):
+                return [selected]
+
+            def get_runtime_setting(self, *, environment: str, key: str, active_only: bool):
+                if key == "ai_workflow_profile_accounting":
+                    return SimpleNamespace(value="Accounting", value_type="str")
+                if key == "ai_fallback_enabled":
+                    return SimpleNamespace(value="true", value_type="bool")
+                return None
+
+        rows = llm_runtime.describe_llm_runtime_chain(Repo(), workflow="accounting")
+
+        self.assertEqual(rows[0]["workflow"], "accounting")
+        self.assertEqual(rows[0]["provider"], "localai")
+        self.assertEqual(rows[0]["api_key"], "present")
+        self.assertEqual(rows[0]["profile_selector"], "Accounting")
+        self.assertNotIn("secret-token", str(rows))
 
     def test_resolve_comp_llm_runtime_config_prefers_db_then_env(self) -> None:
         db_row = SimpleNamespace(
@@ -318,13 +362,16 @@ class LLMRuntimeTests(unittest.TestCase):
                 return [default_row, selected]
 
             def get_runtime_setting(self, *, environment: str, key: str, active_only: bool):
-                if key == "ai_workflow_profile_listing":
+                if key in {"ai_workflow_profile_listing", "ai_workflow_profile_accounting"}:
                     return SimpleNamespace(value="Listing Profile")
                 return None
 
         chain = llm_runtime.resolve_comp_llm_runtime_chain(Repo(), workflow="listing")
         self.assertGreaterEqual(len(chain), 2)
         self.assertEqual(chain[0].model, "listing-model")
+        accounting_chain = llm_runtime.resolve_comp_llm_runtime_chain(Repo(), workflow="accounting")
+        self.assertGreaterEqual(len(accounting_chain), 2)
+        self.assertEqual(accounting_chain[0].model, "listing-model")
 
     def test_generate_comp_ai_summary_validates_and_parses_chat_and_responses(self) -> None:
         disabled_cfg = LLMRuntimeConfig(

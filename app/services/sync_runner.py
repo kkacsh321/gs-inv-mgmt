@@ -16,6 +16,7 @@ from app.services.notification_outbox import (
     cleanup_notification_outbox_retention,
     process_due_notification_outbox,
 )
+from app.services.ai_accountant_monitor import run_ai_accountant_monitor
 from app.services.lifecycle_retention import cleanup_lifecycle_retention
 from app.services.sync_jobs import execute_sync_job, is_sync_job_enabled, maybe_auto_refresh_ebay_user_token
 from app.utils.time import utcnow_naive
@@ -24,6 +25,36 @@ from app.utils.time import utcnow_naive
 def _log(message: str) -> None:
     stamp = datetime.now(UTC).isoformat(timespec="seconds")
     print(f"[sync-runner] {stamp} {message}", flush=True)
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _product_default_landed_unit_cost(product) -> float:
+    landed = (
+        _safe_float(getattr(product, "acquisition_cost", None))
+        + _safe_float(getattr(product, "acquisition_tax_paid", None))
+        + _safe_float(getattr(product, "acquisition_shipping_paid", None))
+        + _safe_float(getattr(product, "acquisition_handling_paid", None))
+    )
+    if landed > 0:
+        return landed
+    return _safe_float(getattr(product, "product_cost", None))
+
+
+def _format_cogs_source_mix(source_totals: dict[str, float], source_counts: dict[str, int]) -> str:
+    if not source_totals:
+        return ""
+    parts = [
+        f"{source} ${float(total):,.2f}/{int(source_counts.get(source, 0))} sale(s)"
+        for source, total in sorted(source_totals.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+        if float(total or 0.0) > 0 or int(source_counts.get(source, 0)) > 0
+    ]
+    return "; ".join(parts)
 
 
 def _run_ebay_orders_pull_import() -> None:
@@ -151,17 +182,19 @@ def _run_ebay_token_auto_refresh() -> None:
                 f"expires_at={result.get('expires_at') or '(unknown)'}"
             )
         elif status == "failed":
+            reason = str(result.get("reason") or "").strip()
+            transient_network = reason == "transient_network_unavailable"
             repo.log_integration_event(
                 actor=settings.sync_runner_actor,
                 integration="ebay_oauth",
                 action="auto_refresh",
-                status="error",
+                status="warning" if transient_network else "error",
                 details={
-                    "reason": str(result.get("reason") or "").strip(),
+                    "reason": reason,
                     "error": str(result.get("error") or "").strip()[:500],
                 },
             )
-            if get_runtime_bool(repo, "slack_notify_ebay_oauth_refresh_failures", True):
+            if (not transient_network) and get_runtime_bool(repo, "slack_notify_ebay_oauth_refresh_failures", True):
                 try:
                     alert_text = build_slack_alert_text(
                         repo,
@@ -186,7 +219,13 @@ def _run_ebay_token_auto_refresh() -> None:
                     )
                 except Exception:
                     pass
-            _log(f"Auto-refresh eBay user token failed: {result.get('error') or 'unknown error'}")
+            if transient_network:
+                _log(
+                    "Auto-refresh eBay user token skipped by transient network/DNS failure: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+            else:
+                _log(f"Auto-refresh eBay user token failed: {result.get('error') or 'unknown error'}")
         elif status == "skipped" and str(result.get("reason") or "").strip().lower() == "failure_cooldown_active":
             _log(
                 "Skipping eBay user token auto-refresh (failure cooldown active): "
@@ -377,6 +416,35 @@ def _is_daily_job_due(
     return bool(last_attempt_date != local_date), local_now, local_date
 
 
+def _is_interval_job_due(
+    repo: InventoryRepository,
+    *,
+    key_prefix: str,
+    timezone_key: str,
+    interval_hours_key: str,
+    default_timezone: str,
+    default_interval_hours: int,
+) -> tuple[bool, datetime, str]:
+    tz = _resolve_schedule_timezone(repo, key=timezone_key, default_tz=default_timezone)
+    local_now = datetime.now(tz)
+    interval_hours = max(
+        1,
+        min(24, int(get_runtime_int(repo, interval_hours_key, int(default_interval_hours or 6)))),
+    )
+    last_attempt_raw = str(get_runtime_str(repo, f"{key_prefix}_last_attempt_at", "") or "").strip()
+    if last_attempt_raw:
+        try:
+            last_attempt = datetime.fromisoformat(last_attempt_raw)
+            if last_attempt.tzinfo is None:
+                last_attempt = last_attempt.replace(tzinfo=tz)
+            due_at = last_attempt.astimezone(tz) + timedelta(hours=interval_hours)
+            if due_at > local_now:
+                return False, local_now, local_now.date().isoformat()
+        except Exception:
+            pass
+    return True, local_now, local_now.date().isoformat()
+
+
 def _parse_daily_cron_hhmm_utc(cron_expr: str, *, default_hour: int, default_minute: int) -> tuple[int, int]:
     raw = str(cron_expr or "").strip()
     parts = raw.split()
@@ -476,6 +544,36 @@ def _mark_daily_job_attempt(
             value=str(local_date or "").strip(),
             value_type="str",
             description=f"Last local-date success marker for `{key_prefix}` scheduler.",
+            is_active=True,
+            actor=actor,
+        )
+
+
+def _mark_interval_job_attempt(
+    repo: InventoryRepository,
+    *,
+    key_prefix: str,
+    actor: str,
+    local_now: datetime,
+    success: bool,
+) -> None:
+    stamp = local_now.isoformat(timespec="seconds")
+    repo.upsert_runtime_setting(
+        environment=settings.app_env,
+        key=f"{key_prefix}_last_attempt_at",
+        value=stamp,
+        value_type="str",
+        description=f"Last local timestamp attempt marker for `{key_prefix}` interval scheduler.",
+        is_active=True,
+        actor=actor,
+    )
+    if success:
+        repo.upsert_runtime_setting(
+            environment=settings.app_env,
+            key=f"{key_prefix}_last_success_at",
+            value=stamp,
+            value_type="str",
+            description=f"Last local timestamp success marker for `{key_prefix}` interval scheduler.",
             is_active=True,
             actor=actor,
         )
@@ -713,10 +811,106 @@ def _run_daily_slack_report() -> None:
         orders = repo.list_orders()
 
         sales_24h = [s for s in sales if getattr(s, "sold_at", None) and s.sold_at >= since]
-        gross_24h = float(sum(float(getattr(s, "sold_price", 0.0) or 0.0) for s in sales_24h))
-        fees_24h = float(sum(float(getattr(s, "fees", 0.0) or 0.0) for s in sales_24h))
-        shipping_24h = float(sum(float(getattr(s, "shipping_cost", 0.0) or 0.0) for s in sales_24h))
-        net_24h = gross_24h - fees_24h - shipping_24h
+        default_unit_cost_by_product = {
+            int(getattr(product, "id")): _product_default_landed_unit_cost(product)
+            for product in products
+            if getattr(product, "id", None) is not None
+        }
+        fifo_unit_cost_by_sale: dict[int, float] = {}
+        fifo_unit_cost_source_by_sale: dict[int, str] = {}
+        if hasattr(repo, "report_sale_unit_cost_maps"):
+            try:
+                maps_payload = repo.report_sale_unit_cost_maps(
+                    end_dt=now,
+                    default_unit_cost_by_product=default_unit_cost_by_product,
+                ) or {}
+                fifo_unit_cost_by_sale = {
+                    int(k): _safe_float(v)
+                    for k, v in dict(maps_payload.get("fifo_unit_cost_by_sale") or {}).items()
+                }
+                fifo_unit_cost_source_by_sale = {
+                    int(k): str(v or "").strip() or "unknown"
+                    for k, v in dict(maps_payload.get("fifo_unit_cost_source_by_sale") or {}).items()
+                }
+            except Exception:
+                db = getattr(repo, "db", None)
+                if db is not None and hasattr(db, "rollback"):
+                    db.rollback()
+                fifo_unit_cost_by_sale = {}
+                fifo_unit_cost_source_by_sale = {}
+        cogs_24h = 0.0
+        cogs_source_totals: dict[str, float] = {}
+        cogs_source_counts: dict[str, int] = {}
+        for sale in sales_24h:
+            sale_id = getattr(sale, "id", None)
+            product_id = int(getattr(sale, "product_id", 0) or 0)
+            quantity = int(getattr(sale, "quantity_sold", 0) or 0)
+            if sale_id is not None and int(sale_id) in fifo_unit_cost_by_sale:
+                unit_cost = _safe_float(fifo_unit_cost_by_sale.get(int(sale_id)))
+                cost_source = fifo_unit_cost_source_by_sale.get(int(sale_id), "unknown")
+            else:
+                unit_cost = _safe_float(default_unit_cost_by_product.get(product_id, 0.0))
+                cost_source = "product_default_landed_cost" if unit_cost > 0 else "missing_cost_basis"
+            sale_cogs = unit_cost * quantity
+            cogs_24h += sale_cogs
+            cogs_source_totals[cost_source] = cogs_source_totals.get(cost_source, 0.0) + sale_cogs
+            cogs_source_counts[cost_source] = cogs_source_counts.get(cost_source, 0) + 1
+        cogs_source_mix = _format_cogs_source_mix(cogs_source_totals, cogs_source_counts)
+        cogs_source_mix_line = f"- COGS source mix 24h: {cogs_source_mix}\n" if cogs_source_mix else ""
+        actual_24h_rows = []
+        if hasattr(repo, "report_sales_actual_econ_rows"):
+            try:
+                actual_24h_rows = list(repo.report_sales_actual_econ_rows(start_dt=since, end_dt=now) or [])
+            except Exception:
+                db = getattr(repo, "db", None)
+                if db is not None and hasattr(db, "rollback"):
+                    db.rollback()
+                actual_24h_rows = []
+        if actual_24h_rows:
+            gross_24h = float(sum(float(row.get("sold_price") or 0.0) for row in actual_24h_rows))
+            net_24h = float(sum(float(row.get("net_before_cogs_actual") or 0.0) for row in actual_24h_rows))
+        else:
+            gross_24h = float(sum(float(getattr(s, "sold_price", 0.0) or 0.0) for s in sales_24h))
+            fees_24h = float(sum(float(getattr(s, "fees", 0.0) or 0.0) for s in sales_24h))
+            shipping_24h = float(sum(float(getattr(s, "shipping_cost", 0.0) or 0.0) for s in sales_24h))
+            label_spend_24h = float(
+                sum(float(getattr(s, "shipping_label_cost", 0.0) or 0.0) for s in sales_24h)
+            )
+            net_24h = gross_24h + shipping_24h - fees_24h - label_spend_24h
+
+        returns_24h_rows = []
+        if hasattr(repo, "report_returns_rows"):
+            try:
+                returns_24h_rows = list(repo.report_returns_rows(start_dt=since, end_dt=now) or [])
+            except Exception:
+                db = getattr(repo, "db", None)
+                if db is not None and hasattr(db, "rollback"):
+                    db.rollback()
+                returns_24h_rows = []
+        returns_24h_count = len(returns_24h_rows)
+        returns_refund_24h = round(
+            sum(
+                _safe_float(row.get("refund_amount"))
+                + _safe_float(row.get("refund_fees"))
+                + _safe_float(row.get("refund_shipping"))
+                for row in returns_24h_rows
+            ),
+            2,
+        )
+        returns_cogs_reversal_24h = 0.0
+        for row in returns_24h_rows:
+            sale_id = row.get("sale_id")
+            product_id = int(row.get("product_id") or 0)
+            return_qty = max(1, int(row.get("quantity") or 1))
+            if sale_id is not None and int(sale_id) in fifo_unit_cost_by_sale:
+                returns_cogs_reversal_24h += _safe_float(fifo_unit_cost_by_sale.get(int(sale_id))) * return_qty
+            elif product_id > 0:
+                returns_cogs_reversal_24h += _safe_float(default_unit_cost_by_product.get(product_id)) * return_qty
+        returns_cogs_reversal_24h = round(float(returns_cogs_reversal_24h), 2)
+        returns_profit_impact_24h = round(-returns_refund_24h + returns_cogs_reversal_24h, 2)
+        profit_before_returns_24h = round(net_24h - cogs_24h, 2)
+        net_after_returns_24h = round(net_24h - returns_refund_24h, 2)
+        estimated_profit_24h = round(profit_before_returns_24h + returns_profit_impact_24h, 2)
 
         draft_listings = [
             l for l in listings if str(getattr(l, "listing_status", "") or "").strip().lower() == "draft"
@@ -787,6 +981,12 @@ def _run_daily_slack_report() -> None:
             "- Sales total: {sale_count} | last 24h: {sales_24h_count}\n"
             "- Gross sales 24h: ${gross_24h}\n"
             "- Net sales 24h: ${net_24h}\n"
+            "- Estimated COGS 24h: ${cogs_24h}\n"
+            "- Profit before returns 24h: ${profit_before_returns_24h}\n"
+            "- Return impact 24h: {returns_24h_count} return(s), refunds ${returns_refund_24h}, "
+            "COGS reversal ${returns_cogs_reversal_24h}, profit impact ${returns_profit_impact_24h}\n"
+            "- Estimated profit 24h after returns: ${estimated_profit_24h}\n"
+            "{cogs_source_mix_line}"
             "- Orders total: {order_count} | last 24h: {orders_24h_count}\n"
             "- Inventory cost basis (snapshot): ${inventory_cost}\n"
             "{fee_coverage_alert_line}"
@@ -807,6 +1007,16 @@ def _run_daily_slack_report() -> None:
                 "sales_24h_count": int(len(sales_24h)),
                 "gross_24h": f"{gross_24h:,.2f}",
                 "net_24h": f"{net_24h:,.2f}",
+                "cogs_24h": f"{cogs_24h:,.2f}",
+                "profit_before_returns_24h": f"{profit_before_returns_24h:,.2f}",
+                "returns_24h_count": int(returns_24h_count),
+                "returns_refund_24h": f"{returns_refund_24h:,.2f}",
+                "returns_cogs_reversal_24h": f"{returns_cogs_reversal_24h:,.2f}",
+                "returns_profit_impact_24h": f"{returns_profit_impact_24h:,.2f}",
+                "net_after_returns_24h": f"{net_after_returns_24h:,.2f}",
+                "estimated_profit_24h": f"{estimated_profit_24h:,.2f}",
+                "cogs_source_mix": cogs_source_mix,
+                "cogs_source_mix_line": cogs_source_mix_line,
                 "order_count": int(len(orders)),
                 "orders_24h_count": int(len(orders_24h)),
                 "inventory_cost": f"{float(metrics.get('inventory_cost', 0.0)):,.2f}",
@@ -849,6 +1059,18 @@ def _run_daily_slack_report() -> None:
                 "sales_24h_count": int(len(sales_24h)),
                 "gross_24h": float(gross_24h),
                 "net_24h": float(net_24h),
+                "cogs_24h": float(cogs_24h),
+                "profit_before_returns_24h": float(profit_before_returns_24h),
+                "returns_24h_count": int(returns_24h_count),
+                "returns_refund_24h": float(returns_refund_24h),
+                "returns_cogs_reversal_24h": float(returns_cogs_reversal_24h),
+                "returns_profit_impact_24h": float(returns_profit_impact_24h),
+                "net_after_returns_24h": float(net_after_returns_24h),
+                "estimated_profit_24h": float(estimated_profit_24h),
+                "cogs_source_mix": cogs_source_mix,
+                "cogs_source_totals": {
+                    source: round(float(total), 2) for source, total in sorted(cogs_source_totals.items())
+                },
                 "normalized_fee_coverage_triggered": bool(normalized_fee_coverage_health.get("triggered")),
                 "normalized_fee_coverage_latest_week_start": str(
                     normalized_fee_coverage_health.get("latest_week_start") or ""
@@ -908,7 +1130,7 @@ def _run_notification_outbox() -> None:
     db = SessionLocal()
     try:
         repo = InventoryRepository(db)
-        if not get_runtime_bool(repo, "notification_outbox_runner_enabled", False):
+        if not get_runtime_bool(repo, "notification_outbox_runner_enabled", True):
             return
         limit = max(1, min(500, int(get_runtime_int(repo, "notification_outbox_runner_limit", 50))))
         result = process_due_notification_outbox(
@@ -1009,6 +1231,158 @@ def _run_notification_outbox_cleanup() -> None:
         db.close()
 
 
+def _run_ai_accountant_monitor_schedule() -> None:
+    db = SessionLocal()
+    schedule_mode = "interval"
+    try:
+        repo = InventoryRepository(db)
+        if not get_runtime_bool(repo, "ai_accountant_monitor_enabled", True):
+            _log("AI Accountant monitor disabled: `ai_accountant_monitor_enabled=false`.")
+            return
+        schedule_mode = str(get_runtime_str(repo, "ai_accountant_monitor_schedule_mode", "interval") or "interval").strip().lower()
+        if schedule_mode == "daily":
+            due, local_now, local_date = _is_daily_job_due(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                timezone_key="ai_accountant_monitor_timezone",
+                local_time_key="ai_accountant_monitor_local_time",
+                default_timezone=_app_default_timezone(repo),
+                default_local_time="08:30",
+            )
+        else:
+            due, local_now, local_date = _is_interval_job_due(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                timezone_key="ai_accountant_monitor_timezone",
+                interval_hours_key="ai_accountant_monitor_interval_hours",
+                default_timezone=_app_default_timezone(repo),
+                default_interval_hours=6,
+            )
+        if not due:
+            _log(
+                "Skipping AI Accountant monitor (not due): "
+                f"local_now={local_now.isoformat(timespec='seconds')}"
+            )
+            return
+        result = run_ai_accountant_monitor(
+            repo,
+            actor=settings.sync_runner_actor,
+            lookback_days=max(1, int(get_runtime_int(repo, "ai_accountant_monitor_lookback_days", 30))),
+            min_severity=str(get_runtime_str(repo, "ai_accountant_monitor_min_severity", "P1") or "P1"),
+            slack_enabled=(
+                get_runtime_bool(repo, "ai_accountant_monitor_slack_enabled", True)
+                and _notification_route_allows_slack(
+                    repo,
+                    route_key="notification_route_ai_accountant_monitor",
+                    default_route="slack",
+                )
+            ),
+            slack_channel=str(get_runtime_str(repo, "ai_accountant_monitor_channel", "") or "").strip(),
+            record_when_empty=get_runtime_bool(repo, "ai_accountant_monitor_record_empty", False),
+        )
+        if schedule_mode == "daily":
+            _mark_daily_job_attempt(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                actor=settings.sync_runner_actor,
+                local_date=local_date,
+                success=True,
+            )
+        else:
+            _mark_interval_job_attempt(
+                repo,
+                key_prefix="ai_accountant_monitor",
+                actor=settings.sync_runner_actor,
+                local_now=local_now,
+                success=True,
+            )
+        repo.log_integration_event(
+            actor=settings.sync_runner_actor,
+            integration="ai_accountant",
+            action="monitor",
+            status="success",
+            details={
+                "local_time": local_now.isoformat(timespec="seconds"),
+                "item_count": int(result.get("item_count") or 0),
+                "actionable_count": int(result.get("actionable_count") or 0),
+                "audit_id": result.get("audit_id"),
+                "slack_outbox_id": result.get("slack_outbox_id"),
+                "period_label": str(result.get("period_label") or ""),
+                "schedule_mode": schedule_mode,
+                "min_severity": str(result.get("min_severity") or ""),
+                "requested_min_severity": str(result.get("requested_min_severity") or ""),
+                "review_enabled": bool(result.get("review_enabled")),
+                "review_status": (
+                    "unavailable"
+                    if str(result.get("review_error") or "").strip()
+                    else ("completed" if str(result.get("review_hash") or "").strip() else "not_run")
+                ),
+                "review_hash": str(result.get("review_hash") or "")[:12],
+                "review_error": str(result.get("review_error") or "")[:500],
+                "review_compact_retry": bool(result.get("review_compact_retry")),
+                "review_runtime_route": str(result.get("review_runtime_route") or "")[:500],
+            },
+        )
+        _log(
+            "Completed AI Accountant monitor: "
+            f"items={result.get('item_count')} actionable={result.get('actionable_count')} "
+            f"audit_id={result.get('audit_id') or '-'} slack_outbox_id={result.get('slack_outbox_id') or '-'} "
+            f"review_status="
+            f"{'unavailable' if str(result.get('review_error') or '').strip() else ('completed' if str(result.get('review_hash') or '').strip() else 'not_run')}"
+        )
+    except Exception as exc:
+        try:
+            repo = InventoryRepository(db)
+            if schedule_mode == "daily":
+                _due, local_now, local_date = _is_daily_job_due(
+                    repo,
+                    key_prefix="ai_accountant_monitor",
+                    timezone_key="ai_accountant_monitor_timezone",
+                    local_time_key="ai_accountant_monitor_local_time",
+                    default_timezone=_app_default_timezone(repo),
+                    default_local_time="08:30",
+                )
+                _mark_daily_job_attempt(
+                    repo,
+                    key_prefix="ai_accountant_monitor",
+                    actor=settings.sync_runner_actor,
+                    local_date=local_date,
+                    success=False,
+                )
+            else:
+                _due, local_now, _local_date = _is_interval_job_due(
+                    repo,
+                    key_prefix="ai_accountant_monitor",
+                    timezone_key="ai_accountant_monitor_timezone",
+                    interval_hours_key="ai_accountant_monitor_interval_hours",
+                    default_timezone=_app_default_timezone(repo),
+                    default_interval_hours=6,
+                )
+                _mark_interval_job_attempt(
+                    repo,
+                    key_prefix="ai_accountant_monitor",
+                    actor=settings.sync_runner_actor,
+                    local_now=local_now,
+                    success=False,
+                )
+            repo.log_integration_event(
+                actor=settings.sync_runner_actor,
+                integration="ai_accountant",
+                action="monitor",
+                status="error",
+                details={
+                    "error": str(exc)[:500],
+                    "local_time": local_now.isoformat(timespec="seconds"),
+                    "schedule_mode": schedule_mode,
+                },
+            )
+        except Exception:
+            pass
+        _log(f"AI Accountant monitor failed: {exc}")
+    finally:
+        db.close()
+
+
 def _run_lifecycle_archive_cleanup() -> None:
     db = SessionLocal()
     try:
@@ -1091,6 +1465,7 @@ def run_once() -> None:
     _run_governance_snapshot_schedule()
     _run_scheduled_db_backup()
     _run_daily_slack_report()
+    _run_ai_accountant_monitor_schedule()
     _run_notification_outbox()
     _run_notification_outbox_cleanup()
     _run_lifecycle_archive_cleanup()

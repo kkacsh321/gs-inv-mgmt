@@ -50,6 +50,10 @@ Status key:
   - Listing Wizard direct-post now uses shared payload helper + regression tests to keep fixed/auction payload semantics stable across refactors.
   - Added Listings category-assist apply hardening so suggested eBay category IDs reliably populate form state before publish/revise.
   - Added default bullion/coin item-specific key `Circulated/Uncirculated` to reduce required-aspect publish blockers.
+  - Added eBay Taxonomy required item-specifics lookup with DB cache (`ebay_category_aspects`), automatic cached hydration, and readiness/publish blockers for missing cached required specifics.
+  - Added explicit `Main eBay Image` selection in Listing Wizard and Listings publish/revise; selected image is ordered first in eBay `imageUrls`, and publish/revise/direct-post success persists the selected main-image metadata for audit review.
+  - Hardened EPS image handling so Listing Wizard direct post and Listings publish/revise stay eBay-hosted only: transient Media API failures retry before publish, URL import is used only as another EPS hosting path, and failed EPS hosting blocks before inventory publish instead of falling back to self-hosted URLs.
+  - Hardened eBay listing video handling: MP4 upload plus MOV/QuickTime conversion, eBay-required upload headers, Inventory/Trading API video ID verification, UI diagnostics, and non-blocking warnings when publish proceeds image-only because no supported video is selected.
   - Production evidence pass is complete from small-scale live usage; continue collecting integrity-check captures as routine operational evidence.
 - [x] **GS-V10-012 eBay fee economics + P&L traceability**
   - Listings and Listing Wizard now provide upfront estimated fee cards (gross/fees/net/fee%) with persisted estimate snapshots in listing metadata.
@@ -81,8 +85,8 @@ This is a code/config-derived prefill to accelerate owner/evidence completion.
 | Coverage gates | Implemented | V1 checklist shows global/scoped gates enforced (`>=38%` global, `>=88%` scoped-core) | Ratchet toward release target and attach latest coverage artifact |
 | Playwright critical suite | Done | Latest local evidence: `8 passed / 1 skipped` (admin-go-live is skip-safe on env/admin-auth mismatch); CI evidence step present | Run full Playwright suite in CI for current release tag/branch, attach link, and confirm admin-go-live behavior with explicit admin creds |
 | eBay OAuth in-app flow | Implemented | In-app callback code exchange + token persistence is implemented | Validate in Dev/Prod account contexts and attach screenshots/log evidence |
-| eBay connection health telemetry | Implemented, not active locally | `ebay_connection_health_check` job + status cards added | Enable scheduler in target env (`SYNC_RUNNER_ENABLED=true`) and collect first health run evidence |
-| Sync worker scheduler | Blocked locally by config | `.env` currently `SYNC_RUNNER_ENABLED=false` | Enable in Dev/Prod and verify cadence jobs execute |
+| eBay connection health telemetry | Implemented, not active locally | `ebay_connection_health_check` job + status cards added; transient DNS/network failures are warning/partial instead of auth/data failures | Enable scheduler in target env (`SYNC_RUNNER_ENABLED=true`) and collect first health run evidence |
+| Sync worker scheduler | Default-on | `SYNC_RUNNER_ENABLED` now defaults to `true` in app config, `.env.example`, and Kubernetes base config | Verify cadence jobs execute in each deployed environment and explicitly set `SYNC_RUNNER_ENABLED=false` only for paused workers |
 | Session persistence across restart | Blocked locally by config | `.env` currently `APP_AUTH_COOKIE_ENABLED=false` | Enable cookie-backed remember mode in target env and capture restart persistence evidence |
 | eBay environment fidelity | Local test mode only | `.env` currently `EBAY_ENVIRONMENT=sandbox` | Validate full prod account flow in Dev/Prod with production eBay credentials and policies |
 | Shipping live-provider validation | Done | Live validation executed during small-scale production testing (Apr 13, 2026) | Continue normal evidence export cadence |
@@ -142,6 +146,61 @@ This is a code/config-derived prefill to accelerate owner/evidence completion.
 - [x] Complete commerce/legal sign-offs (tax treatment, record retention, marketplace policy, role controls).
 - [x] eBay operator UX consolidation (dedicated Templates page + Listing Wizard with optional direct single-listing post + reusable wizard eBay post profiles).
 - [x] AI-first workflow readiness (in-flow assists with approval/audit guardrails) for listing/intake operations.
+- [~] Accounting model verification + AI Accountant readiness.
+  - Deterministic dashboard/Reports profit math now uses `gross + shipping charged - fees - label spend - COGS`.
+  - Cost basis now honors explicit lot-assignment costs, remaining lot-total allocation for blank assignments, product landed acquisition cost, then `product_cost` fallback.
+  - Multi-lot product repurchases now use time-aware FIFO sale COGS and FIFO remaining lot cost for inventory value, preventing sales from consuming later repurchase lots.
+  - Mixed-value lots now support exact assignment allocated dollars and assignment allocation weights for proportional bulk-lot cost splits across different products.
+  - Purchase lots now support optional expected total quantity for whole-lot cost allocation, preventing partial check-ins from overstating early sale COGS when the lot is not fully assigned yet.
+  - Dashboard estimated profit now shows a cost-basis review warning when 30-day sold COGS includes equal fallback, mixed, or missing basis so partially checked-in lots do not silently make profit appear wrong.
+  - Reports now includes an Accounting Review / Close Readiness panel for inventory value, sales net before COGS, FIFO COGS, profit before returns, estimated profit after returns, exception counts, reconciliation flags, fee-source fallback coverage, and shipping label-spend coverage.
+  - Reports now includes in-app Accounting Field Semantics for product cost fields, lot totals, assignment landed components, and FIFO remaining lot cost.
+  - Reports now includes an accounting exception queue for missing cost/fee/shipping evidence, fee-source fallback, nonpositive margins, and lot allocation anomalies.
+  - Reports now includes a deterministic Accounting Close Packet ZIP for accountant-review evidence.
+  - Ask/AI accounting snapshots now prefer FIFO/lot cost maps before product-level fallbacks, aligning AI-visible context with dashboard/Reports.
+  - QBO sales/refund staging exports now preserve COGS source, return COGS reversal, and estimated return profit impact; Accounting Close Readiness applies restocked return COGS reversals.
+  - Period-level drift checks now compare Accounting Close Readiness totals against QBO sales/refund staging exports, Dashboard Live Metrics 30-day totals, Slack-style daily/weekly business summary totals, and Ask/AI accounting snapshot 30-day totals when the selected Reports window matches each comparison window; results are included in the Accounting Close Packet, passed into Reports Copilot/AI Accountant structured review context, and drift warnings block close-ready status through a `Period Drift Warnings` close-readiness check.
+  - Accounting Close Formula Checks now verify profit before returns, return profit impact, and estimated profit after returns arithmetic, include the rows in close packets and AI Accountant citations, and block close-ready status if formula drift appears.
+  - Accounting Sales Component Checks now verify Sales Detail fee/shipping/label components tie to COGS & Margin close totals, include the rows in close packets and AI Accountant citations, and block close-ready status if component drift appears.
+  - Accounting Return Tie-Out Checks now verify Returns refund totals, QBO refund/adjustment staging, return COGS reversals, and staged return profit impact, include the rows in close packets and AI Accountant citations, and block close-ready status if return tie-out drift appears.
+  - Accounting Inventory Valuation Checks now verify stocked inventory landed-cost coverage, Inventory Snapshot value formulas, and close-readiness inventory value tie-out, include the rows in close packets and AI Accountant citations, and block close-ready status if valuation drift appears.
+  - Accounting Fee Evidence Checks now verify eBay Fee Reconciliation row/fee totals and Fee Source Priority rows tie to Sales Detail, flag sale-field fee fallback rows, include the rows in close packets and AI Accountant citations, and block close-ready status if fee-evidence drift appears.
+  - Accounting Shipping Evidence Checks now verify Sales Detail shipping charged/label spend ties to Shipping Economics detail and summary rows, validate shipping delta formulas, flag paid-shipping rows missing label spend, include the rows in close packets and AI Accountant citations, and block close-ready status if shipping-evidence drift appears.
+  - Accounting Reconciliation Tie-Out Checks now verify Reconciliation by Marketplace sales/return counts and totals tie to Sales Detail, Returns, net-after-return formulas, and close reconciliation flags, include the rows in close packets and AI Accountant citations, and block close-ready status if reconciliation tie-out drift appears.
+  - Accounting COGS Source Checks now verify Sold COGS Source Summary sale count, quantity, FIFO COGS, and profit before returns tie to COGS & Margin Detail and close readiness, include the rows in close packets and AI Accountant citations, and block close-ready status if sold COGS uses equal fallback or missing/unknown basis.
+  - Accounting Lot Allocation Checks now verify Lot Allocation Source Summary assignment count, quantity, and resolved landed cost tie to Lot Assignment detail and close readiness, include the rows in close packets and AI Accountant citations, and block close-ready status if lot assignments use equal fallback or missing/unknown basis.
+  - Accounting Exception Queue Checks now verify Accounting Exception Queue total/P0/P1 counts tie to close readiness, flag malformed queue rows, include the rows in close packets and AI Accountant citations, and keep P0 exceptions visibly blocking close-ready status.
+  - Accounting Margin Anomaly Checks now verify negative/nonpositive COGS & Margin rows tie to close readiness and `nonpositive_margin` exception evidence, include the rows in close packets and AI Accountant citations, and block close-ready status while margin anomalies remain unresolved.
+  - Accounting Close Consistency Checks now verify final close-readiness status, blocker/warning counts, blocker/warning text, and close-check fail/warn rows agree before close sign-off evidence is trusted.
+  - Accounting Close Packet Completeness Checks now verify required close-packet evidence artifacts are present and populated, include the rows in close packets and AI Accountant citations, and should be clear before close sign-off evidence is trusted.
+  - Accounting Close Packet Manifest Checks now verify selected close-packet prefixes and manifest row-count values match exported report dataframes, include the rows in close packets and AI Accountant citations, and should be clear before close sign-off evidence is trusted.
+  - Accounting Close Packet Hash Checks now add SHA-256 CSV hashes to the close packet manifest, verify selected packet artifacts have hash evidence, include the rows in close packets and AI Accountant citations, and should be clear before close sign-off evidence is trusted.
+  - Accounting Close Packet manifests now include stable `accounting_close_packet_evidence_hash_sha256` values derived from selected close CSV payloads, date range, and close summary for deterministic sign-off evidence references.
+  - Accounting Close Sign-Off Tracker now captures the Accounting Close Packet evidence hash, and Accounting Close Sign-Off Review compares approved sign-off hashes against the recalculated packet evidence hash to flag stale packet evidence.
+  - Reports now shows and exports an Accounting Close Packet Evidence Hash table and can record Accounting Close Sign-Off audit evidence directly from the close packet workflow.
+  - Accounting Close Sign-Off Review now warns when approved close sign-offs have packet references but no matching packet evidence hash, keeping incomplete deterministic evidence visible before approval is trusted.
+  - Accounting Close Sign-Off Review now compares approved sign-off exception counts against recalculated close total exceptions, flagging stale approvals when exception totals drift.
+  - Accounting Close Sign-Off Review now warns when approved close sign-offs are missing owner or sign-off date evidence, keeping monthly close approvals tied to accountable reviewer evidence.
+  - Accounting Close Sign-Off Review now validates approved sign-off dates are parseable, not before period end, and not future-dated before approval evidence is trusted.
+  - Reports now includes latest Accounting Close Sign-Off Tracker rows in close packet evidence and AI Accountant context, tying owner/date/packet evidence directly to the close-readiness review.
+  - Reports now includes Accounting Close Sign-Off Review evidence in close packets and AI Accountant citations, warning when approved sign-offs are stale relative to recalculated readiness, blocker count, drift warning count, or packet/evidence references.
+  - Next hardening step: run production-sample close review before sign-off.
+  - Remaining before close-ready sign-off: accountant/human review against production samples and completed monthly close owner/date evidence in the Accounting Close Sign-Off Tracker, including readiness status, blocker count, and period drift warning count.
+- [ ] Tax reporting + guidance readiness.
+  - Scope tracked in `GS-V10-021`: tax review workspace, monthly/quarterly tax packet exports, tax exception checks, saved tax profiles, tax reporting sign-offs, and role-gated AI tax/accounting guidance.
+  - First packet/export foundation is live; Admin and Reports now capture tax profiles/sign-off evidence with Go-Live Evidence Pack artifacts (`tax_profiles.csv`, `tax_reporting_signoffs.csv`).
+  - Reports can apply saved tax profiles to tax review assumptions, includes selected profile metadata in Tax Review Packet evidence, and reviews approved tax sign-offs against current packet/profile/exception evidence.
+  - Reports includes tax reporting sign-off evidence and Tax Reporting Sign-Off Review evidence in Tax Review and Accounting Close packets.
+  - Reports Copilot and AI Accountant review now cite tax assumptions, selected tax profile evidence, tax reporting sign-off rows, and Tax Reporting Sign-Off Review evidence while preserving advisory-only boundaries; both render structured JSON sections as readable bullets while retaining raw JSON for audit/debug review and tolerate fenced/prefaced JSON wrappers.
+  - Reports Copilot review runs now write read-only audit events with deterministic prompt/data-scope hashes, packet evidence hashes, and cited tax/accounting row counts.
+  - AI Accountant audit metadata now records deterministic prompt/data-scope hashes, packet evidence hashes, context keys, and compact cited row-count scope metadata for tax/accounting review traceability.
+  - Reports Copilot and AI Accountant results now support accepted/edited/rejected feedback audit events tied to the response hash and original review metadata.
+  - Reports now surfaces AI Review Outcome Evidence from audit logs, includes it in Accounting Close Packet exports, and passes it into AI Accountant context/citations.
+  - Accounting Close Readiness now blocks close-ready status when the latest Copilot/AI Accountant outcome per review type is `edited` or `rejected`.
+  - Accounting Close Sign-Off evidence now captures `ai_review_followup_count`, and Sign-Off Review warns when approved sign-offs no longer match recalculated AI review follow-up blockers.
+  - Reports close sign-off workflow now displays the readiness/blocker/drift/AI-review-follow-up snapshot that will be captured with the sign-off evidence.
+  - Next hardening step: production-sample tax/accounting review using packet/profile/sign-off evidence.
+  - Guidance boundary: in-app/AI tax outputs are advisory planning aids only; bullion/coin exemptions, shipping taxability, marketplace facilitator treatment, and local/state rules require tax-advisor validation before filing or remittance decisions.
 
 ## Go-Live Execution Board (Working Tracker)
 
@@ -161,6 +220,7 @@ Use this table as the operational board for the current release candidate.
 | Commerce | Not-sold listing outcome validation (no sale posted) | Dev | P0 |  |  | Done |  |  |
 | AI Workflow | Listing Wizard AI assist + approval/audit flow validation | Dev | P0 |  |  | Done |  |  |
 | Commerce | eBay fee estimate calibration (estimate vs actual) | Prod | P0 |  |  | Done |  | Small-scale production testing complete (2026-04-13) |
+| Accounting | Cost-basis/profit model sign-off + exception review | Dev/Prod | P0 |  |  | In Progress |  | Deterministic model patched; dashboard profit-basis warnings, Reports close-readiness panel, close packet, accounting exception queue, QBO COGS/return provenance, close-vs-QBO/dashboard/Slack/AI drift checks, FIFO-aware Ask/AI accounting context, AI Accountant review, Accounting Close Sign-Off Tracker, and close-packet sign-off evidence export are implemented; remaining work is production-sample human/accountant review and completed sign-off evidence |
 | AI Governance | Runtime model/profile fallback controls validated for listing/intake workflows | Dev/Prod | P1 |  |  | Done |  |  |
 | Lifecycle Governance | GS-V10-017 lifecycle retention policy sign-off entries completed (Dev/Prod) | Dev/Prod | P1 | Keith Kacsh | 2026-04-15 | Done | Internal go-live evidence pack (2026-04-15) -> `lifecycle_retention_policy_signoffs.csv` | Admin tracker + evidence-pack export (`lifecycle_retention_policy_signoffs.csv`) completed for closeout |
 | Legal/Tax | Tax treatment sign-off (including bullion/coin exemptions) | Prod | P0 | Keith Kacsh | 2026-04-15 | Done | Internal go-live evidence pack (2026-04-15) -> `commerce_legal_signoffs.csv` |  |

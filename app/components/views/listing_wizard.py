@@ -3,6 +3,7 @@ import hashlib
 import imghdr
 import re
 import statistics
+import time
 
 import requests
 import streamlit as st
@@ -27,14 +28,31 @@ from app.services.ai_quality import (
     is_weak_listing_title,
     load_ai_quality_policy,
 )
-from app.services.ebay_aspects import merge_ebay_aspects_defaults
-from app.services.ebay import EbayClient
+from app.services.ebay_aspects import (
+    merge_ebay_aspects_defaults,
+    missing_required_ebay_aspects,
+    normalize_ebay_category_aspect_rows,
+)
+from app.services.ebay import (
+    EBAY_DEFAULT_INVENTORY_CONDITIONS,
+    EBAY_MAX_CONDITION_DESCRIPTION_CHARS,
+    EbayClient,
+    ebay_condition_label,
+    normalize_ebay_condition_policy_rows,
+)
 from app.services.ebay_fee_estimator import estimate_ebay_fees
 from app.services.listing_readiness import evaluate_ebay_readiness
 from app.services.llm_runtime import resolve_comp_llm_runtime_chain
 from app.services.media_storage import MediaStorageService
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
 from app.services.spot_price import SpotPriceService
+from app.services.video_processing import (
+    is_ebay_video_upload_candidate,
+    is_mov_video_media,
+    is_mp4_video_media,
+    mp4_filename_for_media,
+    transcode_mov_to_mp4,
+)
 from app.services.workflow_contracts import build_listing_draft_payload, extract_listing_draft_payload
 from app.utils.time import utcnow_naive
 
@@ -69,6 +87,9 @@ LISTING_WIZARD_DRAFT_SESSION_KEYS = [
     "listing_wizard_mode",
     "listing_wizard_price",
     "listing_wizard_quantity",
+    "listing_wizard_bundle_enabled",
+    "listing_wizard_bundle_primary_qty",
+    "listing_wizard_bundle_extra_product_labels",
     "listing_wizard_category_id",
     "listing_wizard_auction_duration",
     "listing_wizard_auction_start",
@@ -94,6 +115,8 @@ LISTING_WIZARD_DRAFT_SESSION_KEYS = [
     "listing_wizard_ebay_content_language",
     "listing_wizard_ebay_condition",
     "listing_wizard_ebay_use_eps_images",
+    "listing_wizard_ebay_upload_video",
+    "listing_wizard_primary_image_ref",
     "listing_wizard_shipping_service",
     "listing_wizard_handling_days",
     "listing_wizard_shipping_cost",
@@ -145,6 +168,52 @@ def _wizard_option_for_product_id(options: dict[str, int], product_id: int | Non
         except Exception:
             continue
     return None
+
+
+def _merge_product_rows(*groups: list[object]) -> list[object]:
+    merged: list[object] = []
+    seen: set[int] = set()
+    for group in groups:
+        for row in group or []:
+            try:
+                product_id = int(getattr(row, "id", 0) or 0)
+            except Exception:
+                product_id = 0
+            if product_id <= 0 or product_id in seen:
+                continue
+            seen.add(product_id)
+            merged.append(row)
+    return merged
+
+
+def _load_listing_wizard_product_rows(
+    repo: InventoryRepository,
+    *,
+    search_query: str = "",
+    selected_product_id: int | None = None,
+    recent_limit: int = 75,
+    search_limit: int = 100,
+) -> list[object]:
+    recent_rows = list(repo.list_products(limit=max(1, int(recent_limit or 75))) or [])
+    query = str(search_query or "").strip()
+    search_rows: list[object] = []
+    if query:
+        search_rows = list(
+            repo.list_products(
+                search_query=query,
+                limit=max(1, int(search_limit or 100)),
+            )
+            or []
+        )
+    selected_rows: list[object] = []
+    if selected_product_id:
+        try:
+            selected_id = int(selected_product_id or 0)
+        except Exception:
+            selected_id = 0
+        if selected_id > 0:
+            selected_rows = list(repo.list_products(product_ids=[selected_id], limit=1) or [])
+    return _merge_product_rows(selected_rows, search_rows, recent_rows)
 
 
 def _wizard_option_for_template_id(template_lookup: dict[str, object], template_id: int | None) -> str | None:
@@ -425,6 +494,33 @@ def _known_unit_cost(product: object | None) -> float:
         return 0.0
 
 
+def _bundle_component(product: object, quantity_per_listing: int) -> dict[str, object]:
+    units = max(1, int(quantity_per_listing or 1))
+    return {
+        "product_id": int(getattr(product, "id", 0) or 0),
+        "sku": str(getattr(product, "sku", "") or "").strip(),
+        "title": str(getattr(product, "title", "") or "").strip(),
+        "quantity_per_listing": units,
+        "current_quantity": int(getattr(product, "current_quantity", 0) or 0),
+    }
+
+
+def _bundle_expected_unit_cost(bundle_metadata: dict, product_by_id: dict[int, object]) -> float:
+    if not bool((bundle_metadata or {}).get("enabled")):
+        return 0.0
+    total = 0.0
+    for component in list((bundle_metadata or {}).get("components") or []):
+        if not isinstance(component, dict):
+            continue
+        try:
+            product_id = int(component.get("product_id") or 0)
+            qty = max(1, int(component.get("quantity_per_listing") or 1))
+        except Exception:
+            continue
+        total += _known_unit_cost(product_by_id.get(product_id)) * qty
+    return round(max(0.0, total), 2)
+
+
 def _expected_net_score(
     *,
     fee_estimate: dict,
@@ -457,6 +553,57 @@ def _expected_net_score(
         "expected_net": expected_net,
         "expected_margin_pct_of_gross": expected_margin_pct,
         "score": score,
+    }
+
+
+def _build_listing_bundle_metadata(
+    *,
+    enabled: bool,
+    primary_product: object | None,
+    units_per_listing: int,
+    available_lots: int,
+    additional_components: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    lots = max(1, int(available_lots or 1))
+    if not enabled or primary_product is None:
+        return {
+            "enabled": False,
+            "components": [],
+            "units_per_listing_total": 1,
+            "available_lots": lots,
+            "inventory_units_committed": lots,
+        }
+    product_id = int(getattr(primary_product, "id", 0) or 0)
+    component = _bundle_component(primary_product, units_per_listing)
+    components = [component]
+    for extra in list(additional_components or []):
+        if not isinstance(extra, dict):
+            continue
+        try:
+            extra_product_id = int(extra.get("product_id") or 0)
+            extra_units = max(1, int(extra.get("quantity_per_listing") or 1))
+        except Exception:
+            continue
+        if extra_product_id <= 0 or extra_product_id == product_id:
+            continue
+        components.append(
+            {
+                "product_id": extra_product_id,
+                "sku": str(extra.get("sku") or "").strip(),
+                "title": str(extra.get("title") or "").strip(),
+                "quantity_per_listing": extra_units,
+                "current_quantity": max(0, int(extra.get("current_quantity") or 0)),
+            }
+        )
+    units_total = sum(max(1, int(row.get("quantity_per_listing") or 1)) for row in components)
+    return {
+        "enabled": True,
+        "kind": "mixed_product_bundle" if len(components) > 1 else "single_product_lot",
+        "primary_product_id": product_id,
+        "components": components,
+        "units_per_listing_total": units_total,
+        "available_lots": lots,
+        "inventory_units_committed": units_total * lots,
     }
 
 
@@ -612,15 +759,33 @@ def _uploaded_file_bytes(uploaded_file) -> bytes:
     return uploaded_file.read()
 
 
-def _is_supported_vision_image(payload: bytes, content_type: str) -> bool:
+def _resolve_vision_mime(payload: bytes, content_type: str) -> str:
     blob = payload or b""
     if not blob:
-        return False
+        return ""
     ctype = str(content_type or "").strip().lower()
+    if ";" in ctype:
+        ctype = ctype.split(";", 1)[0].strip()
+    if ctype == "image/jpg":
+        ctype = "image/jpeg"
     if ctype.startswith("image/svg"):
-        return False
+        return ""
     detected = str(imghdr.what(None, h=blob[:2048]) or "").strip().lower()
-    return detected in {"jpeg", "png", "gif", "webp"}
+    detected_mime = {
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }.get(detected, "")
+    if detected_mime:
+        return detected_mime
+    if ctype in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+        return ctype
+    return ""
+
+
+def _is_supported_vision_image(payload: bytes, content_type: str) -> bool:
+    return bool(_resolve_vision_mime(payload, content_type))
 
 
 def _sanitize_preview_html(value: str) -> str:
@@ -661,6 +826,427 @@ def _wizard_normalize_aspects_payload(raw_text: str) -> dict[str, list[str]]:
         if vals:
             out[name] = vals
     return out
+
+
+def _wizard_norm_aspect_name(value: object) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _wizard_category_aspect_table_rows(
+    category_aspects: list[dict[str, object]],
+    existing_aspects: dict[str, list[str]],
+) -> list[dict[str, object]]:
+    existing_keys = {
+        _wizard_norm_aspect_name(key): values for key, values in (existing_aspects or {}).items()
+    }
+    rows: list[dict[str, object]] = []
+    for row in normalize_ebay_category_aspect_rows(category_aspects):
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        values = row.get("values") or []
+        current_values = existing_keys.get(_wizard_norm_aspect_name(name)) or []
+        rows.append(
+            {
+                "aspect": name,
+                "required": "yes" if bool(row.get("required")) else "no",
+                "status": "filled" if current_values else "missing",
+                "usage": str(row.get("usage") or ""),
+                "mode": str(row.get("mode") or ""),
+                "allowed_values": ", ".join(str(value) for value in values[:8]),
+            }
+        )
+    return rows
+
+
+def _wizard_category_aspect_input_key(prefix: str, aspect_name: str) -> str:
+    digest = hashlib.sha1(str(aspect_name or "").strip().lower().encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{digest}"
+
+
+def _wizard_condition_option_labels(
+    condition_rows: list[dict[str, object]],
+    current_condition: str = "",
+) -> dict[str, str]:
+    rows = condition_rows if isinstance(condition_rows, list) else []
+    labels: dict[str, str] = {}
+    for row in rows:
+        condition = str((row or {}).get("condition") or "").strip().upper()
+        if not condition:
+            continue
+        label = str((row or {}).get("label") or "").strip() or ebay_condition_label(condition)
+        condition_id = str((row or {}).get("condition_id") or "").strip()
+        labels[condition] = f"{label} ({condition})" + (f" / eBay ID {condition_id}" if condition_id else "")
+    if not labels:
+        labels = {condition: ebay_condition_label(condition) for condition in EBAY_DEFAULT_INVENTORY_CONDITIONS}
+    current = str(current_condition or "").strip().upper()
+    if current and current not in labels:
+        labels[current] = f"{ebay_condition_label(current)} ({current}) - not in loaded category policy"
+    return labels
+
+
+def _wizard_condition_options(condition_rows: list[dict[str, object]], current_condition: str = "") -> list[str]:
+    labels = _wizard_condition_option_labels(condition_rows, current_condition)
+    ordered = [str((row or {}).get("condition") or "").strip().upper() for row in (condition_rows or [])]
+    options = [condition for condition in ordered if condition in labels]
+    if not options:
+        options = [condition for condition in EBAY_DEFAULT_INVENTORY_CONDITIONS if condition in labels]
+    current = str(current_condition or "").strip().upper()
+    if current and current not in options:
+        options.append(current)
+    return options
+
+
+def _wizard_is_condition_valid_for_loaded_policy(condition_rows: list[dict[str, object]], condition: str) -> bool:
+    if not condition_rows:
+        return True
+    allowed = {str((row or {}).get("condition") or "").strip().upper() for row in condition_rows}
+    return str(condition or "").strip().upper() in allowed
+
+
+def _wizard_order_media_rows_for_primary(media_rows: list[object], primary_ref: str) -> list[object]:
+    rows = list(media_rows or [])
+    ref = str(primary_ref or "").strip()
+    if not rows or not ref:
+        return rows
+    if ref.startswith("media:"):
+        try:
+            primary_id = int(ref.split(":", 1)[1])
+        except Exception:
+            primary_id = 0
+        if primary_id > 0:
+            return sorted(rows, key=lambda row: 0 if int(getattr(row, "id", 0) or 0) == primary_id else 1)
+    if ref.startswith("upload:"):
+        filename = ref.split(":", 1)[1].strip()
+        if filename:
+            return sorted(
+                rows,
+                key=lambda row: (
+                    0 if str(getattr(row, "original_filename", "") or "").strip() == filename else 1
+                ),
+            )
+    return rows
+
+
+def _wizard_primary_image_metadata(media_rows: list[object], primary_ref: str) -> dict[str, object]:
+    rows = list(media_rows or [])
+    primary_media = rows[0] if rows else None
+    ref = str(primary_ref or "").strip()
+    return {
+        "primary_image_ref": ref,
+        "primary_image_media_id": int(getattr(primary_media, "id", 0) or 0)
+        if primary_media is not None
+        else 0,
+        "primary_image_filename": str(getattr(primary_media, "original_filename", "") or "").strip()
+        if primary_media is not None
+        else "",
+    }
+
+
+def _wizard_ebay_image_url_from_result(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    direct = str(result.get("imageUrl") or "").strip()
+    if direct:
+        return direct
+    nested = result.get("image")
+    if isinstance(nested, dict):
+        return str(nested.get("imageUrl") or "").strip()
+    return ""
+
+
+def _wizard_is_transient_ebay_media_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in [
+            " 500 ",
+            " 502 ",
+            " 503 ",
+            " 504 ",
+            "internal server error",
+            "service unavailable",
+            "gateway",
+            "timed out",
+            "timeout",
+            "temporarily",
+        ]
+    )
+
+
+def _wizard_create_eps_image_with_retry(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    media,
+    storage,
+    max_attempts: int = 3,
+) -> tuple[str, dict]:
+    original_url = str(getattr(media, "s3_url", "") or "").strip()
+    filename = str(getattr(media, "original_filename", "") or "image.jpg").strip() or "image.jpg"
+    content_type = str(getattr(media, "content_type", "") or "image/jpeg").strip() or "image/jpeg"
+    errors: list[str] = []
+
+    image_bytes, image_content_type, load_err = load_media_bytes(media, storage=storage)
+    if image_bytes is not None:
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            try:
+                image_result = ebay.create_image_from_file(
+                    access_token=access_token,
+                    file_bytes=image_bytes,
+                    filename=filename,
+                    content_type=image_content_type or content_type,
+                )
+                eps_url = _wizard_ebay_image_url_from_result(image_result)
+                if eps_url:
+                    return eps_url, {
+                        "media_asset_id": int(getattr(media, "id", 0) or 0),
+                        "filename": filename,
+                        "source_url": original_url,
+                        "eps_url": eps_url,
+                        "mode": "file_upload",
+                        "attempts": attempt,
+                    }
+                raise RuntimeError("No imageUrl returned from eBay Media API file upload.")
+            except Exception as exc:
+                errors.append(f"file-upload attempt {attempt}: {exc}")
+                if attempt >= max_attempts or not _wizard_is_transient_ebay_media_error(exc):
+                    break
+                time.sleep(0.5 * attempt)
+    else:
+        errors.append(load_err or "media bytes unavailable")
+
+    if original_url.startswith("https://"):
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            try:
+                image_result = ebay.create_image_from_url(access_token=access_token, image_url=original_url)
+                eps_url = _wizard_ebay_image_url_from_result(image_result)
+                if eps_url:
+                    return eps_url, {
+                        "media_asset_id": int(getattr(media, "id", 0) or 0),
+                        "filename": filename,
+                        "source_url": original_url,
+                        "eps_url": eps_url,
+                        "mode": "url_import",
+                        "attempts": attempt,
+                    }
+                raise RuntimeError("No imageUrl returned from eBay Media API URL import.")
+            except Exception as exc:
+                errors.append(f"url-import attempt {attempt}: {exc}")
+                if attempt >= max_attempts or not _wizard_is_transient_ebay_media_error(exc):
+                    break
+                time.sleep(0.5 * attempt)
+    else:
+        errors.append("URL import unavailable because media has no public HTTPS URL.")
+
+    raise RuntimeError("eBay EPS image hosting failed; direct/self-hosted image fallback is disabled. " + " | ".join(errors[:6]))
+
+
+def _wizard_is_mp4_video_media(media) -> bool:
+    return is_mp4_video_media(media)
+
+
+def _wizard_select_ebay_video_media(media_rows: list[object]) -> object | None:
+    for media in list(media_rows or []):
+        if str(getattr(media, "media_type", "") or "").strip().lower() != "video":
+            continue
+        if is_ebay_video_upload_candidate(media):
+            return media
+    return None
+
+
+def _wizard_video_upload_warning(upload_video_to_ebay: bool, video_rows: list[object]) -> str:
+    if not bool(upload_video_to_ebay):
+        return ""
+    rows = list(video_rows or [])
+    if not rows:
+        return (
+            "Video upload was enabled, but no video media was linked to the created listing draft. "
+            "Attach/select an MP4 or MOV listing video and retry."
+        )
+    if _wizard_select_ebay_video_media(rows) is None:
+        return (
+            "Attached listing video media exists, but no supported MP4/MOV video was found for eBay upload. "
+            "Attach/select an MP4 video or MOV/QuickTime video and retry."
+        )
+    return ""
+
+
+def _wizard_upload_ebay_video_with_retry(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    media,
+    storage,
+    listing_title: str,
+    max_attempts: int = 3,
+    status_checks: int = 30,
+    status_sleep_seconds: float = 3.0,
+) -> tuple[str, dict]:
+    if not is_ebay_video_upload_candidate(media):
+        raise RuntimeError("Only MP4 or MOV video upload is currently supported for eBay video attach.")
+
+    original_filename = str(getattr(media, "original_filename", "") or "listing-video.mp4").strip()
+    filename = mp4_filename_for_media(media)
+    content_type = str(getattr(media, "content_type", "") or "video/mp4").strip() or "video/mp4"
+    video_bytes, video_content_type, load_err = load_media_bytes(media, storage=storage)
+    if video_bytes is None:
+        raise RuntimeError(load_err or "Video bytes unavailable.")
+    converted_from = ""
+    if is_mov_video_media(media):
+        video_bytes = transcode_mov_to_mp4(video_bytes, filename=original_filename or "listing-video.mov")
+        video_content_type = "video/mp4"
+        content_type = "video/mp4"
+        converted_from = "mov"
+
+    errors: list[str] = []
+    for attempt in range(1, max(1, int(max_attempts)) + 1):
+        try:
+            video_id = ebay.create_video(
+                access_token=access_token,
+                title=filename,
+                size_bytes=len(video_bytes),
+                description=str(listing_title or filename).strip(),
+            )
+            ebay.upload_video(
+                access_token=access_token,
+                video_id=video_id,
+                file_bytes=video_bytes,
+            )
+            final_status = ""
+            for _ in range(max(1, int(status_checks))):
+                video_state = ebay.get_video(access_token=access_token, video_id=video_id)
+                final_status = str(video_state.get("status") or "").upper()
+                if final_status == "LIVE":
+                    return video_id, {
+                        "media_asset_id": int(getattr(media, "id", 0) or 0),
+                        "filename": filename,
+                        "original_filename": original_filename,
+                        "video_id": video_id,
+                        "status": final_status,
+                        "attempts": attempt,
+                        "converted_from": converted_from,
+                    }
+                if final_status in {"PROCESSING_FAILED", "BLOCKED"}:
+                    raise RuntimeError(f"Video status reached terminal failure state: {final_status}")
+                time.sleep(float(status_sleep_seconds))
+            raise RuntimeError(
+                "Video upload did not reach LIVE status within timeout. "
+                f"Last status: {final_status or 'unknown'}"
+            )
+        except Exception as exc:
+            errors.append(f"attempt {attempt}: {exc}")
+            if attempt >= max_attempts or not _wizard_is_transient_ebay_media_error(exc):
+                break
+            time.sleep(0.5 * attempt)
+    raise RuntimeError("eBay video upload failed. " + " | ".join(errors[:5]))
+
+
+def _wizard_verify_inventory_video_ids(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    sku: str,
+    expected_video_ids: list[str],
+    content_language: str = "en-US",
+    max_attempts: int = 3,
+    sleep_seconds: float = 1.0,
+) -> dict:
+    expected = [str(value or "").strip() for value in expected_video_ids if str(value or "").strip()]
+    if not expected:
+        return {"verified": True, "actual_video_ids": []}
+    last_payload: dict = {}
+    for attempt in range(1, max(1, int(max_attempts or 1)) + 1):
+        payload = ebay.get_inventory_item(
+            access_token=access_token,
+            sku=str(sku or "").strip(),
+            content_language=content_language,
+        )
+        last_payload = payload if isinstance(payload, dict) else {}
+        product_payload = last_payload.get("product") if isinstance(last_payload.get("product"), dict) else {}
+        actual = [str(value or "").strip() for value in product_payload.get("videoIds") or [] if str(value or "").strip()]
+        if all(video_id in actual for video_id in expected):
+            return {"verified": True, "actual_video_ids": actual, "attempts": attempt}
+        if attempt < max(1, int(max_attempts or 1)):
+            time.sleep(max(0.0, float(sleep_seconds or 0.0)))
+    product_payload = last_payload.get("product") if isinstance(last_payload.get("product"), dict) else {}
+    actual = [str(value or "").strip() for value in product_payload.get("videoIds") or [] if str(value or "").strip()]
+    raise RuntimeError(
+        "eBay inventory item did not retain listing videoIds after update. "
+        f"expected={expected}; actual={actual or []}"
+    )
+
+
+def _wizard_is_ebay_inventory_internal_error(exc: Exception) -> bool:
+    text = str(exc or "")
+    lowered = text.lower()
+    return (
+        "errorid\":25001" in lowered
+        or "core inventory service internal error" in lowered
+        or ("api_inventory" in lowered and "system error" in lowered)
+    )
+
+
+def _wizard_create_or_replace_inventory_item_with_fallback(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    sku: str,
+    payload: dict,
+    content_language: str,
+    preserve_video_ids: bool = False,
+) -> tuple[bool, str]:
+    try:
+        ebay.create_or_replace_inventory_item(
+            access_token=access_token,
+            sku=sku,
+            payload=payload,
+            content_language=content_language,
+        )
+        return False, ""
+    except Exception as exc:
+        if not _wizard_is_ebay_inventory_internal_error(exc):
+            raise
+        fallback_payload = dict(payload)
+        if isinstance(fallback_payload.get("product"), dict):
+            fallback_product = dict(fallback_payload["product"])
+            if not preserve_video_ids:
+                fallback_product.pop("videoIds", None)
+            fallback_payload["product"] = fallback_product
+        fallback_payload.pop("packageWeightAndSize", None)
+        time.sleep(1.0)
+        ebay.create_or_replace_inventory_item(
+            access_token=access_token,
+            sku=sku,
+            payload=fallback_payload,
+            content_language=content_language,
+        )
+        return True, str(exc)
+
+
+def _wizard_verify_trading_listing_video_ids(
+    *,
+    ebay: EbayClient,
+    access_token: str,
+    listing_id: str,
+    expected_video_ids: list[str],
+    marketplace_id: str = "EBAY_US",
+) -> dict:
+    expected = [str(value or "").strip() for value in expected_video_ids if str(value or "").strip()]
+    if not expected:
+        return {"verified": True, "actual_video_ids": []}
+    result = ebay.get_trading_item_video_ids(
+        access_token=access_token,
+        item_id=str(listing_id or "").strip(),
+        marketplace_id=marketplace_id,
+    )
+    actual = [str(value or "").strip() for value in result.get("video_ids") or [] if str(value or "").strip()]
+    if all(video_id in actual for video_id in expected):
+        return {**result, "verified": True, "actual_video_ids": actual}
+    raise RuntimeError(
+        "Trading GetItem did not return the expected listing video ID. "
+        f"listing_id={listing_id}; expected={expected}; actual={actual or []}"
+    )
 
 
 def _wizard_normalize_volume_pricing_tiers(
@@ -818,15 +1404,11 @@ def _wizard_external_listing_id_owner(
     ext_id = str(external_listing_id or "").strip()
     if not ext_id:
         return None
-    target_market = str(marketplace or "").strip().lower()
-    for row in repo.list_listings():
-        if int(getattr(row, "id", 0) or 0) == int(exclude_listing_id):
-            continue
-        if str(getattr(row, "marketplace", "") or "").strip().lower() != target_market:
-            continue
-        if str(getattr(row, "external_listing_id", "") or "").strip() == ext_id:
-            return int(getattr(row, "id", 0) or 0)
-    return None
+    return repo.find_listing_owner_by_external_id(
+        marketplace=marketplace,
+        external_listing_id=ext_id,
+        exclude_listing_id=int(exclude_listing_id),
+    )
 
 
 def _wizard_maybe_add_package_data(payload: dict, product) -> None:
@@ -888,8 +1470,8 @@ def _collect_uploaded_media_context(uploaded_files) -> tuple[list[tuple[bytes, s
         fname = str(getattr(f, "name", "") or "").strip()
         payload = _uploaded_file_bytes(f)
         if ctype.startswith("image/"):
-            resolved_type = ctype or "image/jpeg"
-            if _is_supported_vision_image(payload, resolved_type):
+            resolved_type = _resolve_vision_mime(payload, ctype or "image/jpeg")
+            if resolved_type:
                 uploaded_images.append((payload, resolved_type))
             continue
         if ctype.startswith("video/"):
@@ -914,8 +1496,9 @@ def _load_product_media_context(repo: InventoryRepository, storage: MediaStorage
             if storage is not None and storage.enabled and row.s3_bucket and row.s3_key:
                 blob, resolved_ct = storage.get_object_bytes(row.s3_bucket, row.s3_key)
                 resolved_content_type = resolved_ct or content_type
-                if _is_supported_vision_image(blob, resolved_content_type):
-                    images.append((blob, resolved_content_type))
+                normalized_mime = _resolve_vision_mime(blob, resolved_content_type)
+                if normalized_mime:
+                    images.append((blob, normalized_mime))
                 continue
         except Exception:
             pass
@@ -924,8 +1507,9 @@ def _load_product_media_context(repo: InventoryRepository, storage: MediaStorage
                 response = requests.get(str(row.s3_url), timeout=20)
                 response.raise_for_status()
                 resolved_ct = response.headers.get("Content-Type") or content_type
-                if _is_supported_vision_image(response.content, resolved_ct):
-                    images.append((response.content, resolved_ct))
+                normalized_mime = _resolve_vision_mime(response.content, resolved_ct)
+                if normalized_mime:
+                    images.append((response.content, normalized_mime))
             except Exception:
                 continue
     videos: list[dict] = []
@@ -962,8 +1546,9 @@ def _load_selected_product_media_context(
             if storage is not None and storage.enabled and row.s3_bucket and row.s3_key:
                 blob, resolved_ct = storage.get_object_bytes(row.s3_bucket, row.s3_key)
                 resolved_content_type = resolved_ct or content_type
-                if _is_supported_vision_image(blob, resolved_content_type):
-                    images.append((blob, resolved_content_type))
+                normalized_mime = _resolve_vision_mime(blob, resolved_content_type)
+                if normalized_mime:
+                    images.append((blob, normalized_mime))
                 continue
         except Exception:
             pass
@@ -972,8 +1557,9 @@ def _load_selected_product_media_context(
                 response = requests.get(str(row.s3_url), timeout=20)
                 response.raise_for_status()
                 resolved_ct = response.headers.get("Content-Type") or content_type
-                if _is_supported_vision_image(response.content, resolved_ct):
-                    images.append((response.content, resolved_ct))
+                normalized_mime = _resolve_vision_mime(response.content, resolved_ct)
+                if normalized_mime:
+                    images.append((response.content, normalized_mime))
             except Exception:
                 continue
 
@@ -1223,11 +1809,7 @@ def _wizard_queue_pending_field_updates(updates: dict | None) -> None:
 
 def _existing_ebay_listings_for_product(repo: InventoryRepository, product_id: int) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for listing in repo.list_listings():
-        if int(listing.product_id or 0) != int(product_id):
-            continue
-        if str(listing.marketplace or "").strip().lower() != "ebay":
-            continue
+    for listing in repo.list_listings_for_product(int(product_id), marketplace="ebay", limit=50):
         rows.append(
             {
                 "id": int(listing.id),
@@ -1499,6 +2081,17 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         "6) AI Assist (optional)  7) Preflight  8) Preview  9) Create Draft"
     )
     quality_policy = load_ai_quality_policy(repo)
+    product_media_rows_cache: dict[int, list[object]] = {}
+
+    def _product_media_rows_cached(product_id: int) -> list[object]:
+        resolved_product_id = int(product_id or 0)
+        if resolved_product_id <= 0:
+            return []
+        if resolved_product_id not in product_media_rows_cache:
+            product_media_rows_cache[resolved_product_id] = list(
+                repo.list_media_assets_for_product(resolved_product_id)
+            )
+        return list(product_media_rows_cache.get(resolved_product_id) or [])
 
     pending_resume_payload = st.session_state.pop("listing_wizard_resume_payload", None)
     if isinstance(pending_resume_payload, dict):
@@ -1531,11 +2124,6 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             or ""
         ).strip()
 
-    products = repo.list_products()
-    if not products:
-        st.info("Create at least one product before using Listing Wizard.")
-        return
-    product_by_id = {int(p.id): p for p in products}
     saved_draft = repo.load_workflow_draft(
         environment=settings.app_env,
         workflow_key=LISTING_WIZARD_WORKFLOW_KEY,
@@ -1615,15 +2203,44 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
 
     st.markdown("### Step 1 of 9: Select Product")
     force_restore_from_resume = bool(st.session_state.pop("listing_wizard_resume_applied_once", False))
-    product_options = build_product_options(products, include_none=False, include_id=True)
-    restored_product_label = _wizard_option_for_product_id(
-        product_options,
-        int(saved_context.get("selected_product_id") or saved_payload.get("selected_product_id") or 0),
+    saved_product_id = int(saved_context.get("selected_product_id") or saved_payload.get("selected_product_id") or 0)
+    current_product_id = _parse_product_id(st.session_state.get("listing_wizard_product"))
+    selected_product_id_for_load = int(current_product_id or saved_product_id or 0) or None
+    recent_product_limit = max(
+        10,
+        min(250, int(get_runtime_int(repo, "listing_wizard_recent_product_limit", 75))),
     )
+    if "listing_wizard_product_search" not in st.session_state:
+        st.session_state["listing_wizard_product_search"] = ""
+    product_search_query = st.text_input(
+        "Search Products",
+        key="listing_wizard_product_search",
+        placeholder="Search by SKU, title, category, material, or product ID",
+    )
+    products = _load_listing_wizard_product_rows(
+        repo,
+        search_query=product_search_query,
+        selected_product_id=selected_product_id_for_load,
+        recent_limit=recent_product_limit,
+        search_limit=100,
+    )
+    if not products:
+        st.info("Create at least one product before using Listing Wizard.")
+        return
+    product_by_id = {int(p.id): p for p in products}
+    product_options = build_product_options(products, include_none=False, include_id=True)
+    restored_product_label = _wizard_option_for_product_id(product_options, saved_product_id)
     if force_restore_from_resume and restored_product_label:
         st.session_state["listing_wizard_product"] = restored_product_label
     elif "listing_wizard_product" not in st.session_state and restored_product_label:
         st.session_state["listing_wizard_product"] = restored_product_label
+    elif st.session_state.get("listing_wizard_product") not in product_options and product_options:
+        current_label = _wizard_option_for_product_id(product_options, current_product_id)
+        st.session_state["listing_wizard_product"] = current_label or next(iter(product_options.keys()))
+    st.caption(
+        f"Dropdown is capped to the most recent {recent_product_limit} product(s)"
+        + (" plus search matches." if str(product_search_query or "").strip() else ".")
+    )
     selected_product_option = st.selectbox(
         "Product",
         options=list(product_options.keys()),
@@ -1949,6 +2566,117 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
     else:
         st.session_state["listing_wizard_quantity"] = 1
         st.caption("Quantity is fixed to 1 for auction listing formats.")
+    current_stock_qty = int(getattr(selected_product, "current_quantity", 0) or 0) if selected_product is not None else 0
+    bundle_enabled = bool(
+        st.checkbox(
+            "This listing is a product lot / bundle",
+            value=bool(st.session_state.get("listing_wizard_bundle_enabled")),
+            key="listing_wizard_bundle_enabled",
+            help=(
+                "Use when one marketplace listing unit contains multiple inventory units, "
+                "for example one eBay listing for a lot of 10 coins."
+            ),
+        )
+    )
+    bundle_primary_qty = 1
+    bundle_inventory_overcommit = False
+    bundle_metadata = _build_listing_bundle_metadata(
+        enabled=False,
+        primary_product=selected_product,
+        units_per_listing=1,
+        available_lots=int(listing_qty),
+    )
+    if bundle_enabled:
+        default_bundle_qty = max(1, min(max(1, current_stock_qty), int(st.session_state.get("listing_wizard_bundle_primary_qty") or 1)))
+        bundle_primary_qty = int(
+            st.number_input(
+                "Units of selected product per listing",
+                min_value=1,
+                max_value=max(1, current_stock_qty),
+                step=1,
+                value=default_bundle_qty,
+                key="listing_wizard_bundle_primary_qty",
+                help="How many units of the selected product are included in each single marketplace listing unit.",
+            )
+        )
+        bundle_extra_options = {
+            label: pid
+            for label, pid in product_options.items()
+            if int(pid or 0) != int(product_id or 0)
+        }
+        st.session_state["listing_wizard_bundle_extra_product_labels"] = [
+            label
+            for label in list(st.session_state.get("listing_wizard_bundle_extra_product_labels") or [])
+            if label in bundle_extra_options
+        ]
+        bundle_extra_labels = st.multiselect(
+            "Additional products in this bundle",
+            options=list(bundle_extra_options.keys()),
+            key="listing_wizard_bundle_extra_product_labels",
+            help=(
+                "Optional. Search products above to make more products available here, "
+                "then choose any extra products included in each bundle listing."
+            ),
+        )
+        additional_bundle_components: list[dict[str, object]] = []
+        for extra_label in bundle_extra_labels:
+            extra_product_id = int(bundle_extra_options.get(extra_label) or 0)
+            extra_product = product_by_id.get(extra_product_id)
+            if extra_product is None:
+                continue
+            extra_stock_qty = int(getattr(extra_product, "current_quantity", 0) or 0)
+            extra_qty = int(
+                st.number_input(
+                    f"Units of {getattr(extra_product, 'sku', '') or extra_product_id} per listing",
+                    min_value=1,
+                    max_value=max(1, extra_stock_qty),
+                    value=max(
+                        1,
+                        min(
+                            max(1, extra_stock_qty),
+                            int(st.session_state.get(f"listing_wizard_bundle_extra_qty_{extra_product_id}") or 1),
+                        ),
+                    ),
+                    step=1,
+                    key=f"listing_wizard_bundle_extra_qty_{extra_product_id}",
+                    help="How many units of this additional product are included in each bundle listing.",
+                )
+            )
+            additional_bundle_components.append(_bundle_component(extra_product, extra_qty))
+        bundle_metadata = _build_listing_bundle_metadata(
+            enabled=True,
+            primary_product=selected_product,
+            units_per_listing=int(bundle_primary_qty),
+            available_lots=int(listing_qty),
+            additional_components=additional_bundle_components,
+        )
+        committed_units = int(bundle_metadata.get("inventory_units_committed") or 0)
+        overcommitted_components: list[str] = []
+        for component in list(bundle_metadata.get("components") or []):
+            if not isinstance(component, dict):
+                continue
+            units_needed = max(1, int(component.get("quantity_per_listing") or 1)) * int(listing_qty)
+            stock_qty = max(0, int(component.get("current_quantity") or 0))
+            if units_needed > stock_qty:
+                overcommitted_components.append(
+                    f"{component.get('sku') or component.get('product_id')}: needs {units_needed}, stock {stock_qty}"
+                )
+        bundle_inventory_overcommit = bool(overcommitted_components)
+        composition_bits = [
+            f"{row.get('sku') or row.get('product_id')} x {int(row.get('quantity_per_listing') or 1)}"
+            for row in list(bundle_metadata.get("components") or [])
+            if isinstance(row, dict)
+        ]
+        st.caption(
+            f"Bundle composition per listing: {', '.join(composition_bits)}. "
+            f"{int(listing_qty)} available lot(s) commits {committed_units} total inventory unit(s)."
+        )
+        if bundle_inventory_overcommit:
+            st.warning(
+                "This bundle quantity exceeds current stock: "
+                + " | ".join(overcommitted_components)
+                + ". Reduce units per listing or available lot quantity before creating/publishing."
+            )
 
     st.markdown("#### Estimated eBay Fees (Pricing Assist)")
     ef1, ef2 = st.columns(2)
@@ -2022,16 +2750,21 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         f"promoted {float(wizard_fee_estimate.get('promoted_rate_percent') or 0.0):.2f}%."
     )
     known_unit_cost = _known_unit_cost(selected_product)
+    expected_net_unit_cost = (
+        _bundle_expected_unit_cost(bundle_metadata, product_by_id)
+        if bundle_enabled
+        else known_unit_cost
+    )
     expected_net = _expected_net_score(
         fee_estimate=wizard_fee_estimate,
         quantity=int(listing_qty),
-        known_unit_cost=float(known_unit_cost or 0.0),
+        known_unit_cost=float(expected_net_unit_cost or 0.0),
         estimated_local_shipping_cost_per_item=float(estimated_local_shipping_cost_per_item or 0.0),
     )
     st.markdown("##### Expected Net Score (Pre-Publish)")
     en1, en2, en3, en4 = st.columns(4)
     with en1:
-        st.metric("Known Unit Cost", f"${float(known_unit_cost or 0.0):,.2f}")
+        st.metric("Known Cost / Listing Unit", f"${float(expected_net_unit_cost or 0.0):,.2f}")
     with en2:
         st.metric("Est COGS Total", f"${float(expected_net.get('known_cogs_total') or 0.0):,.2f}")
     with en3:
@@ -2055,7 +2788,14 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         runtime_category_id=runtime_category_id,
         cached_suggestions=category_suggestions,
     )
+    seed_product_id = int(getattr(selected_product, "id", 0) or 0) if selected_product is not None else 0
     current_category_id = str(st.session_state.get("listing_wizard_category_id") or "").strip()
+    last_category_id = str(st.session_state.get("listing_wizard_last_category_id") or "").strip()
+    last_category_product_id = int(st.session_state.get("listing_wizard_last_category_product_id") or 0)
+    last_category_matches_product = not seed_product_id or not last_category_product_id or last_category_product_id == seed_product_id
+    if not current_category_id and last_category_id and last_category_matches_product:
+        current_category_id = last_category_id
+        st.session_state["listing_wizard_category_id"] = last_category_id
     current_category_label = next(
         (label for label, cid in category_label_to_id.items() if cid == current_category_id),
         "__manual__",
@@ -2070,6 +2810,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
     if selected_category_label != "__manual__":
         selected_id = str(category_label_to_id.get(selected_category_label) or current_category_id).strip()
         if selected_id and selected_id != str(st.session_state.get("listing_wizard_category_id") or "").strip():
+            st.session_state["listing_wizard_last_category_id"] = selected_id
+            st.session_state["listing_wizard_last_category_product_id"] = seed_product_id
             _wizard_queue_pending_field_updates({"listing_wizard_category_id": selected_id})
             st.rerun()
     selected_category_id = st.text_input(
@@ -2077,7 +2819,15 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         key="listing_wizard_category_id",
         help="Required for publish preflight. Select from dropdown or enter manually.",
     ).strip()
-    seed_product_id = int(getattr(selected_product, "id", 0) or 0) if selected_product is not None else 0
+    if selected_category_id:
+        st.session_state["listing_wizard_last_category_id"] = selected_category_id
+        st.session_state["listing_wizard_last_category_product_id"] = seed_product_id
+    else:
+        selected_category_id = (
+            str(st.session_state.get("listing_wizard_last_category_id") or "").strip()
+            if last_category_matches_product
+            else ""
+        )
     seed_query = _category_query_seed(
         title=str(getattr(selected_product, "title", "") or "").strip() if selected_product is not None else "",
         category=str(getattr(selected_product, "category", "") or "").strip() if selected_product is not None else "",
@@ -2148,6 +2898,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     if fresh:
                         next_category_id = str((fresh[0] or {}).get("category_id") or selected_category_id).strip()
                         if next_category_id:
+                            st.session_state["listing_wizard_last_category_id"] = next_category_id
+                            st.session_state["listing_wizard_last_category_product_id"] = seed_product_id
                             _wizard_queue_pending_field_updates({"listing_wizard_category_id": next_category_id})
                     else:
                         st.info("No category suggestions found for that query.")
@@ -2188,6 +2940,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         )
                         next_category_id = str((fresh[0] or {}).get("category_id") or selected_category_id).strip()
                         if next_category_id:
+                            st.session_state["listing_wizard_last_category_id"] = next_category_id
+                            st.session_state["listing_wizard_last_category_product_id"] = seed_product_id
                             _wizard_queue_pending_field_updates({"listing_wizard_category_id": next_category_id})
                         st.success(f"Refreshed {len(fresh)} category suggestion(s) from eBay.")
                     else:
@@ -2197,6 +2951,253 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     st.error(f"Category refresh failed: {exc}")
     if not selected_category_id:
         st.caption("Tip: choose a category above or fetch suggestions to satisfy preflight.")
+    category_aspect_rows = st.session_state.get("listing_wizard_category_aspect_rows")
+    if not isinstance(category_aspect_rows, list):
+        category_aspect_rows = []
+    aspect_cache_marketplace_id = str(
+        st.session_state.get("listing_wizard_ebay_marketplace_id")
+        or get_runtime_str(repo, "ebay_marketplace_id", settings.ebay_marketplace_id)
+        or "EBAY_US"
+    ).strip()
+    aspect_cache_signature = f"{aspect_cache_marketplace_id.upper()}:{selected_category_id}"
+    if selected_category_id and st.session_state.get("listing_wizard_category_aspect_signature") != aspect_cache_signature:
+        category_aspect_rows = []
+        st.session_state["listing_wizard_category_aspect_rows"] = category_aspect_rows
+        st.session_state["listing_wizard_category_aspect_signature"] = aspect_cache_signature
+    elif not selected_category_id and category_aspect_rows:
+        category_aspect_rows = []
+        st.session_state["listing_wizard_category_aspect_rows"] = []
+        st.session_state["listing_wizard_category_aspect_signature"] = ""
+    load_aspects_col, refresh_aspects_col, aspect_status_col = st.columns([1, 1, 2])
+    with load_aspects_col:
+        if st.button("Load Required Item Specifics", key="listing_wizard_load_required_aspects_btn"):
+            marketplace_id = str(
+                st.session_state.get("listing_wizard_ebay_marketplace_id")
+                or get_runtime_str(repo, "ebay_marketplace_id", settings.ebay_marketplace_id)
+                or "EBAY_US"
+            ).strip()
+            if not selected_category_id:
+                st.warning("Select or enter an eBay category ID first.")
+            else:
+                cached = repo.get_cached_ebay_category_aspects(
+                    environment=settings.app_env,
+                    marketplace_id=marketplace_id,
+                    category_id=selected_category_id,
+                )
+                if cached:
+                    category_aspect_rows = normalize_ebay_category_aspect_rows(cached.get("aspects") or [])
+                    st.session_state["listing_wizard_category_aspect_rows"] = category_aspect_rows
+                    st.session_state["listing_wizard_category_aspect_signature"] = aspect_cache_signature
+                    st.success(
+                        f"Loaded {len(category_aspect_rows)} cached category item specific(s)."
+                    )
+                else:
+                    access_token = get_runtime_str(
+                        repo, "ebay_user_access_token", settings.ebay_user_access_token
+                    ).strip()
+                    if not access_token:
+                        st.warning("Missing eBay user access token. Set it in Admin eBay Verify first.")
+                        st.stop()
+                    try:
+                        client = EbayClient()
+                        raw_aspects = client.get_item_aspects_for_category(
+                            access_token=access_token,
+                            category_id=selected_category_id,
+                            marketplace_id=marketplace_id,
+                        )
+                        category_aspect_rows = normalize_ebay_category_aspect_rows(raw_aspects)
+                        repo.cache_ebay_category_aspects(
+                            environment=settings.app_env,
+                            marketplace_id=marketplace_id,
+                            category_id=selected_category_id,
+                            aspects=category_aspect_rows,
+                            actor=user.username,
+                        )
+                        st.session_state["listing_wizard_category_aspect_rows"] = category_aspect_rows
+                        st.session_state["listing_wizard_category_aspect_signature"] = aspect_cache_signature
+                        required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+                        st.success(
+                            f"Loaded {len(category_aspect_rows)} category item specific(s) from eBay; "
+                            f"{required_count} required."
+                        )
+                    except Exception as exc:
+                        st.error(f"Required item specifics fetch failed: {exc}")
+    with refresh_aspects_col:
+        if st.button("Refresh Required Item Specifics", key="listing_wizard_refresh_required_aspects_btn"):
+            access_token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+            marketplace_id = str(
+                st.session_state.get("listing_wizard_ebay_marketplace_id")
+                or get_runtime_str(repo, "ebay_marketplace_id", settings.ebay_marketplace_id)
+                or "EBAY_US"
+            ).strip()
+            if not selected_category_id:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not access_token:
+                st.warning("Missing eBay user access token. Set it in Admin eBay Verify first.")
+            else:
+                try:
+                    client = EbayClient()
+                    raw_aspects = client.get_item_aspects_for_category(
+                        access_token=access_token,
+                        category_id=selected_category_id,
+                        marketplace_id=marketplace_id,
+                    )
+                    category_aspect_rows = normalize_ebay_category_aspect_rows(raw_aspects)
+                    repo.cache_ebay_category_aspects(
+                        environment=settings.app_env,
+                        marketplace_id=marketplace_id,
+                        category_id=selected_category_id,
+                        aspects=category_aspect_rows,
+                        actor=user.username,
+                    )
+                    st.session_state["listing_wizard_category_aspect_rows"] = category_aspect_rows
+                    st.session_state["listing_wizard_category_aspect_signature"] = aspect_cache_signature
+                    required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+                    st.success(
+                        f"Refreshed {len(category_aspect_rows)} category item specific(s) from eBay; "
+                        f"{required_count} required."
+                    )
+                except Exception as exc:
+                    st.error(f"Required item specifics fetch failed: {exc}")
+    with aspect_status_col:
+        if category_aspect_rows:
+            required_count = sum(1 for row in category_aspect_rows if bool((row or {}).get("required")))
+            st.caption(
+                f"eBay category aspects loaded for `{selected_category_id or '(no category)'}`: "
+                f"{required_count} required of {len(category_aspect_rows)} total."
+            )
+    local_category_aspects_cache: dict[tuple[str, str], list[dict]] = {}
+
+    def _wizard_required_specific_blockers(*, category_id_value: str, marketplace_id_value: str) -> list[str]:
+        category_id_clean = str(category_id_value or "").strip()
+        marketplace_id_clean = str(marketplace_id_value or aspect_cache_marketplace_id or "EBAY_US").strip()
+        if not category_id_clean:
+            return []
+        cache_key = (marketplace_id_clean.upper(), category_id_clean)
+        if cache_key not in local_category_aspects_cache:
+            cached = repo.get_cached_ebay_category_aspects(
+                environment=settings.app_env,
+                marketplace_id=marketplace_id_clean,
+                category_id=category_id_clean,
+            )
+            local_category_aspects_cache[cache_key] = (
+                normalize_ebay_category_aspect_rows((cached or {}).get("aspects") or [])
+                if cached
+                else []
+            )
+        rows = list(local_category_aspects_cache.get(cache_key) or [])
+        if not rows:
+            return []
+        aspects_payload = _wizard_normalize_aspects_payload(
+            st.session_state.get("listing_wizard_aspects_json") or ""
+        )
+        return [
+            f"Missing required eBay item specific: {str((row or {}).get('name') or '').strip()}"
+            for row in missing_required_ebay_aspects(rows, aspects_payload)
+            if str((row or {}).get("name") or "").strip()
+        ]
+
+    category_condition_rows = st.session_state.get("listing_wizard_category_condition_rows")
+    if not isinstance(category_condition_rows, list):
+        category_condition_rows = []
+    condition_policy_marketplace_id = str(
+        st.session_state.get("listing_wizard_ebay_marketplace_id")
+        or get_runtime_str(repo, "ebay_marketplace_id", settings.ebay_marketplace_id)
+        or "EBAY_US"
+    ).strip()
+    condition_policy_signature = f"{condition_policy_marketplace_id.upper()}:{selected_category_id}"
+    if (
+        selected_category_id
+        and st.session_state.get("listing_wizard_category_condition_signature") != condition_policy_signature
+    ):
+        category_condition_rows = []
+        st.session_state["listing_wizard_category_condition_rows"] = []
+        st.session_state["listing_wizard_category_condition_signature"] = condition_policy_signature
+    elif not selected_category_id and category_condition_rows:
+        category_condition_rows = []
+        st.session_state["listing_wizard_category_condition_rows"] = []
+        st.session_state["listing_wizard_category_condition_signature"] = ""
+
+    cond_col1, cond_col2, cond_col3 = st.columns([1, 1, 2])
+    with cond_col1:
+        if st.button("Load Category Conditions", key="listing_wizard_load_conditions_btn"):
+            access_token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+            if not selected_category_id:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not access_token:
+                st.warning("Missing eBay user access token. Set it in Admin eBay Verify first.")
+            else:
+                try:
+                    client = EbayClient()
+                    policies = client.get_item_condition_policies(
+                        access_token=access_token,
+                        category_id=selected_category_id,
+                        marketplace_id=condition_policy_marketplace_id,
+                    )
+                    category_condition_rows = normalize_ebay_condition_policy_rows(
+                        policies,
+                        category_id=selected_category_id,
+                    )
+                    st.session_state["listing_wizard_category_condition_rows"] = category_condition_rows
+                    st.session_state["listing_wizard_category_condition_signature"] = condition_policy_signature
+                    current_condition = str(st.session_state.get("listing_wizard_ebay_condition") or "").strip().upper()
+                    if category_condition_rows and not _wizard_is_condition_valid_for_loaded_policy(
+                        category_condition_rows,
+                        current_condition,
+                    ):
+                        st.session_state["listing_wizard_ebay_condition"] = str(category_condition_rows[0]["condition"])
+                    st.success(f"Loaded {len(category_condition_rows)} eBay category condition option(s).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Category condition fetch failed: {exc}")
+    with cond_col2:
+        if st.button("Refresh Category Conditions", key="listing_wizard_refresh_conditions_btn"):
+            access_token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+            if not selected_category_id:
+                st.warning("Select or enter an eBay category ID first.")
+            elif not access_token:
+                st.warning("Missing eBay user access token. Set it in Admin eBay Verify first.")
+            else:
+                try:
+                    client = EbayClient()
+                    policies = client.get_item_condition_policies(
+                        access_token=access_token,
+                        category_id=selected_category_id,
+                        marketplace_id=condition_policy_marketplace_id,
+                    )
+                    category_condition_rows = normalize_ebay_condition_policy_rows(
+                        policies,
+                        category_id=selected_category_id,
+                    )
+                    st.session_state["listing_wizard_category_condition_rows"] = category_condition_rows
+                    st.session_state["listing_wizard_category_condition_signature"] = condition_policy_signature
+                    current_condition = str(st.session_state.get("listing_wizard_ebay_condition") or "").strip().upper()
+                    if category_condition_rows and not _wizard_is_condition_valid_for_loaded_policy(
+                        category_condition_rows,
+                        current_condition,
+                    ):
+                        st.session_state["listing_wizard_ebay_condition"] = str(category_condition_rows[0]["condition"])
+                    st.success(f"Refreshed {len(category_condition_rows)} eBay category condition option(s).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Category condition refresh failed: {exc}")
+    with cond_col3:
+        if category_condition_rows:
+            st.caption(
+                f"eBay category conditions loaded for `{selected_category_id}`: "
+                + ", ".join(
+                    f"{row.get('label')} ({row.get('condition')})"
+                    for row in category_condition_rows[:6]
+                )
+            )
+        else:
+            st.caption(
+                "Category-specific condition policy not loaded yet. Load it before direct eBay post to avoid "
+                "eBay 25021 condition/category mismatches."
+            )
+    current_wizard_condition = str(st.session_state.get("listing_wizard_ebay_condition") or "NEW").strip().upper()
+    wizard_condition_options = _wizard_condition_options(category_condition_rows, current_wizard_condition)
+    wizard_condition_labels = _wizard_condition_option_labels(category_condition_rows, current_wizard_condition)
 
     listing_details = st.text_area(
         "Listing Details",
@@ -2204,47 +3205,58 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         height=180,
     )
     st.markdown("#### Item Specifics Defaults")
-    compact_aspects_preview = _wizard_normalize_aspects_payload(
-        st.session_state.get("listing_wizard_aspects_json") or ""
+    load_compact_aspects_defaults = st.checkbox(
+        "Load Suggested Item Specific Defaults (slower)",
+        value=False,
+        key="listing_wizard_load_compact_aspect_defaults",
+        help="Defers default item-specific merge/table rendering while editing basic listing details.",
     )
-    compact_defaults_payload, _compact_injected = merge_ebay_aspects_defaults(
-        category=str(getattr(selected_product, "category", "") or "").strip(),
-        metal_type=str(getattr(selected_product, "metal_type", "") or "").strip(),
-        title=str(listing_title or getattr(selected_product, "title", "") or "").strip(),
-        weight_oz=getattr(selected_product, "weight_oz", None),
-        existing_aspects=compact_aspects_preview,
-    )
-    compact_default_only_payload = {
-        key: values
-        for key, values in compact_defaults_payload.items()
-        if key not in compact_aspects_preview
-    }
-    if compact_default_only_payload:
-        st.caption("Suggested bullion/coin defaults:")
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {"aspect": k, "values": ", ".join(v)}
-                    for k, v in sorted(compact_default_only_payload.items(), key=lambda kv: kv[0].lower())
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
+    if not load_compact_aspects_defaults:
+        st.caption(
+            "Suggested item-specific defaults are deferred. Enable the checkbox above to preview/apply defaults."
         )
-        if st.button(
-            "Apply Suggested Default Aspects",
-            key="listing_wizard_aspect_apply_defaults_compact_btn",
-        ):
-            _wizard_queue_pending_field_updates(
-                {"listing_wizard_aspects_json": json.dumps(compact_defaults_payload, indent=2)}
-            )
-            st.session_state["listing_wizard_apply_flash"] = (
-                "Applied default bullion/coin item specifics: "
-                + ", ".join(sorted(compact_default_only_payload.keys(), key=str.lower))
-            )
-            st.rerun()
     else:
-        st.caption("Default item specifics are already applied or no defaults were detected.")
+        compact_aspects_preview = _wizard_normalize_aspects_payload(
+            st.session_state.get("listing_wizard_aspects_json") or ""
+        )
+        compact_defaults_payload, _compact_injected = merge_ebay_aspects_defaults(
+            category=str(getattr(selected_product, "category", "") or "").strip(),
+            metal_type=str(getattr(selected_product, "metal_type", "") or "").strip(),
+            title=str(listing_title or getattr(selected_product, "title", "") or "").strip(),
+            weight_oz=getattr(selected_product, "weight_oz", None),
+            existing_aspects=compact_aspects_preview,
+        )
+        compact_default_only_payload = {
+            key: values
+            for key, values in compact_defaults_payload.items()
+            if key not in compact_aspects_preview
+        }
+        if compact_default_only_payload:
+            st.caption("Suggested bullion/coin defaults:")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"aspect": k, "values": ", ".join(v)}
+                        for k, v in sorted(compact_default_only_payload.items(), key=lambda kv: kv[0].lower())
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if st.button(
+                "Apply Suggested Default Aspects",
+                key="listing_wizard_aspect_apply_defaults_compact_btn",
+            ):
+                _wizard_queue_pending_field_updates(
+                    {"listing_wizard_aspects_json": json.dumps(compact_defaults_payload, indent=2)}
+                )
+                st.session_state["listing_wizard_apply_flash"] = (
+                    "Applied default bullion/coin item specifics: "
+                    + ", ".join(sorted(compact_default_only_payload.keys(), key=str.lower))
+                )
+                st.rerun()
+        else:
+            st.caption("Default item specifics are already applied or no defaults were detected.")
 
     with st.expander("Advanced eBay Fields + Item Specifics (Optional)", expanded=True):
         st.text_input(
@@ -2256,8 +3268,18 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             "Condition Description",
             key="listing_wizard_condition_description",
             height=80,
-            help="Optional extra condition details for buyers.",
+            help=f"Optional extra condition details for buyers. eBay limit: {EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters.",
         )
+        condition_description_len = len(str(st.session_state.get("listing_wizard_condition_description") or ""))
+        if condition_description_len > EBAY_MAX_CONDITION_DESCRIPTION_CHARS:
+            st.error(
+                "Condition Description is too long for eBay: "
+                f"{condition_description_len}/{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters."
+            )
+        else:
+            st.caption(
+                f"Condition Description: {condition_description_len}/{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters."
+            )
         grading_prefill_msg = _ai_grading_prefill_status(
             current_value=st.session_state.get("listing_wizard_condition_description"),
             default_value=default_condition_description,
@@ -2320,6 +3342,74 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             )
         else:
             st.caption("No parsed item specifics yet.")
+
+        if category_aspect_rows:
+            table_rows = _wizard_category_aspect_table_rows(category_aspect_rows, aspects_preview)
+            required_table_rows = [row for row in table_rows if row.get("required") == "yes"]
+            missing_required_rows = missing_required_ebay_aspects(category_aspect_rows, aspects_preview)
+            if required_table_rows:
+                st.caption("Required item specifics from selected eBay category:")
+                st.dataframe(
+                    pd.DataFrame(required_table_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            if missing_required_rows:
+                st.warning(
+                    "Missing required item specifics: "
+                    + ", ".join(str(row.get("name") or "") for row in missing_required_rows)
+                )
+                missing_labels = [str(row.get("name") or "").strip() for row in missing_required_rows]
+                selected_missing = st.selectbox(
+                    "Required Specific",
+                    options=missing_labels,
+                    key="listing_wizard_required_aspect_select",
+                )
+                selected_missing_row = next(
+                    (
+                        row
+                        for row in missing_required_rows
+                        if str(row.get("name") or "").strip() == selected_missing
+                    ),
+                    {},
+                )
+                allowed_values = [
+                    str(value or "").strip()
+                    for value in (selected_missing_row.get("values") or [])
+                    if str(value or "").strip()
+                ]
+                if allowed_values:
+                    required_value = st.selectbox(
+                        "Required Specific Value",
+                        options=[""] + allowed_values,
+                        key=_wizard_category_aspect_input_key(
+                            "listing_wizard_required_aspect_value", selected_missing
+                        ),
+                    )
+                else:
+                    required_value = st.text_input(
+                        "Required Specific Value",
+                        key=_wizard_category_aspect_input_key(
+                            "listing_wizard_required_aspect_value", selected_missing
+                        ),
+                    )
+                if st.button("Apply Required Specific", key="listing_wizard_apply_required_aspect_btn"):
+                    if not selected_missing:
+                        st.warning("Select a required item specific first.")
+                    elif not str(required_value or "").strip():
+                        st.warning("Enter a value before applying.")
+                    else:
+                        next_payload = dict(aspects_preview)
+                        next_payload[selected_missing] = [str(required_value).strip()]
+                        _wizard_queue_pending_field_updates(
+                            {"listing_wizard_aspects_json": json.dumps(next_payload, indent=2)}
+                        )
+                        st.session_state["listing_wizard_apply_flash"] = (
+                            f"Applied required item specific `{selected_missing}`."
+                        )
+                        st.rerun()
+            elif required_table_rows:
+                st.success("All loaded required item specifics are filled.")
 
         asp1, asp2 = st.columns(2)
         with asp1:
@@ -2602,8 +3692,9 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         allow_enhanced=True,
     )
     selected_existing_media_ids: list[int] = []
+    primary_image_options: dict[str, str] = {"Auto": ""}
     if selected_product is not None:
-        product_media_rows = repo.list_media_assets_for_product(int(selected_product.id))
+        product_media_rows = _product_media_rows_cached(int(selected_product.id))
         attachable_rows = sorted(
             [row for row in product_media_rows if row.listing_id in {None, 0}],
             key=lambda row: int(row.id),
@@ -2632,6 +3723,24 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     key="listing_wizard_existing_media_select",
                 )
                 selected_existing_media_ids = [media_options[label] for label in selected_labels if label in media_options]
+                selected_existing_image_labels = {
+                    label: f"media:{media_options[label]}"
+                    for label in selected_labels
+                    if label in media_options
+                    and str(
+                        next(
+                            (
+                                row.media_type
+                                for row in attachable_rows
+                                if int(row.id) == int(media_options[label])
+                            ),
+                            "",
+                        )
+                        or ""
+                    ).strip().lower()
+                    == "image"
+                }
+                primary_image_options.update(selected_existing_image_labels)
                 st.caption(
                     f"Selected existing media: {len(selected_existing_media_ids)} / {len(attachable_rows)}"
                 )
@@ -2651,32 +3760,57 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                                     f"#{int(media_row.id)} • {str(media_row.media_type or '').strip()} • "
                                     f"{str(media_row.original_filename or '').strip()}"
                                 )
-                                media_bytes, preview_content_type, _ = load_media_bytes(media_row, storage=storage)
                                 media_type = str(media_row.media_type or "").strip().lower()
                                 if media_type == "image":
+                                    media_bytes, _preview_content_type, load_err = load_media_bytes(
+                                        media_row,
+                                        storage=storage,
+                                    )
                                     if media_bytes is not None:
                                         try:
                                             st.image(media_bytes, use_container_width=True)
                                         except Exception:
-                                            if media_row.s3_url:
-                                                try:
-                                                    st.image(str(media_row.s3_url), use_container_width=True)
-                                                except Exception:
-                                                    st.caption("Image preview unavailable (invalid image bytes/URL content).")
-                                            else:
-                                                st.caption("Image preview unavailable (invalid image bytes).")
-                                    elif media_row.s3_url:
-                                        try:
-                                            st.image(str(media_row.s3_url), use_container_width=True)
-                                        except Exception:
-                                            st.caption("Image preview unavailable (invalid image URL content).")
+                                            st.caption("Image preview unavailable (invalid image bytes).")
+                                    else:
+                                        st.caption("Image preview unavailable from private storage.")
+                                        if str(load_err or "").strip():
+                                            st.caption(f"Load warning: {str(load_err).strip()[:240]}")
                                 elif media_type == "video":
+                                    media_bytes, preview_content_type, load_err = load_media_bytes(
+                                        media_row,
+                                        storage=storage,
+                                    )
                                     if media_bytes is not None:
                                         st.video(media_bytes, format=preview_content_type)
-                                    elif media_row.s3_url:
-                                        st.video(str(media_row.s3_url))
+                                    else:
+                                        st.caption("Video preview unavailable from private storage.")
+                                        if str(load_err or "").strip():
+                                            st.caption(f"Load warning: {str(load_err).strip()[:240]}")
                                 else:
                                     st.caption("Unsupported preview type.")
+    uploaded_image_options = {
+        f"Upload | {str(getattr(file, 'name', '') or '').strip()}": (
+            f"upload:{str(getattr(file, 'name', '') or '').strip()}"
+        )
+        for file in (wizard_files or [])
+        if str(getattr(file, "type", "") or "").strip().lower().startswith("image/")
+        and str(getattr(file, "name", "") or "").strip()
+    }
+    primary_image_options.update(uploaded_image_options)
+    if len(primary_image_options) > 1:
+        current_primary_ref = str(st.session_state.get("listing_wizard_primary_image_ref") or "").strip()
+        primary_labels = list(primary_image_options.keys())
+        current_primary_label = next(
+            (label for label, ref in primary_image_options.items() if ref == current_primary_ref),
+            "Auto",
+        )
+        primary_label = st.selectbox(
+            "Main eBay Image",
+            options=primary_labels,
+            index=primary_labels.index(current_primary_label) if current_primary_label in primary_labels else 0,
+            key="listing_wizard_primary_image_select",
+        )
+        st.session_state["listing_wizard_primary_image_ref"] = primary_image_options.get(primary_label, "")
 
     st.markdown("### Step 6 of 9: AI Draft Assist")
     fallback_enabled = bool(get_runtime_bool(repo, "ai_fallback_enabled", True))
@@ -2913,19 +4047,72 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                 try:
                     primary_bytes, primary_content_type = image_inputs[0]
                     additional_images = image_inputs[1:] if len(image_inputs) > 1 else []
-                    mm_result = execute_multimodal_task(
-                        repo,
-                        tool_name="listing_wizard_ai_draft",
-                        system_message=system_message,
-                        instruction=prompt + "\n\nProduct context:\n" + query,
-                        image_bytes=primary_bytes,
-                        image_content_type=primary_content_type,
-                        additional_images=additional_images,
-                        workflow="listing",
-                        context={"workflow": "listing_wizard", "product_id": int(selected_product.id)},
+                    mm_attempts: list[tuple[str, str, list[tuple[bytes, str]], dict[str, object]]] = [
+                        (
+                            "listing_full_images",
+                            "listing",
+                            additional_images,
+                            {"workflow": "listing_wizard", "product_id": int(selected_product.id)},
+                        )
+                    ]
+                    if additional_images:
+                        mm_attempts.append(
+                            (
+                                "listing_primary_only",
+                                "listing",
+                                [],
+                                {
+                                    "workflow": "listing_wizard",
+                                    "product_id": int(selected_product.id),
+                                    "fallback_from_attempt": "listing_full_images",
+                                },
+                            )
+                        )
+                    mm_attempts.append(
+                        (
+                            "comp_primary_only",
+                            "comp",
+                            [],
+                            {
+                                "workflow": "listing_wizard",
+                                "product_id": int(selected_product.id),
+                                "fallback_from_workflow": "listing",
+                            },
+                        )
                     )
+
+                    mm_result = None
+                    mm_workflow = "listing"
+                    mm_attempt = ""
+                    last_mm_exc: Exception | None = None
+                    for attempt_label, attempt_workflow, attempt_additional_images, attempt_context in mm_attempts:
+                        try:
+                            mm_result = execute_multimodal_task(
+                                repo,
+                                tool_name="listing_wizard_ai_draft",
+                                system_message=system_message,
+                                instruction=prompt + "\n\nProduct context:\n" + query,
+                                image_bytes=primary_bytes,
+                                image_content_type=primary_content_type,
+                                additional_images=attempt_additional_images,
+                                workflow=attempt_workflow,
+                                context=attempt_context,
+                            )
+                            mm_workflow = attempt_workflow
+                            mm_attempt = attempt_label
+                            break
+                        except Exception as attempt_exc:
+                            last_mm_exc = attempt_exc
+                            ai_diag["errors"] = [
+                                *list(ai_diag.get("errors") or []),
+                                f"multimodal {attempt_label}: {attempt_exc}",
+                            ]
+                    if mm_result is None:
+                        raise RuntimeError(str(last_mm_exc or "unknown multimodal error"))
                     ai_diag["used_runtime"] = {
                         "mode": "multimodal",
+                        "workflow": mm_workflow,
+                        "attempt": mm_attempt,
                         "provider": mm_result.used_config.provider,
                         "source": mm_result.used_config.source,
                         "model": mm_result.used_config.multimodal_model or mm_result.used_config.model,
@@ -3387,6 +4574,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
     st.session_state.setdefault("listing_wizard_ebay_content_language", default_content_language)
     st.session_state.setdefault("listing_wizard_ebay_condition", "NEW")
     st.session_state.setdefault("listing_wizard_ebay_use_eps_images", True)
+    st.session_state.setdefault("listing_wizard_ebay_upload_video", True)
     st.session_state.setdefault("listing_wizard_include_volume_pricing_in_details", False)
     st.session_state.setdefault("listing_wizard_volume_discount_buy2", 0.0)
     st.session_state.setdefault("listing_wizard_volume_discount_buy3", 0.0)
@@ -3439,6 +4627,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                 ).strip()
                 st.session_state["listing_wizard_ebay_condition"] = str(payload.get("condition") or "NEW").strip()
                 st.session_state["listing_wizard_ebay_use_eps_images"] = bool(payload.get("use_eps_images"))
+                st.session_state["listing_wizard_ebay_upload_video"] = bool(payload.get("upload_video_to_ebay", True))
                 saved_cat = str(payload.get("category_id") or "").strip()
                 if saved_cat:
                     _wizard_queue_pending_field_updates({"listing_wizard_category_id": saved_cat})
@@ -3488,6 +4677,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     ).strip(),
                     "condition": str(st.session_state.get("listing_wizard_ebay_condition") or "NEW").strip().upper(),
                     "use_eps_images": bool(st.session_state.get("listing_wizard_ebay_use_eps_images")),
+                    "upload_video_to_ebay": bool(st.session_state.get("listing_wizard_ebay_upload_video")),
                     "category_id": str(st.session_state.get("listing_wizard_category_id") or "").strip(),
                 }
                 _save_wizard_ebay_post_profiles(
@@ -3549,11 +4739,21 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         st.text_input("Marketplace ID", key="listing_wizard_ebay_marketplace_id")
         st.text_input("Currency", key="listing_wizard_ebay_currency")
         st.text_input("Content Language", key="listing_wizard_ebay_content_language")
-        st.text_input("Condition", key="listing_wizard_ebay_condition")
+        st.selectbox(
+            "Condition",
+            options=wizard_condition_options,
+            key="listing_wizard_ebay_condition",
+            format_func=lambda value: wizard_condition_labels.get(str(value), str(value)),
+        )
         st.checkbox(
             "Use eBay EPS image import",
             key="listing_wizard_ebay_use_eps_images",
             help="When enabled, imports image URLs into eBay EPS before publish.",
+        )
+        st.checkbox(
+            "Upload first MP4/MOV video to eBay",
+            key="listing_wizard_ebay_upload_video",
+            help="When direct posting, uploads the first supported listing video to eBay Media. MOV/QuickTime files are converted to MP4 before upload.",
         )
     st.text_area(
         "eBay User Access Token",
@@ -3590,6 +4790,11 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         payment_policy_id=preflight_payment_policy_id,
         fulfillment_policy_id=preflight_fulfillment_policy_id,
         return_policy_id=preflight_return_policy_id,
+        aspects=_wizard_normalize_aspects_payload(st.session_state.get("listing_wizard_aspects_json") or ""),
+        category_aspects=category_aspect_rows,
+        condition=str(st.session_state.get("listing_wizard_ebay_condition") or "").strip().upper(),
+        condition_description=str(st.session_state.get("listing_wizard_condition_description") or ""),
+        category_conditions=category_condition_rows,
     )
     p1, p2, p3, p4 = st.columns(4)
     p1.metric("Status", preflight.status)
@@ -4015,6 +5220,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         create_block_reasons.append(
             "Existing draft/active eBay listings detected for this product. Enable duplicate override to continue."
         )
+    if bundle_inventory_overcommit:
+        create_block_reasons.append("Lot/bundle composition exceeds selected product stock.")
     create_disabled = bool(create_block_reasons)
     stay_on_wizard_after_create = st.checkbox(
         "Stay on Wizard after Create",
@@ -4082,15 +5289,31 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         "checks": [],
                     }
                 else:
-                    result_payload = ebay.verify_publish_dependencies(
-                        access_token=token_to_use,
-                        marketplace_id=marketplace_id,
-                        category_id=str(selected_category_id or "").strip(),
-                        merchant_location_key=merchant_location_key,
-                        payment_policy_id=payment_policy_id,
-                        fulfillment_policy_id=fulfillment_policy_id,
-                        return_policy_id=return_policy_id,
+                    local_specific_blockers = _wizard_required_specific_blockers(
+                        category_id_value=str(selected_category_id or "").strip(),
+                        marketplace_id_value=marketplace_id,
                     )
+                    if local_specific_blockers:
+                        result_payload = {
+                            "blockers": local_specific_blockers,
+                            "warnings": [],
+                            "checks": [],
+                        }
+                    else:
+                        result_payload = ebay.verify_publish_dependencies(
+                            access_token=token_to_use,
+                            marketplace_id=marketplace_id,
+                            category_id=str(selected_category_id or "").strip(),
+                            merchant_location_key=merchant_location_key,
+                            payment_policy_id=payment_policy_id,
+                            fulfillment_policy_id=fulfillment_policy_id,
+                            return_policy_id=return_policy_id,
+                            format_type=str(format_type or "FIXED_PRICE").strip().upper(),
+                            auction_buy_now_price=float(auction_bin or 0.0),
+                            condition=str(
+                                st.session_state.get("listing_wizard_ebay_condition") or ""
+                            ).strip().upper(),
+                        )
             except Exception as exc:
                 result_payload = {
                     "blockers": [],
@@ -4197,6 +5420,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             "volume_pricing_tiers": volume_pricing_tiers,
             "volume_pricing_json": str(st.session_state.get("listing_wizard_volume_pricing_json") or "").strip(),
             "quantity": int(listing_qty),
+            "bundle": bundle_metadata,
             "auction_start_price": float(auction_start or 0),
             "auction_reserve_price": float(auction_reserve or 0),
             "auction_buy_now_price": float(auction_bin or 0),
@@ -4219,6 +5443,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             ).strip(),
             "aspects_json": str(st.session_state.get("listing_wizard_aspects_json") or "").strip(),
             "aspects": _wizard_normalize_aspects_payload(st.session_state.get("listing_wizard_aspects_json") or ""),
+            "primary_image_ref": str(st.session_state.get("listing_wizard_primary_image_ref") or "").strip(),
+            "upload_video_to_ebay": bool(st.session_state.get("listing_wizard_ebay_upload_video")),
             "fee_estimate": estimate_ebay_fees(
                 repo,
                 unit_price=(
@@ -4240,6 +5466,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             "aspects_json": str(st.session_state.get("listing_wizard_aspects_json") or "").strip(),
             "aspects": _wizard_normalize_aspects_payload(st.session_state.get("listing_wizard_aspects_json") or ""),
             "ebay_publish": ebay_publish_payload,
+            "bundle": bundle_metadata,
             "wizard_mode": str(listing_mode),
             "wizard_created_by": user.username,
         }
@@ -4347,7 +5574,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         linked_existing_errors: list[str] = []
         attach_lookup = {
             int(row.id): row
-            for row in repo.list_media_assets_for_product(int(selected_product.id))
+            for row in _product_media_rows_cached(int(selected_product.id))
         }
         for media_id in selected_existing_media_ids:
             row = attach_lookup.get(int(media_id))
@@ -4422,6 +5649,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             ).strip()
             condition = str(st.session_state.get("listing_wizard_ebay_condition") or "NEW").strip().upper() or "NEW"
             use_eps_images = bool(st.session_state.get("listing_wizard_ebay_use_eps_images"))
+            upload_video_to_ebay = bool(st.session_state.get("listing_wizard_ebay_upload_video"))
 
             if not token_to_use:
                 st.error("Direct eBay post skipped: missing user access token.")
@@ -4431,6 +5659,14 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                 st.error("Direct eBay post skipped: missing merchant location key.")
             elif not payment_policy_id or not fulfillment_policy_id or not return_policy_id:
                 st.error("Direct eBay post skipped: missing payment/fulfillment/return policy IDs.")
+            elif category_condition_rows and not _wizard_is_condition_valid_for_loaded_policy(
+                category_condition_rows,
+                condition,
+            ):
+                st.error(
+                    f"Direct eBay post skipped: condition `{condition}` is not valid for eBay category "
+                    f"`{selected_category_id}`. Load/refresh Category Conditions and choose a returned option."
+                )
             else:
                 direct_post_stage = "init"
                 direct_post_context: dict[str, object] = {
@@ -4443,6 +5679,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     "fulfillment_policy_id": fulfillment_policy_id,
                     "return_policy_id": return_policy_id,
                     "use_eps_images": bool(use_eps_images),
+                    "upload_video_to_ebay": bool(upload_video_to_ebay),
                     "listing_qty": int(listing_qty or 1),
                 }
                 try:
@@ -4450,6 +5687,40 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     ebay = EbayClient()
                     if not ebay.is_configured():
                         raise RuntimeError("eBay app credentials are not configured.")
+                    effective_condition_rows = list(category_condition_rows or [])
+                    if not effective_condition_rows and selected_category_id and token_to_use:
+                        direct_post_stage = "load_category_condition_policy"
+                        policies = ebay.get_item_condition_policies(
+                            access_token=token_to_use,
+                            category_id=selected_category_id,
+                            marketplace_id=marketplace_id,
+                        )
+                        effective_condition_rows = normalize_ebay_condition_policy_rows(
+                            policies,
+                            category_id=selected_category_id,
+                        )
+                        if effective_condition_rows:
+                            st.session_state["listing_wizard_category_condition_rows"] = effective_condition_rows
+                            st.session_state["listing_wizard_category_condition_signature"] = (
+                                f"{marketplace_id.upper()}:{selected_category_id}"
+                            )
+                    if effective_condition_rows and not _wizard_is_condition_valid_for_loaded_policy(
+                        effective_condition_rows,
+                        condition,
+                    ):
+                        raise RuntimeError(
+                            f"Selected condition `{condition}` is not valid for eBay category `{selected_category_id}`. "
+                            "Load/refresh Category Conditions and choose one of the returned options."
+                        )
+                    local_specific_blockers = _wizard_required_specific_blockers(
+                        category_id_value=str(selected_category_id or "").strip(),
+                        marketplace_id_value=marketplace_id,
+                    )
+                    if local_specific_blockers:
+                        raise RuntimeError(
+                            "Direct eBay post blocked by required item specifics: "
+                            + " | ".join(local_specific_blockers[:3])
+                        )
                     direct_post_stage = "resolve_merchant_location"
                     effective_merchant_location_key = ebay.resolve_merchant_location_key(
                         access_token=token_to_use,
@@ -4467,6 +5738,9 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         payment_policy_id=payment_policy_id,
                         fulfillment_policy_id=fulfillment_policy_id,
                         return_policy_id=return_policy_id,
+                        format_type=str(format_type or "FIXED_PRICE").strip().upper(),
+                        auction_buy_now_price=float(auction_bin or 0.0),
+                        condition=condition,
                     )
                     preflight_blockers = list(preflight_result.get("blockers") or [])
                     preflight_warnings = list(preflight_result.get("warnings") or [])
@@ -4484,6 +5758,17 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     image_rows = [
                         m for m in listing_media_rows if str(m.media_type or "").strip().lower() == "image"
                     ]
+                    video_rows = [
+                        m for m in listing_media_rows if str(m.media_type or "").strip().lower() == "video"
+                    ]
+                    image_rows = _wizard_order_media_rows_for_primary(
+                        image_rows,
+                        str(st.session_state.get("listing_wizard_primary_image_ref") or ""),
+                    )
+                    primary_image_meta = _wizard_primary_image_metadata(
+                        image_rows,
+                        str(st.session_state.get("listing_wizard_primary_image_ref") or ""),
+                    )
                     image_urls: list[str] = []
                     eps_uploads: list[dict] = []
                     eps_upload_errors: list[str] = []
@@ -4491,63 +5776,27 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         original_url = str(media.s3_url or "").strip()
                         if use_eps_images:
                             try:
-                                image_bytes, image_content_type, load_err = load_media_bytes(media, storage=storage)
-                                if image_bytes is None:
-                                    raise RuntimeError(load_err or "media bytes unavailable")
-                                image_result = ebay.create_image_from_file(
+                                eps_url, eps_meta = _wizard_create_eps_image_with_retry(
+                                    ebay=ebay,
                                     access_token=token_to_use,
-                                    file_bytes=image_bytes,
-                                    filename=str(media.original_filename or "image.jpg").strip() or "image.jpg",
-                                    content_type=image_content_type or str(media.content_type or "image/jpeg"),
+                                    media=media,
+                                    storage=storage,
                                 )
-                                eps_url = str(image_result.get("imageUrl") or "").strip()
-                                if eps_url:
-                                    image_urls.append(eps_url)
-                                    eps_uploads.append(
-                                        {
-                                            "media_asset_id": int(media.id),
-                                            "filename": str(media.original_filename or "").strip(),
-                                            "source_url": original_url,
-                                            "eps_url": eps_url,
-                                            "mode": "file_upload",
-                                        }
-                                    )
-                                    continue
-                                raise RuntimeError("No imageUrl returned from eBay Media API.")
-                            except Exception as file_exc:
-                                try:
-                                    if original_url and original_url.startswith("https://"):
-                                        image_result = ebay.create_image_from_url(
-                                            access_token=token_to_use,
-                                            image_url=original_url,
-                                        )
-                                        eps_url = str(image_result.get("imageUrl") or "").strip()
-                                        if eps_url:
-                                            image_urls.append(eps_url)
-                                            eps_uploads.append(
-                                                {
-                                                    "media_asset_id": int(media.id),
-                                                    "filename": str(media.original_filename or "").strip(),
-                                                    "source_url": original_url,
-                                                    "eps_url": eps_url,
-                                                    "mode": "url_import_fallback",
-                                                }
-                                            )
-                                            continue
-                                    raise RuntimeError(
-                                        "Image URL import unavailable (non-public or missing HTTPS URL)."
-                                    )
-                                except Exception as url_exc:
-                                    eps_upload_errors.append(
-                                        f"{str(media.original_filename or '').strip()}: "
-                                        f"file-upload={file_exc} | url-import={url_exc}"
-                                    )
-                                    if original_url and original_url.startswith("https://"):
-                                        image_urls.append(original_url)
+                                image_urls.append(eps_url)
+                                eps_uploads.append(eps_meta)
+                            except Exception as exc:
+                                eps_upload_errors.append(f"{str(media.original_filename or '').strip()}: {exc}")
                         else:
                             if original_url and original_url.startswith("https://"):
                                 image_urls.append(original_url)
 
+                    image_source_mode = "ebay_eps" if use_eps_images else "direct_https_urls"
+                    if use_eps_images and eps_upload_errors:
+                        raise RuntimeError(
+                            "eBay EPS image hosting failed for one or more selected images. "
+                            "Direct/self-hosted image fallback is disabled. "
+                            + " | ".join(eps_upload_errors[:5])
+                        )
                     if not image_urls:
                         raise RuntimeError(
                             "No publishable images found on the created draft. "
@@ -4555,11 +5804,36 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         )
                     if len(image_urls) > 24:
                         image_urls = image_urls[:24]
-                    if eps_upload_errors:
-                        st.warning(
-                            "Some EPS uploads failed and were replaced with URL fallback where possible: "
-                            + " | ".join(eps_upload_errors[:5])
-                        )
+
+                    video_ids: list[str] = []
+                    uploaded_video_info: dict | None = None
+                    skipped_video_count = 0
+                    video_warning = _wizard_video_upload_warning(upload_video_to_ebay, video_rows)
+                    if video_warning:
+                        direct_post_context["video_warning"] = video_warning
+                        st.warning(video_warning + " Continuing without listing video.")
+                    if upload_video_to_ebay and video_rows:
+                        selected_video = _wizard_select_ebay_video_media(video_rows)
+                        skipped_video_count = int(len(video_rows) - (1 if selected_video is not None else 0))
+                        if selected_video is not None:
+                            direct_post_stage = "upload_video"
+                            video_id, uploaded_video_info = _wizard_upload_ebay_video_with_retry(
+                                ebay=ebay,
+                                access_token=token_to_use,
+                                media=selected_video,
+                                storage=storage,
+                                listing_title=str(listing_title or selected_product.title or "").strip(),
+                            )
+                            video_ids = [video_id]
+                            direct_post_context["video_id"] = video_id
+                            direct_post_context["video_media_asset_id"] = int(
+                                getattr(selected_video, "id", 0) or 0
+                            )
+                            if skipped_video_count > 0:
+                                st.info(
+                                    "eBay supports one video per listing; attached the first supported video and skipped "
+                                    f"{skipped_video_count} additional video file(s)."
+                                )
 
                     effective_listing_description = _sanitize_preview_html(effective_details_for_save)
                     if not effective_listing_description:
@@ -4600,6 +5874,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         inventory_payload["conditionDescription"] = condition_description
                     if effective_aspects_payload:
                         inventory_payload["product"]["aspects"] = effective_aspects_payload
+                    if video_ids:
+                        inventory_payload["product"]["videoIds"] = video_ids
                     _wizard_maybe_add_package_data(inventory_payload, selected_product)
 
                     offer_payload = _wizard_build_ebay_offer_payload(
@@ -4630,12 +5906,38 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         )
 
                     direct_post_stage = "upsert_inventory"
-                    ebay.create_or_replace_inventory_item(
+                    fell_back_inventory, inventory_error = _wizard_create_or_replace_inventory_item_with_fallback(
+                        ebay=ebay,
                         access_token=token_to_use,
                         sku=selected_product.sku,
                         payload=inventory_payload,
                         content_language=content_language,
+                        preserve_video_ids=bool(video_ids),
                     )
+                    if fell_back_inventory:
+                        st.warning(
+                            "eBay inventory upsert hit a transient Core Inventory Service error and "
+                            "succeeded after retrying with a simpler payload."
+                        )
+                    inventory_video_verification: dict[str, object] = {}
+                    post_offer_video_verification: dict[str, object] = {}
+                    post_publish_video_verification: dict[str, object] = {}
+                    trading_listing_video_verification: dict[str, object] = {}
+                    if video_ids:
+                        direct_post_stage = "verify_inventory_video_ids"
+                        inventory_video_verification = _wizard_verify_inventory_video_ids(
+                            ebay=ebay,
+                            access_token=token_to_use,
+                            sku=str(selected_product.sku or "").strip(),
+                            expected_video_ids=video_ids,
+                            content_language=content_language,
+                        )
+                        direct_post_context["inventory_video_ids_verified"] = bool(
+                            inventory_video_verification.get("verified")
+                        )
+                        direct_post_context["inventory_video_ids"] = list(
+                            inventory_video_verification.get("actual_video_ids") or []
+                        )
                     direct_post_stage = "create_offer"
                     offer_result = ebay.create_offer(
                         access_token=token_to_use,
@@ -4648,16 +5950,65 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     run_publish_live = str(direct_post_mode or "").strip().lower() == "publish live listing"
                     direct_post_context["offer_id"] = offer_id
                     direct_post_context["run_publish_live"] = bool(run_publish_live)
+                    if video_ids:
+                        direct_post_stage = "verify_post_offer_inventory_video_ids"
+                        post_offer_video_verification = _wizard_verify_inventory_video_ids(
+                            ebay=ebay,
+                            access_token=token_to_use,
+                            sku=str(selected_product.sku or "").strip(),
+                            expected_video_ids=video_ids,
+                            content_language=content_language,
+                        )
+                        direct_post_context["post_offer_inventory_video_ids_verified"] = bool(
+                            post_offer_video_verification.get("verified")
+                        )
+                        direct_post_context["post_offer_inventory_video_ids"] = list(
+                            post_offer_video_verification.get("actual_video_ids") or []
+                        )
                     publish_result = {}
                     listing_id = ""
                     listing_url = ""
                     if run_publish_live:
                         direct_post_stage = "publish_offer"
-                        publish_result = ebay.publish_offer(access_token=token_to_use, offer_id=offer_id)
+                        publish_result = ebay.publish_offer(
+                            access_token=token_to_use,
+                            offer_id=offer_id,
+                            inventory_sku=str(selected_product.sku or "").strip(),
+                            content_language=content_language,
+                        )
                         listing_id = str(publish_result.get("listingId") or "").strip()
                         if not listing_id:
                             raise RuntimeError(f"eBay publishOffer missing listingId. payload={publish_result}")
                         listing_url = ebay.listing_url_for_id(listing_id)
+                        if video_ids:
+                            direct_post_stage = "verify_post_publish_inventory_video_ids"
+                            post_publish_video_verification = _wizard_verify_inventory_video_ids(
+                                ebay=ebay,
+                                access_token=token_to_use,
+                                sku=str(selected_product.sku or "").strip(),
+                                expected_video_ids=video_ids,
+                                content_language=content_language,
+                            )
+                            direct_post_context["post_publish_inventory_video_ids_verified"] = bool(
+                                post_publish_video_verification.get("verified")
+                            )
+                            direct_post_context["post_publish_inventory_video_ids"] = list(
+                                post_publish_video_verification.get("actual_video_ids") or []
+                            )
+                            direct_post_stage = "verify_trading_listing_video_ids"
+                            trading_listing_video_verification = _wizard_verify_trading_listing_video_ids(
+                                ebay=ebay,
+                                access_token=token_to_use,
+                                listing_id=listing_id,
+                                expected_video_ids=video_ids,
+                                marketplace_id=marketplace_id,
+                            )
+                            direct_post_context["trading_listing_video_ids_verified"] = bool(
+                                trading_listing_video_verification.get("verified")
+                            )
+                            direct_post_context["trading_listing_video_ids"] = list(
+                                trading_listing_video_verification.get("actual_video_ids") or []
+                            )
                     offer_status = "PUBLISHED" if run_publish_live else ""
                     try:
                         offer_lookup = ebay.get_offer(access_token=token_to_use, offer_id=offer_id)
@@ -4709,9 +6060,19 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                             "direct_post_last_context": {},
                             "marketplace_id": marketplace_id,
                             "published_at": utcnow_naive().isoformat(),
-                            "image_source": "ebay_eps" if use_eps_images else "direct_https_urls",
+                            "image_source": image_source_mode,
                             "image_count": len(image_urls),
+                            **primary_image_meta,
                             "eps_uploads": eps_uploads,
+                            "upload_video_to_ebay": bool(upload_video_to_ebay),
+                            "video_attached": bool(video_ids),
+                            "video_warning": video_warning,
+                            "video_upload": uploaded_video_info or {},
+                            "inventory_video_verification": inventory_video_verification,
+                            "post_offer_video_verification": post_offer_video_verification,
+                            "post_publish_video_verification": post_publish_video_verification,
+                            "trading_listing_video_verification": trading_listing_video_verification,
+                            "skipped_video_count": int(skipped_video_count),
                             "quantity": int(listing_qty),
                             "shipping_service": str(st.session_state.get("listing_wizard_shipping_service") or "").strip(),
                             "handling_days": int(st.session_state.get("listing_wizard_handling_days") or 0),
@@ -4758,10 +6119,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         update_payload,
                         actor=user.username,
                     )
-                    refreshed_listing = next(
-                        (row for row in repo.list_listings() if int(row.id) == int(created.id)),
-                        None,
-                    )
+                    refreshed_listing = repo.get_listing(int(created.id))
                     if run_publish_live:
                         if owner_listing_id is not None:
                             st.warning(
@@ -4822,10 +6180,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     direct_post_error = str(exc)
                     st.error(f"Direct eBay post failed: {direct_post_error}")
                     try:
-                        existing_row = next(
-                            (row for row in repo.list_listings() if int(getattr(row, "id", 0) or 0) == int(created.id)),
-                            None,
-                        )
+                        existing_row = repo.get_listing(int(created.id))
                         details_obj: dict = {}
                         raw_details = str(getattr(existing_row, "marketplace_details", "") or "").strip()
                         if raw_details:
@@ -4886,9 +6241,10 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
 
     if last_listing_id > 0:
         st.info(f"Last draft created from wizard: #{last_listing_id} | {last_listing_sku} | {last_listing_title}")
-        created_listing = next((row for row in repo.list_listings() if int(row.id) == int(last_listing_id)), None)
+        created_listing = repo.get_listing(int(last_listing_id))
         last_direct_error = ""
         last_direct_error_at = ""
+        last_direct_video_diagnostics: dict[str, object] = {}
         if created_listing is not None:
             raw_details = str(getattr(created_listing, "marketplace_details", "") or "").strip()
             if raw_details:
@@ -4907,6 +6263,19 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                             last_direct_error_context = publish_meta.get("direct_post_last_context")
                             if not isinstance(last_direct_error_context, dict):
                                 last_direct_error_context = {}
+                            video_diag_keys = [
+                                "upload_video_to_ebay",
+                                "video_attached",
+                                "video_upload",
+                                "inventory_video_verification",
+                                "post_offer_video_verification",
+                                "post_publish_video_verification",
+                                "trading_listing_video_verification",
+                                "skipped_video_count",
+                            ]
+                            last_direct_video_diagnostics = {
+                                key: publish_meta.get(key) for key in video_diag_keys if key in publish_meta
+                            }
                 except Exception:
                     pass
         ebay_review_url = str(getattr(created_listing, "marketplace_url", "") or "").strip()
@@ -4940,6 +6309,16 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             if last_direct_error_context:
                 with st.expander("Last Direct Post Diagnostics", expanded=False):
                     st.json(last_direct_error_context)
+        if last_direct_video_diagnostics:
+            direct_video_warning = str(last_direct_video_diagnostics.get("video_warning") or "").strip()
+            if direct_video_warning:
+                st.warning(direct_video_warning)
+            with st.expander("Last Direct Post Video Diagnostics", expanded=False):
+                st.caption(
+                    "Shows whether eBay Media upload completed and whether Inventory retained `product.videoIds` "
+                    "after inventory upsert, offer create/update, and live publish."
+                )
+                st.json(last_direct_video_diagnostics)
         st.success("Next recommended action: review the draft in Listings or open on eBay when URL is available.")
 
     autosave_payload = _wizard_build_draft_payload(

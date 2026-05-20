@@ -976,6 +976,9 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         def _operations_help() -> str:
             return (
                 "*Slack Ops operations commands*\n"
+                "- `accountant <question>` for read-only AI Accountant answers (aliases: `accounting`, `tax`, `ai-accountant`)\n"
+                "- `comp <query>` for pricing/comparable research\n"
+                "- `status` for queue + business status\n"
                 "- `operations run_due <integration> [limit]` where integration in `slack_ops|google|shipping|slack`\n"
                 "- `operations approve <queue_job_id>`\n"
                 "- `operations create_ebay_draft <product_id> [price] [qty]`"
@@ -1108,7 +1111,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
             _persist_slack_summary(summary=summary)
             return False, f"Unsupported operations command `{op}`."
 
-        if not file_rows and intent not in {"comp", "intake"}:
+        if not file_rows and intent not in {"comp", "intake", "accountant"}:
             return True, "Slack ops command ingested (no file attachments)."
 
         storage = None
@@ -1222,7 +1225,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         min_qualified_rows: int = 2
         trusted_web_domains = _trusted_comp_web_domains()
         filtered_web_rows_count = 0
-        if intent in {"comp", "intake"} and get_runtime_bool(repo, "slack_ops_ai_assist_enabled", True):
+        if intent in {"comp", "intake", "accountant"} and get_runtime_bool(repo, "slack_ops_ai_assist_enabled", True):
             try:
                 from app.services.ai_orchestration import execute_comp_summary, execute_multimodal_task
 
@@ -1374,6 +1377,70 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                             ),
                         ),
                         workflow="comp",
+                    )
+                elif intent == "accountant":
+                    from app.services.ai_accountant_web import (
+                        search_ai_accountant_web,
+                        should_run_ai_accountant_web_research,
+                    )
+                    from app.services.chat_context_builders import build_accounting_snapshot
+
+                    accounting_answer, accounting_citations = build_accounting_snapshot(
+                        repo,
+                        max_scan_rows=max(50, min(5000, get_runtime_int(repo, "chat_max_scan_rows", 1000))),
+                    )
+                    accountant_web_rows: list[dict[str, Any]] = []
+                    accountant_web_error = ""
+                    if get_runtime_bool(
+                        repo,
+                        "ai_accountant_web_research_enabled",
+                        True,
+                    ) and should_run_ai_accountant_web_research(query_text):
+                        try:
+                            accountant_web_rows = search_ai_accountant_web(
+                                query_text,
+                                limit=max(1, min(10, get_runtime_int(repo, "ai_accountant_web_research_limit", 5))),
+                                timeout_seconds=max(
+                                    2,
+                                    min(30, get_runtime_int(repo, "ai_accountant_web_research_timeout_seconds", 10)),
+                                ),
+                            )
+                        except Exception as exc:
+                            accountant_web_error = str(exc)
+                    ai_result = execute_comp_summary(
+                        repo,
+                        query=query_text or "Slack AI Accountant request",
+                        ebay_rows=[],
+                        web_rows=accountant_web_rows,
+                        spot_context={
+                            "source": "slack_ops",
+                            "intent": "accountant",
+                            "accounting_snapshot": accounting_answer,
+                            "citations": accounting_citations,
+                            "web_research_error": accountant_web_error,
+                            "guardrails": {
+                                "read_only": True,
+                                "tax_legal_guardrail": "Tax/legal conclusions require human advisor validation.",
+                            },
+                        },
+                        system_message=get_runtime_str(
+                            repo,
+                            "accountant_llm_system_message",
+                            (
+                                "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller. "
+                                "Cite evidence, label estimates versus actuals, and route unsupported tax/legal "
+                                "conclusions to human advisor review."
+                            ),
+                        ),
+                        instruction=get_runtime_str(
+                            repo,
+                            "ai_accountant_chat_instruction",
+                            (
+                                "Answer the Slack operator in concise markdown with direct answer, evidence checked, "
+                                "risks/corrections, and advisor-review notes. Do not propose direct writes."
+                            ),
+                        ),
+                        workflow="accounting",
                     )
                 else:
                     ai_result = execute_multimodal_task(
@@ -1722,7 +1789,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
             msg += f" | Created product draft #{int(product_id)}."
         if ai_summary:
             msg += " | AI summary generated."
-        elif intent in {"comp", "intake"} and ai_error:
+        elif intent in {"comp", "intake", "accountant"} and ai_error:
             msg += f" | AI assist unavailable: {ai_error[:180]}"
         return (True, msg)
 

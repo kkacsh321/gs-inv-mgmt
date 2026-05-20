@@ -20,7 +20,7 @@ class SlackNotifyConfig:
 
 def resolve_slack_notify_config(repo: Any) -> SlackNotifyConfig:
     return SlackNotifyConfig(
-        enabled=get_runtime_bool(repo, "slack_notifications_enabled", False),
+        enabled=get_runtime_bool(repo, "slack_notifications_enabled", True),
         bot_token=get_runtime_str(repo, "slack_bot_token", "").strip(),
         default_channel=get_runtime_str(repo, "slack_default_channel", "").strip(),
         timeout_seconds=max(3, min(60, int(get_runtime_int(repo, "slack_http_timeout_seconds", 15)))),

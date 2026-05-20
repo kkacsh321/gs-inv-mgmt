@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.services import chat_context_builders as ccb
 
@@ -129,11 +129,55 @@ class ChatContextBuildersTests(unittest.TestCase):
         self.assertEqual(citations[0]["table"], "marketplace_listings")
 
     def test_sales_snapshot(self):
-        text, citations = ccb.build_sales_snapshot(_Repo(), max_scan_rows=100)
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_sales_snapshot(_Repo(), max_scan_rows=100)
         self.assertIn("`2` sales", text)
         self.assertIn("Gross sold: `$180.00`", text)
         self.assertIn("Fees: `$18.00`", text)
+        self.assertIn("Net (gross + shipping charged - fees - label spend): `$171.00`", text)
         self.assertEqual(citations[0]["table"], "sales")
+
+    def test_sales_snapshot_prefers_repository_actual_economics(self):
+        class ActualsRepo(_Repo):
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "sale_id": 1,
+                        "sold_price": 100.0,
+                        "allocated_fee_actual": 7.5,
+                        "allocated_shipping_charged": 5.0,
+                        "allocated_shipping_actual": 4.25,
+                        "net_before_cogs_actual": 93.25,
+                    }
+                ]
+
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_sales_snapshot(ActualsRepo(), max_scan_rows=100)
+
+        self.assertIn("`1` sales", text)
+        self.assertIn("Gross sold: `$100.00`", text)
+        self.assertIn("Fees: `$7.50`", text)
+        self.assertIn("Label spend: `$4.25`", text)
+        self.assertIn("Net (gross + shipping charged - fees - label spend): `$93.25`", text)
+        self.assertEqual(citations[0]["table"], "sales, order_finance_entries")
+        self.assertIn("normalized finance", citations[0]["finance_basis"])
+
+    def test_sales_snapshot_rolls_back_failed_actual_economics_lookup(self):
+        class FailingActualsRepo(_Repo):
+            def __init__(self):
+                super().__init__()
+                self.db = SimpleNamespace(rollback=Mock())
+
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                raise RuntimeError("aborted transaction")
+
+        repo = FailingActualsRepo()
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_sales_snapshot(repo, max_scan_rows=100)
+
+        self.assertIn("sale fields fallback", citations[0]["finance_basis"])
+        self.assertIn("Net (gross + shipping charged - fees - label spend)", text)
+        repo.db.rollback.assert_called_once()
 
     def test_shipping_snapshot(self):
         text, citations = ccb.build_shipping_snapshot(_Repo(), max_scan_rows=100)
@@ -157,12 +201,164 @@ class ChatContextBuildersTests(unittest.TestCase):
         self.assertEqual(citations[0]["table"], "orders")
 
     def test_reports_snapshot(self):
-        text, citations = ccb.build_reports_snapshot(_Repo(), max_scan_rows=100)
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_reports_snapshot(_Repo(), max_scan_rows=100)
         self.assertIn("Gross sold: `$180.00`", text)
         self.assertIn("Estimated COGS: `$50.00`", text)
-        self.assertIn("Estimated margin: `$103.00`", text)
-        self.assertEqual(len(citations), 3)
+        self.assertIn("Estimated margin before returns: `$121.00`", text)
+        self.assertEqual(len(citations), 4)
         self.assertEqual(citations[0]["table"], "sales")
+        self.assertEqual(citations[1]["table"], "returns")
+
+    def test_reports_snapshot_prefers_repository_actual_economics(self):
+        class ActualsRepo(_Repo):
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "sale_id": 1,
+                        "sold_price": 100.0,
+                        "allocated_fee_actual": 7.5,
+                        "allocated_shipping_charged": 5.0,
+                        "allocated_shipping_actual": 4.25,
+                        "net_before_cogs_actual": 93.25,
+                    }
+                ]
+
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_reports_snapshot(ActualsRepo(), max_scan_rows=100)
+
+        self.assertIn("Gross sold: `$100.00`", text)
+        self.assertIn("Fees + label spend: `$11.75`", text)
+        self.assertIn("Estimated COGS: `$50.00`", text)
+        self.assertIn("Estimated margin before returns: `$43.25`", text)
+        self.assertEqual(citations[0]["table"], "sales, order_finance_entries")
+        self.assertIn("normalized finance", citations[0]["finance_basis"])
+
+    def test_reports_snapshot_includes_return_adjusted_profit_when_returns_present(self):
+        class ReturnsRepo(_Repo):
+            def __init__(self):
+                super().__init__()
+                for idx, sale in enumerate(self._sales, start=10):
+                    sale.id = idx
+
+            def report_sale_unit_cost_maps(self, *, end_dt, default_unit_cost_by_product):
+                return {
+                    "fifo_unit_cost_by_sale": {10: 20.0, 12: 30.0},
+                    "fifo_unit_cost_source_by_sale": {
+                        10: "lot_expected_quantity_fallback",
+                        12: "product_default_landed_cost",
+                    },
+                }
+
+            def report_returns_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "return_id": 1,
+                        "sale_id": 10,
+                        "quantity": 1,
+                        "refund_amount": 30.0,
+                        "refund_fees": 2.0,
+                        "refund_shipping": 3.0,
+                    }
+                ]
+
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_reports_snapshot(ReturnsRepo(), max_scan_rows=100)
+
+        self.assertIn("Estimated margin before returns: `$101.00`", text)
+        self.assertIn("Return refunds: `$35.00`", text)
+        self.assertIn("Return COGS reversal: `$20.00`", text)
+        self.assertIn("Return profit impact: `$-15.00`", text)
+        self.assertIn("Estimated profit after returns: `$86.00`", text)
+        self.assertEqual(citations[0]["returns_count"], 1)
+        self.assertEqual(citations[0]["profit_before_returns"], 101.0)
+        self.assertEqual(citations[0]["estimated_profit_after_returns"], 86.0)
+
+    def test_accounting_snapshot_includes_exceptions_and_lot_sources(self):
+        class AccountingRepo(_Repo):
+            def report_accounting_exception_rows(self, *, start_dt, end_dt):
+                return [
+                    {"exception_type": "missing_cost_basis", "severity": "P1"},
+                    {"exception_type": "lot_equal_fallback_review_needed", "severity": "P2"},
+                ]
+
+            def report_lot_assignment_rows(self, *, start_dt=None, end_dt=None):
+                return [
+                    {"cost_source": "lot_allocation_weight"},
+                    {"cost_source": "lot_equal_quantity_fallback"},
+                    {"cost_source": "missing_cost_basis"},
+                ]
+
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_accounting_snapshot(AccountingRepo(), max_scan_rows=100)
+
+        self.assertIn("AI Accountant snapshot", text)
+        self.assertIn("Profit before returns", text)
+        self.assertIn("Estimated profit after returns", text)
+        self.assertIn("missing_cost_basis", text)
+        self.assertIn("AI Accountant questions to answer", text)
+        self.assertIn("What cost-basis evidence should we use", text)
+        self.assertIn("Recent AI Accountant operator answers recorded: `0`", text)
+        self.assertIn("Recent AI Accountant answer follow-ups recorded: `0`", text)
+        self.assertIn("fallback/missing-basis rows", text)
+        self.assertEqual(citations[-5]["table"], "accounting_exception_queue")
+        self.assertEqual(citations[-4]["table"], "ai_accountant_monitor_questions")
+        self.assertEqual(citations[-3]["table"], "ai_accountant_answers")
+        self.assertEqual(citations[-2]["table"], "ai_accountant_answer_followups")
+        self.assertEqual(citations[-1]["table"], "product_lot_assignments")
+
+    def test_accounting_snapshots_prefer_repository_fifo_cost_maps(self):
+        class RepoWithCostMaps(_Repo):
+            def __init__(self):
+                super().__init__()
+                for idx, sale in enumerate(self._sales, start=10):
+                    sale.id = idx
+
+            def report_sale_unit_cost_maps(self, *, end_dt, default_unit_cost_by_product):
+                return {
+                    "fifo_unit_cost_by_sale": {10: 11.0, 12: 31.0},
+                    "fifo_unit_cost_source_by_sale": {
+                        10: "lot_expected_quantity_fallback",
+                        12: "lot_allocation_weight",
+                    },
+                    "fifo_remaining_unit_cost_by_product": {1: 12.0, 3: 35.0},
+                    "lot_weighted_unit_cost_by_product": {1: 10.0, 3: 30.0},
+                }
+
+        repo = RepoWithCostMaps()
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            inventory_text, inventory_citations = ccb.build_inventory_snapshot(repo, max_scan_rows=100)
+            reports_text, reports_citations = ccb.build_reports_snapshot(repo, max_scan_rows=100)
+
+        self.assertIn("Estimated inventory cost basis: `$165.00`", inventory_text)
+        self.assertIn("Estimated COGS: `$53.00`", reports_text)
+        self.assertIn("Estimated margin before returns: `$118.00`", reports_text)
+        self.assertIn("Sold COGS source mix:", reports_text)
+        self.assertIn("`lot_allocation_weight`: `$31.00`", reports_text)
+        self.assertIn("`lot_expected_quantity_fallback`: `$22.00`", reports_text)
+        self.assertIn("FIFO remaining lot cost", inventory_citations[0]["cost_basis"])
+        self.assertIn("time-aware FIFO sale COGS", reports_citations[0]["cost_basis"])
+        self.assertEqual(
+            reports_citations[0]["cogs_source_mix"]["lot_expected_quantity_fallback"]["sale_rows"],
+            1,
+        )
+
+    def test_inventory_snapshot_rolls_back_failed_cost_map_lookup(self):
+        class FailingCostMapRepo(_Repo):
+            def __init__(self):
+                super().__init__()
+                self.db = SimpleNamespace(rollback=Mock())
+
+            def report_sale_unit_cost_maps(self, *, end_dt, default_unit_cost_by_product):
+                raise RuntimeError("aborted transaction")
+
+        repo = FailingCostMapRepo()
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_inventory_snapshot(repo, max_scan_rows=100)
+
+        self.assertIn("Estimated inventory cost basis", text)
+        self.assertIn("product landed acquisition cost", citations[0]["cost_basis"])
+        repo.db.rollback.assert_called_once()
 
     def test_admin_snapshot_and_fallback_help(self):
         with patch.object(ccb, "settings", SimpleNamespace(app_env="local")):

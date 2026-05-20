@@ -91,6 +91,7 @@ INVENTORY_INTAKE_DRAFT_SESSION_KEYS = [
     "inv_intake_form_new_lot_total_tax_paid",
     "inv_intake_form_new_lot_total_shipping_paid",
     "inv_intake_form_new_lot_total_handling_paid",
+    "inv_intake_form_new_lot_expected_total_quantity",
     "inv_intake_form_new_lot_notes",
     "inv_intake_form_purchase_doc_kind",
     "inv_intake_form_purchase_doc_title",
@@ -122,6 +123,95 @@ INVENTORY_INTAKE_DRAFT_SESSION_KEYS = [
     "inv_intake_starter_image_size_bytes",
     "inv_intake_ai_buffered_media_count",
 ]
+
+INVENTORY_INTAKE_SESSION_DEFAULTS = {
+    "inv_intake_default_category": "bullion",
+    "inv_intake_default_title": "",
+    "inv_intake_default_description": "",
+    "inv_intake_default_ai_description": "",
+    "inv_intake_default_ai_comp": "",
+    "inv_intake_default_item_type": "precious_metal",
+    "inv_intake_default_metal_type": "",
+    "inv_intake_starter_image_bytes": None,
+    "inv_intake_starter_image_name": "",
+    "inv_intake_starter_image_type": "",
+    "inv_intake_include_starter_image_upload": True,
+    "inv_intake_image_start_raw": "",
+    "inv_intake_ai_seed_prompt": "",
+    "inv_intake_ai_suggestion_raw": "",
+    "inv_intake_ai_hint": "",
+    "inv_intake_ai_buffered_media": [],
+    "inv_intake_include_ai_images_on_submit": True,
+    "inv_intake_uploaded_by": "",
+    "coin_identifier_last_result": "",
+    "coin_grader_last_result": "",
+    "coin_grader_last_structured": {},
+    "comp_last_ai_summary": "",
+    "inv_intake_form_category": "bullion",
+    "inv_intake_form_inventory_class": "sellable",
+    "inv_intake_form_item_type": "precious_metal",
+    "inv_intake_form_metal_type": "",
+    "inv_intake_form_sku_seed_category": "bullion",
+    "inv_intake_form_sku_seed_type": "precious_metal",
+    "inv_intake_form_sku": "",
+    "inv_intake_form_title": "",
+    "inv_intake_form_description": "",
+    "inv_intake_form_quantity": 1,
+    "inv_intake_form_acquisition_cost": 0.0,
+    "inv_intake_form_weight_oz": 0.0,
+    "inv_intake_form_acquisition_tax_paid": 0.0,
+    "inv_intake_form_acquisition_shipping_paid": 0.0,
+    "inv_intake_form_acquisition_handling_paid": 0.0,
+    "inv_intake_form_product_cost": 0.0,
+    "inv_intake_form_ebay_purchase": False,
+    "inv_intake_form_ebay_purchase_item_id": "",
+    "inv_intake_form_ebay_purchase_url": "",
+    "inv_intake_form_package_weight_oz": 0.0,
+    "inv_intake_form_package_length_in": 0.0,
+    "inv_intake_form_package_width_in": 0.0,
+    "inv_intake_form_package_height_in": 0.0,
+    "inv_intake_form_acquired_date": None,
+    "inv_intake_form_source_key": "None",
+    "inv_intake_form_lot_key": "None",
+    "inv_intake_form_create_new_lot": False,
+    "inv_intake_form_new_lot_code": "",
+    "inv_intake_form_new_lot_vendor": "",
+    "inv_intake_form_new_lot_total_cost": 0.0,
+    "inv_intake_form_new_lot_total_tax_paid": 0.0,
+    "inv_intake_form_new_lot_total_shipping_paid": 0.0,
+    "inv_intake_form_new_lot_total_handling_paid": 0.0,
+    "inv_intake_form_new_lot_expected_total_quantity": 0,
+    "inv_intake_form_new_lot_notes": "",
+    "inv_intake_form_purchase_doc_kind": "incoming_invoice",
+    "inv_intake_form_purchase_doc_title": "",
+    "inv_intake_form_purchase_doc_run_ai_extract": True,
+    "inv_intake_form_purchase_doc_extraction_mode": "llm",
+    "inv_intake_form_apply_last_comp_summary": True,
+    "inv_intake_form_apply_last_coin_identifier": False,
+    "inv_intake_form_apply_last_coin_grader": False,
+    "inv_intake_form_ai_graded": False,
+    "inv_intake_form_ai_grading_description": "",
+    "inv_intake_form_ai_description": "",
+    "inv_intake_form_ai_comp": "",
+    "inv_intake_form_create_draft_listing": True,
+    "inv_intake_form_draft_marketplace": "ebay",
+    "inv_intake_form_draft_markup_pct": 20.0,
+    "inv_intake_form_draft_qty": 1,
+    "inv_intake_form_attach_uploaded_media_to_listing": True,
+    "inventory_intake_existing_product_media_search_text": "",
+    "inventory_intake_existing_product_media_media_type_filter": "all",
+    "inventory_intake_existing_product_media_only_unlinked": True,
+    "inventory_intake_existing_product_media_selected_labels": [],
+    "inventory_intake_existing_listing_media_search_text": "",
+    "inventory_intake_existing_listing_media_media_type_filter": "all",
+    "inventory_intake_existing_listing_media_only_unlinked": True,
+    "inventory_intake_existing_listing_media_selected_labels": [],
+    "inventory_intake_media_capture_mode": "Basic",
+    "inventory_intake_listing_media_capture_mode": "Basic",
+    "inv_intake_starter_image_buffered": False,
+    "inv_intake_starter_image_size_bytes": 0,
+    "inv_intake_ai_buffered_media_count": 0,
+}
 
 
 class _BufferedUploadFile:
@@ -355,6 +445,28 @@ def _inventory_intake_apply_draft_payload(payload: dict) -> None:
             st.session_state[key] = payload.get(key)
 
 
+def _inventory_intake_set_state_default(key: str) -> None:
+    default = INVENTORY_INTAKE_SESSION_DEFAULTS.get(key, "")
+    if key == "inv_intake_form_acquired_date" and default is None:
+        default = utc_today()
+    if isinstance(default, (list, dict)):
+        default = default.copy()
+    st.session_state[key] = default
+
+
+def _inventory_intake_clear_draft_session_state() -> None:
+    for key in INVENTORY_INTAKE_DRAFT_SESSION_KEYS:
+        _inventory_intake_set_state_default(key)
+    st.session_state["inventory_intake_last_autosave_signature"] = ""
+    st.session_state["inventory_intake_last_draft_id"] = 0
+
+
+def _inventory_intake_take_flag(key: str) -> bool:
+    value = bool(st.session_state.get(key, False))
+    st.session_state[key] = False
+    return value
+
+
 def _inventory_intake_build_draft_payload() -> dict:
     # Uploaded/captured media binaries are intentionally not persisted in workflow drafts.
     non_persisted_binary_keys = {
@@ -391,7 +503,8 @@ def _inventory_intake_draft_signature(payload: dict) -> str:
 def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStorageService) -> None:
     user = current_user()
     quality_policy = load_ai_quality_policy(repo)
-    pending_resume_payload = st.session_state.pop("inventory_intake_resume_payload", None)
+    pending_resume_payload = st.session_state.get("inventory_intake_resume_payload")
+    st.session_state["inventory_intake_resume_payload"] = None
     if isinstance(pending_resume_payload, dict):
         _inventory_intake_apply_draft_payload(pending_resume_payload)
         st.session_state["inventory_intake_draft_flash"] = "Resumed saved draft."
@@ -418,7 +531,8 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
         roadmap_phase="v0.6 GS-V06-006 Inventory Intake Wizard (Generalized)",
     )
     st.page_link("pages/06_Tools.py", label="Open AI Tools (Comp / Coin / Chat)")
-    draft_flash = str(st.session_state.pop("inventory_intake_draft_flash", "") or "").strip()
+    draft_flash = str(st.session_state.get("inventory_intake_draft_flash") or "").strip()
+    st.session_state["inventory_intake_draft_flash"] = ""
     if draft_flash:
         st.success(draft_flash)
     starter_buffered = bool(st.session_state.get("inv_intake_starter_image_buffered"))
@@ -502,9 +616,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                 actor=user.username,
                 reason="operator_reset",
             )
-            for key in INVENTORY_INTAKE_DRAFT_SESSION_KEYS:
-                st.session_state.pop(key, None)
-            st.session_state.pop("inventory_intake_last_autosave_signature", None)
+            _inventory_intake_clear_draft_session_state()
             st.session_state["inventory_intake_draft_flash"] = "Cleared draft."
             st.rerun()
     render_workspace_feedback(
@@ -568,9 +680,11 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
             except Exception:
                 st.caption("Starter image preview unavailable (invalid image bytes).")
         if st.button("Clear Buffered Starter Image", key="inv_intake_clear_starter_buffer"):
-            st.session_state.pop("inv_intake_starter_image_bytes", None)
-            st.session_state.pop("inv_intake_starter_image_name", None)
-            st.session_state.pop("inv_intake_starter_image_type", None)
+            st.session_state["inv_intake_starter_image_bytes"] = None
+            st.session_state["inv_intake_starter_image_name"] = ""
+            st.session_state["inv_intake_starter_image_type"] = ""
+            st.session_state["inv_intake_starter_image_buffered"] = False
+            st.session_state["inv_intake_starter_image_size_bytes"] = 0
             st.success("Cleared buffered starter image.")
             st.rerun()
     if st.button("Analyze Starter Image For Intake Defaults", key="inv_intake_image_start_analyze"):
@@ -786,7 +900,8 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
     if buffered_ai_images:
         st.caption(f"Buffered AI assist images: {len(buffered_ai_images)}")
         if st.button("Clear Buffered AI Assist Images", key="inv_intake_clear_ai_buffered"):
-            st.session_state.pop("inv_intake_ai_buffered_media", None)
+            st.session_state["inv_intake_ai_buffered_media"] = []
+            st.session_state["inv_intake_ai_buffered_media_count"] = 0
             st.success("Cleared buffered AI assist images.")
             st.rerun()
 
@@ -1038,9 +1153,9 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
     )
 
     with st.form("inventory_intake_wizard_form", clear_on_submit=False):
-        force_identifier = bool(st.session_state.pop("inv_intake_force_apply_identifier_prefill", False))
-        force_grader = bool(st.session_state.pop("inv_intake_force_apply_grader_prefill", False))
-        force_comp = bool(st.session_state.pop("inv_intake_force_apply_comp_prefill", False))
+        force_identifier = _inventory_intake_take_flag("inv_intake_force_apply_identifier_prefill")
+        force_grader = _inventory_intake_take_flag("inv_intake_force_apply_grader_prefill")
+        force_comp = _inventory_intake_take_flag("inv_intake_force_apply_comp_prefill")
         _apply_inventory_intake_ai_defaults_to_form_state(
             force_identifier=force_identifier,
             force_grader=force_grader,
@@ -1087,6 +1202,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
         st.session_state.setdefault("inv_intake_form_new_lot_total_tax_paid", 0.0)
         st.session_state.setdefault("inv_intake_form_new_lot_total_shipping_paid", 0.0)
         st.session_state.setdefault("inv_intake_form_new_lot_total_handling_paid", 0.0)
+        st.session_state.setdefault("inv_intake_form_new_lot_expected_total_quantity", 0)
         st.session_state.setdefault("inv_intake_form_new_lot_notes", "")
         st.session_state.setdefault("inv_intake_form_purchase_doc_kind", "incoming_invoice")
         st.session_state.setdefault("inv_intake_form_purchase_doc_title", "")
@@ -1197,6 +1313,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
         new_lot_total_tax_paid = 0.0
         new_lot_total_shipping_paid = 0.0
         new_lot_total_handling_paid = 0.0
+        new_lot_expected_total_quantity = 0
         new_lot_notes = ""
         if create_new_lot:
             l1, l2 = st.columns(2)
@@ -1208,6 +1325,13 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
             new_lot_total_tax_paid = st.number_input("New Lot Total Tax Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_tax_paid")
             new_lot_total_shipping_paid = st.number_input("New Lot Total Shipping Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_shipping_paid")
             new_lot_total_handling_paid = st.number_input("New Lot Total Handling Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_handling_paid")
+            new_lot_expected_total_quantity = st.number_input(
+                "New Lot Expected Total Quantity",
+                min_value=0,
+                step=1,
+                key="inv_intake_form_new_lot_expected_total_quantity",
+                help="Optional. Use when this lot's cost covers products that have not all been checked in yet.",
+            )
             new_lot_notes = st.text_area("New Lot Notes", key="inv_intake_form_new_lot_notes")
 
         st.markdown("### 3) Incoming Purchase Invoice / Document (Optional)")
@@ -1348,6 +1472,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                 total_tax_paid=to_decimal_or_none(new_lot_total_tax_paid),
                 total_shipping_paid=to_decimal_or_none(new_lot_total_shipping_paid),
                 total_handling_paid=to_decimal_or_none(new_lot_total_handling_paid),
+                expected_total_quantity=int(new_lot_expected_total_quantity or 0) or None,
                 notes=new_lot_notes.strip(),
                 source_id=selected_source_id,
                 ebay_purchase=bool(ebay_purchase),

@@ -6,6 +6,7 @@ from datetime import datetime
 from io import BytesIO
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import pandas as pd
@@ -22,6 +23,39 @@ from app.utils.time import utcnow_naive
 
 MARKETPLACES = ["ebay", "facebook_marketplace", "craigslist", "whatnot", "shopify", "local"]
 MEDIA_UPLOAD_TYPES = ["jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "avi", "mkv", "webm"]
+
+
+def _is_public_media_url(url: str | None) -> bool:
+    raw = str(url or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return False
+    public_base = str(getattr(settings, "s3_public_base_url", "") or "").strip().rstrip("/")
+    if public_base and raw.startswith(f"{public_base}/"):
+        return True
+    private_endpoint = str(getattr(settings, "s3_endpoint_url", "") or "").strip().rstrip("/")
+    if private_endpoint and raw.startswith(f"{private_endpoint}/"):
+        return False
+    host = (urlparse(raw).hostname or "").strip().lower()
+    if not host:
+        return False
+    private_bucket = str(getattr(settings, "s3_bucket", "") or "").strip().lower()
+    if private_bucket and host in {private_bucket, f"{private_bucket}.localhost", f"{private_bucket}.local"}:
+        return False
+    private_markers = (
+        ".s3.",
+        ".s3-",
+        ".s3.amazonaws.com",
+        ".s3-accelerate.amazonaws.com",
+        "s3.amazonaws.com",
+    )
+    return not any(marker in host or host == marker.strip(".") for marker in private_markers)
+
+
+def _media_load_warning(error: str | None) -> str:
+    raw = str(error or "").strip()
+    if not raw:
+        return ""
+    return raw[:240]
 VIDEO_UPLOAD_TYPES = ["mp4", "mov", "avi", "mkv", "webm", "mpeg4"]
 
 
@@ -558,6 +592,7 @@ def render_media_gallery(
     section_title: str = "Media Preview",
     columns: int = 3,
     storage: MediaStorageService | None = None,
+    prefer_url_previews: bool = False,
 ) -> None:
     st.markdown(f"### {section_title}")
     if not media_items:
@@ -571,30 +606,57 @@ def render_media_gallery(
             st.caption(
                 f"#{media.id} • {media.media_type} • {media.original_filename}"
             )
-            preview_bytes, preview_content_type, _ = load_media_bytes(media, storage=storage)
-
             if media.media_type == "image":
+                if bool(prefer_url_previews) and _is_public_media_url(media.s3_url):
+                    try:
+                        st.image(media.s3_url, use_container_width=True)
+                    except Exception:
+                        st.caption("Image preview unavailable (invalid image URL content).")
+                    st.caption("Preview loaded from media URL.")
+                    st.caption(
+                        f"product_id={media.product_id} | listing_id={media.listing_id} | size={media.size_bytes} bytes"
+                    )
+                    continue
+                preview_bytes, _preview_content_type, load_error = load_media_bytes(media, storage=storage)
                 if preview_bytes is not None:
                     try:
                         st.image(preview_bytes, use_container_width=True)
                     except Exception:
-                        if media.s3_url:
+                        if _is_public_media_url(media.s3_url):
                             try:
                                 st.image(media.s3_url, use_container_width=True)
                             except Exception:
                                 st.caption("Image preview unavailable (invalid image bytes/URL content).")
                         else:
                             st.caption("Image preview unavailable (invalid image bytes).")
-                else:
+                elif _is_public_media_url(media.s3_url):
                     try:
                         st.image(media.s3_url, use_container_width=True)
                     except Exception:
                         st.caption("Image preview unavailable (invalid image URL content).")
+                else:
+                    st.caption("Image preview unavailable from private storage.")
+                    warning = _media_load_warning(load_error)
+                    if warning:
+                        st.caption(f"Load warning: {warning}")
             elif media.media_type == "video":
+                if bool(prefer_url_previews) and _is_public_media_url(media.s3_url):
+                    st.video(media.s3_url)
+                    st.caption("Preview streamed from media URL.")
+                    st.caption(
+                        f"product_id={media.product_id} | listing_id={media.listing_id} | size={media.size_bytes} bytes"
+                    )
+                    continue
+                preview_bytes, preview_content_type, load_error = load_media_bytes(media, storage=storage)
                 if preview_bytes is not None:
                     st.video(preview_bytes, format=preview_content_type)
-                else:
+                elif _is_public_media_url(media.s3_url):
                     st.video(media.s3_url)
+                else:
+                    st.caption("Video preview unavailable from private storage.")
+                    warning = _media_load_warning(load_error)
+                    if warning:
+                        st.caption(f"Load warning: {warning}")
             else:
                 st.markdown(f"[Open Asset]({media.s3_url})")
             st.caption(
@@ -602,25 +664,75 @@ def render_media_gallery(
             )
 
 
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def _cached_media_url_bytes(
+    url: str,
+    *,
+    content_type_hint: str = "application/octet-stream",
+    size_hint: int = 0,
+) -> tuple[bytes | None, str, str | None]:
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        return (
+            response.content,
+            response.headers.get("Content-Type", content_type_hint),
+            None,
+        )
+    except Exception as exc:
+        return None, content_type_hint, str(exc)
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def _cached_s3_media_bytes(
+    bucket: str,
+    key: str,
+    *,
+    content_type_hint: str = "application/octet-stream",
+    size_hint: int = 0,
+) -> tuple[bytes | None, str, str | None]:
+    try:
+        storage = MediaStorageService()
+        if not storage.enabled:
+            return None, content_type_hint, "S3 media storage is not configured."
+        data, content_type = storage.get_object_bytes(bucket, key)
+        return data, content_type or content_type_hint, None
+    except Exception as exc:
+        return None, content_type_hint, str(exc)
+
+
 def load_media_bytes(media, storage: MediaStorageService | None = None) -> tuple[bytes | None, str, str | None]:
     preview_bytes = None
     preview_content_type = media.content_type or "application/octet-stream"
     last_error: str | None = None
     if storage is not None and storage.enabled and media.s3_bucket and media.s3_key:
-        try:
-            preview_bytes, preview_content_type = storage.get_object_bytes(media.s3_bucket, media.s3_key)
-            return preview_bytes, preview_content_type, None
-        except Exception as exc:
-            last_error = str(exc)
-    if media.s3_url:
-        try:
-            response = requests.get(media.s3_url, timeout=20)
-            response.raise_for_status()
-            preview_bytes = response.content
-            preview_content_type = response.headers.get("Content-Type", preview_content_type)
-            return preview_bytes, preview_content_type, None
-        except Exception as exc:
-            last_error = str(exc)
+        if isinstance(storage, MediaStorageService):
+            data, content_type, err = _cached_s3_media_bytes(
+                str(media.s3_bucket),
+                str(media.s3_key),
+                content_type_hint=str(preview_content_type),
+                size_hint=int(getattr(media, "size_bytes", 0) or 0),
+            )
+            if data is not None:
+                return data, content_type, None
+            last_error = err
+        else:
+            try:
+                preview_bytes, preview_content_type = storage.get_object_bytes(media.s3_bucket, media.s3_key)
+                return preview_bytes, preview_content_type, None
+            except Exception as exc:
+                last_error = str(exc)
+    if media.s3_url and _is_public_media_url(media.s3_url):
+        data, content_type, err = _cached_media_url_bytes(
+            str(media.s3_url),
+            content_type_hint=str(preview_content_type),
+            size_hint=int(getattr(media, "size_bytes", 0) or 0),
+        )
+        if data is not None:
+            return data, content_type, None
+        last_error = err
+    elif media.s3_url:
+        last_error = last_error or "Direct media URL is private; backend storage credentials are required."
     return None, preview_content_type, last_error
 
 
@@ -655,23 +767,27 @@ def render_media_file_actions(
             try:
                 st.image(data, use_container_width=True)
             except Exception:
-                if selected.s3_url:
+                if _is_public_media_url(selected.s3_url):
                     try:
                         st.image(selected.s3_url, use_container_width=True)
                     except Exception:
                         st.caption("Image preview unavailable (invalid image bytes/URL content).")
                 else:
                     st.caption("Image preview unavailable (invalid image bytes).")
-        elif selected.s3_url:
+        elif _is_public_media_url(selected.s3_url):
             try:
                 st.image(selected.s3_url, use_container_width=True)
             except Exception:
                 st.caption("Image preview unavailable (invalid image URL content).")
+        else:
+            st.caption("Image preview unavailable from private storage.")
     elif selected.media_type == "video":
         if data is not None:
             st.video(data, format=content_type)
-        elif selected.s3_url:
+        elif _is_public_media_url(selected.s3_url):
             st.video(selected.s3_url)
+        else:
+            st.caption("Video preview unavailable from private storage.")
     else:
         st.caption("Preview not available for this file type.")
 
@@ -688,8 +804,10 @@ def render_media_file_actions(
         else:
             st.caption("Download unavailable (could not load file bytes in app).")
     with c2:
-        if selected.s3_url:
+        if _is_public_media_url(selected.s3_url):
             st.markdown(f"[Open File URL]({selected.s3_url})")
+        elif selected.s3_url:
+            st.caption("Direct file URL is private; use backend preview/download controls.")
         else:
             st.caption("No URL available.")
 

@@ -145,6 +145,43 @@ class ReportsFeeReconciliationTests(unittest.TestCase):
         self.assertEqual(row["order_fee_breakdown_total_marketplace_fee"], 2.15)
         self.assertTrue(row["order_fee_breakdown_present"])
 
+    def test_prefers_normalized_order_finance_entries_when_present(self) -> None:
+        listing = SimpleNamespace(
+            external_listing_id="XYZ",
+            marketplace_details=json.dumps({"ebay_publish": {"fee_estimate": {"estimated_total_fees": 4.0, "quantity": 1}}}),
+        )
+        order = SimpleNamespace(
+            notes='Imported from eBay sync pull. fee_breakdown_json={"total_marketplace_fee":2.15}',
+            finance_entries=[
+                SimpleNamespace(entry_kind="marketplace_fee", amount=1.25),
+                SimpleNamespace(entry_kind="marketplace_fee", amount=1.75),
+                SimpleNamespace(entry_kind="shipping_label", amount=4.25),
+            ],
+        )
+        sale = SimpleNamespace(
+            id=30,
+            sold_at=None,
+            external_order_id="ORDER-30",
+            listing_id=12,
+            listing=listing,
+            product=SimpleNamespace(sku="SKU30", title="Product 30"),
+            quantity_sold=1,
+            sold_price=20.0,
+            fees=9.99,
+            marketplace="ebay",
+            order=order,
+        )
+
+        rows = build_ebay_fee_reconciliation_rows([sale])
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["actual_fee"], 3.0)
+        self.assertEqual(row["actual_fee_source"], "normalized_order_finance_entries_marketplace_fee_sum")
+        self.assertEqual(row["normalized_order_finance_marketplace_fee_total"], 3.0)
+        self.assertTrue(row["normalized_order_finance_marketplace_fee_present"])
+        self.assertEqual(row["order_fee_breakdown_total_marketplace_fee"], 2.15)
+
     def test_non_ebay_sales_are_ignored(self) -> None:
         sale = SimpleNamespace(
             marketplace="local",

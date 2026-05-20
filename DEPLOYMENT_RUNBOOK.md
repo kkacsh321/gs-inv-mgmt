@@ -121,7 +121,26 @@ Prod gate:
 - change approved
 - rollback tag prepared
 
-## 9) Build Metadata Visibility
+## 9) eBay Sync Network Incidents
+
+Symptoms:
+- sync worker logs include `NameResolutionError`, `Failed to resolve 'api.ebay.com'`, `No address associated with hostname`, `network is unreachable`, or connection timeouts/resets
+- `ebay_connection_health_check` reports `partial` with transient-network warning details
+- `ebay_orders_pull_import` records `status=skipped`, `records_failed=0`, and sync error code `EBAY_NETWORK_UNAVAILABLE`
+- eBay OAuth auto-refresh records `ebay_oauth / auto_refresh` warning telemetry and enters the configured refresh-failure cooldown without sending Slack auth-failure alerts
+- System Health shows `eBay Network Holds`, and Sync highlights unresolved `EBAY_NETWORK_UNAVAILABLE` exceptions
+
+Operator response:
+1. Treat this as infrastructure/network/DNS first, not token revocation or eBay credential failure.
+2. Check host/container DNS resolution and egress:
+   - Docker: `docker compose exec app getent hosts api.ebay.com`
+   - Kubernetes: verify DNS egress (`53/TCP`, `53/UDP`) and HTTPS egress (`443/TCP`) are allowed by NetworkPolicy.
+3. Check whether other external integrations are also failing; if yes, escalate as broader DNS/egress incident.
+4. Do not rotate eBay OAuth credentials unless health checks continue failing after DNS/egress is healthy.
+5. After network recovery, either wait for the next sync-runner pass or run manual eBay health/order import from Admin/Sync.
+6. Attach sync run IDs, integration events, and DNS/egress evidence to the incident notes.
+
+## 10) Build Metadata Visibility
 
 Recommended next step:
 - expose `APP_BUILD_VERSION` and `APP_BUILD_SHA` in runtime config and surface in Admin/System Health for environment traceability.

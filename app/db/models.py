@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -428,6 +429,36 @@ class EbayCategorySuggestion(Base, TimestampMixin):
     created_by: Mapped[str] = mapped_column(String(128), default="system")
 
 
+class EbayCategoryAspect(Base, TimestampMixin):
+    __tablename__ = "ebay_category_aspects"
+    __table_args__ = (
+        UniqueConstraint(
+            "environment",
+            "marketplace_id",
+            "category_id",
+            name="uq_ebay_category_aspect_env_market_category",
+        ),
+        Index(
+            "ix_ebay_category_aspect_lookup",
+            "environment",
+            "marketplace_id",
+            "category_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    marketplace_id: Mapped[str] = mapped_column(String(32), default="EBAY_US", index=True)
+    category_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    aspects_json: Mapped[str] = mapped_column(Text, default="[]")
+    required_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(32), default="ebay_taxonomy")
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    created_by: Mapped[str] = mapped_column(String(128), default="system")
+
+
 class EbayListingTemplateProfile(Base, TimestampMixin):
     __tablename__ = "ebay_listing_template_profiles"
     __table_args__ = (
@@ -823,6 +854,7 @@ class PurchaseLot(Base, TimestampMixin):
     total_tax_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     total_shipping_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     total_handling_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    expected_total_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ebay_purchase: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     ebay_purchase_item_id: Mapped[str] = mapped_column(String(128), default="")
     ebay_purchase_url: Mapped[str] = mapped_column(Text, default="")
@@ -852,6 +884,7 @@ class ProductLotAssignment(Base, TimestampMixin):
     allocated_tax_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     allocated_shipping_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     allocated_handling_paid: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    allocation_weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     acquired_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
 
     product: Mapped[Product] = relationship(back_populates="lot_assignments")
@@ -923,6 +956,20 @@ class AuditLog(Base):
     actor: Mapped[str] = mapped_column(String(128), default="system")
     changes_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+
+    @property
+    def changes(self) -> dict:
+        raw = str(self.changes_json or "{}")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @changes.setter
+    def changes(self, payload: dict | None) -> None:
+        value = payload if isinstance(payload, dict) else {}
+        self.changes_json = json.dumps(value)
 
 
 class WorkflowDraft(Base, TimestampMixin):

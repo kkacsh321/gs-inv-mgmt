@@ -551,6 +551,13 @@ def render_sync(repo: InventoryRepository) -> None:
         }
         for err, run in queue_pairs
     ]
+    ebay_network_rows = [
+        row
+        for row in queue_rows
+        if str(row.get("provider") or "").strip().lower() == "ebay"
+        and str(row.get("code") or "").strip().upper() == "EBAY_NETWORK_UNAVAILABLE"
+        and row.get("resolved_at") is None
+    ]
     if not queue_rows:
         render_workspace_empty_state(
             title="Exception Queue",
@@ -560,6 +567,11 @@ def render_sync(repo: InventoryRepository) -> None:
         render_workspace_loading_state(
             title="Exception Queue",
             detail=f"Showing {len(queue_rows)} rows.",
+        )
+    if ebay_network_rows:
+        st.warning(
+            f"{len(ebay_network_rows)} unresolved eBay network/DNS hold(s) are in the queue. "
+            "Confirm DNS and outbound HTTPS connectivity before rotating eBay OAuth credentials."
         )
     st.dataframe(pd.DataFrame(queue_rows), use_container_width=True)
     _render_sync_copilot(repo, user, runs, queue_pairs)

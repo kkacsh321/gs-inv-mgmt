@@ -172,6 +172,35 @@ class IntakeWizardHelperTests(unittest.TestCase):
         got = iiw._normalize_inventory_grader_output(raw_result_text=raw, structured_grade=structured)
         self.assertIn("AU55", got)
 
+    def test_inventory_clear_draft_session_state_resets_without_deleting_keys(self) -> None:
+        dummy_st = _DummySt()
+        dummy_st.session_state.update(
+            {
+                "inv_intake_form_title": "Old title",
+                "inv_intake_form_quantity": 9,
+                "inv_intake_ai_buffered_media": [{"name": "a.jpg"}],
+                "inventory_intake_last_autosave_signature": "abc",
+                "inventory_intake_last_draft_id": 42,
+            }
+        )
+        with patch.object(iiw, "st", dummy_st):
+            iiw._inventory_intake_clear_draft_session_state()
+
+        self.assertIn("inv_intake_form_title", dummy_st.session_state)
+        self.assertEqual(dummy_st.session_state["inv_intake_form_title"], "")
+        self.assertEqual(dummy_st.session_state["inv_intake_form_quantity"], 1)
+        self.assertEqual(dummy_st.session_state["inv_intake_ai_buffered_media"], [])
+        self.assertEqual(dummy_st.session_state["inventory_intake_last_autosave_signature"], "")
+        self.assertEqual(dummy_st.session_state["inventory_intake_last_draft_id"], 0)
+
+    def test_inventory_take_flag_resets_instead_of_popping(self) -> None:
+        dummy_st = _DummySt()
+        dummy_st.session_state["inv_intake_force_apply_grader_prefill"] = True
+        with patch.object(iiw, "st", dummy_st):
+            self.assertTrue(iiw._inventory_intake_take_flag("inv_intake_force_apply_grader_prefill"))
+        self.assertIn("inv_intake_force_apply_grader_prefill", dummy_st.session_state)
+        self.assertFalse(dummy_st.session_state["inv_intake_force_apply_grader_prefill"])
+
 
 if __name__ == "__main__":
     unittest.main()

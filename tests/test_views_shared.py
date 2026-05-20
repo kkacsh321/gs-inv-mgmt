@@ -383,6 +383,54 @@ class SharedViewsTests(unittest.TestCase):
             shared.render_media_gallery(items, storage=None)
         self.assertEqual(len(fake_st.images), 1)
         self.assertEqual(len(fake_st.videos), 1)
+        self.assertEqual(fake_st.images[0], b"img")
+        self.assertEqual(fake_st.videos[0], b"vid")
+
+    def test_render_media_gallery_does_not_preview_private_s3_url_directly(self):
+        fake_st = _FakeSt()
+        items = [
+            SimpleNamespace(
+                id=1,
+                media_type="image",
+                original_filename="a.jpg",
+                s3_url="https://private-bucket.s3.amazonaws.com/a.jpg",
+                product_id=1,
+                listing_id=2,
+                size_bytes=10,
+                content_type="image/jpeg",
+                s3_bucket="b",
+                s3_key="k1",
+            ),
+        ]
+        with patch.object(shared, "st", fake_st), patch.object(
+            shared, "load_media_bytes", return_value=(None, "image/jpeg", "denied")
+        ):
+            shared.render_media_gallery(items, storage=None, prefer_url_previews=True)
+        self.assertEqual(fake_st.images, [])
+        self.assertTrue(any("private storage" in msg for msg in fake_st.captions))
+
+    def test_public_media_url_detection(self):
+        self.assertFalse(shared._is_public_media_url("https://bucket.s3.amazonaws.com/a.jpg"))
+        self.assertFalse(shared._is_public_media_url("https://bucket.s3.us-west-2.amazonaws.com/a.jpg"))
+        self.assertTrue(shared._is_public_media_url("https://cdn.example.com/a.jpg"))
+
+    def test_public_media_url_detection_treats_configured_s3_endpoint_as_private(self):
+        settings_stub = SimpleNamespace(
+            s3_endpoint_url="http://minio:9000",
+            s3_public_base_url="",
+            s3_bucket="goldenstackers-media",
+        )
+        with patch.object(shared, "settings", settings_stub):
+            self.assertFalse(shared._is_public_media_url("http://minio:9000/goldenstackers-media/media/a.jpg"))
+
+    def test_public_media_url_detection_allows_configured_public_base(self):
+        settings_stub = SimpleNamespace(
+            s3_endpoint_url="http://minio:9000",
+            s3_public_base_url="https://cdn.example.com/media",
+            s3_bucket="goldenstackers-media",
+        )
+        with patch.object(shared, "settings", settings_stub):
+            self.assertTrue(shared._is_public_media_url("https://cdn.example.com/media/a.jpg"))
 
     def test_load_media_bytes_storage_and_http(self):
         media = SimpleNamespace(content_type="image/jpeg", s3_bucket="b", s3_key="k", s3_url="https://x/a.jpg")
@@ -399,6 +447,27 @@ class SharedViewsTests(unittest.TestCase):
         self.assertEqual(data, b"http")
         self.assertEqual(ctype, "image/png")
         self.assertIsNone(err)
+
+    def test_load_media_bytes_does_not_fetch_private_configured_endpoint_url(self):
+        settings_stub = SimpleNamespace(
+            s3_endpoint_url="http://minio:9000",
+            s3_public_base_url="",
+            s3_bucket="goldenstackers-media",
+        )
+        media = SimpleNamespace(
+            content_type="image/jpeg",
+            s3_bucket="",
+            s3_key="",
+            s3_url="http://minio:9000/goldenstackers-media/media/a.jpg",
+            size_bytes=10,
+        )
+        with patch.object(shared, "settings", settings_stub), patch.object(shared, "_cached_media_url_bytes") as fetch:
+            data, ctype, err = shared.load_media_bytes(media, storage=None)
+
+        self.assertIsNone(data)
+        self.assertEqual(ctype, "image/jpeg")
+        self.assertIn("private", str(err or ""))
+        fetch.assert_not_called()
 
     def test_render_media_file_actions_no_media(self):
         fake_st = _FakeSt()
