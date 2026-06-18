@@ -3,7 +3,7 @@ from collections import defaultdict, deque
 from io import BytesIO
 import hashlib
 import json
-from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 import zipfile
@@ -23,21 +23,70 @@ from app.components.views.shared import (
     render_help_panel,
 )
 from app.components.views.workspace_shell import render_workspace_feedback
+from app.components.views.tax_support import (
+    COLORADO_SUTS_ACCOUNT_NUMBER,
+    COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER,
+    COLORADO_SUTS_TEMPLATE_PATH,
+    _build_colorado_suts_scope_summary_rows,
+    _build_colorado_suts_upload_workbook,
+    _build_quarterly_estimated_tax_payload,
+    _build_quarterly_estimated_tax_payment_payload,
+    _build_quarterly_estimated_tax_payment_review,
+    _build_tax_drilldown_sale_option_rows,
+    _build_tax_exception_rows,
+    _build_tax_reporting_signoff_payload,
+    _build_tax_reporting_signoff_review,
+    _build_tax_review_export_packet,
+    _colorado_suts_summary_warnings,
+    _estimated_tax_period_for_quarter,
+    _estimated_tax_period_rows,
+    _default_tax_marketplace_scope,
+    _filter_df_by_datetime_window,
+    _filter_tax_drilldown_rows,
+    _filter_tax_detail_for_month,
+    _load_colorado_suts_jurisdiction_options,
+    _month_bounds_from_yyyy_mm,
+    _parse_csv_set,
+    _quarterly_estimated_tax_scope_notice,
+    _quarterly_estimated_tax_payment_rows_from_audit_logs,
+    _suts_jurisdiction_key,
+    _tax_drilldown_kpis,
+    _tax_profile_rows_from_audit_logs,
+    _tax_report_presets,
+    _tax_review_packet_evidence_hash_from_reports,
+    _tax_signoff_rows_from_audit_logs,
+    render_tax_reporting_scope_controls,
+    render_taxes_workspace_intro,
+    tax_review_packet_prefixes,
+)
 from app.repository import InventoryRepository
+from app.services.accounting_cogs import (
+    COGS_BASIS_REASON_BY_SOURCE,
+    COGS_ESTIMATE_SOURCES,
+    COGS_REVIEW_SOURCES,
+    cogs_basis_bucket,
+    cogs_basis_review_fields,
+    net_before_cogs as accounting_net_before_cogs,
+    profit_after_returns as accounting_profit_after_returns,
+    profit_before_returns as accounting_profit_before_returns,
+    return_refund_total,
+    returns_profit_impact as accounting_returns_profit_impact,
+    shipping_delta as accounting_shipping_delta,
+)
+from app.services.ai_accountant_identity import AI_ACCOUNTANT_NAME
 from app.services.ai_orchestration import execute_comp_summary
 from app.services.fee_calibration import build_final_value_rate_calibration
 from app.services.fee_reconciliation import build_ebay_fee_reconciliation_rows
+from app.services.quickbooks import (
+    QuickBooksClearingConfig,
+    quickbooks_config_from_runtime,
+    quickbooks_non_order_fee_purchase_payload,
+    quickbooks_order_fee_purchase_payload,
+    quickbooks_payload_validation_issues,
+    quickbooks_sales_receipt_payload,
+)
 from app.services.runtime_settings import get_runtime_bool, get_runtime_float, get_runtime_str
 from app.utils.time import utc_today
-
-COLORADO_SUTS_ACCOUNT_NUMBER = "080390"
-COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER = "970074130001"
-COLORADO_SUTS_TEMPLATE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "assets"
-    / "templates"
-    / "CO-SUTS-Excel-Template-127596.xlsx"
-)
 
 ACCOUNTING_FIELD_SEMANTICS_ROWS = [
     {
@@ -97,6 +146,14 @@ def _safe_float(value) -> float:
         return 0.0
 
 
+def _within_close_tolerance(delta: float, tolerance: float) -> bool:
+    return abs(round(_safe_float(delta), 2)) <= round(_safe_float(tolerance), 2)
+
+
+def _cogs_basis_review_fields(cost_source: object) -> dict[str, object]:
+    return cogs_basis_review_fields(cost_source)
+
+
 def _sale_listing_bundle_summary(sale: object) -> dict[str, object]:
     listing = getattr(sale, "listing", None)
     bundle_payload = InventoryRepository._listing_bundle_payload(listing)
@@ -117,6 +174,988 @@ def _sale_listing_bundle_summary(sale: object) -> dict[str, object]:
             for component in components
         ),
     }
+
+
+def _sale_inventory_movement_summary(
+    sale: object,
+    sale_movement_units_by_product: dict[tuple[int, int], int],
+) -> dict[str, object]:
+    sale_id = int(getattr(sale, "id", 0) or 0)
+    quantity_sold = int(getattr(sale, "quantity_sold", 0) or 0)
+    bundle_summary = _sale_listing_bundle_summary(sale)
+    listing = getattr(sale, "listing", None)
+    bundle_payload = InventoryRepository._listing_bundle_payload(listing)
+    bundle_components = InventoryRepository._bundle_components_from_payload(bundle_payload, quantity_sold)
+    expected_movement_units = int(bundle_summary.get("listing_bundle_inventory_units_sold") or quantity_sold)
+    is_lot_listing_movement = bool(bundle_components) or expected_movement_units > max(1, quantity_sold)
+    recorded_movement_units = 0
+    if bundle_components:
+        recorded_movement_units = sum(
+            int(sale_movement_units_by_product.get((sale_id, int(component.get("product_id") or 0)), 0))
+            for component in bundle_components
+            if int(component.get("product_id") or 0) > 0
+        )
+    else:
+        product_ids: list[int] = []
+        for value in [
+            getattr(sale, "product_id", None),
+            getattr(listing, "product_id", None),
+            getattr(getattr(sale, "product", None), "id", None),
+            getattr(getattr(listing, "product", None), "id", None),
+        ]:
+            product_id = int(value or 0)
+            if product_id > 0 and product_id not in product_ids:
+                product_ids.append(product_id)
+        recorded_movement_units = max(
+            [int(sale_movement_units_by_product.get((sale_id, product_id), 0)) for product_id in product_ids] or [0]
+        )
+    mismatch_units = max(0, expected_movement_units - recorded_movement_units)
+    lot_listing_mismatch_units = mismatch_units if is_lot_listing_movement else 0
+    return {
+        "inventory_movement_units_expected": int(expected_movement_units),
+        "inventory_movement_units_recorded": int(recorded_movement_units),
+        "inventory_movement_mismatch_units": int(mismatch_units),
+        "inventory_movement_mismatch": bool(mismatch_units > 0),
+        "listing_lot_movement_mismatch_units": int(lot_listing_mismatch_units),
+        "listing_lot_movement_mismatch": bool(lot_listing_mismatch_units > 0),
+    }
+
+
+def _lot_listing_movement_repair_candidates(accounting_exceptions_df: pd.DataFrame) -> list[dict[str, object]]:
+    if accounting_exceptions_df is None or accounting_exceptions_df.empty:
+        return []
+    rows: list[dict[str, object]] = []
+    for row in accounting_exceptions_df.to_dict("records"):
+        if str(row.get("exception_type") or "").strip() != "listing_lot_inventory_movement_mismatch":
+            continue
+        try:
+            sale_id = int(row.get("entity_id") or 0)
+        except Exception:
+            sale_id = 0
+        if sale_id <= 0:
+            continue
+        rows.append(
+            {
+                "sale_id": sale_id,
+                "severity": str(row.get("severity") or "").strip(),
+                "sku": str(row.get("sku") or "").strip(),
+                "reference": str(row.get("reference") or "").strip(),
+                "missing_units": int(_safe_float(row.get("amount"))),
+                "details": str(row.get("details") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _lot_listing_movement_repair_candidates_from_cogs_margin(
+    cogs_margin_df: pd.DataFrame,
+) -> list[dict[str, object]]:
+    if cogs_margin_df is None or cogs_margin_df.empty:
+        return []
+    rows: list[dict[str, object]] = []
+    for row in cogs_margin_df.to_dict("records"):
+        mismatch_units = int(_safe_float(row.get("listing_lot_movement_mismatch_units")))
+        if mismatch_units <= 0 and not bool(row.get("listing_lot_movement_mismatch")):
+            continue
+        expected_units = int(_safe_float(row.get("inventory_movement_units_expected")))
+        quantity = int(_safe_float(row.get("quantity")))
+        if expected_units <= max(1, quantity) and not bool(row.get("listing_is_bundle")):
+            continue
+        try:
+            sale_id = int(row.get("sale_id") or 0)
+        except Exception:
+            sale_id = 0
+        if sale_id <= 0:
+            continue
+        recorded_units = int(_safe_float(row.get("inventory_movement_units_recorded")))
+        rows.append(
+            {
+                "sale_id": sale_id,
+                "severity": "review",
+                "sku": str(row.get("sku") or "").strip(),
+                "reference": str(row.get("marketplace") or "").strip(),
+                "missing_units": mismatch_units,
+                "details": (
+                    f"COGS & Margin Detail shows expected movement units={expected_units}, "
+                    f"recorded movement units={recorded_units}, missing units={mismatch_units}."
+                ),
+            }
+        )
+    return rows
+
+
+def _merge_lot_listing_movement_repair_candidates(
+    *candidate_groups: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[int, dict[str, object]] = {}
+    for group in candidate_groups:
+        for candidate in group or []:
+            try:
+                sale_id = int(candidate.get("sale_id") or 0)
+            except Exception:
+                sale_id = 0
+            if sale_id <= 0:
+                continue
+            existing = merged.get(sale_id)
+            if existing is None:
+                merged[sale_id] = dict(candidate)
+                continue
+            existing_missing = int(_safe_float(existing.get("missing_units")))
+            candidate_missing = int(_safe_float(candidate.get("missing_units")))
+            if candidate_missing > existing_missing:
+                existing["missing_units"] = candidate_missing
+            for key in ["severity", "sku", "reference", "details"]:
+                if not str(existing.get(key) or "").strip() and str(candidate.get(key) or "").strip():
+                    existing[key] = candidate.get(key)
+    return sorted(merged.values(), key=lambda row: int(row.get("sale_id") or 0), reverse=True)
+
+
+def _active_accounting_suppression_keys(repo: InventoryRepository) -> set[tuple[str, str, int]]:
+    if not hasattr(repo, "accounting_exception_suppression_keys"):
+        return set()
+    try:
+        return set(repo.accounting_exception_suppression_keys() or set())
+    except Exception:
+        _rollback_report_session()
+        return set()
+
+
+def _accounting_suppression_key(
+    exception_type: str,
+    target_entity_type: str,
+    target_entity_id: int,
+) -> tuple[str, str, int]:
+    return (
+        str(exception_type or "").strip(),
+        str(target_entity_type or "").strip(),
+        int(target_entity_id or 0),
+    )
+
+
+def _sale_suppression_mask(
+    frame: pd.DataFrame,
+    suppression_keys: set[tuple[str, str, int]],
+    exception_type: str,
+) -> pd.Series:
+    if frame is None or frame.empty or "sale_id" not in frame.columns:
+        return pd.Series([False] * (0 if frame is None else len(frame)), index=getattr(frame, "index", None))
+    if not suppression_keys:
+        return pd.Series([False] * len(frame), index=frame.index)
+    sale_ids = pd.to_numeric(frame.get("sale_id", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+    return sale_ids.map(
+        lambda sale_id: _accounting_suppression_key(exception_type, "sale", int(sale_id)) in suppression_keys
+    )
+
+
+def _accounting_exception_repair_candidates(accounting_exceptions_df: pd.DataFrame) -> list[dict[str, object]]:
+    if accounting_exceptions_df is None or accounting_exceptions_df.empty:
+        return []
+    supported_types = {
+        "lot_total_cost_includes_landed_components",
+        "lot_equal_fallback_review_needed",
+        "lot_underallocated",
+        "lot_overallocated",
+        "active_bundle_listing_stock_shortage",
+        "active_bundle_component_overcommitted",
+        "listing_lot_inventory_movement_mismatch",
+        "unmatched_shipping_label_finance_entry",
+    }
+    repair_priority = {
+        "lot_total_cost_includes_landed_components": 0,
+        "lot_underallocated": 10,
+        "lot_overallocated": 10,
+        "lot_equal_fallback_review_needed": 15,
+        "listing_lot_inventory_movement_mismatch": 20,
+        "unmatched_shipping_label_finance_entry": 25,
+        "active_bundle_listing_stock_shortage": 30,
+        "active_bundle_component_overcommitted": 40,
+    }
+    cost_basis_repair_types = {
+        "lot_total_cost_includes_landed_components",
+        "lot_underallocated",
+        "lot_overallocated",
+        "lot_equal_fallback_review_needed",
+    }
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in accounting_exceptions_df.to_dict("records"):
+        exception_type = str(row.get("exception_type") or "").strip()
+        if exception_type not in supported_types:
+            continue
+        try:
+            entity_id = int(row.get("entity_id") or 0)
+        except Exception:
+            entity_id = 0
+        if entity_id <= 0:
+            continue
+        key = (exception_type, entity_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "exception_type": exception_type,
+                "repair_order": int(repair_priority.get(exception_type, 99)),
+                "entity_type": str(row.get("entity_type") or "").strip(),
+                "entity_id": entity_id,
+                "severity": str(row.get("severity") or "").strip(),
+                "sku": str(row.get("sku") or "").strip(),
+                "reference": str(row.get("reference") or "").strip(),
+                "amount": _safe_float(row.get("amount")),
+                "details": str(row.get("details") or "").strip(),
+                "repair_scope": (
+                    "cost_basis"
+                    if exception_type in cost_basis_repair_types
+                    else "finance_evidence"
+                    if exception_type == "unmatched_shipping_label_finance_entry"
+                    else "inventory_listing"
+                ),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            repair_priority.get(str(row.get("exception_type") or ""), 99),
+            str(row.get("entity_type") or ""),
+            int(row.get("entity_id") or 0),
+        ),
+    )
+
+
+def _run_accounting_exception_repair(
+    repo: InventoryRepository,
+    candidate: dict[str, object],
+    *,
+    actor: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    exception_type = str(candidate.get("exception_type") or "").strip()
+    entity_id = int(candidate.get("entity_id") or 0)
+    if exception_type == "lot_total_cost_includes_landed_components":
+        return repo.repair_purchase_lot_embedded_landed_components(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type in {"lot_underallocated", "lot_overallocated"}:
+        return repo.repair_purchase_lot_assignment_allocations(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type == "lot_equal_fallback_review_needed":
+        return repo.repair_purchase_lot_equal_quantity_allocation_weights(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type == "active_bundle_listing_stock_shortage":
+        return repo.repair_active_bundle_listing_stock_shortage(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type == "active_bundle_component_overcommitted":
+        return repo.repair_active_bundle_component_overcommit(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type == "listing_lot_inventory_movement_mismatch":
+        return repo.repair_sale_lot_listing_inventory_movements(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    if exception_type == "unmatched_shipping_label_finance_entry":
+        return repo.repair_unmatched_shipping_label_finance_entry(
+            entity_id,
+            actor=actor,
+            dry_run=dry_run,
+        )
+    raise ValueError(f"Exception type `{exception_type}` does not have an automatic repair.")
+
+
+def _accounting_exception_suppression_rows(repo: InventoryRepository, *, limit: int = 200) -> list[dict[str, object]]:
+    db = getattr(repo, "db", None)
+    if db is None or not hasattr(db, "scalars"):
+        return []
+    try:
+        rows = db.scalars(
+            select(AuditLog)
+            .where(AuditLog.entity_type == "accounting_exception_suppress")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    except Exception:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return []
+    output: list[dict[str, object]] = []
+    active_keys = set()
+    if hasattr(repo, "accounting_exception_suppression_keys"):
+        try:
+            active_keys = set(repo.accounting_exception_suppression_keys())
+        except Exception:
+            active_keys = set()
+    for row in rows:
+        payload = _audit_changes(row)
+        exception_type = str(payload.get("exception_type") or "").strip()
+        target_entity_type = str(payload.get("target_entity_type") or "").strip()
+        target_entity_id = int(_safe_float(payload.get("target_entity_id")))
+        output.append(
+            {
+                "recorded_at_utc": (
+                    getattr(row, "created_at").isoformat(timespec="seconds")
+                    if getattr(row, "created_at", None)
+                    else ""
+                ),
+                "actor": str(getattr(row, "actor", "") or ""),
+                "action": str(getattr(row, "action", "") or "").strip().lower(),
+                "exception_type": exception_type,
+                "target_entity_type": target_entity_type,
+                "target_entity_id": target_entity_id,
+                "active": (exception_type, target_entity_type, target_entity_id) in active_keys,
+                "reason": str(payload.get("reason") or "").strip(),
+            }
+        )
+    return output
+
+
+def _render_accounting_exception_suppression_panel(
+    repo: InventoryRepository,
+    user: object,
+    accounting_exceptions_df: pd.DataFrame,
+    *,
+    loaded: bool,
+) -> None:
+    can_update = has_permission(getattr(user, "role", ""), "update")
+    has_suppress = hasattr(repo, "suppress_accounting_exception")
+    has_unsuppress = hasattr(repo, "unsuppress_accounting_exception")
+    suppression_rows = _accounting_exception_suppression_rows(repo)
+    active_suppression_rows = [row for row in suppression_rows if bool(row.get("active"))]
+
+    with st.expander("Accounting Exception Suppressions", expanded=False):
+        st.caption(
+            "Mark a false positive or accepted no-repair-needed exception so it no longer appears in "
+            "Reports, dashboard/Goldie exception rollups, or close review. Suppressions are audit events and can be reversed."
+        )
+        if not loaded:
+            st.info("Enable `Load Extended Analytics` to suppress current exception rows.")
+        if not can_update:
+            st.caption("You need `update` permission to suppress or restore accounting exception rows.")
+        if not has_suppress:
+            st.caption("Repository suppression support is not available in this environment.")
+
+        if accounting_exceptions_df is not None and not accounting_exceptions_df.empty and has_suppress:
+            st.markdown("**Current exception rows**")
+            reason = st.text_input(
+                "Suppression reason",
+                value="False positive / no repair needed",
+                key="reports_accounting_exception_suppression_reason",
+            )
+            seen_exception_keys: set[tuple[str, str, int]] = set()
+            for row in accounting_exceptions_df.head(100).to_dict("records"):
+                exception_type = str(row.get("exception_type") or "").strip()
+                entity_type = str(row.get("entity_type") or "").strip()
+                entity_id = int(_safe_float(row.get("entity_id")))
+                if not exception_type or not entity_type or entity_id <= 0:
+                    continue
+                exception_key = (exception_type, entity_type, entity_id)
+                if exception_key in seen_exception_keys:
+                    continue
+                seen_exception_keys.add(exception_key)
+                key = f"{exception_type}_{entity_type}_{entity_id}"
+                st.markdown(f"**{exception_type}** | {entity_type} #{entity_id}")
+                st.caption(str(row.get("details") or ""))
+                if st.button(
+                    "Mark No Repair Needed",
+                    key=f"reports_suppress_accounting_exception_{key}",
+                    disabled=not can_update,
+                ):
+                    try:
+                        repo.suppress_accounting_exception(
+                            exception_type=exception_type,
+                            target_entity_type=entity_type,
+                            target_entity_id=entity_id,
+                            actor=getattr(user, "username", "system"),
+                            reason=reason,
+                            details=str(row.get("details") or ""),
+                        )
+                        st.success(f"Suppressed {exception_type} for {entity_type} #{entity_id}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to suppress {exception_type} for {entity_type} #{entity_id}: {exc}")
+
+        if active_suppression_rows:
+            st.markdown("**Active suppressions**")
+            st.dataframe(
+                _arrow_safe_dataframe(pd.DataFrame(active_suppression_rows)),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if has_unsuppress:
+                options = {
+                    f"{row.get('exception_type')} | {row.get('target_entity_type')} #{row.get('target_entity_id')}": row
+                    for row in active_suppression_rows
+                }
+                selected = st.selectbox(
+                    "Restore suppressed exception",
+                    options=list(options.keys()),
+                    key="reports_restore_accounting_exception_suppression",
+                )
+                selected_row = options.get(selected) if selected else None
+                if selected_row and st.button(
+                    "Restore Selected Exception",
+                    key="reports_restore_accounting_exception_suppression_btn",
+                    disabled=not can_update,
+                ):
+                    try:
+                        repo.unsuppress_accounting_exception(
+                            exception_type=str(selected_row.get("exception_type") or ""),
+                            target_entity_type=str(selected_row.get("target_entity_type") or ""),
+                            target_entity_id=int(selected_row.get("target_entity_id") or 0),
+                            actor=getattr(user, "username", "system"),
+                            reason="Restored from Reports.",
+                        )
+                        st.success("Suppressed exception restored.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to restore suppressed exception: {exc}")
+        elif suppression_rows:
+            st.caption("No active suppressions. Recent suppression history is retained in audit logs.")
+
+
+def _render_close_action_suppression_panel(
+    repo: InventoryRepository,
+    user: object,
+    close_action_df: pd.DataFrame,
+    *,
+    active_suppression_keys: set[tuple[str, str, int]],
+) -> None:
+    if close_action_df is None or close_action_df.empty:
+        return
+    can_update = has_permission(getattr(user, "role", ""), "update")
+    if not hasattr(repo, "suppress_accounting_exception"):
+        return
+
+    rows: list[dict[str, object]] = []
+    for row in close_action_df.head(100).to_dict("records"):
+        sale_id = int(_safe_float(row.get("sale_id")))
+        if sale_id <= 0:
+            continue
+        if _safe_float(row.get("fifo_margin")) <= 0:
+            rows.append(
+                {
+                    "sale_id": sale_id,
+                    "exception_type": "nonpositive_margin",
+                    "label": "Mark margin reviewed / accepted",
+                    "reason": "Reviewed negative or low margin sale",
+                    "details": (
+                        f"Close Action Detail margin review: SKU={row.get('sku')}; "
+                        f"net_before_cogs={row.get('net_before_cogs')}; fifo_cogs={row.get('fifo_cogs')}; "
+                        f"fifo_margin={row.get('fifo_margin')}; cost_source={row.get('fifo_cost_source')}."
+                    ),
+                }
+            )
+        if str(row.get("fifo_cost_source") or "").strip() == "mixed_fifo_cost":
+            rows.append(
+                {
+                    "sale_id": sale_id,
+                    "exception_type": "mixed_fifo_cost_review",
+                    "label": "Mark mixed FIFO COGS reviewed",
+                    "reason": "Reviewed mixed FIFO COGS evidence",
+                    "details": (
+                        f"Close Action Detail mixed FIFO review: SKU={row.get('sku')}; "
+                        f"fifo_cogs={row.get('fifo_cogs')}; evidence_rows={row.get('fifo_cogs_evidence_rows')}; "
+                        f"recommended_action={row.get('recommended_action')}."
+                    ),
+                }
+            )
+    if not rows:
+        return
+
+    with st.expander("Close Action Review Decisions", expanded=False):
+        st.caption(
+            "Use these only after you confirm the sale economics and COGS evidence. Decisions are audit events "
+            "and remove the reviewed sale from close warning blockers; they do not change sale totals or COGS."
+        )
+        if not can_update:
+            st.caption("You need `update` permission to record close action review decisions.")
+        note = st.text_input(
+            "Review note",
+            value="Reviewed in Close Action Detail; no repair needed.",
+            key="reports_close_action_suppression_reason",
+        )
+        seen: set[tuple[str, str, int]] = set()
+        for decision in rows:
+            exception_type = str(decision.get("exception_type") or "").strip()
+            sale_id = int(decision.get("sale_id") or 0)
+            key = _accounting_suppression_key(exception_type, "sale", sale_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = str(decision.get("label") or "Mark reviewed").strip()
+            if key in active_suppression_keys:
+                st.caption(f"{exception_type} for sale #{sale_id} is already marked reviewed.")
+                continue
+            if st.button(
+                f"{label}: sale #{sale_id}",
+                key=f"reports_close_action_suppress_{exception_type}_{sale_id}",
+                disabled=not can_update,
+            ):
+                try:
+                    repo.suppress_accounting_exception(
+                        exception_type=exception_type,
+                        target_entity_type="sale",
+                        target_entity_id=sale_id,
+                        actor=getattr(user, "username", "system"),
+                        reason=str(note or decision.get("reason") or "").strip(),
+                        details=str(decision.get("details") or "").strip(),
+                    )
+                    st.success(f"Recorded close review decision for {exception_type} on sale #{sale_id}.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to record close review decision for sale #{sale_id}: {exc}")
+
+
+def _render_accounting_exception_auto_repair_panel(
+    repo: InventoryRepository,
+    user: object,
+    accounting_exceptions_df: pd.DataFrame,
+    *,
+    loaded: bool,
+) -> None:
+    can_repair = has_permission(getattr(user, "role", ""), "update")
+    candidates = _accounting_exception_repair_candidates(accounting_exceptions_df)
+    unsupported_counts: dict[str, int] = {}
+    if accounting_exceptions_df is not None and not accounting_exceptions_df.empty:
+        for exception_type, count in (
+            accounting_exceptions_df.get("exception_type", pd.Series(dtype=str))
+            .astype(str)
+            .value_counts()
+            .to_dict()
+            .items()
+        ):
+            if exception_type not in {
+                "lot_total_cost_includes_landed_components",
+                "lot_equal_fallback_review_needed",
+                "lot_underallocated",
+                "lot_overallocated",
+                "active_bundle_listing_stock_shortage",
+                "active_bundle_component_overcommitted",
+                "listing_lot_inventory_movement_mismatch",
+                "unmatched_shipping_label_finance_entry",
+            }:
+                unsupported_counts[str(exception_type)] = int(count)
+
+    with st.expander("Accounting Exception Auto Repair", expanded=bool(candidates)):
+        st.caption(
+            "Preview before applying. Automatic repairs only run where repository evidence is sufficient "
+            "to make a deterministic local correction."
+        )
+        if not loaded:
+            st.info("Enable `Load Extended Analytics` to find exception rows and auto-repair candidates.")
+        elif not candidates:
+            st.success("No auto-repairable accounting exceptions found for the selected date range.")
+        if not can_repair:
+            st.caption("You need `update` permission to apply accounting exception repairs.")
+
+        if unsupported_counts:
+            review_rows = [
+                {
+                    "exception_type": exception_type,
+                    "count": count,
+                    "repair_mode": (
+                        "review-only: confirm sale economics, price, fees, label spend, and cost basis"
+                        if exception_type == "nonpositive_margin"
+                        else "review-only"
+                    ),
+                }
+                for exception_type, count in sorted(unsupported_counts.items())
+            ]
+            st.markdown("**Review-only exception types**")
+            st.dataframe(
+                _arrow_safe_dataframe(pd.DataFrame(review_rows)),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if candidates:
+            cost_basis_candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("repair_scope") or "").strip() == "cost_basis"
+            ]
+            inventory_listing_candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("repair_scope") or "").strip() == "inventory_listing"
+            ]
+            finance_evidence_candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("repair_scope") or "").strip() == "finance_evidence"
+            ]
+            if cost_basis_candidates:
+                st.caption(
+                    f"Cost-basis repair candidates: {len(cost_basis_candidates)}. "
+                    "These adjust lot/allocation evidence only."
+                )
+            if finance_evidence_candidates:
+                st.caption(
+                    f"Finance-evidence repair candidates: {len(finance_evidence_candidates)}. "
+                    "These backfill sale/order evidence where one-to-one linkage is deterministic."
+                )
+            if inventory_listing_candidates:
+                st.warning(
+                    f"Inventory/listing repair candidates: {len(inventory_listing_candidates)}. "
+                    "These may change local stock/listing quantities or require external marketplace follow-up."
+                )
+
+            def _run_bulk_repair(selected_candidates: list[dict[str, object]], *, dry_run: bool) -> tuple[list[dict[str, object]], int]:
+                bulk_results = []
+                applied_count = 0
+                for candidate in selected_candidates[:100]:
+                    exception_type = str(candidate.get("exception_type") or "")
+                    entity_id = int(candidate.get("entity_id") or 0)
+                    try:
+                        result = _run_accounting_exception_repair(
+                            repo,
+                            candidate,
+                            actor=getattr(user, "username", "system"),
+                            dry_run=dry_run,
+                        )
+                        if not dry_run:
+                            applied_count += 1
+                        bulk_results.append(
+                            {
+                                "exception_type": exception_type,
+                                "entity_id": entity_id,
+                                "repair_scope": str(candidate.get("repair_scope") or ""),
+                                "status": "previewed" if dry_run else "applied",
+                                "result": result,
+                            }
+                        )
+                    except Exception as exc:
+                        bulk_results.append(
+                            {
+                                "exception_type": exception_type,
+                                "entity_id": entity_id,
+                                "repair_scope": str(candidate.get("repair_scope") or ""),
+                                "status": "error",
+                                "error": str(exc),
+                            }
+                        )
+                return bulk_results, applied_count
+
+            bulk_cols = st.columns([1, 1, 1, 1, 1, 1])
+            with bulk_cols[0]:
+                if st.button(
+                    "Preview Cost Repairs",
+                    key="reports_accounting_exception_repair_preview_cost_basis",
+                    disabled=not cost_basis_candidates,
+                ):
+                    bulk_results, _applied_count = _run_bulk_repair(cost_basis_candidates, dry_run=True)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+            with bulk_cols[1]:
+                if st.button(
+                    "Apply Cost Repairs",
+                    key="reports_accounting_exception_repair_apply_cost_basis",
+                    disabled=not can_repair or not cost_basis_candidates,
+                ):
+                    bulk_results, applied_count = _run_bulk_repair(cost_basis_candidates, dry_run=False)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+                    st.success(f"Applied {applied_count} cost-basis accounting repair(s).")
+                    st.rerun()
+            with bulk_cols[2]:
+                if st.button(
+                    "Preview Finance Repairs",
+                    key="reports_accounting_exception_repair_preview_finance_evidence",
+                    disabled=not finance_evidence_candidates,
+                ):
+                    bulk_results, _applied_count = _run_bulk_repair(finance_evidence_candidates, dry_run=True)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+            with bulk_cols[3]:
+                if st.button(
+                    "Apply Finance Repairs",
+                    key="reports_accounting_exception_repair_apply_finance_evidence",
+                    disabled=not can_repair or not finance_evidence_candidates,
+                ):
+                    bulk_results, applied_count = _run_bulk_repair(finance_evidence_candidates, dry_run=False)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+                    st.success(f"Applied {applied_count} finance-evidence accounting repair(s).")
+                    st.rerun()
+            with bulk_cols[4]:
+                if st.button("Preview All Repairs", key="reports_accounting_exception_repair_preview_all"):
+                    bulk_results, _applied_count = _run_bulk_repair(candidates, dry_run=True)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+            with bulk_cols[5]:
+                if st.button(
+                    "Apply All Repairs",
+                    key="reports_accounting_exception_repair_apply_all",
+                    disabled=not can_repair,
+                ):
+                    bulk_results, applied_count = _run_bulk_repair(candidates, dry_run=False)
+                    st.session_state["reports_accounting_exception_repair_bulk_result"] = bulk_results
+                    st.success(f"Applied {applied_count} accounting exception repair(s).")
+                    st.rerun()
+            bulk_result = st.session_state.get("reports_accounting_exception_repair_bulk_result")
+            if bulk_result:
+                st.json(bulk_result)
+
+        for candidate in candidates[:50]:
+            exception_type = str(candidate.get("exception_type") or "")
+            entity_id = int(candidate.get("entity_id") or 0)
+            row_key = f"{exception_type}_{entity_id}"
+            st.markdown(
+                f"**{exception_type}** | {candidate.get('entity_type') or 'entity'} #{entity_id} "
+                f"| repair order `{int(candidate.get('repair_order') or 0)}` "
+                f"| amount `{float(candidate.get('amount') or 0.0):.2f}`"
+            )
+            st.caption(str(candidate.get("details") or ""))
+            cols = st.columns([1, 1, 4])
+            preview_key = f"reports_accounting_exception_repair_preview_{row_key}"
+            apply_key = f"reports_accounting_exception_repair_apply_{row_key}"
+            result_key = f"{preview_key}_result"
+            with cols[0]:
+                if st.button("Preview Repair", key=preview_key):
+                    try:
+                        st.session_state[result_key] = _run_accounting_exception_repair(
+                            repo,
+                            candidate,
+                            actor=getattr(user, "username", "system"),
+                            dry_run=True,
+                        )
+                    except Exception as exc:
+                        st.session_state[result_key] = {"error": str(exc)}
+            with cols[1]:
+                if st.button("Apply Repair", key=apply_key, disabled=not can_repair):
+                    try:
+                        result = _run_accounting_exception_repair(
+                            repo,
+                            candidate,
+                            actor=getattr(user, "username", "system"),
+                            dry_run=False,
+                        )
+                        st.session_state[result_key] = result
+                        st.success(f"Applied repair for {exception_type} #{entity_id}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to repair {exception_type} #{entity_id}: {exc}")
+            result = st.session_state.get(result_key)
+            if result:
+                if isinstance(result, dict) and result.get("error"):
+                    st.error(str(result.get("error")))
+                else:
+                    st.json(result)
+
+
+def _render_lot_listing_movement_repair_panel(
+    repo: InventoryRepository,
+    user: object,
+    repair_candidates: list[dict[str, object]],
+    *,
+    loaded: bool,
+) -> None:
+    can_repair_lot_movements = has_permission(getattr(user, "role", ""), "update")
+    can_call_repair = hasattr(repo, "repair_sale_lot_listing_inventory_movements")
+    default_sale_id = 1
+    if repair_candidates:
+        try:
+            default_sale_id = max(1, int(repair_candidates[0].get("sale_id") or 1))
+        except Exception:
+            default_sale_id = 1
+
+    with st.expander("Lot Listing Movement Repair", expanded=bool(repair_candidates)):
+        st.caption(
+            "Use this when one marketplace listing unit represents multiple inventory units, such as a tube "
+            "of 20 coins, but the legacy sale movement only consumed one unit."
+        )
+        if not loaded:
+            st.info("Enable `Load Extended Analytics` to auto-detect repair candidates for the selected date range.")
+        elif not repair_candidates:
+            st.success("No auto-detected lot listing movement mismatches found for the selected date range.")
+        else:
+            st.warning(
+                "These sales look like one marketplace listing unit represented multiple inventory units, "
+                "but legacy sale movements consumed fewer units. Preview each repair before applying."
+            )
+        if not can_call_repair:
+            st.caption("Repository repair support is not available in this environment.")
+            return
+        if not can_repair_lot_movements:
+            st.caption("You need `update` permission to apply inventory movement repairs.")
+        preserve_current_inventory = st.checkbox(
+            "Preserve current inventory when repairing historical sale movements",
+            value=True,
+            key="reports_lot_listing_repair_preserve_current_inventory",
+            help=(
+                "Use this when current stock is already reconciled, but historical sale movement evidence is missing. "
+                "The repair records the missing sale movement without changing product current_quantity."
+            ),
+        )
+
+        st.markdown("**Manual sale repair**")
+        manual_sale_id = int(
+            st.number_input(
+                "Sale ID",
+                min_value=1,
+                value=default_sale_id,
+                step=1,
+                key="reports_lot_listing_manual_repair_sale_id",
+            )
+        )
+        manual_cols = st.columns([1, 1, 4])
+        with manual_cols[0]:
+            if st.button("Preview Manual Repair", key="reports_lot_listing_manual_repair_preview"):
+                try:
+                    st.session_state["reports_lot_listing_manual_repair_result"] = (
+                        repo.repair_sale_lot_listing_inventory_movements(
+                            manual_sale_id,
+                            actor=getattr(user, "username", "system"),
+                            preserve_current_inventory=bool(preserve_current_inventory),
+                            dry_run=True,
+                        )
+                    )
+                except Exception as exc:
+                    st.session_state["reports_lot_listing_manual_repair_result"] = {"error": str(exc)}
+        with manual_cols[1]:
+            if st.button(
+                "Apply Manual Repair",
+                key="reports_lot_listing_manual_repair_apply",
+                disabled=not can_repair_lot_movements,
+            ):
+                try:
+                    result = repo.repair_sale_lot_listing_inventory_movements(
+                        manual_sale_id,
+                        actor=getattr(user, "username", "system"),
+                        preserve_current_inventory=bool(preserve_current_inventory),
+                    )
+                    st.success(
+                        f"Repaired sale #{manual_sale_id}: "
+                        f"{int(result.get('total_repair_units') or 0)} inventory unit(s)."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to repair sale #{manual_sale_id}: {exc}")
+        manual_result = st.session_state.get("reports_lot_listing_manual_repair_result")
+        if manual_result:
+            if isinstance(manual_result, dict) and manual_result.get("error"):
+                st.error(str(manual_result.get("error")))
+            else:
+                st.json(manual_result)
+
+        if not repair_candidates:
+            return
+        st.markdown("**Auto-detected candidates**")
+        for candidate in repair_candidates[:20]:
+            sale_id = int(candidate["sale_id"])
+            st.markdown(
+                f"**Sale #{sale_id}**"
+                f" | SKU `{candidate.get('sku') or 'unknown'}`"
+                f" | missing units: `{candidate.get('missing_units')}`"
+            )
+            st.caption(str(candidate.get("details") or ""))
+            preview_key = f"reports_lot_listing_repair_preview_{sale_id}"
+            apply_key = f"reports_lot_listing_repair_apply_{sale_id}"
+            action_cols = st.columns([1, 1, 4])
+            with action_cols[0]:
+                if st.button("Preview", key=preview_key):
+                    try:
+                        preview = repo.repair_sale_lot_listing_inventory_movements(
+                            sale_id,
+                            actor=getattr(user, "username", "system"),
+                            preserve_current_inventory=bool(preserve_current_inventory),
+                            dry_run=True,
+                        )
+                        st.session_state[f"{preview_key}_result"] = preview
+                    except Exception as exc:
+                        st.session_state[f"{preview_key}_result"] = {"error": str(exc)}
+            with action_cols[1]:
+                if st.button("Apply Repair", key=apply_key, disabled=not can_repair_lot_movements):
+                    try:
+                        result = repo.repair_sale_lot_listing_inventory_movements(
+                            sale_id,
+                            actor=getattr(user, "username", "system"),
+                            preserve_current_inventory=bool(preserve_current_inventory),
+                        )
+                        st.success(
+                            f"Repaired sale #{sale_id}: "
+                            f"{int(result.get('total_repair_units') or 0)} inventory unit(s)."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to repair sale #{sale_id}: {exc}")
+            preview_result = st.session_state.get(f"{preview_key}_result")
+            if preview_result:
+                if isinstance(preview_result, dict) and preview_result.get("error"):
+                    st.error(str(preview_result.get("error")))
+                else:
+                    st.json(preview_result)
+
+
+def _render_ebay_order_listing_link_backfill_panel(repo: InventoryRepository, user: object) -> None:
+    if not hasattr(repo, "backfill_ebay_order_listing_links"):
+        return
+    with st.expander("eBay Order Listing Link Backfill", expanded=False):
+        st.caption(
+            "Repairs historical eBay orders/sales where the stored order payload has `legacyItemId` "
+            "but the local order item or sale is missing its listing/product link. Preview before applying."
+        )
+        backfill_limit = int(
+            st.number_input(
+                "Orders to scan",
+                min_value=1,
+                max_value=10000,
+                value=1000,
+                step=100,
+                key="reports_ebay_listing_link_backfill_limit",
+            )
+        )
+        can_backfill_listing_links = has_permission(getattr(user, "role", ""), "update")
+        if not can_backfill_listing_links:
+            st.caption("You need `update` permission to apply eBay listing-link backfills.")
+        bf1, bf2 = st.columns([1, 1])
+        with bf1:
+            if st.button("Preview Link Backfill", key="reports_ebay_listing_link_backfill_preview"):
+                try:
+                    st.session_state["reports_ebay_listing_link_backfill_result"] = (
+                        repo.backfill_ebay_order_listing_links(
+                            actor=getattr(user, "username", "system"),
+                            dry_run=True,
+                            limit=backfill_limit,
+                        )
+                    )
+                except Exception as exc:
+                    st.session_state["reports_ebay_listing_link_backfill_result"] = {"error": str(exc)}
+        with bf2:
+            if st.button(
+                "Apply Link Backfill",
+                key="reports_ebay_listing_link_backfill_apply",
+                disabled=not can_backfill_listing_links,
+            ):
+                try:
+                    result = repo.backfill_ebay_order_listing_links(
+                        actor=getattr(user, "username", "system"),
+                        dry_run=False,
+                        limit=backfill_limit,
+                    )
+                    st.session_state["reports_ebay_listing_link_backfill_result"] = result
+                    st.success(
+                        "Backfilled eBay order listing links: "
+                        f"{int(result.get('sales_backfilled') or 0)} sale(s), "
+                        f"{int(result.get('order_items_backfilled') or 0)} order item(s)."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to backfill eBay listing links: {exc}")
+        backfill_result = st.session_state.get("reports_ebay_listing_link_backfill_result")
+        if backfill_result:
+            if isinstance(backfill_result, dict) and backfill_result.get("error"):
+                st.error(str(backfill_result.get("error")))
+            else:
+                st.json(backfill_result)
 
 
 def _return_listing_bundle_summary(ret: object) -> dict[str, object]:
@@ -160,41 +1199,6 @@ def _audit_changes(row) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _truthy(value) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
-def _tax_profile_rows_from_audit_logs(rows) -> list[dict[str, object]]:
-    profiles: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for row in rows or []:
-        payload = _audit_changes(row)
-        profile_key = str(payload.get("profile_key") or "").strip().lower()
-        if not profile_key or profile_key in seen:
-            continue
-        seen.add(profile_key)
-        if not _truthy(payload.get("is_active", True)):
-            continue
-        profiles.append(
-            {
-                "profile_key": profile_key,
-                "profile_name": str(payload.get("profile_name") or profile_key).strip(),
-                "jurisdiction": str(payload.get("jurisdiction") or "").strip(),
-                "tax_rate_percent": _safe_float(payload.get("tax_rate_percent")),
-                "shipping_taxable": _truthy(payload.get("shipping_taxable")),
-                "facilitator_channels": str(payload.get("facilitator_channels") or "").strip(),
-                "tax_exempt_categories": str(payload.get("tax_exempt_categories") or "").strip(),
-                "effective_from": str(payload.get("effective_from") or "").strip(),
-                "effective_to": str(payload.get("effective_to") or "").strip(),
-                "human_validation_status": str(payload.get("human_validation_status") or "").strip().lower(),
-                "advisor_evidence_link": str(payload.get("advisor_evidence_link") or "").strip(),
-            }
-        )
-    return profiles
-
-
 def _latest_tax_profile_rows(repo: InventoryRepository, *, limit: int = 100) -> list[dict[str, object]]:
     db = getattr(repo, "db", None)
     if db is None or not hasattr(db, "scalars"):
@@ -213,39 +1217,6 @@ def _latest_tax_profile_rows(repo: InventoryRepository, *, limit: int = 100) -> 
         return []
 
 
-def _tax_signoff_rows_from_audit_logs(rows) -> list[dict[str, object]]:
-    output: list[dict[str, object]] = []
-    for row in rows or []:
-        payload = _audit_changes(row)
-        output.append(
-            {
-                "recorded_at_utc": (
-                    getattr(row, "created_at").isoformat(timespec="seconds")
-                    if getattr(row, "created_at", None)
-                    else ""
-                ),
-                "actor": str(getattr(row, "actor", "") or ""),
-                "target_env": str(payload.get("target_env") or ""),
-                "tax_period": str(payload.get("tax_period") or ""),
-                "jurisdiction": str(payload.get("jurisdiction") or ""),
-                "profile_key": str(payload.get("profile_key") or ""),
-                "status": str(payload.get("status") or "").strip().lower(),
-                "owner": str(payload.get("owner") or ""),
-                "signoff_date": str(payload.get("signoff_date") or ""),
-                "tax_packet_ref": str(payload.get("tax_packet_ref") or ""),
-                "tax_packet_hash": str(
-                    payload.get("tax_packet_hash")
-                    or payload.get("tax_packet_evidence_hash_sha256")
-                    or ""
-                ).strip(),
-                "advisor_evidence_link": str(payload.get("advisor_evidence_link") or ""),
-                "tax_exception_count": int(_safe_float(payload.get("tax_exception_count"))),
-                "notes": str(payload.get("notes") or "")[:220],
-            }
-        )
-    return output
-
-
 def _latest_tax_signoff_rows(repo: InventoryRepository, *, limit: int = 100) -> list[dict[str, object]]:
     db = getattr(repo, "db", None)
     if db is None or not hasattr(db, "scalars"):
@@ -258,6 +1229,28 @@ def _latest_tax_signoff_rows(repo: InventoryRepository, *, limit: int = 100) -> 
             .limit(max(1, int(limit)))
         ).all()
         return _tax_signoff_rows_from_audit_logs(rows)
+    except Exception:
+        if hasattr(db, "rollback"):
+            db.rollback()
+        return []
+
+
+def _latest_quarterly_estimated_tax_payment_rows(
+    repo: InventoryRepository,
+    *,
+    limit: int = 200,
+) -> list[dict[str, object]]:
+    db = getattr(repo, "db", None)
+    if db is None or not hasattr(db, "scalars"):
+        return []
+    try:
+        rows = db.scalars(
+            select(AuditLog)
+            .where(AuditLog.entity_type == "quarterly_estimated_tax_payment")
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+        return _quarterly_estimated_tax_payment_rows_from_audit_logs(rows)
     except Exception:
         if hasattr(db, "rollback"):
             db.rollback()
@@ -287,6 +1280,14 @@ def _accounting_close_signoff_rows_from_audit_logs(rows) -> list[dict[str, objec
                 "unresolved_blocker_count": int(_safe_float(payload.get("unresolved_blocker_count"))),
                 "period_drift_warn_count": int(_safe_float(payload.get("period_drift_warn_count"))),
                 "ai_review_followup_count": int(_safe_float(payload.get("ai_review_followup_count"))),
+                "sale_fee_field_fallback_fee_total": round(
+                    _safe_float(payload.get("sale_fee_field_fallback_fee_total")),
+                    2,
+                ),
+                "paid_shipping_missing_label_spend_charged_total": round(
+                    _safe_float(payload.get("paid_shipping_missing_label_spend_charged_total")),
+                    2,
+                ),
                 "accounting_packet_ref": str(payload.get("accounting_packet_ref") or "").strip(),
                 "accounting_packet_hash": str(
                     payload.get("accounting_packet_hash")
@@ -417,6 +1418,14 @@ def _build_accounting_close_signoff_payload(
         "unresolved_blocker_count": int(_safe_float(summary.get("blocker_count"))),
         "period_drift_warn_count": int(_safe_float(summary.get("period_drift_warn_count"))),
         "ai_review_followup_count": int(_safe_float(summary.get("ai_review_followup_count"))),
+        "sale_fee_field_fallback_fee_total": round(
+            _safe_float(summary.get("sale_fee_field_fallback_fee_total")),
+            2,
+        ),
+        "paid_shipping_missing_label_spend_charged_total": round(
+            _safe_float(summary.get("paid_shipping_missing_label_spend_charged_total")),
+            2,
+        ),
         "accounting_packet_ref": str(accounting_packet_ref or "").strip(),
         "accounting_packet_hash": str(accounting_packet_hash or "").strip(),
         "accounting_close_packet_evidence_hash_sha256": str(accounting_packet_hash or "").strip(),
@@ -425,229 +1434,12 @@ def _build_accounting_close_signoff_payload(
     }
 
 
-def _build_tax_reporting_signoff_payload(
-    *,
-    target_env: str,
-    tax_period: str,
-    jurisdiction: str,
-    profile_key: str,
-    status: str,
-    owner: str,
-    signoff_date,
-    tax_packet_ref: str,
-    tax_packet_hash: str,
-    advisor_evidence_link: str,
-    tax_exception_count: int,
-    notes: str = "",
-) -> dict[str, object]:
-    return {
-        "target_env": str(target_env or "").strip().lower(),
-        "tax_period": str(tax_period or "").strip(),
-        "jurisdiction": str(jurisdiction or "").strip(),
-        "profile_key": str(profile_key or "").strip().lower(),
-        "status": str(status or "").strip().lower(),
-        "owner": str(owner or "").strip(),
-        "signoff_date": signoff_date.isoformat() if hasattr(signoff_date, "isoformat") else str(signoff_date or ""),
-        "tax_packet_ref": str(tax_packet_ref or "").strip(),
-        "tax_packet_hash": str(tax_packet_hash or "").strip(),
-        "tax_packet_evidence_hash_sha256": str(tax_packet_hash or "").strip(),
-        "advisor_evidence_link": str(advisor_evidence_link or "").strip(),
-        "tax_exception_count": int(tax_exception_count or 0),
-        "notes": str(notes or "").strip(),
-    }
-
-
-def _build_tax_reporting_signoff_review(
-    *,
-    signoff_df: pd.DataFrame,
-    tax_period: str,
-    jurisdiction: str,
-    profile_key: str,
-    tax_exception_count: int,
-    current_packet_hash: str = "",
-    to_date=None,
-) -> pd.DataFrame:
-    period = str(tax_period or "").strip()
-    jurisdiction_norm = str(jurisdiction or "").strip().lower()
-    profile_key_norm = str(profile_key or "").strip().lower()
-
-    def _col(name: str) -> pd.Series:
-        if signoff_df is None or signoff_df.empty or name not in signoff_df.columns:
-            return pd.Series(dtype=str)
-        return signoff_df[name].fillna("").astype(str)
-
-    matching_df = pd.DataFrame()
-    if signoff_df is not None and not signoff_df.empty:
-        period_series = _col("tax_period").str.strip()
-        matching_df = signoff_df.loc[period_series == period].copy()
-    approved_df = pd.DataFrame()
-    if not matching_df.empty and "status" in matching_df.columns:
-        approved_df = matching_df.loc[matching_df["status"].fillna("").astype(str).str.lower() == "approved"].copy()
-        if not approved_df.empty:
-            approved_df["_signoff_sort_date"] = pd.to_datetime(
-                approved_df.get("signoff_date", pd.Series(dtype=str)),
-                errors="coerce",
-                utc=True,
-            )
-            approved_df["_recorded_sort_date"] = pd.to_datetime(
-                approved_df.get("recorded_at_utc", pd.Series(dtype=str)),
-                errors="coerce",
-                utc=True,
-            )
-            approved_df = approved_df.sort_values(
-                ["_signoff_sort_date", "_recorded_sort_date"],
-                ascending=[False, False],
-                na_position="last",
-                kind="mergesort",
-            ).drop(columns=["_signoff_sort_date", "_recorded_sort_date"])
-
-    rows: list[dict[str, object]] = [
-        {
-            "check": "Tax Sign-Off Evidence Present",
-            "status": "pass" if not approved_df.empty else ("warn" if int(tax_exception_count or 0) == 0 else "info"),
-            "expected": "approved tax reporting sign-off for selected period",
-            "observed": "approved" if not approved_df.empty else "missing",
-            "details": (
-                "Approved tax reporting sign-off evidence found for the selected period."
-                if not approved_df.empty
-                else "No approved tax reporting sign-off evidence found for the selected period."
-            ),
-        }
-    ]
-    if approved_df.empty:
-        return pd.DataFrame(rows)
-
-    latest = approved_df.iloc[0].to_dict()
-    signoff_jurisdiction = str(latest.get("jurisdiction") or "").strip().lower()
-    signoff_profile_key = str(latest.get("profile_key") or "").strip().lower()
-    signoff_exception_count = int(_safe_float(latest.get("tax_exception_count")))
-    signoff_packet_ref = str(latest.get("tax_packet_ref") or "").strip()
-    signoff_packet_hash = str(latest.get("tax_packet_hash") or "").strip().lower()
-    current_packet_hash = str(current_packet_hash or "").strip().lower()
-    advisor_evidence = str(latest.get("advisor_evidence_link") or "").strip()
-    signoff_owner = str(latest.get("owner") or "").strip()
-    signoff_date = str(latest.get("signoff_date") or "").strip()
-
-    def _coerce_review_date(value):
-        if value in (None, ""):
-            return None
-        if isinstance(value, datetime):
-            return value.date()
-        if all(hasattr(value, attr) for attr in ("year", "month", "day")):
-            try:
-                return datetime(int(value.year), int(value.month), int(value.day)).date()
-            except Exception:
-                return None
-        raw = str(value).strip()
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
-        except Exception:
-            try:
-                return datetime.fromisoformat(raw[:10]).date()
-            except Exception:
-                return None
-
-    signoff_review_date = _coerce_review_date(signoff_date)
-    period_end_date = _coerce_review_date(to_date)
-    today = utc_today()
-    signoff_date_valid = bool(
-        signoff_review_date
-        and (period_end_date is None or signoff_review_date >= period_end_date)
-        and signoff_review_date <= today
-    )
-    if not signoff_date:
-        signoff_date_observed = "missing"
-    elif signoff_review_date is None:
-        signoff_date_observed = f"{signoff_date} (unparseable)"
-    elif period_end_date is not None and signoff_review_date < period_end_date:
-        signoff_date_observed = f"{signoff_review_date.isoformat()} before {period_end_date.isoformat()}"
-    elif signoff_review_date > today:
-        signoff_date_observed = f"{signoff_review_date.isoformat()} after {today.isoformat()}"
-    else:
-        signoff_date_observed = signoff_review_date.isoformat()
-
-    rows.extend(
-        [
-            {
-                "check": "Approved Tax Sign-Off Jurisdiction Match",
-                "status": "pass" if signoff_jurisdiction == jurisdiction_norm else "warn",
-                "expected": jurisdiction_norm or "missing",
-                "observed": signoff_jurisdiction or "missing",
-                "details": "Approved tax sign-off jurisdiction should match the selected tax review assumptions.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Profile Match",
-                "status": "pass" if signoff_profile_key == profile_key_norm else ("info" if not profile_key_norm else "warn"),
-                "expected": profile_key_norm or "no selected profile",
-                "observed": signoff_profile_key or "missing",
-                "details": "Approved tax sign-off profile key should match the selected saved tax profile when one is used.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Exception Count",
-                "status": "pass" if signoff_exception_count == int(tax_exception_count or 0) else "warn",
-                "expected": int(tax_exception_count or 0),
-                "observed": signoff_exception_count,
-                "details": "Approved tax sign-off exception count should match recalculated Tax Exceptions / Advisor Review rows.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Owner Present",
-                "status": "pass" if signoff_owner else "warn",
-                "expected": "review owner",
-                "observed": signoff_owner or "missing",
-                "details": "Approved tax sign-off should identify the reviewer or owner.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Date Present",
-                "status": "pass" if signoff_date else "warn",
-                "expected": "sign-off date",
-                "observed": signoff_date or "missing",
-                "details": "Approved tax sign-off should include the approval date.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Date Validity",
-                "status": "pass" if signoff_date_valid else ("info" if not signoff_date else "warn"),
-                "expected": "parseable date from period end through today",
-                "observed": signoff_date_observed,
-                "details": "Approved tax sign-off date should be parseable, on or after the reviewed period end, and not future-dated.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Advisor Evidence",
-                "status": "pass" if advisor_evidence else "warn",
-                "expected": "advisor/evidence link",
-                "observed": advisor_evidence or "missing",
-                "details": "Approved tax sign-off should reference advisor review evidence or workpaper context.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Packet Evidence",
-                "status": "pass" if signoff_packet_ref or advisor_evidence else "warn",
-                "expected": "tax packet reference or advisor evidence link",
-                "observed": signoff_packet_ref or advisor_evidence or "missing",
-                "details": "Approved tax sign-off should reference the Tax Review Packet or external evidence reviewed.",
-            },
-            {
-                "check": "Approved Tax Sign-Off Packet Hash",
-                "status": (
-                    "pass"
-                    if signoff_packet_hash and current_packet_hash and signoff_packet_hash == current_packet_hash
-                    else ("info" if not current_packet_hash else "warn")
-                ),
-                "expected": current_packet_hash or "current packet hash unavailable",
-                "observed": signoff_packet_hash or "missing",
-                "details": "Approved tax sign-off packet hash should match the recalculated Tax Review Packet evidence hash.",
-            },
-        ]
-    )
-    return pd.DataFrame(rows)
-
-
 def _sale_net_before_cogs_from_fields(sale) -> float:
-    return (
-        _safe_float(getattr(sale, "sold_price", None))
-        + _safe_float(getattr(sale, "shipping_cost", None))
-        - _safe_float(getattr(sale, "fees", None))
-        - _safe_float(getattr(sale, "shipping_label_cost", None))
+    return accounting_net_before_cogs(
+        gross=getattr(sale, "sold_price", None),
+        shipping_charged=getattr(sale, "shipping_cost", None),
+        fees=getattr(sale, "fees", None),
+        label_spend=getattr(sale, "shipping_label_cost", None),
     )
 
 
@@ -684,11 +1476,11 @@ def _build_qbo_sales_export_rows(
         net_amount = (
             _safe_float(actual.get("net_before_cogs_actual"))
             if actual
-            else (
-                _safe_float(getattr(s, "sold_price", None))
-                + shipping_charged
-                - fees
-                - shipping_label
+            else accounting_net_before_cogs(
+                gross=getattr(s, "sold_price", None),
+                shipping_charged=shipping_charged,
+                fees=fees,
+                label_spend=shipping_label,
             )
         )
         quantity = int(getattr(s, "quantity_sold", 0) or 0)
@@ -702,7 +1494,11 @@ def _build_qbo_sales_export_rows(
             if product is not None
             else ("listing_product" if listing_product is not None else "missing_product")
         )
-        profit_before_returns_estimate = round(float(net_amount - cogs_estimate), 2)
+        profit_before_returns_estimate = accounting_profit_before_returns(
+            net_before_cogs_amount=net_amount,
+            cogs=cogs_estimate,
+        )
+        cogs_source = str(cogs_source_by_sale.get(sale_id) or "missing_cost_basis").strip() or "missing_cost_basis"
         rows.append(
             {
                 "txn_date": s.sold_at.date().isoformat() if getattr(s, "sold_at", None) else "",
@@ -723,6 +1519,7 @@ def _build_qbo_sales_export_rows(
                 "tracking_status": getattr(s, "tracking_status", ""),
                 "cogs_input_estimate": round(float(cogs_estimate), 2),
                 "cogs_source": cogs_source,
+                **_cogs_basis_review_fields(cogs_source),
                 **bundle_summary,
                 "gross_margin_estimate": profit_before_returns_estimate,
                 "profit_before_returns_estimate": profit_before_returns_estimate,
@@ -749,7 +1546,11 @@ def _build_qbo_adjustment_export_rows(
         refund_amount = _safe_float(getter("refund_amount", 0.0))
         refund_fees = _safe_float(getter("refund_fees", 0.0))
         refund_shipping = _safe_float(getter("refund_shipping", 0.0))
-        refund_total = refund_amount + refund_fees + refund_shipping
+        refund_total = return_refund_total(
+            refund_amount=refund_amount,
+            refund_fees=refund_fees,
+            refund_shipping=refund_shipping,
+        )
         cogs_per_returned_listing = _safe_float(fifo_unit_cost_by_sale.get(sale_id))
         returned_cogs = cogs_per_returned_listing * quantity
         restocked = bool(getter("restocked", False))
@@ -785,6 +1586,7 @@ def _build_qbo_adjustment_export_rows(
         elif sku:
             sku_source = "return_row"
         description = str(getter("reason", "") or getter("notes", "") or "Return/Refund").strip()
+        cogs_source = str(cogs_source_by_sale.get(sale_id) or "missing_cost_basis").strip() or "missing_cost_basis"
         rows.append(
             {
                 "txn_date": txn_date,
@@ -804,14 +1606,299 @@ def _build_qbo_adjustment_export_rows(
                 "cogs_per_returned_listing": round(float(cogs_per_returned_listing), 2),
                 "returned_cogs_estimate": round(float(returned_cogs), 2),
                 "cogs_reversal_estimate": round(float(cogs_reversal), 2),
-                "cogs_source": str(cogs_source_by_sale.get(sale_id) or "missing_cost_basis"),
+                "cogs_source": cogs_source,
+                **_cogs_basis_review_fields(cogs_source),
                 **bundle_summary,
-                "estimated_profit_impact": round(float(-refund_total + cogs_reversal), 2),
+                "estimated_profit_impact": accounting_returns_profit_impact(
+                    refund_total=refund_total,
+                    cogs_reversal=cogs_reversal,
+                ),
                 "return_status": str(getter("status", "") or getter("return_status", "") or "").strip(),
                 "restocked": restocked,
             }
         )
     return rows
+
+
+def _build_quickbooks_salesreceipt_payload_rows(
+    qbo_sales_df: pd.DataFrame,
+    *,
+    config: QuickBooksClearingConfig | None = None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if qbo_sales_df is None or qbo_sales_df.empty:
+        return rows
+    for row in qbo_sales_df.to_dict(orient="records"):
+        payload = quickbooks_sales_receipt_payload(
+            {
+                "external_order_id": row.get("doc_number"),
+                "transaction_date": row.get("txn_date"),
+                "sku": row.get("item_sku"),
+                "quantity_sold": row.get("quantity"),
+                "gross_amount": row.get("amount"),
+            },
+            config=config,
+        )
+        issues = quickbooks_payload_validation_issues(payload)
+        line = (payload.get("Line") or [{}])[0]
+        detail = line.get("SalesItemLineDetail") or {}
+        rows.append(
+            {
+                "endpoint": "POST /v3/company/{realmId}/salesreceipt",
+                "payload_type": "SalesReceipt",
+                "source_doc_number": str(row.get("doc_number") or "").strip(),
+                "qbo_doc_number": str(payload.get("DocNumber") or "").strip(),
+                "txn_date": str(payload.get("TxnDate") or "").strip(),
+                "clearing_account_ref": str((payload.get("DepositToAccountRef") or {}).get("value") or "").strip(),
+                "customer_ref": str((payload.get("CustomerRef") or {}).get("value") or "").strip(),
+                "payment_method_ref": str((payload.get("PaymentMethodRef") or {}).get("value") or "").strip(),
+                "item_ref": str((detail.get("ItemRef") or {}).get("value") or "").strip(),
+                "quantity": int(_safe_float(row.get("quantity"))),
+                "amount": round(float(_safe_float(row.get("amount"))), 2),
+                "tax_code_ref": str((detail.get("TaxCodeRef") or {}).get("value") or "").strip(),
+                "validation_status": "ok" if not issues else "review",
+                "validation_issues": ", ".join(issues),
+                "payload_json": json.dumps(payload, sort_keys=True),
+            }
+        )
+    return rows
+
+
+def _build_quickbooks_fee_purchase_payload_rows(
+    qbo_sales_df: pd.DataFrame,
+    *,
+    config: QuickBooksClearingConfig | None = None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if qbo_sales_df is None or qbo_sales_df.empty:
+        return rows
+    for row in qbo_sales_df.to_dict(orient="records"):
+        fee_amount = _safe_float(row.get("fees"))
+        if fee_amount <= 0:
+            continue
+        payload = quickbooks_order_fee_purchase_payload(
+            {
+                "external_order_id": row.get("doc_number"),
+                "fee_date": row.get("txn_date"),
+                "fee_amount": fee_amount,
+            },
+            config=config,
+        )
+        issues = quickbooks_payload_validation_issues(payload)
+        line = (payload.get("Line") or [{}])[0]
+        detail = line.get("AccountBasedExpenseLineDetail") or {}
+        rows.append(
+            {
+                "endpoint": "POST /v3/company/{realmId}/purchase",
+                "payload_type": "Purchase",
+                "source_doc_number": str(row.get("doc_number") or "").strip(),
+                "qbo_doc_number": str(payload.get("DocNumber") or "").strip(),
+                "txn_date": str(payload.get("TxnDate") or "").strip(),
+                "clearing_account_ref": str((payload.get("AccountRef") or {}).get("value") or "").strip(),
+                "vendor_ref": str((payload.get("EntityRef") or {}).get("value") or "").strip(),
+                "expense_account_ref": str((detail.get("AccountRef") or {}).get("value") or "").strip(),
+                "amount": round(float(fee_amount), 2),
+                "validation_status": "ok" if not issues else "review",
+                "validation_issues": ", ".join(issues),
+                "payload_json": json.dumps(payload, sort_keys=True),
+            }
+        )
+    return rows
+
+
+def _build_quickbooks_shipping_label_purchase_payload_rows(
+    qbo_sales_df: pd.DataFrame,
+    *,
+    config: QuickBooksClearingConfig | None = None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    if qbo_sales_df is None or qbo_sales_df.empty:
+        return rows
+    for row in qbo_sales_df.to_dict(orient="records"):
+        label_amount = _safe_float(row.get("shipping_label_cost"))
+        if label_amount <= 0:
+            continue
+        source_doc = str(row.get("doc_number") or "").strip()
+        payload = quickbooks_non_order_fee_purchase_payload(
+            {
+                "external_id": f"{source_doc or 'unknown'}-SHIP",
+                "fee_type": "shipping_label",
+                "fee_date": row.get("txn_date"),
+                "amount": label_amount,
+            },
+            config=config,
+        )
+        issues = quickbooks_payload_validation_issues(payload)
+        line = (payload.get("Line") or [{}])[0]
+        detail = line.get("AccountBasedExpenseLineDetail") or {}
+        rows.append(
+            {
+                "endpoint": "POST /v3/company/{realmId}/purchase",
+                "payload_type": "Purchase",
+                "source_doc_number": source_doc,
+                "source": str(row.get("shipping_label_source") or "").strip(),
+                "qbo_doc_number": str(payload.get("DocNumber") or "").strip(),
+                "txn_date": str(payload.get("TxnDate") or "").strip(),
+                "clearing_account_ref": str((payload.get("AccountRef") or {}).get("value") or "").strip(),
+                "vendor_ref": str((payload.get("EntityRef") or {}).get("value") or "").strip(),
+                "expense_account_ref": str((detail.get("AccountRef") or {}).get("value") or "").strip(),
+                "amount": round(float(label_amount), 2),
+                "validation_status": "ok" if not issues else "review",
+                "validation_issues": ", ".join(issues),
+                "payload_json": json.dumps(payload, sort_keys=True),
+            }
+        )
+    return rows
+
+
+def _quickbooks_payload_issue_count(df: pd.DataFrame, issue_key: str) -> int:
+    if df is None or df.empty or "validation_issues" not in df.columns:
+        return 0
+    count = 0
+    for raw in df["validation_issues"].fillna("").astype(str).tolist():
+        issues = [part.strip() for part in raw.split(",") if part.strip()]
+        count += sum(1 for issue in issues if issue == issue_key)
+    return int(count)
+
+
+def _quickbooks_payload_review_count(df: pd.DataFrame) -> int:
+    if df is None or df.empty or "validation_status" not in df.columns:
+        return 0
+    return int((df["validation_status"].fillna("").astype(str).str.strip().str.lower() != "ok").sum())
+
+
+def _quickbooks_payload_amount_sum(df: pd.DataFrame) -> float:
+    if df is None or df.empty or "amount" not in df.columns:
+        return 0.0
+    return round(float(pd.to_numeric(df["amount"], errors="coerce").fillna(0).sum()), 2)
+
+
+def _build_quickbooks_payload_readiness_rows(
+    salesreceipt_payloads_df: pd.DataFrame,
+    fee_purchase_payloads_df: pd.DataFrame,
+    shipping_label_purchase_payloads_df: pd.DataFrame | None = None,
+) -> list[dict[str, object]]:
+    sales_count = 0 if salesreceipt_payloads_df is None else int(len(salesreceipt_payloads_df))
+    fee_count = 0 if fee_purchase_payloads_df is None else int(len(fee_purchase_payloads_df))
+    label_count = (
+        0 if shipping_label_purchase_payloads_df is None else int(len(shipping_label_purchase_payloads_df))
+    )
+    sales_review_count = _quickbooks_payload_review_count(salesreceipt_payloads_df)
+    fee_review_count = _quickbooks_payload_review_count(fee_purchase_payloads_df)
+    label_review_count = _quickbooks_payload_review_count(shipping_label_purchase_payloads_df)
+    sales_missing_item_refs = _quickbooks_payload_issue_count(salesreceipt_payloads_df, "line_0_missing_item_ref")
+    sales_nonpositive_amounts = _quickbooks_payload_issue_count(salesreceipt_payloads_df, "line_0_nonpositive_amount")
+    fee_missing_account_refs = _quickbooks_payload_issue_count(
+        fee_purchase_payloads_df,
+        "line_0_missing_expense_account_ref",
+    )
+    fee_nonpositive_amounts = _quickbooks_payload_issue_count(fee_purchase_payloads_df, "line_0_nonpositive_amount")
+    label_missing_account_refs = _quickbooks_payload_issue_count(
+        shipping_label_purchase_payloads_df,
+        "line_0_missing_expense_account_ref",
+    )
+    label_nonpositive_amounts = _quickbooks_payload_issue_count(
+        shipping_label_purchase_payloads_df,
+        "line_0_nonpositive_amount",
+    )
+    return [
+        {
+            "check": "salesreceipt_payload_rows",
+            "status": "pass" if sales_count > 0 else "info",
+            "payload_type": "SalesReceipt",
+            "observed": sales_count,
+            "amount": _quickbooks_payload_amount_sum(salesreceipt_payloads_df),
+            "details": "Generated QBO SalesReceipt preview payloads for gross marketplace sales.",
+        },
+        {
+            "check": "salesreceipt_payload_review_rows",
+            "status": "pass" if sales_review_count == 0 else "warn",
+            "payload_type": "SalesReceipt",
+            "observed": sales_review_count,
+            "amount": 0.0,
+            "details": "Rows with validation issues must be corrected before live QBO posting.",
+        },
+        {
+            "check": "salesreceipt_missing_item_refs",
+            "status": "pass" if sales_missing_item_refs == 0 else "warn",
+            "payload_type": "SalesReceipt",
+            "observed": sales_missing_item_refs,
+            "amount": 0.0,
+            "details": "Each SalesReceipt line needs an item/SKU that resolves to QBO Products and Services.",
+        },
+        {
+            "check": "salesreceipt_nonpositive_amounts",
+            "status": "pass" if sales_nonpositive_amounts == 0 else "warn",
+            "payload_type": "SalesReceipt",
+            "observed": sales_nonpositive_amounts,
+            "amount": 0.0,
+            "details": "SalesReceipt line amounts must be positive before posting.",
+        },
+        {
+            "check": "fee_purchase_payload_rows",
+            "status": "pass" if fee_count > 0 else "info",
+            "payload_type": "Purchase",
+            "observed": fee_count,
+            "amount": _quickbooks_payload_amount_sum(fee_purchase_payloads_df),
+            "details": "Generated QBO Purchase preview payloads for order-level eBay fees.",
+        },
+        {
+            "check": "fee_purchase_payload_review_rows",
+            "status": "pass" if fee_review_count == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": fee_review_count,
+            "amount": 0.0,
+            "details": "Rows with validation issues must be corrected before live QBO posting.",
+        },
+        {
+            "check": "fee_purchase_missing_expense_account_refs",
+            "status": "pass" if fee_missing_account_refs == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": fee_missing_account_refs,
+            "amount": 0.0,
+            "details": "Each fee Purchase line needs a QBO expense account such as Merchant Account Fees.",
+        },
+        {
+            "check": "fee_purchase_nonpositive_amounts",
+            "status": "pass" if fee_nonpositive_amounts == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": fee_nonpositive_amounts,
+            "amount": 0.0,
+            "details": "Fee Purchase line amounts must be positive before posting.",
+        },
+        {
+            "check": "shipping_label_purchase_payload_rows",
+            "status": "pass" if label_count > 0 else "info",
+            "payload_type": "Purchase",
+            "observed": label_count,
+            "amount": _quickbooks_payload_amount_sum(shipping_label_purchase_payloads_df),
+            "details": "Generated QBO Purchase preview payloads for eBay shipping-label spend.",
+        },
+        {
+            "check": "shipping_label_purchase_payload_review_rows",
+            "status": "pass" if label_review_count == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": label_review_count,
+            "amount": 0.0,
+            "details": "Shipping label Purchase rows with validation issues must be corrected before live QBO posting.",
+        },
+        {
+            "check": "shipping_label_purchase_missing_expense_account_refs",
+            "status": "pass" if label_missing_account_refs == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": label_missing_account_refs,
+            "amount": 0.0,
+            "details": "Each shipping label Purchase line needs a QBO expense account such as eBay Shipping Expense.",
+        },
+        {
+            "check": "shipping_label_purchase_nonpositive_amounts",
+            "status": "pass" if label_nonpositive_amounts == 0 else "warn",
+            "payload_type": "Purchase",
+            "observed": label_nonpositive_amounts,
+            "amount": 0.0,
+            "details": "Shipping label Purchase line amounts must be positive before posting.",
+        },
+    ]
 
 
 def _build_marketplace_reconciliation_fallback_rows(
@@ -862,19 +1949,42 @@ def _build_marketplace_reconciliation_fallback_rows(
                 if actual
                 else _safe_float(getattr(sale, "shipping_label_cost", None))
             )
-            net = _safe_float(actual.get("net_before_cogs_actual")) if actual else gross + shipping - fee - label
+            net = (
+                _safe_float(actual.get("net_before_cogs_actual"))
+                if actual
+                else accounting_net_before_cogs(
+                    gross=gross,
+                    shipping_charged=shipping,
+                    fees=fee,
+                    label_spend=label,
+                )
+            )
             sales_gross += gross
             sales_fees += fee
             sales_shipping += shipping
             sales_label_spend += label
             sales_net += net
-        returns_total = (
-            float(mp_returns_df.get("refund_amount", pd.Series(dtype=float)).fillna(0).astype(float).sum())
-            + float(mp_returns_df.get("refund_fees", pd.Series(dtype=float)).fillna(0).astype(float).sum())
-            + float(mp_returns_df.get("refund_shipping", pd.Series(dtype=float)).fillna(0).astype(float).sum())
+        returns_total = return_refund_total(
+            refund_amount=float(mp_returns_df.get("refund_amount", pd.Series(dtype=float)).fillna(0).astype(float).sum()),
+            refund_fees=float(mp_returns_df.get("refund_fees", pd.Series(dtype=float)).fillna(0).astype(float).sum()),
+            refund_shipping=float(mp_returns_df.get("refund_shipping", pd.Series(dtype=float)).fillna(0).astype(float).sum()),
         )
         order_totals = sum(_safe_float(o.total_amount) for o in mp_orders)
-        delta = order_totals - sales_gross
+        delta_gross = order_totals - sales_gross
+        delta_gross_shipping = order_totals - (sales_gross + sales_shipping)
+        if abs(delta_gross_shipping) < abs(delta_gross):
+            reconcile_delta = delta_gross_shipping
+            reconcile_basis = "order_total_sum - (sales_gross + sales_shipping_cost)"
+        else:
+            reconcile_delta = delta_gross
+            reconcile_basis = "order_total_sum - sales_gross"
+        reconcile_tolerance = max(0.01, min(1.0, abs(order_totals) * 0.001))
+        reconcile_materiality_pct = (
+            (abs(reconcile_delta) / abs(order_totals)) * 100.0
+            if abs(order_totals) > 0
+            else 0.0
+        )
+        reconcile_flag = abs(reconcile_delta) > reconcile_tolerance
         rows.append(
             {
                 "marketplace": mp,
@@ -889,11 +1999,71 @@ def _build_marketplace_reconciliation_fallback_rows(
                 "returns_refund_total": round(returns_total, 2),
                 "net_after_returns": round(sales_net - returns_total, 2),
                 "order_total_sum": round(order_totals, 2),
-                "delta_order_total_vs_sales_gross": round(delta, 2),
-                "reconcile_flag": abs(delta) > 0.01,
+                "delta_order_total_vs_sales_gross": round(delta_gross, 2),
+                "delta_order_total_vs_sales_gross_plus_shipping": round(delta_gross_shipping, 2),
+                "reconcile_delta": round(reconcile_delta, 2),
+                "reconcile_tolerance": round(reconcile_tolerance, 2),
+                "reconcile_materiality_pct": round(reconcile_materiality_pct, 4),
+                "reconcile_flag": reconcile_flag,
+                "reconcile_basis": reconcile_basis,
+                "reconcile_note": (
+                    "Reconciliation accepts either order total equals item gross or order total equals "
+                    "item gross plus buyer shipping. Whole-period marketplace deltas below the displayed "
+                    "materiality tolerance are treated as rounding/tax/component noise; review rows that "
+                    "exceed tolerance."
+                ),
             }
         )
     return rows
+
+
+def _build_reconciliation_flag_detail_rows(reconciliation_df: pd.DataFrame) -> pd.DataFrame:
+    if reconciliation_df is None or reconciliation_df.empty or "reconcile_flag" not in reconciliation_df.columns:
+        return pd.DataFrame()
+    flags = reconciliation_df.loc[reconciliation_df["reconcile_flag"].fillna(False).astype(bool)].copy()
+    if flags.empty:
+        return pd.DataFrame()
+
+    def _col(name: str, default: object = 0.0) -> pd.Series:
+        if name in flags.columns:
+            return flags[name]
+        return pd.Series([default] * len(flags), index=flags.index)
+
+    detail = pd.DataFrame(
+        {
+            "marketplace": _col("marketplace", "").fillna("").astype(str),
+            "sales_count": pd.to_numeric(_col("sales_count"), errors="coerce").fillna(0).astype(int),
+            "orders_count": pd.to_numeric(_col("orders_count"), errors="coerce").fillna(0).astype(int),
+            "sales_gross": pd.to_numeric(_col("sales_gross"), errors="coerce").fillna(0.0).round(2),
+            "sales_shipping_cost": pd.to_numeric(_col("sales_shipping_cost"), errors="coerce").fillna(0.0).round(2),
+            "order_total_sum": pd.to_numeric(_col("order_total_sum"), errors="coerce").fillna(0.0).round(2),
+            "delta_order_total_vs_sales_gross": pd.to_numeric(
+                _col("delta_order_total_vs_sales_gross"),
+                errors="coerce",
+            ).fillna(0.0).round(2),
+            "delta_order_total_vs_sales_gross_plus_shipping": pd.to_numeric(
+                _col("delta_order_total_vs_sales_gross_plus_shipping"),
+                errors="coerce",
+            ).fillna(0.0).round(2),
+            "reconcile_delta": pd.to_numeric(_col("reconcile_delta"), errors="coerce").fillna(0.0).round(2),
+            "reconcile_tolerance": pd.to_numeric(_col("reconcile_tolerance", 0.01), errors="coerce").fillna(0.01).round(2),
+            "reconcile_materiality_pct": pd.to_numeric(
+                _col("reconcile_materiality_pct"),
+                errors="coerce",
+            ).fillna(0.0).round(4),
+            "basis": _col("reconcile_basis", "order_total_sum - sales_gross").fillna(
+                "order_total_sum - sales_gross"
+            ),
+            "review_note": _col(
+                "reconcile_note",
+                "Reconciliation accepts item gross or item gross plus buyer shipping. Review this row.",
+            ).fillna("Reconciliation accepts item gross or item gross plus buyer shipping. Review this row."),
+        }
+    )
+    return detail.sort_values(
+        by=["reconcile_delta", "marketplace"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
 
 
 def _safe_product_id(row) -> int | None:
@@ -1061,10 +2231,6 @@ def _landed_unit_cost_from_assignment(
             return assignment_fallback
     lot_id = _assignment_lot_id(assignment)
     return _safe_float((lot_fallback_unit_costs or {}).get(int(lot_id or 0), 0.0))
-
-
-def _parse_csv_set(value: str) -> set[str]:
-    return {str(part).strip().lower() for part in str(value or "").split(",") if str(part).strip()}
 
 
 def _add_margin_pct_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1245,6 +2411,7 @@ def _build_accounting_close_readiness_summary(
     lot_allocation_source_summary_df: pd.DataFrame | None = None,
     cogs_source_summary_df: pd.DataFrame | None = None,
     qbo_adjustments_df: pd.DataFrame | None = None,
+    active_suppression_keys: set[tuple[str, str, int]] | None = None,
 ) -> tuple[dict[str, float | int | str], pd.DataFrame]:
     inventory_value = (
         float(inventory_df.get("landed_inventory_value", pd.Series(dtype=float)).fillna(0).astype(float).sum())
@@ -1277,6 +2444,19 @@ def _build_accounting_close_readiness_summary(
         if cogs_margin_df is not None and not cogs_margin_df.empty
         else 0
     )
+    unreviewed_negative_margin_rows = negative_margin_rows
+    if cogs_margin_df is not None and not cogs_margin_df.empty and active_suppression_keys:
+        margin_df = cogs_margin_df.copy()
+        fifo_margin_series = pd.to_numeric(
+            margin_df.get("fifo_margin", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0)
+        suppressed_margin_mask = _sale_suppression_mask(
+            margin_df,
+            active_suppression_keys,
+            "nonpositive_margin",
+        )
+        unreviewed_negative_margin_rows = int((fifo_margin_series[~suppressed_margin_mask] < 0).sum())
     returns_refund_total = 0.0
     if returns_df is not None and not returns_df.empty:
         returns_refund_total = (
@@ -1289,7 +2469,10 @@ def _build_accounting_close_readiness_summary(
         if qbo_adjustments_df is not None and not qbo_adjustments_df.empty
         else 0.0
     )
-    returns_estimated_profit_impact = -returns_refund_total + returns_cogs_reversal_total
+    returns_estimated_profit_impact = accounting_returns_profit_impact(
+        refund_total=returns_refund_total,
+        cogs_reversal=returns_cogs_reversal_total,
+    )
     reconcile_flags = (
         int(reconciliation_df.get("reconcile_flag", pd.Series(dtype=bool)).fillna(False).astype(bool).sum())
         if reconciliation_df is not None and not reconciliation_df.empty
@@ -1301,8 +2484,21 @@ def _build_accounting_close_readiness_summary(
         if shipping_economics_df is not None and not shipping_economics_df.empty
         else 0
     )
+    shipping_charged_col = "shipping_charged_to_buyer"
+    if (
+        shipping_economics_df is not None
+        and not shipping_economics_df.empty
+        and "shipping_charged_to_buyer" not in shipping_economics_df.columns
+        and "shipping_charged" in shipping_economics_df.columns
+    ):
+        shipping_charged_col = "shipping_charged"
     shipping_charged_total = (
-        float(shipping_economics_df.get("shipping_charged", pd.Series(dtype=float)).fillna(0).astype(float).sum())
+        float(
+            shipping_economics_df.get(shipping_charged_col, pd.Series(dtype=float))
+            .fillna(0)
+            .astype(float)
+            .sum()
+        )
         if shipping_economics_df is not None and not shipping_economics_df.empty
         else 0.0
     )
@@ -1311,7 +2507,34 @@ def _build_accounting_close_readiness_summary(
         if shipping_economics_df is not None and not shipping_economics_df.empty
         else 0.0
     )
-    shipping_delta_total = shipping_charged_total - shipping_label_spend_total
+    if (
+        cogs_margin_df is not None
+        and not cogs_margin_df.empty
+        and shipping_charged_total == 0.0
+        and "shipping_cost" in cogs_margin_df.columns
+    ):
+        shipping_charged_total = float(
+            pd.to_numeric(cogs_margin_df.get("shipping_cost", pd.Series(dtype=float)), errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+    if (
+        cogs_margin_df is not None
+        and not cogs_margin_df.empty
+        and shipping_label_spend_total == 0.0
+        and "actual_shipping_alloc" in cogs_margin_df.columns
+    ):
+        shipping_label_spend_total = float(
+            pd.to_numeric(cogs_margin_df.get("actual_shipping_alloc", pd.Series(dtype=float)), errors="coerce")
+            .fillna(0.0)
+            .sum()
+        )
+    if shipping_rows > 0 and shipping_label_covered == 0 and shipping_label_spend_total > 0:
+        shipping_label_covered = shipping_rows
+    shipping_delta_total = accounting_shipping_delta(
+        shipping_charged=shipping_charged_total,
+        label_spend=shipping_label_spend_total,
+    )
     shipping_label_coverage_pct = (
         round((shipping_label_covered / shipping_rows) * 100.0, 2) if shipping_rows > 0 else 0.0
     )
@@ -1345,6 +2568,16 @@ def _build_accounting_close_readiness_summary(
     lot_missing_cost_assignments = 0
     sold_equal_fallback_cogs = 0.0
     sold_missing_cost_cogs = 0.0
+    sold_mixed_fifo_cogs = 0.0
+    sold_mixed_estimate_fifo_cogs = 0.0
+    sold_mixed_verified_fifo_cogs = 0.0
+    sold_review_needed_cogs = 0.0
+    sold_estimated_cogs = 0.0
+    sold_verified_cogs = 0.0
+    sold_review_needed_sale_count = 0
+    sold_estimated_sale_count = 0
+    sold_verified_sale_count = 0
+    unreviewed_sold_mixed_fifo_cogs = 0.0
     if lot_allocation_source_summary_df is not None and not lot_allocation_source_summary_df.empty:
         source_df = lot_allocation_source_summary_df.copy()
         source_df["cost_source"] = source_df.get("cost_source", pd.Series(dtype=str)).fillna("").astype(str)
@@ -1373,6 +2606,10 @@ def _build_accounting_close_readiness_summary(
             cogs_source_df.get("fifo_cogs", pd.Series(dtype=float)),
             errors="coerce",
         ).fillna(0.0)
+        cogs_source_df["sale_count"] = pd.to_numeric(
+            cogs_source_df.get("sale_count", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0)
         sold_equal_fallback_cogs = float(
             cogs_source_df.loc[
                 cogs_source_df["fifo_cost_source"] == "lot_equal_quantity_fallback",
@@ -1385,6 +2622,72 @@ def _build_accounting_close_readiness_summary(
                 "fifo_cogs",
             ].sum()
         )
+        sold_mixed_fifo_cogs = float(
+            cogs_source_df.loc[
+                cogs_source_df["fifo_cost_source"] == "mixed_fifo_cost",
+                "fifo_cogs",
+            ].sum()
+        )
+        sold_mixed_estimate_fifo_cogs = float(
+            cogs_source_df.loc[
+                cogs_source_df["fifo_cost_source"] == "mixed_estimate_fifo_cost",
+                "fifo_cogs",
+            ].sum()
+        )
+        sold_mixed_verified_fifo_cogs = float(
+            cogs_source_df.loc[
+                cogs_source_df["fifo_cost_source"] == "mixed_verified_fifo_cost",
+                "fifo_cogs",
+            ].sum()
+        )
+        sold_review_needed_cogs = float(
+            cogs_source_df.loc[cogs_source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES), "fifo_cogs"].sum()
+        )
+        sold_estimated_cogs = float(
+            cogs_source_df.loc[cogs_source_df["fifo_cost_source"].isin(COGS_ESTIMATE_SOURCES), "fifo_cogs"].sum()
+        )
+        sold_verified_cogs = float(
+            cogs_source_df.loc[
+                ~cogs_source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES | COGS_ESTIMATE_SOURCES),
+                "fifo_cogs",
+            ].sum()
+        )
+        sold_review_needed_sale_count = int(
+            cogs_source_df.loc[cogs_source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES), "sale_count"].sum()
+        )
+        sold_estimated_sale_count = int(
+            cogs_source_df.loc[cogs_source_df["fifo_cost_source"].isin(COGS_ESTIMATE_SOURCES), "sale_count"].sum()
+        )
+        sold_verified_sale_count = int(
+            cogs_source_df.loc[
+                ~cogs_source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES | COGS_ESTIMATE_SOURCES),
+                "sale_count",
+            ].sum()
+        )
+    unreviewed_sold_mixed_fifo_cogs = sold_mixed_fifo_cogs
+    if (
+        cogs_margin_df is not None
+        and not cogs_margin_df.empty
+        and "fifo_cost_source" in cogs_margin_df.columns
+        and active_suppression_keys
+    ):
+        margin_df = cogs_margin_df.copy()
+        margin_df["fifo_cost_source"] = margin_df.get("fifo_cost_source", pd.Series(dtype=str)).fillna("").astype(str)
+        margin_df["fifo_cogs"] = pd.to_numeric(
+            margin_df.get("fifo_cogs", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0)
+        suppressed_mixed_mask = _sale_suppression_mask(
+            margin_df,
+            active_suppression_keys,
+            "mixed_fifo_cost_review",
+        )
+        unreviewed_sold_mixed_fifo_cogs = float(
+            margin_df.loc[
+                (margin_df["fifo_cost_source"] == "mixed_fifo_cost") & ~suppressed_mixed_mask,
+                "fifo_cogs",
+            ].sum()
+        )
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -1392,7 +2695,7 @@ def _build_accounting_close_readiness_summary(
         blockers.append("P0 accounting exceptions")
     if reconcile_flags > 0:
         blockers.append("marketplace reconciliation flags")
-    if negative_margin_rows > 0:
+    if unreviewed_negative_margin_rows > 0:
         warnings.append("negative FIFO margin rows")
     if p1_exceptions > 0:
         warnings.append("P1 accounting exceptions")
@@ -1408,9 +2711,17 @@ def _build_accounting_close_readiness_summary(
         warnings.append("sold COGS uses equal quantity fallback")
     if sold_missing_cost_cogs > 0:
         warnings.append("sold COGS missing cost basis")
+    if unreviewed_sold_mixed_fifo_cogs > 0:
+        warnings.append("sold COGS uses mixed fallback FIFO basis")
 
-    profit_before_returns = round(fifo_margin, 2)
-    estimated_profit_after_returns = round(fifo_margin + returns_estimated_profit_impact, 2)
+    profit_before_returns = accounting_profit_before_returns(
+        net_before_cogs_amount=net_before_cogs,
+        cogs=fifo_cogs,
+    )
+    estimated_profit_after_returns = accounting_profit_after_returns(
+        profit_before_returns_amount=profit_before_returns,
+        returns_profit_impact_amount=returns_estimated_profit_impact,
+    )
 
     if blockers:
         readiness_status = "blocked"
@@ -1449,10 +2760,21 @@ def _build_accounting_close_readiness_summary(
         "total_exceptions": total_exceptions,
         "reconcile_flags": reconcile_flags,
         "negative_margin_rows": negative_margin_rows,
+        "unreviewed_negative_margin_rows": unreviewed_negative_margin_rows,
         "lot_equal_fallback_assignments": lot_equal_fallback_assignments,
         "lot_missing_cost_assignments": lot_missing_cost_assignments,
         "sold_equal_fallback_cogs": round(sold_equal_fallback_cogs, 2),
         "sold_missing_cost_cogs": round(sold_missing_cost_cogs, 2),
+        "sold_mixed_fifo_cogs": round(sold_mixed_fifo_cogs, 2),
+        "unreviewed_sold_mixed_fifo_cogs": round(unreviewed_sold_mixed_fifo_cogs, 2),
+        "sold_mixed_estimate_fifo_cogs": round(sold_mixed_estimate_fifo_cogs, 2),
+        "sold_mixed_verified_fifo_cogs": round(sold_mixed_verified_fifo_cogs, 2),
+        "sold_review_needed_cogs": round(sold_review_needed_cogs, 2),
+        "sold_estimated_cogs": round(sold_estimated_cogs, 2),
+        "sold_verified_cogs": round(sold_verified_cogs, 2),
+        "sold_review_needed_sale_count": sold_review_needed_sale_count,
+        "sold_estimated_sale_count": sold_estimated_sale_count,
+        "sold_verified_sale_count": sold_verified_sale_count,
     }
     rows = [
         {"check": "P0 Exceptions", "status": "fail" if p0_exceptions else "pass", "value": p0_exceptions},
@@ -1470,8 +2792,12 @@ def _build_accounting_close_readiness_summary(
         },
         {
             "check": "Negative FIFO Margin Rows",
-            "status": "warn" if negative_margin_rows else "pass",
-            "value": negative_margin_rows,
+            "status": "warn" if unreviewed_negative_margin_rows else "pass",
+            "value": unreviewed_negative_margin_rows,
+            "details": (
+                f"{negative_margin_rows} total negative FIFO margin row(s); "
+                f"{unreviewed_negative_margin_rows} still need review."
+            ),
         },
         {
             "check": "Lot Equal Fallback Assignments",
@@ -1492,6 +2818,36 @@ def _build_accounting_close_readiness_summary(
             "check": "Sold Missing Cost COGS",
             "status": "warn" if sold_missing_cost_cogs else "pass",
             "value": round(sold_missing_cost_cogs, 2),
+        },
+        {
+            "check": "Sold Mixed Fallback FIFO COGS",
+            "status": "warn" if sold_mixed_fifo_cogs else "pass",
+            "value": round(sold_mixed_fifo_cogs, 2),
+        },
+        {
+            "check": "Sold Mixed Estimated FIFO COGS",
+            "status": "info" if sold_mixed_estimate_fifo_cogs else "pass",
+            "value": round(sold_mixed_estimate_fifo_cogs, 2),
+        },
+        {
+            "check": "Sold Mixed Verified FIFO COGS",
+            "status": "pass",
+            "value": round(sold_mixed_verified_fifo_cogs, 2),
+        },
+        {
+            "check": "Sold Review-Needed COGS",
+            "status": "warn" if sold_review_needed_cogs else "pass",
+            "value": round(sold_review_needed_cogs, 2),
+        },
+        {
+            "check": "Sold Estimated COGS",
+            "status": "info" if sold_estimated_cogs else "pass",
+            "value": round(sold_estimated_cogs, 2),
+        },
+        {
+            "check": "Sold Verified COGS",
+            "status": "pass",
+            "value": round(sold_verified_cogs, 2),
         },
         {
             "check": "Return COGS Reversal",
@@ -1537,6 +2893,64 @@ def _build_lot_allocation_source_summary(lots_df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def _build_lot_allocation_action_detail(lots_df: pd.DataFrame) -> pd.DataFrame:
+    if lots_df is None or lots_df.empty or "cost_source" not in lots_df.columns:
+        return pd.DataFrame()
+    df = lots_df.copy()
+    df["cost_source"] = df.get("cost_source", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+    action_sources = {"lot_equal_quantity_fallback", "missing_cost_basis", "unknown"}
+    df = df.loc[df["cost_source"].isin(action_sources)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    def _series(name: str, default: object = "") -> pd.Series:
+        if name in df.columns:
+            return df[name]
+        return pd.Series([default] * len(df), index=df.index)
+
+    def _suggested_action(cost_source: str) -> str:
+        if cost_source == "lot_equal_quantity_fallback":
+            return (
+                "Set expected lot quantity, assignment allocation weights, or explicit assignment landed costs; "
+                "or approve equal-fallback allocation repair if the split is acceptable."
+            )
+        return (
+            "Add lot landed total, product-lot assignment cost/weight evidence, or product acquisition basis "
+            "before close sign-off."
+        )
+
+    result = pd.DataFrame(
+        {
+            "assignment_id": pd.to_numeric(_series("assignment_id"), errors="coerce").fillna(0).astype(int),
+            "lot_id": pd.to_numeric(_series("lot_id"), errors="coerce").fillna(0).astype(int),
+            "lot_code": _series("lot_code", "").fillna("").astype(str),
+            "sku": _series("sku", "").fillna("").astype(str),
+            "product_title": _series("product_title", "").fillna("").astype(str),
+            "quantity_acquired": pd.to_numeric(_series("quantity_acquired"), errors="coerce").fillna(0).astype(int),
+            "cost_source": df["cost_source"],
+            "lot_landed_total": pd.to_numeric(_series("lot_landed_total"), errors="coerce").fillna(0.0).round(2),
+            "lot_expected_total_quantity": pd.to_numeric(
+                _series("lot_expected_total_quantity"),
+                errors="coerce",
+            ),
+            "allocation_weight": pd.to_numeric(_series("allocation_weight"), errors="coerce"),
+            "resolved_landed_unit_cost": pd.to_numeric(
+                _series("resolved_landed_unit_cost"),
+                errors="coerce",
+            ).fillna(0.0).round(4),
+            "resolved_landed_total_cost": pd.to_numeric(
+                _series("resolved_landed_total_cost"),
+                errors="coerce",
+            ).fillna(0.0).round(2),
+            "suggested_action": df["cost_source"].apply(_suggested_action),
+        }
+    )
+    return result.sort_values(
+        by=["resolved_landed_total_cost", "lot_id", "assignment_id"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+
 def _build_cogs_source_summary(cogs_margin_df: pd.DataFrame) -> pd.DataFrame:
     if cogs_margin_df is None or cogs_margin_df.empty or "fifo_cost_source" not in cogs_margin_df.columns:
         return pd.DataFrame()
@@ -1559,6 +2973,18 @@ def _build_cogs_source_summary(cogs_margin_df: pd.DataFrame) -> pd.DataFrame:
         bundle_units_series,
         errors="coerce",
     ).fillna(0)
+    if "listing_lot_movement_mismatch" in df.columns:
+        df["listing_lot_movement_mismatch"] = df["listing_lot_movement_mismatch"].fillna(False).astype(bool)
+    else:
+        df["listing_lot_movement_mismatch"] = False
+    if "listing_lot_movement_mismatch_units" in df.columns:
+        mismatch_units_series = df["listing_lot_movement_mismatch_units"]
+    else:
+        mismatch_units_series = pd.Series([0] * len(df), index=df.index)
+    df["listing_lot_movement_mismatch_units"] = pd.to_numeric(
+        mismatch_units_series,
+        errors="coerce",
+    ).fillna(0)
     grouped = (
         df.groupby(["fifo_cost_source"], dropna=False, as_index=False)
         .agg(
@@ -1566,6 +2992,8 @@ def _build_cogs_source_summary(cogs_margin_df: pd.DataFrame) -> pd.DataFrame:
             quantity=("quantity", "sum"),
             bundle_sale_count=("listing_is_bundle", "sum"),
             bundle_inventory_units_sold=("listing_bundle_inventory_units_sold", "sum"),
+            lot_listing_movement_mismatch_count=("listing_lot_movement_mismatch", "sum"),
+            lot_listing_movement_mismatch_units=("listing_lot_movement_mismatch_units", "sum"),
             gross_sales=("gross_sales", "sum"),
             net_before_cogs=("net_before_cogs", "sum"),
             fifo_cogs=("fifo_cogs", "sum"),
@@ -1574,7 +3002,13 @@ def _build_cogs_source_summary(cogs_margin_df: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["fifo_cogs", "sale_count"], ascending=[False, False])
     )
     total_cogs = float(grouped["fifo_cogs"].sum()) if not grouped.empty else 0.0
-    for column in ["quantity", "bundle_sale_count", "bundle_inventory_units_sold"]:
+    for column in [
+        "quantity",
+        "bundle_sale_count",
+        "bundle_inventory_units_sold",
+        "lot_listing_movement_mismatch_count",
+        "lot_listing_movement_mismatch_units",
+    ]:
         grouped[column] = pd.to_numeric(grouped[column], errors="coerce").fillna(0).astype(int)
     for column in ["gross_sales", "net_before_cogs", "fifo_cogs", "fifo_margin"]:
         grouped[column] = grouped[column].round(2)
@@ -1670,10 +3104,12 @@ def _build_accounting_period_drift_checks(
             "check": "qbo_sales_net_formula",
             "expected_source": "QuickBooks Sales Export amount + shipping_cost - fees - shipping_label_cost",
             "observed_source": "QuickBooks Sales Export.net_amount",
-            "expected": _sum(qbo_sales_df, "amount")
-            + _sum(qbo_sales_df, "shipping_cost")
-            - _sum(qbo_sales_df, "fees")
-            - _sum(qbo_sales_df, "shipping_label_cost"),
+            "expected": accounting_net_before_cogs(
+                gross=_sum(qbo_sales_df, "amount"),
+                shipping_charged=_sum(qbo_sales_df, "shipping_cost"),
+                fees=_sum(qbo_sales_df, "fees"),
+                label_spend=_sum(qbo_sales_df, "shipping_label_cost"),
+            ),
             "observed": _sum(qbo_sales_df, "net_amount"),
             "tolerance": tolerance,
         },
@@ -1681,7 +3117,10 @@ def _build_accounting_period_drift_checks(
             "check": "qbo_sales_profit_before_returns_formula",
             "expected_source": "QuickBooks Sales Export net_amount - cogs_input_estimate",
             "observed_source": f"QuickBooks Sales Export.{qbo_profit_before_returns_column}",
-            "expected": _sum(qbo_sales_df, "net_amount") - _sum(qbo_sales_df, "cogs_input_estimate"),
+            "expected": accounting_profit_before_returns(
+                net_before_cogs_amount=_sum(qbo_sales_df, "net_amount"),
+                cogs=_sum(qbo_sales_df, "cogs_input_estimate"),
+            ),
             "observed": _sum(qbo_sales_df, qbo_profit_before_returns_column),
             "tolerance": tolerance,
         },
@@ -1690,9 +3129,11 @@ def _build_accounting_period_drift_checks(
             "expected_source": "Accounting Close Readiness",
             "observed_source": "QuickBooks Refund/Adjustment Export refund components",
             "expected": _safe_float(close_summary.get("returns_refund_total")),
-            "observed": _sum(qbo_adjustments_df, "refund_amount")
-            + _sum(qbo_adjustments_df, "refund_fees")
-            + _sum(qbo_adjustments_df, "refund_shipping"),
+            "observed": return_refund_total(
+                refund_amount=_sum(qbo_adjustments_df, "refund_amount"),
+                refund_fees=_sum(qbo_adjustments_df, "refund_fees"),
+                refund_shipping=_sum(qbo_adjustments_df, "refund_shipping"),
+            ),
             "tolerance": tolerance,
         },
         {
@@ -1707,12 +3148,14 @@ def _build_accounting_period_drift_checks(
             "check": "qbo_return_profit_impact_formula",
             "expected_source": "QuickBooks Refund/Adjustment Export -(refund_amount + refund_fees + refund_shipping) + cogs_reversal_estimate",
             "observed_source": "QuickBooks Refund/Adjustment Export.estimated_profit_impact",
-            "expected": -(
-                _sum(qbo_adjustments_df, "refund_amount")
-                + _sum(qbo_adjustments_df, "refund_fees")
-                + _sum(qbo_adjustments_df, "refund_shipping")
-            )
-            + _sum(qbo_adjustments_df, "cogs_reversal_estimate"),
+            "expected": accounting_returns_profit_impact(
+                refund_total=return_refund_total(
+                    refund_amount=_sum(qbo_adjustments_df, "refund_amount"),
+                    refund_fees=_sum(qbo_adjustments_df, "refund_fees"),
+                    refund_shipping=_sum(qbo_adjustments_df, "refund_shipping"),
+                ),
+                cogs_reversal=_sum(qbo_adjustments_df, "cogs_reversal_estimate"),
+            ),
             "observed": _sum(qbo_adjustments_df, "estimated_profit_impact"),
             "tolerance": tolerance,
         },
@@ -1721,8 +3164,10 @@ def _build_accounting_period_drift_checks(
             "expected_source": "Accounting Close Readiness.estimated_profit_after_returns",
             "observed_source": "QBO profit_before_returns_estimate + return estimated_profit_impact",
             "expected": _close_estimated_profit_after_returns(),
-            "observed": _sum(qbo_sales_df, qbo_profit_before_returns_column)
-            + _sum(qbo_adjustments_df, "estimated_profit_impact"),
+            "observed": accounting_profit_after_returns(
+                profit_before_returns_amount=_sum(qbo_sales_df, qbo_profit_before_returns_column),
+                returns_profit_impact_amount=_sum(qbo_adjustments_df, "estimated_profit_impact"),
+            ),
             "tolerance": tolerance,
         },
     ]
@@ -1835,8 +3280,10 @@ def _build_accounting_period_drift_checks(
                     "check": "dashboard_30d_return_profit_impact_formula",
                     "expected_source": "Dashboard -returns_30d_refund_total + returns_30d_cogs_reversal",
                     "observed_source": "Dashboard Live Metrics returns_30d_profit_impact",
-                    "expected": -_safe_float(dashboard.get("returns_30d_refund_total"))
-                    + _safe_float(dashboard.get("returns_30d_cogs_reversal")),
+                    "expected": accounting_returns_profit_impact(
+                        refund_total=dashboard.get("returns_30d_refund_total"),
+                        cogs_reversal=dashboard.get("returns_30d_cogs_reversal"),
+                    ),
                     "observed": _safe_float(dashboard.get("returns_30d_profit_impact")),
                     "tolerance": tolerance,
                 },
@@ -1844,10 +3291,12 @@ def _build_accounting_period_drift_checks(
                     "check": "dashboard_30d_net_formula",
                     "expected_source": "Dashboard gross + shipping charged - fees - label spend",
                     "observed_source": "Dashboard Live Metrics sales_30d_net",
-                    "expected": _safe_float(dashboard.get("sales_30d_gross"))
-                    + _safe_float(dashboard.get("sales_30d_shipping_charged"))
-                    - _safe_float(dashboard.get("ebay_fees_30d_total"))
-                    - _safe_float(dashboard.get("sales_30d_shipping_label_spend")),
+                    "expected": accounting_net_before_cogs(
+                        gross=dashboard.get("sales_30d_gross"),
+                        shipping_charged=dashboard.get("sales_30d_shipping_charged"),
+                        fees=dashboard.get("ebay_fees_30d_total"),
+                        label_spend=dashboard.get("sales_30d_shipping_label_spend"),
+                    ),
                     "observed": _safe_float(dashboard.get("sales_30d_net")),
                     "tolerance": tolerance,
                 },
@@ -1855,8 +3304,10 @@ def _build_accounting_period_drift_checks(
                     "check": "dashboard_30d_shipping_delta_formula",
                     "expected_source": "Dashboard shipping charged - label spend",
                     "observed_source": "Dashboard Live Metrics sales_30d_shipping_delta",
-                    "expected": _safe_float(dashboard.get("sales_30d_shipping_charged"))
-                    - _safe_float(dashboard.get("sales_30d_shipping_label_spend")),
+                    "expected": accounting_shipping_delta(
+                        shipping_charged=dashboard.get("sales_30d_shipping_charged"),
+                        label_spend=dashboard.get("sales_30d_shipping_label_spend"),
+                    ),
                     "observed": _safe_float(dashboard.get("sales_30d_shipping_delta")),
                     "tolerance": tolerance,
                 },
@@ -1864,18 +3315,70 @@ def _build_accounting_period_drift_checks(
                     "check": "dashboard_30d_profit_formula",
                     "expected_source": "Dashboard profit before returns + return profit impact",
                     "observed_source": "Dashboard Live Metrics sales_30d_est_profit",
-                    "expected": (
-                        _safe_float(dashboard.get("sales_30d_profit_before_returns"))
-                        if dashboard.get("sales_30d_profit_before_returns") is not None
-                        else _safe_float(dashboard.get("sales_30d_net"))
-                        - _safe_float(dashboard.get("sales_30d_est_cogs"))
-                    )
-                    + _safe_float(dashboard.get("returns_30d_profit_impact")),
+                    "expected": accounting_profit_after_returns(
+                        profit_before_returns_amount=(
+                            _safe_float(dashboard.get("sales_30d_profit_before_returns"))
+                            if dashboard.get("sales_30d_profit_before_returns") is not None
+                            else accounting_profit_before_returns(
+                                net_before_cogs_amount=dashboard.get("sales_30d_net"),
+                                cogs=dashboard.get("sales_30d_est_cogs"),
+                            )
+                        ),
+                        returns_profit_impact_amount=dashboard.get("returns_30d_profit_impact"),
+                    ),
                     "observed": _safe_float(dashboard.get("sales_30d_est_profit")),
                     "tolerance": tolerance,
                 },
             ]
         )
+        dashboard_has_cogs_evidence_split = any(
+            key in dashboard
+            for key in (
+                "sales_30d_cogs_verified_amount",
+                "sales_30d_cogs_estimate_amount",
+                "sales_30d_cogs_review_amount",
+            )
+        )
+        if dashboard_has_cogs_evidence_split:
+            cogs_review_count = int(_safe_float(dashboard.get("sales_30d_cogs_review_count")))
+            cogs_review_amount = _safe_float(dashboard.get("sales_30d_cogs_review_amount"))
+            cogs_estimate_amount = _safe_float(dashboard.get("sales_30d_cogs_estimate_amount"))
+            cogs_verified_amount = _safe_float(dashboard.get("sales_30d_cogs_verified_amount"))
+            cogs_status = str(dashboard.get("sales_30d_profit_basis_status") or "").strip().lower()
+            checks.extend(
+                [
+                    {
+                        "check": "dashboard_30d_cogs_evidence_split_formula",
+                        "expected_source": "Dashboard Live Metrics sales_30d_est_cogs",
+                        "observed_source": (
+                            "Dashboard verified COGS + estimated COGS + review-needed COGS"
+                        ),
+                        "expected": _safe_float(dashboard.get("sales_30d_est_cogs")),
+                        "observed": cogs_verified_amount + cogs_estimate_amount + cogs_review_amount,
+                        "tolerance": tolerance,
+                    },
+                    {
+                        "check": "dashboard_30d_cogs_review_status_formula",
+                        "expected_source": "Dashboard review COGS count/amount > 0",
+                        "observed_source": "Dashboard Live Metrics sales_30d_profit_basis_status",
+                        "expected": 1.0 if cogs_review_count > 0 or cogs_review_amount > 0 else 0.0,
+                        "observed": 1.0 if cogs_status == "review_needed" else 0.0,
+                        "tolerance": 0.0,
+                    },
+                    {
+                        "check": "dashboard_30d_cogs_partial_estimate_status_formula",
+                        "expected_source": "Dashboard estimated COGS > 0 and review-needed COGS = 0",
+                        "observed_source": "Dashboard Live Metrics sales_30d_profit_basis_status",
+                        "expected": (
+                            1.0
+                            if cogs_review_count <= 0 and cogs_review_amount <= 0 and cogs_estimate_amount > 0
+                            else 0.0
+                        ),
+                        "observed": 1.0 if cogs_status == "partial_lot_estimate" else 0.0,
+                        "tolerance": 0.0,
+                    },
+                ]
+            )
     slack_metrics = slack_summary_metrics or {}
     if slack_metrics:
         slack_label = str(slack_metrics.get("window_label") or "summary").strip().lower().replace(" ", "_")
@@ -1926,8 +3429,10 @@ def _build_accounting_period_drift_checks(
                     "check": f"slack_{slack_label}_profit_before_returns_formula",
                     "expected_source": f"{observed_source} net_window - cogs_window",
                     "observed_source": _profit_before_returns_source(slack_metrics, observed_source),
-                    "expected": _safe_float(slack_metrics.get("net_window"))
-                    - _safe_float(slack_metrics.get("cogs_window")),
+                    "expected": accounting_profit_before_returns(
+                        net_before_cogs_amount=slack_metrics.get("net_window"),
+                        cogs=slack_metrics.get("cogs_window"),
+                    ),
                     "observed": _profit_before_returns_metric(slack_metrics),
                     "tolerance": tolerance,
                 },
@@ -1951,8 +3456,10 @@ def _build_accounting_period_drift_checks(
                     "check": f"slack_{slack_label}_return_profit_impact_formula",
                     "expected_source": f"{observed_source} -returns_refund_window + returns_cogs_reversal_window",
                     "observed_source": f"{observed_source} returns_profit_impact_window",
-                    "expected": -_safe_float(slack_metrics.get("returns_refund_window"))
-                    + _safe_float(slack_metrics.get("returns_cogs_reversal_window")),
+                    "expected": accounting_returns_profit_impact(
+                        refund_total=slack_metrics.get("returns_refund_window"),
+                        cogs_reversal=slack_metrics.get("returns_cogs_reversal_window"),
+                    ),
                     "observed": _safe_float(slack_metrics.get("returns_profit_impact_window")),
                     "tolerance": tolerance,
                 },
@@ -1970,9 +3477,13 @@ def _build_accounting_period_drift_checks(
                         f"{observed_source} net_window - cogs_window + returns_profit_impact_window"
                     ),
                     "observed_source": f"{observed_source} estimated_profit_after_returns",
-                    "expected": _safe_float(slack_metrics.get("net_window"))
-                    - _safe_float(slack_metrics.get("cogs_window"))
-                    + _safe_float(slack_metrics.get("returns_profit_impact_window")),
+                    "expected": accounting_profit_after_returns(
+                        profit_before_returns_amount=accounting_profit_before_returns(
+                            net_before_cogs_amount=slack_metrics.get("net_window"),
+                            cogs=slack_metrics.get("cogs_window"),
+                        ),
+                        returns_profit_impact_amount=slack_metrics.get("returns_profit_impact_window"),
+                    ),
                     "observed": _safe_float(slack_metrics.get("estimated_profit_after_returns")),
                     "tolerance": tolerance,
                 },
@@ -2028,7 +3539,10 @@ def _build_accounting_period_drift_checks(
                     "check": f"ai_accounting_{ai_label}_profit_before_returns_formula",
                     "expected_source": f"{observed_source} net_window - cogs_window",
                     "observed_source": _profit_before_returns_source(ai_metrics, observed_source),
-                    "expected": _safe_float(ai_metrics.get("net_window")) - _safe_float(ai_metrics.get("cogs_window")),
+                    "expected": accounting_profit_before_returns(
+                        net_before_cogs_amount=ai_metrics.get("net_window"),
+                        cogs=ai_metrics.get("cogs_window"),
+                    ),
                     "observed": _profit_before_returns_metric(ai_metrics),
                     "tolerance": tolerance,
                 },
@@ -2052,8 +3566,10 @@ def _build_accounting_period_drift_checks(
                     "check": f"ai_accounting_{ai_label}_return_profit_impact_formula",
                     "expected_source": f"{observed_source} -returns_refund_window + returns_cogs_reversal_window",
                     "observed_source": f"{observed_source} returns_profit_impact_window",
-                    "expected": -_safe_float(ai_metrics.get("returns_refund_window"))
-                    + _safe_float(ai_metrics.get("returns_cogs_reversal_window")),
+                    "expected": accounting_returns_profit_impact(
+                        refund_total=ai_metrics.get("returns_refund_window"),
+                        cogs_reversal=ai_metrics.get("returns_cogs_reversal_window"),
+                    ),
                     "observed": _safe_float(ai_metrics.get("returns_profit_impact_window")),
                     "tolerance": tolerance,
                 },
@@ -2071,9 +3587,13 @@ def _build_accounting_period_drift_checks(
                         f"{observed_source} net_window - cogs_window + returns_profit_impact_window"
                     ),
                     "observed_source": f"{observed_source} estimated_profit_after_returns",
-                    "expected": _safe_float(ai_metrics.get("net_window"))
-                    - _safe_float(ai_metrics.get("cogs_window"))
-                    + _safe_float(ai_metrics.get("returns_profit_impact_window")),
+                    "expected": accounting_profit_after_returns(
+                        profit_before_returns_amount=accounting_profit_before_returns(
+                            net_before_cogs_amount=ai_metrics.get("net_window"),
+                            cogs=ai_metrics.get("cogs_window"),
+                        ),
+                        returns_profit_impact_amount=ai_metrics.get("returns_profit_impact_window"),
+                    ),
                     "observed": _safe_float(ai_metrics.get("estimated_profit_after_returns")),
                     "tolerance": tolerance,
                 },
@@ -2084,11 +3604,13 @@ def _build_accounting_period_drift_checks(
         expected = _safe_float(row.get("expected"))
         observed = _safe_float(row.get("observed"))
         row_tolerance = _safe_float(row.get("tolerance"))
+        if row_tolerance > 0:
+            row_tolerance = max(row_tolerance, min(1.0, max(abs(expected), abs(observed)) * 0.001))
         delta = observed - expected
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2109,12 +3631,22 @@ def _build_slack_summary_drift_metrics(
 ) -> dict[str, object]:
     returns_count = int(len(returns_df)) if returns_df is not None else 0
     returns_refund = (
-        float(pd.to_numeric(returns_df.get("refund_amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
-        + float(pd.to_numeric(returns_df.get("refund_fees", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
-        + float(
-            pd.to_numeric(returns_df.get("refund_shipping", pd.Series(dtype=float)), errors="coerce")
-            .fillna(0.0)
-            .sum()
+        return_refund_total(
+            refund_amount=float(
+                pd.to_numeric(returns_df.get("refund_amount", pd.Series(dtype=float)), errors="coerce")
+                .fillna(0.0)
+                .sum()
+            ),
+            refund_fees=float(
+                pd.to_numeric(returns_df.get("refund_fees", pd.Series(dtype=float)), errors="coerce")
+                .fillna(0.0)
+                .sum()
+            ),
+            refund_shipping=float(
+                pd.to_numeric(returns_df.get("refund_shipping", pd.Series(dtype=float)), errors="coerce")
+                .fillna(0.0)
+                .sum()
+            ),
         )
         if returns_df is not None and not returns_df.empty
         else 0.0
@@ -2131,7 +3663,10 @@ def _build_slack_summary_drift_metrics(
         if qbo_adjustments_df is not None and not qbo_adjustments_df.empty
         else 0.0
     )
-    returns_profit_impact = -returns_refund + returns_cogs_reversal
+    returns_profit_impact = accounting_returns_profit_impact(
+        refund_total=returns_refund,
+        cogs_reversal=returns_cogs_reversal,
+    )
     if cogs_margin_df is None or cogs_margin_df.empty:
         return {
             "window_label": window_label,
@@ -2146,12 +3681,15 @@ def _build_slack_summary_drift_metrics(
             "returns_refund_window": round(returns_refund, 2),
             "returns_cogs_reversal_window": round(returns_cogs_reversal, 2),
             "returns_profit_impact_window": round(returns_profit_impact, 2),
-            "estimated_profit_after_returns": round(returns_profit_impact, 2),
+            "estimated_profit_after_returns": accounting_profit_after_returns(
+                profit_before_returns_amount=0.0,
+                returns_profit_impact_amount=returns_profit_impact,
+            ),
         }
     gross = float(pd.to_numeric(cogs_margin_df.get("gross_sales", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
     net = float(pd.to_numeric(cogs_margin_df.get("net_before_cogs", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
     cogs = float(pd.to_numeric(cogs_margin_df.get("fifo_cogs", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
-    profit_before_returns = net - cogs
+    profit_before_returns = accounting_profit_before_returns(net_before_cogs_amount=net, cogs=cogs)
     return {
         "window_label": window_label,
         "observed_source": f"Slack {window_label} business summary",
@@ -2165,7 +3703,10 @@ def _build_slack_summary_drift_metrics(
         "returns_refund_window": round(returns_refund, 2),
         "returns_cogs_reversal_window": round(returns_cogs_reversal, 2),
         "returns_profit_impact_window": round(returns_profit_impact, 2),
-        "estimated_profit_after_returns": round(profit_before_returns + returns_profit_impact, 2),
+        "estimated_profit_after_returns": accounting_profit_after_returns(
+            profit_before_returns_amount=profit_before_returns,
+            returns_profit_impact_amount=returns_profit_impact,
+        ),
     }
 
 
@@ -2208,31 +3749,48 @@ def _build_accounting_close_formula_checks(
         {
             "check": "net_before_cogs_component_formula",
             "formula": "gross_sales + shipping_charged_total - fee_total - shipping_label_spend_total",
-            "expected": round(gross_sales + shipping_charged_total - fee_total - shipping_label_spend_total, 2),
+            "expected": accounting_net_before_cogs(
+                gross=gross_sales,
+                shipping_charged=shipping_charged_total,
+                fees=fee_total,
+                label_spend=shipping_label_spend_total,
+            ),
             "observed": round(net_before_cogs, 2),
         },
         {
             "check": "net_before_cogs_minus_fifo_cogs_equals_fifo_margin",
             "formula": "net_before_cogs - fifo_cogs",
-            "expected": round(net_before_cogs - fifo_cogs, 2),
+            "expected": accounting_profit_before_returns(
+                net_before_cogs_amount=net_before_cogs,
+                cogs=fifo_cogs,
+            ),
             "observed": round(fifo_margin, 2),
         },
         {
             "check": "shipping_delta_total_formula",
             "formula": "shipping_charged_total - shipping_label_spend_total",
-            "expected": round(shipping_charged_total - shipping_label_spend_total, 2),
+            "expected": accounting_shipping_delta(
+                shipping_charged=shipping_charged_total,
+                label_spend=shipping_label_spend_total,
+            ),
             "observed": round(shipping_delta_total, 2),
         },
         {
             "check": "return_profit_impact_formula",
             "formula": "-returns_refund_total + returns_cogs_reversal_total",
-            "expected": round(-returns_refund_total + returns_cogs_reversal_total, 2),
+            "expected": accounting_returns_profit_impact(
+                refund_total=returns_refund_total,
+                cogs_reversal=returns_cogs_reversal_total,
+            ),
             "observed": round(returns_estimated_profit_impact, 2),
         },
         {
             "check": "net_after_returns_and_cogs_formula",
             "formula": "fifo_margin + returns_estimated_profit_impact",
-            "expected": round(fifo_margin + returns_estimated_profit_impact, 2),
+            "expected": accounting_profit_after_returns(
+                profit_before_returns_amount=fifo_margin,
+                returns_profit_impact_amount=returns_estimated_profit_impact,
+            ),
             "observed": round(net_after_returns_and_cogs, 2),
         },
     ]
@@ -2244,7 +3802,7 @@ def _build_accounting_close_formula_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, tolerance) else "warn",
                 "formula": str(row.get("formula") or ""),
                 "expected": round(expected, 2),
                 "observed": round(observed, 2),
@@ -2303,6 +3861,124 @@ def _apply_formula_checks_to_close_readiness(
     if checks.empty:
         return summary, check_row
     return summary, pd.concat([checks, check_row], ignore_index=True)
+
+
+def _build_accounting_close_warning_source_detail_rows(
+    check_frames: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Flatten source check warnings so close blockers point to exact rows."""
+
+    detail_rows: list[dict[str, object]] = []
+    source_columns = [
+        "check",
+        "status",
+        "value",
+        "expected",
+        "observed",
+        "delta_observed_minus_expected",
+        "details",
+        "formula",
+        "expected_source",
+        "observed_source",
+    ]
+    for category, frame in (check_frames or {}).items():
+        if frame is None or frame.empty or "status" not in frame.columns:
+            continue
+        status = frame.get("status", pd.Series(dtype=str)).fillna("").astype(str).str.lower()
+        flagged = frame[status.isin({"fail", "warn"})].copy()
+        if flagged.empty:
+            continue
+        for record in flagged.to_dict("records"):
+            row: dict[str, object] = {"category": category}
+            for column in source_columns:
+                if column in record:
+                    row[column] = record.get(column)
+            detail_rows.append(row)
+    return pd.DataFrame(detail_rows)
+
+
+def _build_accounting_close_action_detail_rows(cogs_margin_df: pd.DataFrame) -> pd.DataFrame:
+    if cogs_margin_df is None or cogs_margin_df.empty:
+        return pd.DataFrame()
+
+    frame = cogs_margin_df.copy()
+    fifo_source = frame.get("fifo_cost_source", pd.Series(dtype=str)).fillna("").astype(str)
+    fifo_margin = pd.to_numeric(frame.get("fifo_margin", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    mismatch_units = pd.to_numeric(
+        frame.get("listing_lot_movement_mismatch_units", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0.0)
+    mismatch_flag = frame.get("listing_lot_movement_mismatch", pd.Series(dtype=bool)).fillna(False).astype(bool)
+    inventory_mismatch_units = pd.to_numeric(
+        frame.get("inventory_movement_mismatch_units", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0.0)
+    inventory_mismatch_flag = (
+        frame.get("inventory_movement_mismatch", pd.Series(dtype=bool)).fillna(False).astype(bool)
+    )
+    actionable = frame[
+        (fifo_source == "mixed_fifo_cost")
+        | (fifo_margin <= 0)
+        | mismatch_flag
+        | (mismatch_units > 0)
+        | inventory_mismatch_flag
+        | (inventory_mismatch_units > 0)
+    ].copy()
+    if actionable.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for record in actionable.to_dict("records"):
+        source = str(record.get("fifo_cost_source") or "").strip()
+        margin_value = _safe_float(record.get("fifo_margin"))
+        missing_units = int(_safe_float(record.get("listing_lot_movement_mismatch_units")))
+        inventory_missing_units = int(_safe_float(record.get("inventory_movement_mismatch_units")))
+        issue_parts: list[str] = []
+        action_parts: list[str] = []
+        if missing_units > 0 or bool(record.get("listing_lot_movement_mismatch")):
+            issue_parts.append("lot/listing movement mismatch")
+            action_parts.append("Preview/apply lot-listing movement repair for this sale.")
+        elif inventory_missing_units > 0 or bool(record.get("inventory_movement_mismatch")):
+            issue_parts.append("sale inventory movement missing")
+            action_parts.append(
+                "Inspect the sale product/listing link and recreate the regular sale inventory movement if the sale should consume stock."
+            )
+        if source == "mixed_fifo_cost":
+            issue_parts.append("mixed fallback FIFO COGS")
+            action_parts.append(
+                "Review Sale FIFO COGS Evidence, then add explicit lot allocation/cost evidence or approve equal-fallback allocation repair."
+            )
+        if margin_value <= 0:
+            issue_parts.append("nonpositive FIFO margin")
+            action_parts.append(
+                "Confirm sale price, fee, label spend, and COGS; if intentionally low-margin/loss, suppress with a note."
+            )
+        rows.append(
+            {
+                "sale_id": record.get("sale_id"),
+                "sold_at": record.get("sold_at"),
+                "marketplace": record.get("marketplace"),
+                "sku": record.get("sku"),
+                "product_title": record.get("product_title"),
+                "quantity": record.get("quantity"),
+                "net_before_cogs": round(_safe_float(record.get("net_before_cogs")), 2),
+                "fifo_cogs": round(_safe_float(record.get("fifo_cogs")), 2),
+                "fifo_margin": round(margin_value, 2),
+                "fifo_cost_source": source,
+                "fifo_cogs_evidence_rows": int(_safe_float(record.get("fifo_cogs_evidence_rows"))),
+                "inventory_movement_units_expected": int(
+                    _safe_float(record.get("inventory_movement_units_expected"))
+                ),
+                "inventory_movement_units_recorded": int(
+                    _safe_float(record.get("inventory_movement_units_recorded"))
+                ),
+                "listing_lot_movement_mismatch_units": missing_units,
+                "inventory_movement_mismatch_units": inventory_missing_units,
+                "issue": "; ".join(issue_parts),
+                "recommended_action": " ".join(action_parts),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _build_accounting_sales_component_checks(
@@ -2371,7 +4047,7 @@ def _build_accounting_sales_component_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2497,7 +4173,7 @@ def _build_accounting_return_tieout_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2612,7 +4288,7 @@ def _build_accounting_inventory_valuation_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": str(row.get("status") or ("pass" if abs(delta) <= row_tolerance else "warn")),
+                "status": str(row.get("status") or ("pass" if _within_close_tolerance(delta, row_tolerance) else "warn")),
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2679,6 +4355,7 @@ def _build_accounting_fee_evidence_checks(
     fee_row_count = 0 if fee_reconciliation_df is None else int(len(fee_reconciliation_df))
     source_row_count = 0
     sale_field_fallback_rows = 0
+    sale_field_fallback_fee_total = 0.0
     source_actual_fee_total = 0.0
     if fee_source_priority_df is not None and not fee_source_priority_df.empty:
         source_df = fee_source_priority_df.copy()
@@ -2694,6 +4371,9 @@ def _build_accounting_fee_evidence_checks(
         source_row_count = int(source_df["sales_count"].sum())
         sale_field_fallback_rows = int(
             source_df.loc[source_df["actual_fee_source"] == "sale_fees_field", "sales_count"].sum()
+        )
+        sale_field_fallback_fee_total = float(
+            source_df.loc[source_df["actual_fee_source"] == "sale_fees_field", "actual_fee_total"].sum()
         )
         source_actual_fee_total = float(source_df["actual_fee_total"].sum())
     sales_actual_fee_total = _sum(sales_df, "actual_fee")
@@ -2739,6 +4419,14 @@ def _build_accounting_fee_evidence_checks(
             "observed": float(sale_field_fallback_rows),
             "tolerance": 0.0,
         },
+        {
+            "check": "sale_fee_field_fallback_fee_total",
+            "expected_source": "Fee source priority",
+            "observed_source": "sale_fees_field fallback actual_fee_total",
+            "expected": 0.0,
+            "observed": sale_field_fallback_fee_total,
+            "tolerance": 0.0,
+        },
     ]
     output: list[dict[str, object]] = []
     for row in checks:
@@ -2749,7 +4437,7 @@ def _build_accounting_fee_evidence_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2774,6 +4462,17 @@ def _apply_fee_evidence_checks_to_close_readiness(
         else 0
     )
     summary["fee_evidence_warn_count"] = fee_warn_count
+    if fee_evidence_df is not None and not fee_evidence_df.empty:
+        fallback_fee_rows = fee_evidence_df[
+            fee_evidence_df.get("check", pd.Series(dtype=str)).astype(str) == "sale_fee_field_fallback_fee_total"
+        ]
+        summary["sale_fee_field_fallback_fee_total"] = (
+            round(_safe_float(fallback_fee_rows.iloc[0].get("observed")), 2)
+            if not fallback_fee_rows.empty
+            else 0.0
+        )
+    else:
+        summary["sale_fee_field_fallback_fee_total"] = 0.0
     if fee_warn_count > 0:
         blockers = [
             part.strip()
@@ -2819,7 +4518,20 @@ def _build_accounting_shipping_evidence_checks(
     summary_shipping_charged = _sum(shipping_econ_summary_df, "total_shipping_charged")
     summary_label_spend = _sum(shipping_econ_summary_df, "total_label_spend")
     summary_delta = _sum(shipping_econ_summary_df, "shipping_delta_charged_minus_spend")
+    if sales_shipping_charged > 0 and detail_shipping_charged == 0.0:
+        detail_shipping_charged = sales_shipping_charged
+        detail_delta = detail_shipping_charged - detail_label_spend
+    if sales_label_spend > 0 and detail_label_spend == 0.0:
+        detail_label_spend = sales_label_spend
+        detail_delta = detail_shipping_charged - detail_label_spend
+    if detail_shipping_charged > 0 and summary_shipping_charged == 0.0:
+        summary_shipping_charged = detail_shipping_charged
+        summary_delta = summary_shipping_charged - summary_label_spend
+    if detail_label_spend > 0 and summary_label_spend == 0.0:
+        summary_label_spend = detail_label_spend
+        summary_delta = summary_shipping_charged - summary_label_spend
     missing_label_rows = 0
+    missing_label_shipping_charged_total = 0.0
     if shipping_economics_df is not None and not shipping_economics_df.empty:
         detail_df = shipping_economics_df.copy()
         detail_df["shipping_charged_to_buyer"] = pd.to_numeric(
@@ -2832,6 +4544,12 @@ def _build_accounting_shipping_evidence_checks(
         ).fillna(0.0)
         missing_label_rows = int(
             ((detail_df["shipping_charged_to_buyer"] > 0) & (detail_df["shipping_label_spend"] <= 0)).sum()
+        )
+        missing_label_shipping_charged_total = float(
+            detail_df.loc[
+                (detail_df["shipping_charged_to_buyer"] > 0) & (detail_df["shipping_label_spend"] <= 0),
+                "shipping_charged_to_buyer",
+            ].sum()
         )
     checks = [
         {
@@ -2890,6 +4608,14 @@ def _build_accounting_shipping_evidence_checks(
             "observed": float(missing_label_rows),
             "tolerance": 0.0,
         },
+        {
+            "check": "paid_shipping_missing_label_spend_charged_total",
+            "expected_source": "Shipping Economics",
+            "observed_source": "buyer shipping charged on rows with zero label spend",
+            "expected": 0.0,
+            "observed": missing_label_shipping_charged_total,
+            "tolerance": 0.0,
+        },
     ]
     output: list[dict[str, object]] = []
     for row in checks:
@@ -2900,7 +4626,7 @@ def _build_accounting_shipping_evidence_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -2925,6 +4651,18 @@ def _apply_shipping_evidence_checks_to_close_readiness(
         else 0
     )
     summary["shipping_evidence_warn_count"] = shipping_warn_count
+    if shipping_evidence_df is not None and not shipping_evidence_df.empty:
+        missing_label_total_rows = shipping_evidence_df[
+            shipping_evidence_df.get("check", pd.Series(dtype=str)).astype(str)
+            == "paid_shipping_missing_label_spend_charged_total"
+        ]
+        summary["paid_shipping_missing_label_spend_charged_total"] = (
+            round(_safe_float(missing_label_total_rows.iloc[0].get("observed")), 2)
+            if not missing_label_total_rows.empty
+            else 0.0
+        )
+    else:
+        summary["paid_shipping_missing_label_spend_charged_total"] = 0.0
     if shipping_warn_count > 0:
         blockers = [
             part.strip()
@@ -3048,7 +4786,7 @@ def _build_accounting_reconciliation_tieout_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3104,6 +4842,7 @@ def _build_accounting_cogs_source_checks(
     cogs_source_summary_df: pd.DataFrame,
     close_summary: dict[str, float | int | str],
     sale_fifo_cogs_evidence_df: pd.DataFrame | None = None,
+    active_suppression_keys: set[tuple[str, str, int]] | None = None,
     tolerance: float = 0.01,
 ) -> pd.DataFrame:
     def _sum(df: pd.DataFrame, column: str) -> float:
@@ -3131,6 +4870,14 @@ def _build_accounting_cogs_source_checks(
         evidence_sale_count = int(sale_fifo_cogs_evidence_df["sale_id"].dropna().nunique())
     equal_fallback_cogs = 0.0
     missing_cost_cogs = 0.0
+    mixed_fifo_cogs = 0.0
+    mixed_estimate_fifo_cogs = 0.0
+    mixed_verified_fifo_cogs = 0.0
+    review_needed_cogs = 0.0
+    estimated_cogs = 0.0
+    verified_cogs = 0.0
+    lot_listing_movement_mismatch_count = 0.0
+    unsuppressed_mixed_fifo_cogs = 0.0
     if cogs_source_summary_df is not None and not cogs_source_summary_df.empty:
         source_df = cogs_source_summary_df.copy()
         source_df["fifo_cost_source"] = source_df.get("fifo_cost_source", pd.Series(dtype=str)).fillna("").astype(str)
@@ -3144,6 +4891,58 @@ def _build_accounting_cogs_source_checks(
         missing_cost_cogs = float(
             source_df.loc[source_df["fifo_cost_source"].isin(["missing_cost_basis", "unknown"]), "fifo_cogs"].sum()
         )
+        mixed_fifo_cogs = float(
+            source_df.loc[source_df["fifo_cost_source"] == "mixed_fifo_cost", "fifo_cogs"].sum()
+        )
+        mixed_estimate_fifo_cogs = float(
+            source_df.loc[source_df["fifo_cost_source"] == "mixed_estimate_fifo_cost", "fifo_cogs"].sum()
+        )
+        mixed_verified_fifo_cogs = float(
+            source_df.loc[source_df["fifo_cost_source"] == "mixed_verified_fifo_cost", "fifo_cogs"].sum()
+        )
+        review_needed_cogs = float(
+            source_df.loc[source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES), "fifo_cogs"].sum()
+        )
+        estimated_cogs = float(
+            source_df.loc[source_df["fifo_cost_source"].isin(COGS_ESTIMATE_SOURCES), "fifo_cogs"].sum()
+        )
+        verified_cogs = float(
+            source_df.loc[
+                ~source_df["fifo_cost_source"].isin(COGS_REVIEW_SOURCES | COGS_ESTIMATE_SOURCES),
+                "fifo_cogs",
+            ].sum()
+        )
+        if "lot_listing_movement_mismatch_count" in source_df.columns:
+            lot_listing_movement_mismatch_count = float(
+                pd.to_numeric(
+                    source_df.get("lot_listing_movement_mismatch_count", pd.Series(dtype=float)),
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .sum()
+            )
+    if (
+        cogs_margin_df is not None
+        and not cogs_margin_df.empty
+        and "fifo_cost_source" in cogs_margin_df.columns
+    ):
+        margin_df = cogs_margin_df.copy()
+        margin_df["fifo_cost_source"] = margin_df.get("fifo_cost_source", pd.Series(dtype=str)).fillna("").astype(str)
+        margin_df["fifo_cogs"] = pd.to_numeric(
+            margin_df.get("fifo_cogs", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0)
+        mixed_mask = margin_df["fifo_cost_source"] == "mixed_fifo_cost"
+        suppressed_mixed_mask = _sale_suppression_mask(
+            margin_df,
+            active_suppression_keys or set(),
+            "mixed_fifo_cost_review",
+        )
+        unsuppressed_mixed_fifo_cogs = float(
+            margin_df.loc[mixed_mask & ~suppressed_mixed_mask, "fifo_cogs"].sum()
+        )
+    else:
+        unsuppressed_mixed_fifo_cogs = mixed_fifo_cogs
     checks = [
         {
             "check": "cogs_source_sale_count_matches_margin_detail",
@@ -3226,6 +5025,62 @@ def _build_accounting_cogs_source_checks(
             "tolerance": tolerance,
         },
         {
+            "check": "sold_mixed_fifo_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_mixed_fifo_cogs",
+            "observed_source": "Sold COGS Source Summary mixed_fifo_cost review bucket",
+            "expected": _safe_float(close_summary.get("sold_mixed_fifo_cogs")),
+            "observed": mixed_fifo_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_mixed_estimate_fifo_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_mixed_estimate_fifo_cogs",
+            "observed_source": "Sold COGS Source Summary mixed_estimate_fifo_cost",
+            "expected": _safe_float(close_summary.get("sold_mixed_estimate_fifo_cogs")),
+            "observed": mixed_estimate_fifo_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_mixed_verified_fifo_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_mixed_verified_fifo_cogs",
+            "observed_source": "Sold COGS Source Summary mixed_verified_fifo_cost",
+            "expected": _safe_float(close_summary.get("sold_mixed_verified_fifo_cogs")),
+            "observed": mixed_verified_fifo_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_review_needed_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_review_needed_cogs",
+            "observed_source": "Sold COGS Source Summary review-needed sources",
+            "expected": _safe_float(close_summary.get("sold_review_needed_cogs")),
+            "observed": review_needed_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_estimated_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_estimated_cogs",
+            "observed_source": "Sold COGS Source Summary estimate sources",
+            "expected": _safe_float(close_summary.get("sold_estimated_cogs")),
+            "observed": estimated_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_verified_cogs_matches_close_summary",
+            "expected_source": "Accounting Close Readiness.sold_verified_cogs",
+            "observed_source": "Sold COGS Source Summary verified sources",
+            "expected": _safe_float(close_summary.get("sold_verified_cogs")),
+            "observed": verified_cogs,
+            "tolerance": tolerance,
+        },
+        {
+            "check": "sold_cogs_evidence_split_matches_fifo_cogs",
+            "expected_source": "Sold COGS Source Summary.fifo_cogs",
+            "observed_source": "verified + estimated + review-needed sold COGS",
+            "expected": source_fifo_cogs,
+            "observed": verified_cogs + estimated_cogs + review_needed_cogs,
+            "tolerance": tolerance,
+        },
+        {
             "check": "sold_equal_fallback_cogs_present",
             "expected_source": "Sold COGS Source Summary",
             "observed_source": "lot_equal_quantity_fallback COGS",
@@ -3241,6 +5096,22 @@ def _build_accounting_cogs_source_checks(
             "observed": missing_cost_cogs,
             "tolerance": 0.0,
         },
+        {
+            "check": "sold_mixed_fifo_cogs_present",
+            "expected_source": "Close readiness mixed FIFO policy",
+            "observed_source": "COGS & Margin Detail mixed_fifo_cost COGS not suppressed as mixed_fifo_cost_review",
+            "expected": 0.0,
+            "observed": unsuppressed_mixed_fifo_cogs,
+            "tolerance": 0.0,
+        },
+        {
+            "check": "sold_lot_listing_movement_mismatches_present",
+            "expected_source": "Close readiness lot-listing movement policy",
+            "observed_source": "Sold COGS Source Summary.lot_listing_movement_mismatch_count",
+            "expected": 0.0,
+            "observed": lot_listing_movement_mismatch_count,
+            "tolerance": 0.0,
+        },
     ]
     output: list[dict[str, object]] = []
     for row in checks:
@@ -3251,7 +5122,7 @@ def _build_accounting_cogs_source_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3423,7 +5294,7 @@ def _build_accounting_lot_allocation_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3500,6 +5371,11 @@ def _build_accounting_exception_queue_checks(
         else pd.Series(dtype=str)
     )
     missing_type_count = int((exception_type == "").sum()) if not exception_type.empty else 0
+    lot_listing_movement_mismatch_count = (
+        int((exception_type == "listing_lot_inventory_movement_mismatch").sum())
+        if not exception_type.empty
+        else 0
+    )
     checks = [
         {
             "check": "total_exception_count_matches_close_summary",
@@ -3549,6 +5425,16 @@ def _build_accounting_exception_queue_checks(
             "observed": float(missing_type_count),
             "tolerance": 0.0,
         },
+        {
+            "check": "lot_listing_inventory_movement_mismatches_present",
+            "expected_source": "Close readiness lot-listing movement policy",
+            "observed_source": (
+                "Accounting Exception Queue.exception_type=listing_lot_inventory_movement_mismatch"
+            ),
+            "expected": 0.0,
+            "observed": float(lot_listing_movement_mismatch_count),
+            "tolerance": 0.0,
+        },
     ]
     output: list[dict[str, object]] = []
     for row in checks:
@@ -3559,7 +5445,7 @@ def _build_accounting_exception_queue_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3614,6 +5500,7 @@ def _build_accounting_margin_anomaly_checks(
     cogs_margin_df: pd.DataFrame,
     accounting_exceptions_df: pd.DataFrame,
     close_summary: dict[str, float | int | str],
+    active_suppression_keys: set[tuple[str, str, int]] | None = None,
     tolerance: float = 0.01,
 ) -> pd.DataFrame:
     margin = (
@@ -3623,10 +5510,23 @@ def _build_accounting_margin_anomaly_checks(
     )
     if not margin.empty:
         fifo_margin = pd.to_numeric(margin.get("fifo_margin", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        suppressed_margin_mask = _sale_suppression_mask(
+            margin,
+            active_suppression_keys or set(),
+            "nonpositive_margin",
+        )
+        unsuppressed_fifo_margin = fifo_margin[~suppressed_margin_mask]
     else:
         fifo_margin = pd.Series(dtype=float)
+        unsuppressed_fifo_margin = pd.Series(dtype=float)
     negative_margin_rows = int((fifo_margin < 0).sum()) if not fifo_margin.empty else 0
     nonpositive_margin_rows = int((fifo_margin <= 0).sum()) if not fifo_margin.empty else 0
+    unsuppressed_negative_margin_rows = (
+        int((unsuppressed_fifo_margin < 0).sum()) if not unsuppressed_fifo_margin.empty else 0
+    )
+    unsuppressed_nonpositive_margin_rows = (
+        int((unsuppressed_fifo_margin <= 0).sum()) if not unsuppressed_fifo_margin.empty else 0
+    )
 
     exceptions = (
         accounting_exceptions_df.copy()
@@ -3651,26 +5551,26 @@ def _build_accounting_margin_anomaly_checks(
         },
         {
             "check": "nonpositive_fifo_margin_rows_have_exception",
-            "expected_source": "COGS & Margin Detail.fifo_margin <= 0",
+            "expected_source": "COGS & Margin Detail.fifo_margin <= 0 not suppressed as nonpositive_margin",
             "observed_source": "Accounting Exception Queue.exception_type=nonpositive_margin",
-            "expected": float(nonpositive_margin_rows),
+            "expected": float(unsuppressed_nonpositive_margin_rows),
             "observed": float(nonpositive_exception_count),
             "tolerance": 0.0,
         },
         {
             "check": "negative_fifo_margin_rows_present",
             "expected_source": "Close readiness margin policy",
-            "observed_source": "COGS & Margin Detail.fifo_margin < 0",
+            "observed_source": "COGS & Margin Detail.fifo_margin < 0 not suppressed as nonpositive_margin",
             "expected": 0.0,
-            "observed": float(negative_margin_rows),
+            "observed": float(unsuppressed_negative_margin_rows),
             "tolerance": 0.0,
         },
         {
             "check": "nonpositive_fifo_margin_rows_present",
             "expected_source": "Close readiness margin policy",
-            "observed_source": "COGS & Margin Detail.fifo_margin <= 0",
+            "observed_source": "COGS & Margin Detail.fifo_margin <= 0 not suppressed as nonpositive_margin",
             "expected": 0.0,
-            "observed": float(nonpositive_margin_rows),
+            "observed": float(unsuppressed_nonpositive_margin_rows),
             "tolerance": 0.0,
         },
     ]
@@ -3683,7 +5583,7 @@ def _build_accounting_margin_anomaly_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= row_tolerance else "warn",
+                "status": "pass" if _within_close_tolerance(delta, row_tolerance) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3804,7 +5704,7 @@ def _build_accounting_close_consistency_checks(
         output.append(
             {
                 "check": str(row.get("check") or ""),
-                "status": "pass" if abs(delta) <= 0.0 else "warn",
+                "status": "pass" if _within_close_tolerance(delta, 0.0) else "warn",
                 "expected_source": str(row.get("expected_source") or ""),
                 "observed_source": str(row.get("observed_source") or ""),
                 "expected": round(expected, 2),
@@ -3921,6 +5821,10 @@ def _accounting_close_packet_prefixes() -> set[str]:
         "returns",
         "qbo_sales_export",
         "qbo_adjustments_export",
+        "quickbooks_salesreceipt_payloads",
+        "quickbooks_fee_purchase_payloads",
+        "quickbooks_shipping_label_purchase_payloads",
+        "quickbooks_payload_readiness",
     }
 
 
@@ -4198,6 +6102,11 @@ def _build_accounting_close_signoff_review(
     current_blockers = int(_safe_float(close_summary.get("blocker_count")))
     current_drift_warnings = int(_safe_float(close_summary.get("period_drift_warn_count")))
     current_ai_followups = int(_safe_float(close_summary.get("ai_review_followup_count")))
+    current_fee_exposure = round(_safe_float(close_summary.get("sale_fee_field_fallback_fee_total")), 2)
+    current_label_exposure = round(
+        _safe_float(close_summary.get("paid_shipping_missing_label_spend_charged_total")),
+        2,
+    )
     rows: list[dict[str, object]] = [
         {
             "check": "Close Sign-Off Evidence Present",
@@ -4220,6 +6129,11 @@ def _build_accounting_close_signoff_review(
     signoff_blockers = int(_safe_float(latest.get("unresolved_blocker_count")))
     signoff_drift_warnings = int(_safe_float(latest.get("period_drift_warn_count")))
     signoff_ai_followups = int(_safe_float(latest.get("ai_review_followup_count")))
+    signoff_fee_exposure = round(_safe_float(latest.get("sale_fee_field_fallback_fee_total")), 2)
+    signoff_label_exposure = round(
+        _safe_float(latest.get("paid_shipping_missing_label_spend_charged_total")),
+        2,
+    )
     signoff_packet_ref = str(latest.get("accounting_packet_ref") or "").strip()
     signoff_packet_hash = str(latest.get("accounting_packet_hash") or "").strip().lower()
     current_packet_hash = str(current_packet_hash or "").strip().lower()
@@ -4302,7 +6216,30 @@ def _build_accounting_close_signoff_review(
                 "status": "pass" if signoff_ai_followups == current_ai_followups else "warn",
                 "expected": current_ai_followups,
                 "observed": signoff_ai_followups,
-                "details": "Latest approved sign-off AI review follow-up count should match recalculated Copilot/AI Accountant outcome blockers.",
+                "details": (
+                    f"Latest approved sign-off AI review follow-up count should match recalculated "
+                    f"Copilot/{AI_ACCOUNTANT_NAME} outcome blockers."
+                ),
+            },
+            {
+                "check": "Approved Sign-Off Fee Evidence Exposure",
+                "status": "pass" if signoff_fee_exposure == current_fee_exposure else "warn",
+                "expected": current_fee_exposure,
+                "observed": signoff_fee_exposure,
+                "details": (
+                    "Latest approved sign-off sale-field fee fallback dollars should match recalculated fee "
+                    "evidence exposure."
+                ),
+            },
+            {
+                "check": "Approved Sign-Off Label Evidence Exposure",
+                "status": "pass" if signoff_label_exposure == current_label_exposure else "warn",
+                "expected": current_label_exposure,
+                "observed": signoff_label_exposure,
+                "details": (
+                    "Latest approved sign-off paid-shipping rows missing label spend should match recalculated "
+                    "shipping evidence exposure."
+                ),
             },
             {
                 "check": "Approved Sign-Off Owner Present",
@@ -4415,6 +6352,11 @@ def _build_accounting_close_export_packet(
                 "Tax outputs are estimates for operational planning. Validate local/state tax treatment with a tax advisor.\n"
                 "Profit convention before returns: gross + shipping charged - fees - label spend - COGS.\n"
                 "Estimated profit after returns: profit before returns - return refunds + return COGS reversal.\n"
+                "Fee evidence exposure: sale_fee_field_fallback_fee_total is fee dollars relying on sale-field fallback.\n"
+                "Shipping evidence exposure: paid_shipping_missing_label_spend_charged_total is buyer-paid shipping "
+                "on rows missing label-spend evidence.\n"
+                "Bundle/lot quantity convention: sale quantity is marketplace listing units; "
+                "listing_bundle_inventory_units_sold is inventory units consumed for bundle/lot COGS.\n"
                 "QuickBooks Sales Export uses profit_before_returns_estimate for before-return profit; "
                 "gross_margin_estimate is retained as a legacy compatibility alias.\n"
             ),
@@ -4433,13 +6375,41 @@ def _report_context_caption(file_prefix: str) -> str:
             "`profit_before_returns_estimate` is the preferred before-return profit field; "
             "`gross_margin_estimate` remains as a legacy compatibility alias."
         ),
+        "quickbooks_salesreceipt_payloads": (
+            "Preview-only Intuit QBO v3 SalesReceipt JSON payloads. These post gross marketplace sales to "
+            "`Custom App Clearing Account`; live API posting is not enabled from this report."
+        ),
+        "quickbooks_fee_purchase_payloads": (
+            "Preview-only Intuit QBO v3 Purchase JSON payloads for order-level eBay fees. These reduce "
+            "`Custom App Clearing Account`; live API posting is not enabled from this report."
+        ),
+        "quickbooks_shipping_label_purchase_payloads": (
+            "Preview-only Intuit QBO v3 Purchase JSON payloads for eBay shipping-label spend. These reduce "
+            "`Custom App Clearing Account` against the configured eBay Shipping Expense account; live API posting "
+            "is not enabled from this report."
+        ),
+        "quickbooks_payload_readiness": (
+            "Readiness checks for preview-only QuickBooks API payloads. Resolve review/warn rows before enabling "
+            "future live QBO posting."
+        ),
+        "quarterly_estimated_tax_fee_detail": (
+            "Marketplace fee detail for quarterly estimated-tax planning. eBay fees are exposed as potential "
+            "commissions/fees expense evidence, but deductibility, capitalization, and return-line treatment "
+            "require tax-advisor review."
+        ),
+        "quarterly_estimated_tax_fee_summary": (
+            "Marketplace fee rollup for quarterly estimated-tax planning, grouped by marketplace, source, and "
+            "planning category for advisor review."
+        ),
         "qbo_adjustments_export": (
             "`estimated_profit_impact` is `-(refund_amount + refund_fees + refund_shipping) "
             "+ cogs_reversal_estimate`."
         ),
         "cogs_margin_detail": (
             "`fifo_margin` is before-return profit by sale. Use close-readiness `Est. Profit After Returns` "
-            "for final return-adjusted profit."
+            "for final return-adjusted profit. For bundle/lot listings, `quantity` is marketplace listing units "
+            "and `listing_bundle_inventory_units_sold` is inventory units consumed for COGS. "
+            "`inventory_movement_units_expected` and `inventory_movement_units_recorded` show sale movement drift."
         ),
         "sale_fifo_cogs_evidence": (
             "One row per FIFO COGS allocation consumed by a sale; ties sale margin back to product, lot, "
@@ -4450,162 +6420,6 @@ def _report_context_caption(file_prefix: str) -> str:
         ),
     }
     return captions.get(prefix, "")
-
-
-def _build_tax_review_export_packet(
-    *,
-    reports: list[tuple[str, pd.DataFrame, str]],
-    from_date,
-    to_date,
-    tax_jurisdiction: str,
-    tax_rate_percent: float,
-    shipping_taxable: bool,
-    marketplace_scope: str,
-    facilitator_channels: set[str] | None,
-    tax_exempt_categories: set[str] | None,
-    tax_profile: dict[str, object] | None = None,
-    extra_artifacts: list[tuple[str, bytes]] | None = None,
-) -> bytes:
-    extra_artifact_hashes = {
-        str(name or "").strip(): hashlib.sha256(payload or b"").hexdigest()
-        for name, payload in (extra_artifacts or [])
-        if str(name or "").strip()
-    }
-    evidence_hash = _tax_review_packet_evidence_hash_from_reports(
-        reports=reports,
-        from_date=from_date,
-        to_date=to_date,
-        tax_jurisdiction=tax_jurisdiction,
-        tax_rate_percent=tax_rate_percent,
-        shipping_taxable=shipping_taxable,
-        marketplace_scope=marketplace_scope,
-        facilitator_channels=facilitator_channels,
-        tax_exempt_categories=tax_exempt_categories,
-        tax_profile=tax_profile,
-        extra_artifact_hashes=extra_artifact_hashes,
-    )
-    tax_report_prefixes = {
-        "tax_summary_estimated",
-        "tax_by_marketplace_estimated",
-        "tax_detail_estimated",
-        "tax_exceptions_advisor_review",
-        "tax_reporting_signoffs",
-        "tax_reporting_signoff_review",
-    }
-    selected_reports = [
-        (label, df, prefix)
-        for label, df, prefix in reports
-        if str(prefix or "").strip() in tax_report_prefixes
-    ]
-    report_csv_by_prefix: dict[str, str] = {}
-    for _label, df, prefix in selected_reports:
-        export_df = df if df is not None else pd.DataFrame()
-        report_csv_by_prefix[str(prefix)] = export_df.to_csv(index=False)
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    manifest_rows = [
-        {"key": "generated_at", "value": generated_at},
-        {"key": "tax_packet_evidence_hash_sha256", "value": evidence_hash},
-        {"key": "from_date", "value": str(from_date)},
-        {"key": "to_date", "value": str(to_date)},
-        {"key": "tax_jurisdiction", "value": str(tax_jurisdiction or "")},
-        {"key": "tax_rate_percent", "value": str(float(tax_rate_percent or 0.0))},
-        {"key": "shipping_taxable", "value": str(bool(shipping_taxable)).lower()},
-        {"key": "marketplace_scope", "value": str(marketplace_scope or "all")},
-        {"key": "facilitator_channels", "value": ",".join(sorted(facilitator_channels or set()))},
-        {"key": "tax_exempt_categories", "value": ",".join(sorted(tax_exempt_categories or set()))},
-    ]
-    if tax_profile:
-        for key in [
-            "profile_key",
-            "profile_name",
-            "effective_from",
-            "effective_to",
-            "human_validation_status",
-            "advisor_evidence_link",
-        ]:
-            manifest_rows.append({"key": f"tax_profile_{key}", "value": str(tax_profile.get(key) or "")})
-    for label, df, prefix in selected_reports:
-        manifest_rows.append(
-            {
-                "key": f"row_count_{prefix}",
-                "value": str(0 if df is None else int(len(df))),
-            }
-        )
-    for name, payload in extra_artifacts or []:
-        safe_name = str(name or "").strip()
-        if not safe_name:
-            continue
-        manifest_rows.append({"key": f"artifact_{safe_name}", "value": str(len(payload or b""))})
-        manifest_rows.append(
-            {
-                "key": f"sha256_{safe_name}",
-                "value": hashlib.sha256(payload or b"").hexdigest(),
-            }
-        )
-
-    buffer = BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as packet:
-        packet.writestr("manifest.csv", pd.DataFrame(manifest_rows).to_csv(index=False))
-        packet.writestr(
-            "README.txt",
-            (
-                "GoldenStackers tax review export packet.\n"
-                "Tax outputs are estimates for operational planning and advisor review.\n"
-                "Validate local/state treatment, marketplace facilitator rules, shipping taxability, "
-                "and bullion/coin exemptions with your tax advisor before filing or remittance decisions.\n"
-            ),
-        )
-        for label, df, prefix in selected_reports:
-            packet.writestr(f"{prefix}.csv", report_csv_by_prefix.get(str(prefix), ""))
-        for name, payload in extra_artifacts or []:
-            safe_name = str(name or "").strip()
-            if safe_name:
-                packet.writestr(safe_name, payload or b"")
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def _tax_review_packet_evidence_hash_from_reports(
-    *,
-    reports: list[tuple[str, pd.DataFrame, str]],
-    from_date,
-    to_date,
-    tax_jurisdiction: str,
-    tax_rate_percent: float,
-    shipping_taxable: bool,
-    marketplace_scope: str,
-    facilitator_channels: set[str] | None,
-    tax_exempt_categories: set[str] | None,
-    tax_profile: dict[str, object] | None = None,
-    extra_artifact_hashes: dict[str, str] | None = None,
-) -> str:
-    tax_report_prefixes = {
-        "tax_summary_estimated",
-        "tax_by_marketplace_estimated",
-        "tax_detail_estimated",
-        "tax_exceptions_advisor_review",
-        "tax_reporting_signoffs",
-    }
-    report_csv_by_prefix: dict[str, str] = {}
-    for _label, df, prefix in reports:
-        if str(prefix or "").strip() not in tax_report_prefixes:
-            continue
-        export_df = df if df is not None else pd.DataFrame()
-        report_csv_by_prefix[str(prefix)] = export_df.to_csv(index=False)
-    hash_payload = {
-        "from_date": str(from_date),
-        "to_date": str(to_date),
-        "tax_jurisdiction": str(tax_jurisdiction or ""),
-        "tax_rate_percent": float(tax_rate_percent or 0.0),
-        "shipping_taxable": bool(shipping_taxable),
-        "marketplace_scope": str(marketplace_scope or "all"),
-        "facilitator_channels": sorted(facilitator_channels or set()),
-        "tax_exempt_categories": sorted(tax_exempt_categories or set()),
-        "tax_profile": tax_profile or {},
-        "extra_artifact_hashes": extra_artifact_hashes or {},
-        "reports": report_csv_by_prefix,
-    }
-    return hashlib.sha256(json.dumps(hash_payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _top_n_records(
@@ -4649,22 +6463,6 @@ def _top_n_by_abs_records(
     return top_df.to_dict("records")
 
 
-def _default_tax_marketplace_scope(
-    sales_marketplace_options: list[str],
-    facilitator_channels: set[str],
-) -> list[str]:
-    options = [str(v or "").strip().lower() for v in (sales_marketplace_options or []) if str(v or "").strip()]
-    unique_options: list[str] = []
-    seen: set[str] = set()
-    for value in options:
-        if value in seen:
-            continue
-        seen.add(value)
-        unique_options.append(value)
-    filtered = [m for m in unique_options if m not in set(facilitator_channels or set())]
-    return filtered
-
-
 def _bounded_dataframe(
     df: pd.DataFrame,
     *,
@@ -4675,6 +6473,48 @@ def _bounded_dataframe(
         return df, False
     limit = max(1, int(preview_row_limit or 1))
     return df.head(limit), int(len(df)) > limit
+
+
+def _arrow_safe_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    safe_df = df.copy()
+
+    def _is_missing(value) -> bool:
+        if isinstance(value, (dict, list, tuple, set, bytes, bytearray)):
+            return False
+        try:
+            return bool(pd.isna(value))
+        except Exception:
+            return False
+
+    for column in safe_df.columns:
+        series = safe_df[column]
+        if not pd.api.types.is_object_dtype(series.dtype):
+            continue
+        non_null = series.dropna()
+        if non_null.empty:
+            safe_df[column] = series.astype("string")
+            continue
+        has_text_like = non_null.map(lambda value: isinstance(value, (str, bytes, bytearray))).any()
+        has_complex = non_null.map(lambda value: isinstance(value, (dict, list, tuple, set))).any()
+        if has_text_like or has_complex:
+            safe_df[column] = series.map(
+                lambda value: ""
+                if _is_missing(value)
+                else value.decode("utf-8", errors="replace")
+                if isinstance(value, (bytes, bytearray))
+                else json.dumps(value, sort_keys=True, default=str)
+                if isinstance(value, (dict, list, tuple, set))
+                else str(value)
+            ).astype("string")
+            continue
+        numeric = pd.to_numeric(series, errors="coerce")
+        if int(numeric.notna().sum()) == int(non_null.shape[0]):
+            safe_df[column] = numeric
+        else:
+            safe_df[column] = series.map(lambda value: "" if _is_missing(value) else str(value)).astype("string")
+    return safe_df
 
 
 def _extract_order_fee_breakdown_from_notes(notes: str | None) -> dict:
@@ -5226,522 +7066,20 @@ def _build_weekly_fee_source_count_chart_data(trend_df: pd.DataFrame) -> pd.Data
     return pivot.sort_values(["week_start"], ascending=[True]).reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, max_entries=128)
-def _filter_tax_drilldown_rows(
-    tax_detail_df: pd.DataFrame,
-    *,
-    marketplace: str,
-    taxability: str,
-) -> pd.DataFrame:
-    if tax_detail_df is None or tax_detail_df.empty:
-        return pd.DataFrame()
-    filtered = tax_detail_df.copy()
-    marketplace_norm = str(marketplace or "all").strip().lower()
-    taxability_norm = str(taxability or "all").strip().lower()
-    if marketplace_norm != "all":
-        filtered = filtered[
-            filtered["marketplace"].astype(str).str.strip().str.lower() == marketplace_norm
-        ]
-    if taxability_norm == "taxable_only":
-        filtered = filtered[filtered["taxable_subtotal"].astype(float) > 0.0]
-    elif taxability_norm == "exempt_only":
-        filtered = filtered[filtered["is_tax_exempt_category"].astype(bool)]
-    return filtered
-
-
-@st.cache_data(show_spinner=False, max_entries=128)
-def _build_tax_drilldown_sale_option_rows(filtered_tax_detail: pd.DataFrame) -> list[dict]:
-    if filtered_tax_detail is None or filtered_tax_detail.empty:
-        return []
-    rows: list[dict] = []
-    for row in filtered_tax_detail.itertuples(index=False):
-        sale_id = int(getattr(row, "sale_id", 0) or 0)
-        if sale_id <= 0:
-            continue
-        label = (
-            f"sale#{sale_id} | {str(getattr(row, 'marketplace', '') or '').strip()} | "
-            f"{str(getattr(row, 'sku', '') or '').strip()} | "
-            f"tax={float(getattr(row, 'estimated_tax_collected', 0.0) or 0.0):,.2f}"
-        )
-        rows.append({"label": label, "sale_id": sale_id})
-    return rows
-
-
-@st.cache_data(show_spinner=False, max_entries=128)
-def _tax_drilldown_kpis(filtered_tax_detail: pd.DataFrame) -> dict[str, float | int]:
-    if filtered_tax_detail is None or filtered_tax_detail.empty:
-        return {
-            "rows": 0,
-            "taxable_subtotal": 0.0,
-            "estimated_tax": 0.0,
-        }
-    return {
-        "rows": int(len(filtered_tax_detail)),
-        "taxable_subtotal": float(filtered_tax_detail["taxable_subtotal"].sum()),
-        "estimated_tax": float(filtered_tax_detail["estimated_tax_collected"].sum()),
-    }
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def _load_colorado_suts_jurisdiction_options(
-    template_path: str = str(COLORADO_SUTS_TEMPLATE_PATH),
-) -> list[dict[str, object]]:
-    path = Path(template_path)
-    if not path.exists():
-        return []
-    wb = load_workbook(path, read_only=True, data_only=False)
-    if "Upload Data" not in wb.sheetnames:
-        return []
-    ws = wb["Upload Data"]
-    rows: list[dict[str, object]] = []
-    for row_idx in range(4, ws.max_row + 1):
-        account_type = str(ws.cell(row_idx, 2).value or "").strip()
-        jurisdiction_code = str(ws.cell(row_idx, 3).value or "").strip()
-        jurisdiction_name = str(ws.cell(row_idx, 4).value or "").strip()
-        if not jurisdiction_code or not jurisdiction_name:
-            continue
-        rows.append(
-            {
-                "row": row_idx,
-                "account_type": account_type,
-                "jurisdiction_code": jurisdiction_code,
-                "jurisdiction_name": jurisdiction_name,
-                "label": f"{jurisdiction_code} | {jurisdiction_name} | {account_type}",
-            }
-        )
-    return rows
-
-
-def _format_suts_gross_text(value: object) -> str:
-    amount = round(_safe_float(value), 2)
-    if abs(amount) < 0.005:
-        return "0"
-    return f"{amount:.2f}"
-
-
-def _month_bounds_from_yyyy_mm(month_value: str) -> tuple[datetime, datetime]:
-    raw = str(month_value or "").strip()
-    try:
-        month_start = datetime.strptime(raw, "%Y-%m")
-    except Exception as exc:
-        raise ValueError("Month must be in YYYY-MM format.") from exc
-    if month_start.month == 12:
-        next_month = datetime(month_start.year + 1, 1, 1)
-    else:
-        next_month = datetime(month_start.year, month_start.month + 1, 1)
-    return month_start, next_month - timedelta(microseconds=1)
-
-
-def _filter_tax_detail_for_month(tax_detail_df: pd.DataFrame, *, month_value: str) -> pd.DataFrame:
-    if tax_detail_df is None or tax_detail_df.empty:
-        return pd.DataFrame()
-    month_start, month_end = _month_bounds_from_yyyy_mm(month_value)
-    if "sold_at" not in tax_detail_df.columns:
-        return tax_detail_df.copy()
-    filtered = tax_detail_df.copy()
-    sold_at = pd.to_datetime(filtered["sold_at"], errors="coerce")
-    filtered = filtered[(sold_at >= month_start) & (sold_at <= month_end)].copy()
-    return filtered
-
-
-def _build_colorado_suts_scope_summary_rows(
-    reportable_tax_detail_df: pd.DataFrame,
-    excluded_facilitator_tax_detail_df: pd.DataFrame,
-    *,
-    selected_marketplaces: set[str] | None,
-    facilitator_channels: set[str] | None,
-) -> list[dict[str, object]]:
-    selected = {str(v or "").strip().lower() for v in (selected_marketplaces or set()) if str(v or "").strip()}
-    facilitators = {str(v or "").strip().lower() for v in (facilitator_channels or set()) if str(v or "").strip()}
-
-    def _summary_row(
-        df: pd.DataFrame,
-        *,
-        scope: str,
-        marketplace_scope: set[str],
-        suts_treatment: str,
-        note: str,
-    ) -> dict[str, object]:
-        if df is None or df.empty:
-            sales_count = 0
-            gross_sales = 0.0
-            marketplaces_seen: list[str] = []
-        else:
-            sales_count = int(len(df))
-            gross_sales = round(float(df.get("gross_sales", pd.Series(dtype=float)).fillna(0).astype(float).sum()), 2)
-            marketplaces_seen = sorted(
-                {
-                    str(v or "").strip().lower()
-                    for v in df.get("marketplace", pd.Series(dtype=str)).dropna().tolist()
-                    if str(v or "").strip()
-                }
-            )
-        return {
-            "scope": scope,
-            "marketplace_scope": ", ".join(sorted(marketplace_scope)) if marketplace_scope else "(none)",
-            "marketplaces_seen": ", ".join(marketplaces_seen) if marketplaces_seen else "(none)",
-            "sales_count": sales_count,
-            "gross_sales": gross_sales,
-            "suts_treatment": suts_treatment,
-            "note": note,
-        }
-
-    excluded_facilitators = facilitators - selected
-    rows = [
-        _summary_row(
-            reportable_tax_detail_df,
-            scope="Reportable SUTS upload gross",
-            marketplace_scope=selected,
-            suts_treatment="included",
-            note="Direct/local marketplace scope selected above; this is what the SUTS gross-sales rows use.",
-        )
-    ]
-    if excluded_facilitators or (excluded_facilitator_tax_detail_df is not None and not excluded_facilitator_tax_detail_df.empty):
-        rows.append(
-            _summary_row(
-                excluded_facilitator_tax_detail_df,
-                scope="Marketplace facilitator gross",
-                marketplace_scope=excluded_facilitators,
-                suts_treatment="excluded by default",
-                note="eBay/facilitator sales are kept out of normal SUTS remittance unless advisor-confirmed.",
-            )
-        )
-    if selected.intersection(facilitators):
-        rows.append(
-            _summary_row(
-                pd.DataFrame(),
-                scope="Advisor override",
-                marketplace_scope=selected.intersection(facilitators),
-                suts_treatment="facilitator selected",
-                note="A marketplace facilitator channel is selected; only submit that scope with advisor-confirmed reporting instructions.",
-            )
-        )
-    return rows
-
-
-def _suts_jurisdiction_key(jurisdiction_code: object, account_type: object) -> str:
-    return (
-        f"{str(jurisdiction_code or '').strip()}|"
-        f"{str(account_type or '').strip().upper()}"
-    )
-
-
-def _build_colorado_suts_upload_workbook(
-    tax_detail_df: pd.DataFrame,
-    *,
-    account_number: str = COLORADO_SUTS_ACCOUNT_NUMBER,
-    gross_jurisdiction_code: str = "",
-    gross_jurisdiction_key: str = "",
-    gross_jurisdiction_codes: list[str] | None = None,
-    gross_jurisdiction_keys: list[str] | None = None,
-    zero_filing_jurisdiction_codes: list[str] | None = None,
-    zero_filing_jurisdiction_keys: list[str] | None = None,
-    account_number_by_jurisdiction_code: dict[str, str] | None = None,
-    account_number_by_jurisdiction_key: dict[str, str] | None = None,
-    allow_blank_account_jurisdiction_keys: set[str] | None = None,
-    custom_jurisdictions: list[dict[str, object]] | None = None,
-    remove_unselected_template_rows: bool = True,
-    template_path: str = str(COLORADO_SUTS_TEMPLATE_PATH),
-) -> tuple[bytes, pd.DataFrame]:
-    path = Path(template_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Colorado SUTS template not found: {path}")
-    wb = load_workbook(path, data_only=False)
-    if "Upload Data" not in wb.sheetnames:
-        raise ValueError("Colorado SUTS template must contain an `Upload Data` sheet.")
-    ws = wb["Upload Data"]
-    ws["A1"].value = None
-
-    account_digits = "".join(ch for ch in str(account_number or "").strip() if ch.isdigit())
-    if not account_digits:
-        raise ValueError("Colorado SUTS account number is required.")
-    gross_code = str(gross_jurisdiction_code or "").strip()
-    gross_key = str(gross_jurisdiction_key or "").strip()
-    gross_codes = {str(code).strip() for code in (gross_jurisdiction_codes or []) if str(code).strip()}
-    gross_keys = {str(key).strip() for key in (gross_jurisdiction_keys or []) if str(key).strip()}
-    if gross_code:
-        gross_codes.add(gross_code)
-    if gross_key:
-        gross_keys.add(gross_key)
-    zero_codes = {str(code).strip() for code in (zero_filing_jurisdiction_codes or []) if str(code).strip()}
-    zero_keys = {str(key).strip() for key in (zero_filing_jurisdiction_keys or []) if str(key).strip()}
-    zero_codes -= gross_codes
-    zero_keys -= gross_keys
-    account_override_digits_by_code = {
-        str(code or "").strip(): "".join(ch for ch in str(value or "").strip() if ch.isdigit())
-        for code, value in (account_number_by_jurisdiction_code or {}).items()
-        if str(code or "").strip()
-    }
-    account_override_digits_by_key = {
-        str(key or "").strip(): "".join(ch for ch in str(value or "").strip() if ch.isdigit())
-        for key, value in (account_number_by_jurisdiction_key or {}).items()
-        if str(key or "").strip()
-    }
-    allow_blank_keys = {str(key or "").strip() for key in (allow_blank_account_jurisdiction_keys or set()) if str(key or "").strip()}
-
-    gross_sales_total = 0.0
-    if tax_detail_df is not None and not tax_detail_df.empty and "gross_sales" in tax_detail_df.columns:
-        gross_sales_total = float(tax_detail_df["gross_sales"].fillna(0).astype(float).sum())
-
-    selected_codes = {*gross_codes, *zero_codes}
-    selected_codes.discard("")
-    selected_keys = {*gross_keys, *zero_keys}
-    selected_keys.discard("")
-    existing_keys = {
-        _suts_jurisdiction_key(ws.cell(row_idx, 3).value, ws.cell(row_idx, 2).value)
-        for row_idx in range(4, ws.max_row + 1)
-    }
-    for custom in custom_jurisdictions or []:
-        code = str(custom.get("jurisdiction_code") or "").strip()
-        account_type = str(custom.get("account_type") or "LOCAL").strip().upper() or "LOCAL"
-        key = _suts_jurisdiction_key(code, account_type)
-        if not code or key in existing_keys or (code not in selected_codes and key not in selected_keys):
-            continue
-        row_idx = ws.max_row + 1
-        ws.cell(row_idx, 2).value = account_type
-        ws.cell(row_idx, 3).value = int(code) if code.isdigit() else code
-        ws.cell(row_idx, 4).value = str(custom.get("jurisdiction_name") or "Custom Jurisdiction").strip()
-        existing_keys.add(key)
-
-    summary_rows: list[dict[str, object]] = []
-    for row_idx in range(4, ws.max_row + 1):
-        jurisdiction_code = str(ws.cell(row_idx, 3).value or "").strip()
-        account_type = str(ws.cell(row_idx, 2).value or "").strip().upper()
-        jurisdiction_key = _suts_jurisdiction_key(jurisdiction_code, account_type)
-        if (
-            not jurisdiction_code
-            or (jurisdiction_code not in selected_codes and jurisdiction_key not in selected_keys)
-        ):
-            continue
-        if jurisdiction_key in account_override_digits_by_key:
-            row_account_digits = account_override_digits_by_key.get(jurisdiction_key) or ""
-        elif jurisdiction_code in account_override_digits_by_code:
-            row_account_digits = account_override_digits_by_code.get(jurisdiction_code) or ""
-        elif jurisdiction_key in allow_blank_keys:
-            row_account_digits = ""
-        else:
-            row_account_digits = account_digits
-        if not row_account_digits and jurisdiction_key not in allow_blank_keys:
-            raise ValueError(f"Account number is required for Colorado SUTS jurisdiction {jurisdiction_code}.")
-        account_cell = ws.cell(row_idx, 1)
-        if row_account_digits:
-            account_cell.value = int(row_account_digits)
-            account_cell.number_format = "0" * max(1, len(row_account_digits))
-        else:
-            account_cell.value = None
-            account_cell.number_format = "General"
-
-        is_gross_row = (
-            jurisdiction_key in gross_keys
-            if gross_keys
-            else jurisdiction_code in gross_codes
-        )
-        gross_text = _format_suts_gross_text(gross_sales_total if is_gross_row else 0.0)
-        gross_cell = ws.cell(row_idx, 5)
-        gross_cell.value = gross_text
-        gross_cell.number_format = "@"
-        summary_rows.append(
-            {
-                "account_number": row_account_digits,
-                "account_type": account_type,
-                "jurisdiction_code": jurisdiction_code,
-                "jurisdiction_key": jurisdiction_key,
-                "jurisdiction_name": str(ws.cell(row_idx, 4).value or "").strip(),
-                "gross_amount": gross_text,
-                "filing_type": "gross_sales" if is_gross_row else "zero_filing",
-                "worksheet_row": row_idx,
-            }
-        )
-
-    if (selected_codes or selected_keys) and not summary_rows:
-        raise ValueError("No selected Colorado SUTS jurisdiction codes were found in the template.")
-    if remove_unselected_template_rows:
-        selected_row_indexes = {
-            int(row["worksheet_row"])
-            for row in summary_rows
-            if int(row.get("worksheet_row") or 0) >= 4
-        }
-        for row_idx in range(ws.max_row, 3, -1):
-            if row_idx not in selected_row_indexes:
-                ws.delete_rows(row_idx)
-
-    output = BytesIO()
-    wb.save(output)
-    return output.getvalue(), pd.DataFrame(summary_rows)
-
-
-def _colorado_suts_summary_warnings(summary_df: pd.DataFrame) -> list[str]:
-    if summary_df is None or summary_df.empty:
-        return ["No Colorado SUTS rows are selected for export."]
-    warnings: list[str] = []
-    rows = summary_df.to_dict(orient="records")
-    gross_rows = [row for row in rows if str(row.get("filing_type") or "") == "gross_sales"]
-    zero_rows = [row for row in rows if str(row.get("filing_type") or "") == "zero_filing"]
-    if not gross_rows and not zero_rows:
-        warnings.append("Selected SUTS rows do not contain a gross-sales row or zero-filing row.")
-    for row in rows:
-        account_type = str(row.get("account_type") or "").strip().upper()
-        jurisdiction_code = str(row.get("jurisdiction_code") or "").strip()
-        account_number = str(row.get("account_number") or "").strip()
-        filing_type = str(row.get("filing_type") or "").strip()
-        if account_type == "STATE" and jurisdiction_code == "110042" and not account_number:
-            warnings.append("Golden STATE row is missing SUTS account 970074130001.")
-        if filing_type == "gross_sales" and not account_number:
-            warnings.append(
-                f"{str(row.get('jurisdiction_name') or jurisdiction_code).strip()} "
-                f"{account_type} gross-sales row is missing an account number."
-            )
-        if (
-            account_type == "LOCAL"
-            and jurisdiction_code == "110042"
-            and filing_type == "gross_sales"
-            and not account_number
-        ):
-            warnings.append(
-                "Golden LOCAL gross-sales row has a blank account number. SUTS accepted blank account only "
-                "for zero filing in observed testing; confirm whether nonzero self-collected Golden filing "
-                "requires a local account before submitting."
-            )
-    duplicate_codes = {
-        str(code)
-        for code, count in summary_df["jurisdiction_code"].astype(str).value_counts().items()
-        if int(count) > 1
-    } if "jurisdiction_code" in summary_df.columns else set()
-    for code in sorted(duplicate_codes):
-        account_types = sorted(
-            {
-                str(row.get("account_type") or "").strip().upper()
-                for row in rows
-                if str(row.get("jurisdiction_code") or "").strip() == code
-            }
-        )
-        if len(account_types) != len(
-            [
-                row
-                for row in rows
-                if str(row.get("jurisdiction_code") or "").strip() == code
-            ]
-        ):
-            warnings.append(f"Jurisdiction {code} has duplicate rows with the same account type.")
-    return warnings
-
-
-def _build_tax_exception_rows(
-    tax_detail_df: pd.DataFrame,
-    *,
-    tax_jurisdiction: str,
-    tax_rate_percent: float,
-    shipping_taxable: bool,
-    facilitator_channels: set[str] | None,
-    tax_exempt_categories: set[str] | None,
-) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    jurisdiction = str(tax_jurisdiction or "").strip()
-    facilitator_set = {
-        str(v).strip().lower()
-        for v in (facilitator_channels or set())
-        if str(v).strip()
-    }
-    exempt_set = {
-        str(v).strip().lower()
-        for v in (tax_exempt_categories or set())
-        if str(v).strip()
-    }
-    tax_rate = _safe_float(tax_rate_percent)
-
-    def _append(
-        *,
-        exception_type: str,
-        severity: str,
-        message: str,
-        sale_id: int | None = None,
-        marketplace: str = "",
-        category: str = "",
-        evidence: str = "",
-    ) -> None:
-        rows.append(
-            {
-                "severity": severity,
-                "exception_type": exception_type,
-                "sale_id": int(sale_id or 0) if sale_id else None,
-                "marketplace": marketplace,
-                "category": category,
-                "message": message,
-                "evidence": evidence,
-            }
-        )
-
-    if not jurisdiction:
-        _append(
-            exception_type="missing_tax_jurisdiction",
-            severity="P1",
-            message="Tax report has no jurisdiction configured for the selected scope.",
-            evidence="tax_jurisdiction is blank",
-        )
-    if tax_rate <= 0 and tax_detail_df is not None and not tax_detail_df.empty:
-        taxable_total = float(tax_detail_df.get("taxable_subtotal", pd.Series(dtype=float)).fillna(0).astype(float).sum())
-        if taxable_total > 0:
-            _append(
-                exception_type="missing_or_zero_tax_rate",
-                severity="P1",
-                message="Taxable sales exist but the configured tax rate is zero or missing.",
-                evidence=f"taxable_subtotal={taxable_total:.2f}; tax_rate_percent={tax_rate:.4f}",
-            )
-    if tax_detail_df is None or tax_detail_df.empty:
-        return rows
-
-    for raw in tax_detail_df.to_dict(orient="records"):
-        sale_id = int(raw.get("sale_id") or 0)
-        marketplace = str(raw.get("marketplace") or "").strip().lower()
-        category = str(raw.get("category") or "").strip().lower()
-        gross_sales = _safe_float(raw.get("gross_sales"))
-        shipping_cost = _safe_float(raw.get("shipping_cost"))
-        taxable_subtotal = _safe_float(raw.get("taxable_subtotal"))
-        taxable_shipping = _safe_float(raw.get("taxable_shipping_subtotal"))
-        estimated_tax = _safe_float(raw.get("estimated_tax_collected"))
-        is_exempt = bool(raw.get("is_tax_exempt_category"))
-
-        if marketplace in facilitator_set and taxable_subtotal > 0:
-            _append(
-                exception_type="facilitator_channel_in_tax_scope",
-                severity="P2",
-                sale_id=sale_id,
-                marketplace=marketplace,
-                category=category,
-                message="Marketplace facilitator channel is included in local tax liability scope.",
-                evidence=f"taxable_subtotal={taxable_subtotal:.2f}; estimated_tax={estimated_tax:.2f}",
-            )
-        if gross_sales > 0 and not category:
-            _append(
-                exception_type="missing_tax_category",
-                severity="P2",
-                sale_id=sale_id,
-                marketplace=marketplace,
-                category=category,
-                message="Sale has no product category for taxable/exempt classification.",
-                evidence=f"gross_sales={gross_sales:.2f}",
-            )
-        if is_exempt:
-            _append(
-                exception_type="exempt_category_review_needed",
-                severity="P3",
-                sale_id=sale_id,
-                marketplace=marketplace,
-                category=category,
-                message="Sale uses configured tax-exempt category treatment; confirm exemption basis with advisor.",
-                evidence=f"category={category}; configured_exempt_categories={','.join(sorted(exempt_set))}",
-            )
-        if is_exempt and bool(shipping_taxable) and shipping_cost > 0 and taxable_shipping > 0:
-            _append(
-                exception_type="exempt_item_taxable_shipping_review_needed",
-                severity="P2",
-                sale_id=sale_id,
-                marketplace=marketplace,
-                category=category,
-                message="Exempt item has taxable shipping under current report settings.",
-                evidence=f"shipping_cost={shipping_cost:.2f}; taxable_shipping={taxable_shipping:.2f}",
-            )
-    return rows
+def _dataframes_to_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        wrote_sheet = False
+        for raw_name, df in frames.items():
+            if df is None:
+                continue
+            sheet_name = re.sub(r"[\[\]\:\*\?\/\\]+", "_", str(raw_name or "Sheet"))[:31] or "Sheet"
+            safe_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+            safe_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            wrote_sheet = True
+        if not wrote_sheet:
+            pd.DataFrame([{"message": "No report rows."}]).to_excel(writer, sheet_name="empty", index=False)
+    return buffer.getvalue()
 
 
 @st.cache_data(show_spinner=False, max_entries=128)
@@ -5780,34 +7118,6 @@ def _build_documents_handoff_order_option_rows(orders_df: pd.DataFrame) -> list[
         )
         rows.append({"label": label, "source_id": order_id})
     return rows
-
-
-def _tax_report_presets(
-    *,
-    default_jurisdiction: str,
-    default_tax_rate_percent: float,
-    default_shipping_taxable: bool,
-) -> dict[str, dict]:
-    return {
-        "Golden Local Retail": {
-            "jurisdiction": default_jurisdiction or "Golden, Colorado",
-            "tax_rate_percent": float(default_tax_rate_percent),
-            "shipping_taxable": bool(default_shipping_taxable),
-            "marketplace_mode": "local_only",
-        },
-        "Marketplace Shipped": {
-            "jurisdiction": default_jurisdiction or "Golden, Colorado",
-            "tax_rate_percent": float(default_tax_rate_percent),
-            "shipping_taxable": False,
-            "marketplace_mode": "all",
-        },
-        "Bullion Exempt Focus": {
-            "jurisdiction": default_jurisdiction or "Golden, Colorado",
-            "tax_rate_percent": float(default_tax_rate_percent),
-            "shipping_taxable": False,
-            "marketplace_mode": "all",
-        },
-    }
 
 
 def _build_fifo_unit_cost_map(
@@ -6461,21 +7771,26 @@ def _build_listing_format_outcome_rows(
     )
 
 
-def render_reports(repo: InventoryRepository) -> None:
+def render_reports(repo: InventoryRepository, *, tax_workspace: bool = False) -> None:
     user = current_user()
-    st.subheader("Reports")
-    st.caption("Operational reports and export files for bookkeeping and QuickBooks workflows.")
-    render_help_panel(
-        section_title="Reports",
-        goal="Generate operational and accounting exports with a selectable date range.",
-        steps=[
-            "Set report start/end dates to scope records for inventory, listings, and sales.",
-            "Review report tables in-app before exporting to CSV or XLSX.",
-            "Use QuickBooks export files as staging inputs for accounting sync workflows.",
-            "Re-run exports after data corrections to keep downstream books accurate.",
-        ],
-        roadmap_phase="v0.3 Channel Sync + Accounting Readiness",
-    )
+    if tax_workspace:
+        render_taxes_workspace_intro(st=st, render_help_panel=render_help_panel)
+    else:
+        st.subheader("Reports")
+        st.caption("Operational reports and export files for bookkeeping and QuickBooks workflows.")
+        render_help_panel(
+            section_title="Reports",
+            goal="Generate operational and accounting exports with a selectable date range.",
+            steps=[
+                "Set report start/end dates to scope records for inventory, listings, and sales.",
+                "Review report tables in-app before exporting to CSV or XLSX.",
+                "Use QuickBooks export files as staging inputs for accounting sync workflows.",
+                "Use the dedicated Taxes page for SUTS, sales-tax packets, and quarterly estimated-tax planning.",
+                "Re-run exports after data corrections to keep downstream books accurate.",
+            ],
+            roadmap_phase="v0.3 Channel Sync + Accounting Readiness",
+        )
+        st.info("Tax/SUTS and quarterly estimated-tax workflows now have a dedicated `Taxes` page in the sidebar.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -6495,12 +7810,15 @@ def render_reports(repo: InventoryRepository) -> None:
         value=False,
         key="reports_load_inventory_cycle_analytics",
     )
-    load_shipping_tax_analytics = st.checkbox(
-        "Load Shipping + Tax/SUTS Analytics (slower)",
-        value=True,
-        key="reports_load_shipping_tax_analytics",
-        help="Shows shipping economics, tax drilldown, and the Colorado SUTS XLSX upload generator.",
-    )
+    if tax_workspace:
+        load_shipping_tax_analytics = st.checkbox(
+            "Load Shipping + Tax/SUTS Analytics (slower)",
+            value=True,
+            key="reports_load_shipping_tax_analytics",
+            help="Shows shipping economics, tax drilldown, and the Colorado SUTS XLSX upload generator.",
+        )
+    else:
+        load_shipping_tax_analytics = False
     render_full_tables = st.checkbox(
         "Render full report tables (slower)",
         value=False,
@@ -6529,7 +7847,7 @@ def render_reports(repo: InventoryRepository) -> None:
                 f"Showing preview rows only (`{int(len(bounded_df))}` of `{int(len(df))}`). "
                 "Enable `Render full report tables` for complete in-app rendering."
             )
-        st.dataframe(bounded_df, use_container_width=True, hide_index=hide_index)
+        st.dataframe(_arrow_safe_dataframe(bounded_df), use_container_width=True, hide_index=hide_index)
 
     def _rollback_report_session() -> None:
         db = getattr(repo, "db", None)
@@ -6699,6 +8017,22 @@ def render_reports(repo: InventoryRepository) -> None:
             for m in _get_all_movements()
             if m.occurred_at is None or start_dt <= m.occurred_at <= end_dt
         ]
+    sale_movement_units_by_product: dict[tuple[int, int], int] = defaultdict(int)
+    movement_sources = movement_rows if movement_rows_loaded else movements
+    for movement in movement_sources:
+        if isinstance(movement, dict):
+            reference_type = str(movement.get("reference_type") or "").strip()
+            reference_id = int(_safe_float(movement.get("reference_id") or 0))
+            product_id = int(_safe_float(movement.get("product_id") or 0))
+            quantity_delta = int(_safe_float(movement.get("quantity_delta") or 0))
+        else:
+            reference_type = str(getattr(movement, "reference_type", "") or "").strip()
+            reference_id = int(getattr(movement, "reference_id", 0) or 0)
+            product_id = int(getattr(movement, "product_id", 0) or 0)
+            quantity_delta = int(getattr(movement, "quantity_delta", 0) or 0)
+        if reference_type != "sale" or reference_id <= 0 or product_id <= 0 or quantity_delta >= 0:
+            continue
+        sale_movement_units_by_product[(reference_id, product_id)] += abs(quantity_delta)
     return_rows, return_rows_loaded = _load_rollup_rows(
         "report_returns_rows",
         enabled=supports_returns_rollup,
@@ -6797,7 +8131,6 @@ def render_reports(repo: InventoryRepository) -> None:
             default_unit_cost_by_product=default_unit_cost_by_product,
         )
 
-    st.markdown("### Tax Reporting Scope")
     tax_default_jurisdiction = get_runtime_str(repo, "invoicing_tax_jurisdiction", "Golden, Colorado")
     tax_default_rate_raw = get_runtime_str(repo, "invoicing_tax_rate_percent_default", "7.50")
     try:
@@ -6811,179 +8144,33 @@ def render_reports(repo: InventoryRepository) -> None:
     )
     tax_exempt_categories_default_csv = get_runtime_str(repo, "invoicing_tax_exempt_categories_csv", "bullion,coins")
     facilitator_channels_default_csv = get_runtime_str(repo, "marketplace_facilitator_channels_csv", "ebay")
-    if "reports_tax_exempt_categories_csv" not in st.session_state:
-        st.session_state["reports_tax_exempt_categories_csv"] = str(tax_exempt_categories_default_csv or "bullion,coins")
-    if "reports_tax_facilitator_channels_csv" not in st.session_state:
-        st.session_state["reports_tax_facilitator_channels_csv"] = str(facilitator_channels_default_csv or "ebay")
-    tax_exempt_categories = _parse_csv_set(str(st.session_state.get("reports_tax_exempt_categories_csv") or ""))
-    sales_marketplace_options = sorted(
-        {
-            str((s.marketplace or "")).strip().lower()
-            for s in sales
-            if str((s.marketplace or "")).strip()
-        }
-    )
-    facilitator_channels = _parse_csv_set(str(st.session_state.get("reports_tax_facilitator_channels_csv") or ""))
-    default_tax_marketplaces = _default_tax_marketplace_scope(
-        sales_marketplace_options=sales_marketplace_options,
-        facilitator_channels=facilitator_channels,
-    )
-    if "reports_tax_jurisdiction" not in st.session_state:
-        st.session_state["reports_tax_jurisdiction"] = str(tax_default_jurisdiction or "Golden, Colorado")
-    if "reports_tax_rate_percent" not in st.session_state:
-        st.session_state["reports_tax_rate_percent"] = float(max(0.0, tax_default_rate))
-    if "reports_tax_shipping_taxable" not in st.session_state:
-        st.session_state["reports_tax_shipping_taxable"] = bool(tax_shipping_taxable_default)
-    if "reports_tax_marketplaces" not in st.session_state:
-        st.session_state["reports_tax_marketplaces"] = list(default_tax_marketplaces)
-    tr1, tr2, tr3 = st.columns(3)
-    with tr1:
-        tax_jurisdiction = st.text_input(
-            "Tax Jurisdiction Context",
-            key="reports_tax_jurisdiction",
-        ).strip()
-    with tr2:
-        tax_rate_percent = st.number_input(
-            "Estimated Tax Rate (%)",
-            min_value=0.0,
-            step=0.01,
-            key="reports_tax_rate_percent",
-        )
-    with tr3:
-        tax_shipping_taxable = st.checkbox(
-            "Treat shipping as taxable",
-            key="reports_tax_shipping_taxable",
-        )
-    if facilitator_channels:
-        st.caption(
-            "Marketplace facilitator channels are excluded by default in local tax scope: "
-            + ", ".join(sorted(facilitator_channels))
-            + "."
-        )
     tax_profile_rows = _latest_tax_profile_rows(repo)
     tax_signoff_df = pd.DataFrame(_latest_tax_signoff_rows(repo))
     accounting_close_signoff_df = pd.DataFrame(_latest_accounting_close_signoff_rows(repo))
     ai_review_outcomes_df = pd.DataFrame(_latest_ai_review_outcome_rows(repo))
-    selected_tax_profile_context: dict[str, object] = {}
-    if tax_profile_rows:
-        profile_options = {
-            f"{row.get('profile_name') or row.get('profile_key')} [{row.get('profile_key')}]": row
-            for row in tax_profile_rows
-        }
-        sp1, sp2 = st.columns([2, 1])
-        with sp1:
-            selected_tax_profile_label = st.selectbox(
-                "Saved Tax Profile",
-                options=list(profile_options.keys()),
-                key="reports_saved_tax_profile",
-            )
-        with sp2:
-            if st.button("Apply Saved Tax Profile", key="reports_apply_saved_tax_profile_btn"):
-                profile = profile_options.get(selected_tax_profile_label) or {}
-                st.session_state["reports_tax_jurisdiction"] = str(
-                    profile.get("jurisdiction") or tax_default_jurisdiction or "Golden, Colorado"
-                )
-                st.session_state["reports_tax_rate_percent"] = float(max(0.0, _safe_float(profile.get("tax_rate_percent"))))
-                st.session_state["reports_tax_shipping_taxable"] = bool(profile.get("shipping_taxable"))
-                st.session_state["reports_tax_facilitator_channels_csv"] = str(profile.get("facilitator_channels") or "")
-                st.session_state["reports_tax_exempt_categories_csv"] = str(profile.get("tax_exempt_categories") or "")
-                st.session_state["reports_tax_marketplaces"] = _default_tax_marketplace_scope(
-                    sales_marketplace_options=sales_marketplace_options,
-                    facilitator_channels=_parse_csv_set(str(profile.get("facilitator_channels") or "")),
-                )
-                st.success(f"Applied saved tax profile `{profile.get('profile_key')}`.")
-                st.rerun()
-        selected_profile = profile_options.get(str(st.session_state.get("reports_saved_tax_profile") or "")) or {}
-        selected_tax_profile_context = dict(selected_profile)
-        validation_status = str(selected_profile.get("human_validation_status") or "").strip()
-        if validation_status and validation_status != "advisor_validated":
-            st.warning(
-                "Selected tax profile is not advisor-validated "
-                f"(`{validation_status}`). Treat outputs as review-only estimates."
-            )
-        elif selected_profile:
-            st.caption("Selected saved tax profile is advisor-validated.")
-    preset_map = _tax_report_presets(
-        default_jurisdiction=tax_default_jurisdiction,
-        default_tax_rate_percent=float(max(0.0, tax_default_rate)),
-        default_shipping_taxable=bool(tax_shipping_taxable_default),
+    tax_scope = render_tax_reporting_scope_controls(
+        st=st,
+        tax_workspace=tax_workspace,
+        sales=sales,
+        tax_default_jurisdiction=tax_default_jurisdiction,
+        tax_default_rate=tax_default_rate,
+        tax_shipping_taxable_default=tax_shipping_taxable_default,
+        tax_exempt_categories_default_csv=tax_exempt_categories_default_csv,
+        facilitator_channels_default_csv=facilitator_channels_default_csv,
+        tax_profile_rows=tax_profile_rows,
     )
-    tp1, tp2 = st.columns([2, 1])
-    with tp1:
-        tax_preset_name = st.selectbox(
-            "Tax Report Preset",
-            options=list(preset_map.keys()),
-            key="reports_tax_preset_name",
-        )
-    with tp2:
-        if st.button("Apply Tax Report Preset", key="reports_apply_tax_preset_btn"):
-            preset = preset_map.get(tax_preset_name) or {}
-            st.session_state["reports_tax_jurisdiction"] = str(
-                preset.get("jurisdiction") or tax_default_jurisdiction or "Golden, Colorado"
-            )
-            st.session_state["reports_tax_rate_percent"] = float(
-                max(0.0, float(preset.get("tax_rate_percent") or 0.0))
-            )
-            st.session_state["reports_tax_shipping_taxable"] = bool(preset.get("shipping_taxable", False))
-            marketplace_mode = str(preset.get("marketplace_mode") or "all").strip().lower()
-            if marketplace_mode == "local_only":
-                local_candidates = [m for m in sales_marketplace_options if m in {"local", "in_person", "pos"}]
-                st.session_state["reports_tax_marketplaces"] = local_candidates
-            else:
-                st.session_state["reports_tax_marketplaces"] = list(sales_marketplace_options)
-            st.success(f"Applied tax report preset `{tax_preset_name}`.")
-            st.rerun()
-    # Keep state value normalized to available options before rendering keyed widget.
-    current_tax_marketplaces = st.session_state.get("reports_tax_marketplaces")
-    if current_tax_marketplaces is None:
-        current_tax_marketplaces = list(default_tax_marketplaces)
-    st.session_state["reports_tax_marketplaces"] = [
-        m for m in current_tax_marketplaces if m in sales_marketplace_options
-    ]
-    selected_tax_marketplaces = st.multiselect(
-        "Tax Marketplace Filter",
-        options=sales_marketplace_options,
-        key="reports_tax_marketplaces",
-        help=(
-            "Choose marketplaces you are responsible for reporting/remitting. "
-            "Leave eBay/facilitator channels unselected for normal SUTS filing unless your advisor tells you otherwise."
-        ),
-    )
-    selected_tax_marketplace_set = {str(v).strip().lower() for v in selected_tax_marketplaces if str(v).strip()}
-    tax_query_marketplace_set = (
-        set(selected_tax_marketplace_set)
-        if selected_tax_marketplace_set
-        else {"__no_tax_marketplace_selected__"}
-    )
-    tax_marketplace_scope_label = (
-        ",".join(sorted(selected_tax_marketplace_set)) if selected_tax_marketplace_set else "none"
-    )
-    if sales_marketplace_options and not selected_tax_marketplace_set:
-        st.warning(
-            "No non-facilitator tax marketplaces are selected. Tax/SUTS outputs for this scope will be zero "
-            "unless you intentionally select a marketplace for advisor-reviewed reporting."
-        )
-    selected_facilitator_marketplaces = selected_tax_marketplace_set.intersection(facilitator_channels)
-    if selected_facilitator_marketplaces:
-        st.warning(
-            "Marketplace facilitator channel(s) selected for tax/SUTS scope: "
-            + ", ".join(sorted(selected_facilitator_marketplaces))
-            + ". For normal SUTS remittance, keep eBay/facilitator channels unselected because the facilitator "
-            "generally collects/remits those taxes. Select only with advisor-confirmed reporting instructions."
-        )
-    else:
-        st.caption(
-            "For SUTS filing, keep eBay/facilitator channels unselected unless your advisor says to report "
-            "marketplace-facilitator gross sales. Direct/local channels are the normal SUTS remittance scope."
-        )
-    st.caption(
-        "Tax-exempt categories (runtime): "
-        + (", ".join(sorted(tax_exempt_categories)) if tax_exempt_categories else "(none)")
-    )
-    st.info(
-        "Tax outputs in this report are estimates for operational planning. "
-        "Validate local/state tax treatment (including bullion/coin exemptions) with your tax advisor."
-    )
+    tax_exempt_categories = tax_scope["tax_exempt_categories"]
+    sales_marketplace_options = tax_scope["sales_marketplace_options"]
+    facilitator_channels = tax_scope["facilitator_channels"]
+    default_tax_marketplaces = tax_scope["default_tax_marketplaces"]
+    tax_jurisdiction = tax_scope["tax_jurisdiction"]
+    tax_rate_percent = tax_scope["tax_rate_percent"]
+    tax_shipping_taxable = tax_scope["tax_shipping_taxable"]
+    selected_tax_profile_context = tax_scope["selected_tax_profile_context"]
+    selected_tax_marketplaces = tax_scope["selected_tax_marketplaces"]
+    selected_tax_marketplace_set = tax_scope["selected_tax_marketplace_set"]
+    tax_query_marketplace_set = tax_scope["tax_query_marketplace_set"]
+    tax_marketplace_scope_label = tax_scope["tax_marketplace_scope_label"]
 
     sales_row_by_id = {
         int(row.get("sale_id") or 0): row
@@ -7131,7 +8318,7 @@ def render_reports(repo: InventoryRepository) -> None:
                     marketplaces=shipping_marketplaces,
                 )
                 shipping_econ_summary_df = pd.DataFrame(summary_rows)
-                shipping_loaded_from_repo = True
+                shipping_loaded_from_repo = not shipping_economics_df.empty
             except Exception:
                 _rollback_report_session()
         if not shipping_loaded_from_repo:
@@ -7397,6 +8584,7 @@ def render_reports(repo: InventoryRepository) -> None:
             ]
         )
     lot_allocation_source_summary_df = _build_lot_allocation_source_summary(lots_df)
+    lot_allocation_action_detail_df = _build_lot_allocation_action_detail(lots_df)
 
     if return_rows_loaded:
         qbo_adjustments_df = pd.DataFrame(
@@ -7483,10 +8671,16 @@ def render_reports(repo: InventoryRepository) -> None:
                     "sold_at": iso_or_none(oi.order.sold_at) if oi.order else None,
                     "marketplace": oi.order.marketplace if oi.order else None,
                     "external_order_id": oi.order.external_order_id if oi.order else None,
-                    "product_id": oi.product_id,
+                    "product_id": oi.product_id
+                    if oi.product_id is not None
+                    else (oi.listing.product_id if oi.listing else None),
                     "listing_id": oi.listing_id,
-                    "sku": oi.product.sku if oi.product else None,
-                    "product_title": oi.product.title if oi.product else None,
+                    "sku": oi.product.sku
+                    if oi.product
+                    else (oi.listing.product.sku if oi.listing and oi.listing.product else None),
+                    "product_title": oi.product.title
+                    if oi.product
+                    else (oi.listing.product.title if oi.listing and oi.listing.product else None),
                     "quantity": oi.quantity,
                     "unit_price": float(oi.unit_price),
                     "line_total": float(oi.line_total),
@@ -7874,11 +9068,29 @@ def render_reports(repo: InventoryRepository) -> None:
             actual_econ_by_sale_id=actual_econ_by_sale_id,
         )
     )
+    quickbooks_config = quickbooks_config_from_runtime(repo)
+    quickbooks_salesreceipt_payloads_df = pd.DataFrame(
+        _build_quickbooks_salesreceipt_payload_rows(qbo_sales_df, config=quickbooks_config)
+    )
+    quickbooks_fee_purchase_payloads_df = pd.DataFrame(
+        _build_quickbooks_fee_purchase_payload_rows(qbo_sales_df, config=quickbooks_config)
+    )
+    quickbooks_shipping_label_purchase_payloads_df = pd.DataFrame(
+        _build_quickbooks_shipping_label_purchase_payload_rows(qbo_sales_df, config=quickbooks_config)
+    )
+    quickbooks_payload_readiness_df = pd.DataFrame(
+        _build_quickbooks_payload_readiness_rows(
+            quickbooks_salesreceipt_payloads_df,
+            quickbooks_fee_purchase_payloads_df,
+            quickbooks_shipping_label_purchase_payloads_df,
+        )
+    )
 
     cogs_margin_rows: list[dict[str, object]] = []
     sale_fifo_cogs_evidence_rows: list[dict[str, object]] = []
     for s in sales:
         bundle_summary = _sale_listing_bundle_summary(s)
+        movement_summary = _sale_inventory_movement_summary(s, sale_movement_units_by_product)
         sale_product_id = getattr(s, "product_id", None)
         if sale_product_id is None:
             sale_product = getattr(s, "product", None)
@@ -7917,6 +9129,7 @@ def render_reports(repo: InventoryRepository) -> None:
                 "product_title": s.product.title if s.product else None,
                 "quantity": qty_sold,
                 **bundle_summary,
+                **movement_summary,
                 "gross_sales": _safe_float(s.sold_price),
                 "fees": _safe_float(s.fees),
                 "shipping_cost": _safe_float(s.shipping_cost),
@@ -7929,6 +9142,7 @@ def render_reports(repo: InventoryRepository) -> None:
                 "actual_net_before_cogs": actual_net_before_cogs,
                 "fifo_unit_cost": _safe_float(fifo_unit_cost_by_sale.get(s.id)),
                 "fifo_cost_source": fifo_cost_source,
+                **_cogs_basis_review_fields(fifo_cost_source),
                 "fifo_cogs_evidence_rows": int(len(sale_cogs_evidence)),
                 "fifo_cogs": fifo_cogs,
                 "fifo_margin": net_before_cogs - fifo_cogs,
@@ -7971,6 +9185,395 @@ def render_reports(repo: InventoryRepository) -> None:
     cogs_margin_df = pd.DataFrame(cogs_margin_rows)
     sale_fifo_cogs_evidence_df = pd.DataFrame(sale_fifo_cogs_evidence_rows)
     cogs_source_summary_df = _build_cogs_source_summary(cogs_margin_df)
+
+    quarterly_tax_summary_df = pd.DataFrame()
+    quarterly_tax_payment_df = pd.DataFrame()
+    quarterly_tax_advisor_checklist_df = pd.DataFrame()
+    quarterly_tax_sales_df = pd.DataFrame()
+    quarterly_tax_fee_df = pd.DataFrame()
+    quarterly_tax_fee_summary_df = pd.DataFrame()
+    quarterly_tax_cogs_df = pd.DataFrame()
+    quarterly_tax_returns_df = pd.DataFrame()
+    quarterly_tax_local_tax_df = pd.DataFrame()
+    quarterly_estimated_tax_payment_df = pd.DataFrame()
+    quarterly_estimated_tax_payment_review_df = pd.DataFrame()
+    if tax_workspace:
+        st.markdown("### Quarterly Estimated Tax Planning")
+        st.caption(
+            "Planning packet for federal/Colorado estimated income-tax payments. IRS estimated-payment periods are "
+            "Q1 Jan-Mar, Q2 Apr-May, Q3 Jun-Aug, and Q4 Sep-Dec. Validate safe-harbor rules, entity treatment, "
+            "deductions, credits, and final payment amounts with your tax advisor."
+        )
+        estimated_tax_treatment = st.selectbox(
+            "Business tax treatment for this estimate",
+            options=[
+                "Default spouse-owned LLC / partnership (include SE tax planning)",
+                "Single-member LLC / Schedule C (include SE tax planning)",
+                "LLC taxed as S-corp/C-corp or advisor says no SE reserve",
+                "Advisor custom / planning only",
+            ],
+            index=0,
+            key="reports_estimated_tax_business_treatment",
+            help=(
+                "LLC legal status is not the same as federal tax treatment. A spouse-owned Colorado LLC is commonly "
+                "a multi-member LLC/partnership unless a corporate election or advisor-confirmed treatment applies."
+            ),
+        )
+        include_self_employment_tax = "include SE tax" in str(estimated_tax_treatment or "")
+        current_year = utc_today().year
+        qt1, qt2, qt3, qt4 = st.columns(4)
+        with qt1:
+            estimated_tax_year = st.number_input(
+                "Estimated Tax Year",
+                min_value=2020,
+                max_value=current_year + 2,
+                value=current_year,
+                step=1,
+                key="reports_estimated_tax_year",
+            )
+        with qt2:
+            estimated_tax_quarter = st.selectbox(
+                "Estimated Tax Quarter",
+                options=["Q1", "Q2", "Q3", "Q4"],
+                key="reports_estimated_tax_quarter",
+            )
+        with qt3:
+            federal_income_tax_rate = st.number_input(
+                "Federal income-tax reserve %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(get_runtime_float(repo, "quarterly_estimated_tax_federal_income_rate_percent", 22.0)),
+                step=0.25,
+                format="%.2f",
+                key="reports_estimated_tax_federal_rate",
+            )
+        with qt4:
+            colorado_income_tax_rate = st.number_input(
+                "Colorado income-tax reserve %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(get_runtime_float(repo, "quarterly_estimated_tax_colorado_income_rate_percent", 4.40)),
+                step=0.05,
+                format="%.2f",
+                key="reports_estimated_tax_colorado_rate",
+            )
+        qr1, qr2, qr3, qr4 = st.columns(4)
+        with qr1:
+            self_employment_tax_rate = st.number_input(
+                "Self-employment tax %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(get_runtime_float(repo, "quarterly_estimated_tax_self_employment_rate_percent", 15.30)),
+                step=0.05,
+                format="%.2f",
+                key="reports_estimated_tax_self_employment_rate",
+                disabled=not include_self_employment_tax,
+            )
+        with qr2:
+            se_net_earnings_multiplier = st.number_input(
+                "SE net earnings multiplier %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(get_runtime_float(repo, "quarterly_estimated_tax_se_net_earnings_multiplier_percent", 92.35)),
+                step=0.05,
+                format="%.2f",
+                key="reports_estimated_tax_se_multiplier",
+                help="Common Schedule SE planning multiplier. Confirm with advisor before filing.",
+                disabled=not include_self_employment_tax,
+            )
+        with qr3:
+            prior_estimated_payments = st.number_input(
+                "Prior estimated payments",
+                min_value=0.0,
+                value=0.0,
+                step=25.0,
+                format="%.2f",
+                key="reports_estimated_tax_prior_payments",
+            )
+        with qr4:
+            deductible_adjustments = st.number_input(
+                "Manual deductible adjustments",
+                min_value=0.0,
+                value=0.0,
+                step=25.0,
+                format="%.2f",
+                key="reports_estimated_tax_deductible_adjustments",
+                help="Use for advisor-approved quarterly deductions not already captured in sales/fees/COGS/labels.",
+            )
+        other_income_adjustments = st.number_input(
+            "Manual other income adjustments",
+            value=0.0,
+            step=25.0,
+            format="%.2f",
+            key="reports_estimated_tax_other_income_adjustments",
+            help="Use for advisor-approved business income not already captured in marketplace/local sales rows.",
+        )
+        ss1, ss2, ss3 = st.columns(3)
+        with ss1:
+            w2_social_security_wages = st.number_input(
+                "Your W-2 Social Security wages",
+                min_value=0.0,
+                value=0.0,
+                step=1000.0,
+                format="%.2f",
+                key="reports_estimated_tax_w2_social_security_wages",
+                help=(
+                    "Enter current-year W-2 wages subject to Social Security. This reduces only the Social Security "
+                    "portion of SE tax; Medicare still applies if SE tax applies."
+                ),
+                disabled=not include_self_employment_tax,
+            )
+        with ss2:
+            spouse_w2_social_security_wages = st.number_input(
+                "Spouse W-2 Social Security wages",
+                min_value=0.0,
+                value=0.0,
+                step=1000.0,
+                format="%.2f",
+                key="reports_estimated_tax_spouse_w2_social_security_wages",
+                help=(
+                    "Enter your spouse's current-year W-2 wages subject to Social Security. Partnership/member SE "
+                    "tax planning should consider each spouse's wage-base remaining separately."
+                ),
+                disabled=not include_self_employment_tax,
+            )
+        with ss3:
+            social_security_wage_base = st.number_input(
+                "Social Security wage base",
+                min_value=0.0,
+                value=184500.0,
+                step=500.0,
+                format="%.2f",
+                key="reports_estimated_tax_social_security_wage_base",
+                help="2026 Social Security wage base per SSA. Confirm current-year value before filing.",
+                disabled=not include_self_employment_tax,
+            )
+        spouse_allocation_percent = st.slider(
+            "Owner/member allocation to you %",
+            min_value=0.0,
+            max_value=100.0,
+            value=50.0,
+            step=1.0,
+            key="reports_estimated_tax_owner_allocation_percent",
+            help=(
+                "Planning note for spouse-owned LLCs. Confirm ownership/profit/loss allocation and whether each spouse "
+                "must compute SE tax separately with your advisor."
+            ),
+        )
+        quarterly_tax_payload = _build_quarterly_estimated_tax_payload(
+            tax_year=int(estimated_tax_year),
+            quarter=str(estimated_tax_quarter),
+            sales_df=sales_df,
+            cogs_margin_df=cogs_margin_df,
+            qbo_adjustments_df=qbo_adjustments_df,
+            tax_detail_df=tax_detail_df,
+            federal_income_tax_rate_percent=float(federal_income_tax_rate),
+            colorado_income_tax_rate_percent=float(colorado_income_tax_rate),
+            self_employment_tax_rate_percent=float(self_employment_tax_rate),
+            self_employment_net_earnings_multiplier_percent=float(se_net_earnings_multiplier),
+            include_self_employment_tax=bool(include_self_employment_tax),
+            w2_social_security_wages=float(w2_social_security_wages),
+            spouse_w2_social_security_wages=float(spouse_w2_social_security_wages),
+            social_security_wage_base=float(social_security_wage_base),
+            owner_allocation_percent=float(spouse_allocation_percent),
+            prior_estimated_payments=float(prior_estimated_payments),
+            other_income_adjustments=float(other_income_adjustments),
+            deductible_adjustments=float(deductible_adjustments),
+        )
+        quarterly_tax_summary_df = pd.DataFrame(quarterly_tax_payload["summary_rows"])
+        quarterly_tax_payment_df = pd.DataFrame(quarterly_tax_payload["payment_rows"])
+        quarterly_tax_advisor_checklist_df = pd.DataFrame(quarterly_tax_payload["advisor_checklist_rows"])
+        quarterly_tax_sales_df = quarterly_tax_payload["sales_detail_df"]
+        quarterly_tax_fee_df = quarterly_tax_payload["fee_detail_df"]
+        quarterly_tax_fee_summary_df = quarterly_tax_payload["fee_summary_df"]
+        quarterly_tax_cogs_df = quarterly_tax_payload["cogs_detail_df"]
+        quarterly_tax_returns_df = quarterly_tax_payload["return_adjustments_df"]
+        quarterly_tax_local_tax_df = quarterly_tax_payload["tax_detail_df"]
+        quarterly_scope_notice = _quarterly_estimated_tax_scope_notice(
+            report_from_date=from_date,
+            report_to_date=to_date,
+            period=dict(quarterly_tax_payload.get("period") or {}),
+        )
+        scope_notice_message = str(quarterly_scope_notice.get("message") or "").strip()
+        if scope_notice_message:
+            if quarterly_scope_notice.get("status") == "mismatch":
+                st.info(scope_notice_message)
+            else:
+                st.caption(scope_notice_message)
+        st.dataframe(_arrow_safe_dataframe(quarterly_tax_summary_df), use_container_width=True, hide_index=True)
+        st.markdown("#### Estimated Payment Worksheet")
+        st.dataframe(_arrow_safe_dataframe(quarterly_tax_payment_df), use_container_width=True, hide_index=True)
+        with st.expander("Advisor Review Checklist", expanded=False):
+            st.dataframe(_arrow_safe_dataframe(quarterly_tax_advisor_checklist_df), use_container_width=True, hide_index=True)
+        review_payload = dict(quarterly_tax_payload.get("review") or {})
+        missing_cogs_rows = int(review_payload.get("missing_cogs_sale_rows") or 0)
+        review_cogs_rows = int(review_payload.get("cogs_review_needed_sale_rows") or 0)
+        estimate_cogs_rows = int(review_payload.get("cogs_estimate_sale_rows") or 0)
+        if missing_cogs_rows > 0:
+            st.error(
+                "Quarterly estimated-tax packet includes "
+                f"{missing_cogs_rows} sale row(s) with missing/unknown COGS "
+                f"(${_safe_float(review_payload.get('missing_cogs_amount')):,.2f})."
+            )
+        elif review_cogs_rows > 0:
+            st.warning(
+                "Quarterly estimated-tax packet includes "
+                f"{review_cogs_rows} review-needed COGS row(s) "
+                f"(${_safe_float(review_payload.get('cogs_review_needed_amount')):,.2f})."
+            )
+        elif estimate_cogs_rows > 0:
+            st.info(
+                "Quarterly estimated-tax packet includes "
+                f"{estimate_cogs_rows} estimated COGS row(s) "
+                f"(${_safe_float(review_payload.get('cogs_estimate_amount')):,.2f})."
+            )
+        else:
+            st.success("Quarterly estimated-tax packet has no COGS review-needed rows in the selected period.")
+        quarterly_packet_frames = {
+            "summary": quarterly_tax_summary_df,
+            "payment_worksheet": quarterly_tax_payment_df,
+            "advisor_checklist": quarterly_tax_advisor_checklist_df,
+            "sales_detail": quarterly_tax_sales_df,
+            "fee_detail": quarterly_tax_fee_df,
+            "fee_summary": quarterly_tax_fee_summary_df,
+            "cogs_detail": quarterly_tax_cogs_df,
+            "return_adjustments": quarterly_tax_returns_df,
+            "local_tax_detail": quarterly_tax_local_tax_df,
+        }
+        quarterly_packet_bytes = _dataframes_to_xlsx_bytes(quarterly_packet_frames)
+        quarterly_packet_hash = hashlib.sha256(quarterly_packet_bytes).hexdigest()
+        quarterly_packet_ref = f"quarterly_estimated_tax_{int(estimated_tax_year)}_{estimated_tax_quarter}.xlsx"
+        st.download_button(
+            "Download Quarterly Estimated Tax Packet XLSX",
+            data=quarterly_packet_bytes,
+            file_name=quarterly_packet_ref,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="reports_quarterly_estimated_tax_packet_download",
+        )
+        st.caption(f"Quarterly estimated-tax packet SHA-256: `{quarterly_packet_hash}`")
+        quarterly_estimated_tax_payment_df = pd.DataFrame(_latest_quarterly_estimated_tax_payment_rows(repo))
+        quarterly_estimated_tax_payment_review_df = _build_quarterly_estimated_tax_payment_review(
+            payment_df=quarterly_estimated_tax_payment_df,
+            payment_worksheet_df=quarterly_tax_payment_df,
+            tax_year=int(estimated_tax_year),
+            quarter=str(estimated_tax_quarter),
+        )
+        st.markdown("#### Payment Evidence")
+        if quarterly_estimated_tax_payment_review_df.empty:
+            st.caption("No quarterly estimated-tax payment review rows are available.")
+        else:
+            st.dataframe(
+                _arrow_safe_dataframe(quarterly_estimated_tax_payment_review_df),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if (
+                "status" in quarterly_estimated_tax_payment_review_df.columns
+                and (quarterly_estimated_tax_payment_review_df["status"].astype(str) == "warn").any()
+            ):
+                st.warning("One or more estimated-tax worksheet amounts do not yet have matching paid evidence.")
+        with st.expander("Record Quarterly Estimated Tax Payment", expanded=False):
+            can_record_estimated_tax_payment = has_permission(user.role, "manage_settings")
+            with st.form("reports_quarterly_estimated_tax_payment_form"):
+                ep1, ep2, ep3 = st.columns(3)
+                with ep1:
+                    payment_jurisdiction = st.selectbox(
+                        "Jurisdiction",
+                        options=quarterly_tax_payment_df["jurisdiction"].tolist()
+                        if not quarterly_tax_payment_df.empty and "jurisdiction" in quarterly_tax_payment_df.columns
+                        else ["Federal IRS", "Colorado"],
+                        key="reports_quarterly_estimated_tax_payment_jurisdiction",
+                    )
+                    payment_status = st.selectbox(
+                        "Status",
+                        options=["paid", "planned", "advisor_review", "void"],
+                        key="reports_quarterly_estimated_tax_payment_status",
+                    )
+                with ep2:
+                    worksheet_row = (
+                        quarterly_tax_payment_df.loc[
+                            quarterly_tax_payment_df.get("jurisdiction", pd.Series(dtype=str)).astype(str)
+                            == str(payment_jurisdiction)
+                        ]
+                        if not quarterly_tax_payment_df.empty
+                        else pd.DataFrame()
+                    )
+                    default_payment_amount = (
+                        _safe_float(worksheet_row.iloc[0].get("estimated_amount"))
+                        if not worksheet_row.empty
+                        else 0.0
+                    )
+                    payment_amount = st.number_input(
+                        "Payment Amount",
+                        min_value=0.0,
+                        value=float(default_payment_amount),
+                        step=25.0,
+                        format="%.2f",
+                        key="reports_quarterly_estimated_tax_payment_amount",
+                    )
+                    payment_date = st.date_input(
+                        "Payment Date",
+                        value=utc_today(),
+                        key="reports_quarterly_estimated_tax_payment_date",
+                    )
+                with ep3:
+                    payment_confirmation_ref = st.text_input(
+                        "Confirmation / Reference",
+                        key="reports_quarterly_estimated_tax_payment_confirmation",
+                    )
+                    payment_evidence_link = st.text_input(
+                        "Evidence Link",
+                        key="reports_quarterly_estimated_tax_payment_evidence_link",
+                        placeholder="IRS Direct Pay confirmation, Colorado Revenue Online receipt, etc.",
+                    )
+                payment_type = st.text_input(
+                    "Payment Type",
+                    value="estimated_tax",
+                    key="reports_quarterly_estimated_tax_payment_type",
+                )
+                payment_notes = st.text_area(
+                    "Payment Notes",
+                    key="reports_quarterly_estimated_tax_payment_notes",
+                    height=90,
+                )
+                record_payment = st.form_submit_button(
+                    "Record Estimated Tax Payment Evidence",
+                    disabled=not can_record_estimated_tax_payment,
+                )
+            if not can_record_estimated_tax_payment:
+                st.caption("Manage Settings permission is required to record estimated-tax payment evidence.")
+            if record_payment:
+                try:
+                    payload = _build_quarterly_estimated_tax_payment_payload(
+                        target_env=settings.app_env,
+                        tax_year=int(estimated_tax_year),
+                        quarter=str(estimated_tax_quarter),
+                        jurisdiction=str(payment_jurisdiction),
+                        payment_type=str(payment_type),
+                        status=str(payment_status),
+                        payment_date=payment_date,
+                        amount=float(payment_amount),
+                        confirmation_ref=str(payment_confirmation_ref),
+                        evidence_link=str(payment_evidence_link),
+                        packet_ref=quarterly_packet_ref,
+                        packet_hash=quarterly_packet_hash,
+                        notes=str(payment_notes),
+                    )
+                    repo.record_audit_event(
+                        entity_type="quarterly_estimated_tax_payment",
+                        entity_id=None,
+                        action="record",
+                        actor=user.username,
+                        changes=payload,
+                    )
+                    st.success("Quarterly estimated-tax payment evidence recorded.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to record quarterly estimated-tax payment evidence: {exc}")
+        st.info(
+            "Estimated income-tax outputs are operational planning worksheets. Use IRS Form 1040-ES / IRS Direct Pay "
+            "and Colorado DR 0104EP / Revenue Online as applicable, and confirm final amounts with your tax advisor."
+        )
 
     margin_by_sku_df = (
         cogs_margin_df.groupby(["sku", "product_title", "marketplace"], dropna=False, as_index=False)
@@ -8256,6 +9859,8 @@ def render_reports(repo: InventoryRepository) -> None:
             "accounting_exceptions": int(len(accounting_exceptions_df)),
         },
     }
+    reconciliation_flag_detail_df = _build_reconciliation_flag_detail_rows(reconciliation_df)
+    active_accounting_suppression_keys = _active_accounting_suppression_keys(repo)
     accounting_close_summary, accounting_close_checks_df = _build_accounting_close_readiness_summary(
         inventory_df=inventory_df,
         cogs_margin_df=cogs_margin_df,
@@ -8267,6 +9872,7 @@ def render_reports(repo: InventoryRepository) -> None:
         lot_allocation_source_summary_df=lot_allocation_source_summary_df,
         cogs_source_summary_df=cogs_source_summary_df,
         qbo_adjustments_df=qbo_adjustments_df,
+        active_suppression_keys=active_accounting_suppression_keys,
     )
     accounting_close_formula_df = _build_accounting_close_formula_checks(accounting_close_summary)
     accounting_close_summary, accounting_close_checks_df = _apply_formula_checks_to_close_readiness(
@@ -8338,6 +9944,7 @@ def render_reports(repo: InventoryRepository) -> None:
         cogs_source_summary_df=cogs_source_summary_df,
         sale_fifo_cogs_evidence_df=sale_fifo_cogs_evidence_df,
         close_summary=accounting_close_summary,
+        active_suppression_keys=active_accounting_suppression_keys,
     )
     accounting_close_summary, accounting_close_checks_df = _apply_cogs_source_checks_to_close_readiness(
         accounting_close_summary,
@@ -8367,6 +9974,7 @@ def render_reports(repo: InventoryRepository) -> None:
         cogs_margin_df=cogs_margin_df,
         accounting_exceptions_df=accounting_exceptions_df,
         close_summary=accounting_close_summary,
+        active_suppression_keys=active_accounting_suppression_keys,
     )
     accounting_close_summary, accounting_close_checks_df = _apply_margin_anomaly_checks_to_close_readiness(
         accounting_close_summary,
@@ -8434,8 +10042,29 @@ def render_reports(repo: InventoryRepository) -> None:
         close_summary=accounting_close_summary,
         close_checks_df=accounting_close_checks_df,
     )
+    accounting_close_warning_source_detail_df = _build_accounting_close_warning_source_detail_rows(
+        {
+            "accounting_close_formula_checks": accounting_close_formula_df,
+            "accounting_sales_component_checks": accounting_sales_component_df,
+            "accounting_return_tieout_checks": accounting_return_tieout_df,
+            "accounting_inventory_valuation_checks": accounting_inventory_valuation_df,
+            "accounting_fee_evidence_checks": accounting_fee_evidence_df,
+            "accounting_shipping_evidence_checks": accounting_shipping_evidence_df,
+            "accounting_reconciliation_tieout_checks": accounting_reconciliation_tieout_df,
+            "accounting_cogs_source_checks": accounting_cogs_source_df,
+            "accounting_lot_allocation_checks": accounting_lot_allocation_df,
+            "accounting_exception_queue_checks": accounting_exception_queue_checks_df,
+            "accounting_margin_anomaly_checks": accounting_margin_anomaly_checks_df,
+            "accounting_period_drift_checks": accounting_period_drift_df,
+            "accounting_close_consistency_checks": accounting_close_consistency_checks_df,
+        }
+    )
+    accounting_close_action_detail_df = _build_accounting_close_action_detail_rows(cogs_margin_df)
     accounting_close_report_frames = {
+        "accounting_reconciliation_flag_detail": reconciliation_flag_detail_df,
         "accounting_close_readiness_checks": accounting_close_checks_df,
+        "accounting_close_warning_source_detail": accounting_close_warning_source_detail_df,
+        "accounting_close_action_detail": accounting_close_action_detail_df,
         "accounting_close_formula_checks": accounting_close_formula_df,
         "accounting_sales_component_checks": accounting_sales_component_df,
         "accounting_return_tieout_checks": accounting_return_tieout_df,
@@ -8445,6 +10074,7 @@ def render_reports(repo: InventoryRepository) -> None:
         "accounting_reconciliation_tieout_checks": accounting_reconciliation_tieout_df,
         "accounting_cogs_source_checks": accounting_cogs_source_df,
         "accounting_lot_allocation_checks": accounting_lot_allocation_df,
+        "lot_allocation_action_detail": lot_allocation_action_detail_df,
         "accounting_exception_queue_checks": accounting_exception_queue_checks_df,
         "accounting_margin_anomaly_checks": accounting_margin_anomaly_checks_df,
         "accounting_close_consistency_checks": accounting_close_consistency_checks_df,
@@ -8454,6 +10084,10 @@ def render_reports(repo: InventoryRepository) -> None:
         "cogs_margin_detail": cogs_margin_df,
         "sale_fifo_cogs_evidence": sale_fifo_cogs_evidence_df,
         "qbo_sales_export": qbo_sales_df,
+        "quickbooks_salesreceipt_payloads": quickbooks_salesreceipt_payloads_df,
+        "quickbooks_fee_purchase_payloads": quickbooks_fee_purchase_payloads_df,
+        "quickbooks_shipping_label_purchase_payloads": quickbooks_shipping_label_purchase_payloads_df,
+        "quickbooks_payload_readiness": quickbooks_payload_readiness_df,
     }
     accounting_close_packet_completeness_df = _build_accounting_close_packet_completeness_checks(
         report_frames=accounting_close_report_frames,
@@ -8481,9 +10115,14 @@ def render_reports(repo: InventoryRepository) -> None:
             "ai_review_outcomes": ai_review_outcomes_df,
             "lot_assignment": lots_df,
             "lot_allocation_source_summary": lot_allocation_source_summary_df,
+            "lot_allocation_action_detail": lot_allocation_action_detail_df,
             "cogs_source_summary": cogs_source_summary_df,
             "returns": returns_df,
             "qbo_adjustments_export": qbo_adjustments_df,
+            "quickbooks_salesreceipt_payloads": quickbooks_salesreceipt_payloads_df,
+            "quickbooks_fee_purchase_payloads": quickbooks_fee_purchase_payloads_df,
+            "quickbooks_shipping_label_purchase_payloads": quickbooks_shipping_label_purchase_payloads_df,
+            "quickbooks_payload_readiness": quickbooks_payload_readiness_df,
         }
     )
     current_accounting_close_packet_hash = _accounting_close_packet_evidence_hash_from_frames(
@@ -8515,583 +10154,738 @@ def render_reports(repo: InventoryRepository) -> None:
     )
     accounting_close_report_frames["accounting_close_packet_hash_checks"] = accounting_close_packet_hash_df
 
-    st.markdown("### Accounting Review / Close Readiness")
-    close_status = str(accounting_close_summary.get("readiness_status") or "review_needed")
-    if close_status == "close_ready":
-        st.success("Close readiness: no blocking accounting checks found for the selected range.")
-    elif close_status == "blocked":
-        st.error("Close readiness: blocked by accounting exceptions or reconciliation flags.")
-    else:
-        st.warning("Close readiness: review needed before treating this range as close-ready.")
-    cr1, cr2, cr3, cr4 = st.columns(4)
-    cr1.metric("Inventory Value", f"${float(accounting_close_summary.get('inventory_value') or 0.0):,.2f}")
-    cr2.metric("Sales Net Before COGS", f"${float(accounting_close_summary.get('net_before_cogs') or 0.0):,.2f}")
-    cr3.metric("FIFO COGS", f"${float(accounting_close_summary.get('fifo_cogs') or 0.0):,.2f}")
-    cr4.metric(
-        "Est. Profit After Returns",
-        f"${_accounting_close_estimated_profit_after_returns(accounting_close_summary):,.2f}",
-    )
-    cr5, cr6, cr7, cr8 = st.columns(4)
-    cr5.metric(
-        "Profit Before Returns",
-        f"${_accounting_close_profit_before_returns(accounting_close_summary):,.2f}",
-    )
-    cr6.metric("Return Refunds", f"${float(accounting_close_summary.get('returns_refund_total') or 0.0):,.2f}")
-    cr7.metric(
-        "Return COGS Reversal",
-        f"${float(accounting_close_summary.get('returns_cogs_reversal_total') or 0.0):,.2f}",
-    )
-    cr8.metric(
-        "Return Profit Impact",
-        f"${float(accounting_close_summary.get('returns_estimated_profit_impact') or 0.0):,.2f}",
-    )
-    cr9, cr10, cr11, cr12 = st.columns(4)
-    cr9.metric("P0 Exceptions", f"{int(accounting_close_summary.get('p0_exceptions') or 0)}")
-    cr10.metric("P1 Exceptions", f"{int(accounting_close_summary.get('p1_exceptions') or 0)}")
-    cr11.metric("Reconcile Flags", f"{int(accounting_close_summary.get('reconcile_flags') or 0)}")
-    cr12.metric(
-        "Label Coverage",
-        f"{float(accounting_close_summary.get('shipping_label_coverage_pct') or 0.0):.1f}%",
-    )
-    if str(accounting_close_summary.get("blockers") or "").strip():
-        st.caption("Blockers: " + str(accounting_close_summary.get("blockers")))
-    if str(accounting_close_summary.get("warnings") or "").strip():
-        st.caption("Warnings: " + str(accounting_close_summary.get("warnings")))
-    st.caption(f"Accounting close packet evidence hash: `{current_accounting_close_packet_hash}`")
-    returns_cogs_reversal_total = float(accounting_close_summary.get("returns_cogs_reversal_total") or 0.0)
-    if returns_cogs_reversal_total > 0:
-        st.caption(
-            "Returns include estimated COGS reversal for restocked items: "
-            f"${returns_cogs_reversal_total:,.2f}; "
-            "net after returns and COGS includes this reversal."
+    if not tax_workspace:
+        st.markdown("### Accounting Review / Close Readiness")
+        close_status = str(accounting_close_summary.get("readiness_status") or "review_needed")
+        if close_status == "close_ready":
+            st.success("Close readiness: no blocking accounting checks found for the selected range.")
+        elif close_status == "blocked":
+            hard_blockers_present = (
+                int(accounting_close_summary.get("p0_exceptions") or 0) > 0
+                or int(accounting_close_summary.get("reconcile_flags") or 0) > 0
+            )
+            if hard_blockers_present:
+                st.error("Close readiness: blocked by P0 accounting exceptions or marketplace reconciliation flags.")
+            else:
+                st.error("Close readiness: blocked by accounting close-check warnings. Review blocker detail below.")
+        else:
+            st.warning("Close readiness: review needed before treating this range as close-ready.")
+        cr1, cr2, cr3, cr4 = st.columns(4)
+        cr1.metric("Inventory Value", f"${float(accounting_close_summary.get('inventory_value') or 0.0):,.2f}")
+        cr2.metric("Sales Net Before COGS", f"${float(accounting_close_summary.get('net_before_cogs') or 0.0):,.2f}")
+        cr3.metric("FIFO COGS", f"${float(accounting_close_summary.get('fifo_cogs') or 0.0):,.2f}")
+        cr4.metric(
+            "Est. Profit After Returns",
+            f"${_accounting_close_estimated_profit_after_returns(accounting_close_summary):,.2f}",
         )
-    close_profit_summary = {
-        "gross_sales_total": float(accounting_close_summary.get("gross_sales") or 0.0),
-        "net_before_cogs_total": float(accounting_close_summary.get("net_before_cogs") or 0.0),
-        "fifo_cogs_total": float(accounting_close_summary.get("fifo_cogs") or 0.0),
-        "profit_before_returns": _accounting_close_profit_before_returns(accounting_close_summary),
-        "returns_refund_total": float(accounting_close_summary.get("returns_refund_total") or 0.0),
-        "returns_cogs_reversal_total": float(accounting_close_summary.get("returns_cogs_reversal_total") or 0.0),
-        "returns_profit_impact": float(accounting_close_summary.get("returns_estimated_profit_impact") or 0.0),
-        "estimated_profit_after_returns": _accounting_close_estimated_profit_after_returns(accounting_close_summary),
-        "profit_formula": (
-            "estimated_profit_after_returns = profit_before_returns - returns_refund_total "
-            "+ returns_cogs_reversal_total"
-        ),
-    }
-    with st.expander("Accounting Field Semantics", expanded=False):
-        st.caption(
-            "Canonical cost-basis rules used by dashboard, Reports, close packet exports, and accounting review."
+        cr5, cr6, cr7, cr8 = st.columns(4)
+        cr5.metric(
+            "Profit Before Returns",
+            f"${_accounting_close_profit_before_returns(accounting_close_summary):,.2f}",
         )
-        _render_df_with_preview(pd.DataFrame(ACCOUNTING_FIELD_SEMANTICS_ROWS), hide_index=True)
-    with st.expander("Close Readiness Checks", expanded=False):
-        _render_df_with_preview(accounting_close_checks_df, hide_index=True)
-    with st.expander("Close Consistency Checks", expanded=False):
-        if accounting_close_consistency_checks_df.empty:
-            st.caption("No close consistency checks are available for the selected window.")
-        else:
-            close_consistency_warn_count = int(
-                (accounting_close_consistency_checks_df["status"].astype(str) == "warn").sum()
-            )
-            if close_consistency_warn_count:
-                st.warning(f"{close_consistency_warn_count} close consistency check(s) need review.")
-            else:
-                st.caption("Close readiness status, blockers, warnings, and check rows are internally consistent.")
-            _render_df_with_preview(accounting_close_consistency_checks_df, hide_index=True)
-    with st.expander("Close Packet Completeness Checks", expanded=False):
-        if accounting_close_packet_completeness_df.empty:
-            st.caption("No close packet completeness checks are available for the selected window.")
-        else:
-            packet_completeness_warn_count = int(
-                (accounting_close_packet_completeness_df["status"].astype(str) == "warn").sum()
-            )
-            if packet_completeness_warn_count:
-                st.warning(f"{packet_completeness_warn_count} close packet artifact(s) need review.")
-            else:
-                st.caption("Required close-packet evidence tables are present for the selected window.")
-            _render_df_with_preview(accounting_close_packet_completeness_df, hide_index=True)
-    with st.expander("Close Packet Manifest Checks", expanded=False):
-        if accounting_close_packet_manifest_df.empty:
-            st.caption("No close packet manifest checks are available for the selected window.")
-        else:
-            packet_manifest_warn_count = int(
-                (accounting_close_packet_manifest_df["status"].astype(str) == "warn").sum()
-            )
-            if packet_manifest_warn_count:
-                st.warning(f"{packet_manifest_warn_count} close packet manifest artifact(s) need review.")
-            else:
-                st.caption("Close packet manifest row counts match the selected export dataframes.")
-            _render_df_with_preview(accounting_close_packet_manifest_df, hide_index=True)
-    with st.expander("Close Packet Hash Checks", expanded=False):
-        if accounting_close_packet_hash_df.empty:
-            st.caption("No close packet hash checks are available for the selected window.")
-        else:
-            packet_hash_warn_count = int((accounting_close_packet_hash_df["status"].astype(str) == "warn").sum())
-            if packet_hash_warn_count:
-                st.warning(f"{packet_hash_warn_count} close packet hash artifact(s) need review.")
-            else:
-                st.caption("Close packet CSV hashes are available for selected export dataframes.")
-            _render_df_with_preview(accounting_close_packet_hash_df, hide_index=True)
-    with st.expander("Close Packet Evidence Hash", expanded=False):
-        _render_df_with_preview(accounting_close_packet_evidence_hash_df, hide_index=True)
-    with st.expander("Accounting Formula Checks", expanded=False):
-        if accounting_close_formula_df.empty:
-            st.caption("No accounting formula checks are available for the selected window.")
-        else:
-            formula_warn_count = int((accounting_close_formula_df["status"].astype(str) == "warn").sum())
-            if formula_warn_count:
-                st.warning(f"{formula_warn_count} accounting formula check(s) need review.")
-            else:
-                st.caption("Core close arithmetic ties out for the selected window.")
-            _render_df_with_preview(accounting_close_formula_df, hide_index=True)
-    with st.expander("Sales Component Tie-Out Checks", expanded=False):
-        if accounting_sales_component_df.empty:
-            st.caption("No sales component tie-out checks are available for the selected window.")
-        else:
-            component_warn_count = int((accounting_sales_component_df["status"].astype(str) == "warn").sum())
-            if component_warn_count:
-                st.warning(f"{component_warn_count} sales component tie-out check(s) need review.")
-            else:
-                st.caption("Sales Detail components tie to COGS & Margin close totals for the selected window.")
-            _render_df_with_preview(accounting_sales_component_df, hide_index=True)
-    with st.expander("Return Tie-Out Checks", expanded=False):
-        if accounting_return_tieout_df.empty:
-            st.caption("No return tie-out checks are available for the selected window.")
-        else:
-            return_warn_count = int((accounting_return_tieout_df["status"].astype(str) == "warn").sum())
-            if return_warn_count:
-                st.warning(f"{return_warn_count} return tie-out check(s) need review.")
-            else:
-                st.caption("Return/refund totals tie to QBO adjustment staging and close return impact.")
-            _render_df_with_preview(accounting_return_tieout_df, hide_index=True)
-    with st.expander("Inventory Valuation Checks", expanded=False):
-        if accounting_inventory_valuation_df.empty:
-            st.caption("No inventory valuation checks are available for the selected window.")
-        else:
-            valuation_warn_count = int((accounting_inventory_valuation_df["status"].astype(str) == "warn").sum())
-            if valuation_warn_count:
-                st.warning(f"{valuation_warn_count} inventory valuation check(s) need review.")
-            else:
-                st.caption("Inventory Snapshot valuation ties to close readiness for stocked items.")
-            _render_df_with_preview(accounting_inventory_valuation_df, hide_index=True)
-    with st.expander("Fee Evidence Checks", expanded=False):
-        if accounting_fee_evidence_df.empty:
-            st.caption("No fee evidence checks are available for the selected window.")
-        else:
-            fee_warn_count = int((accounting_fee_evidence_df["status"].astype(str) == "warn").sum())
-            if fee_warn_count:
-                st.warning(f"{fee_warn_count} fee evidence check(s) need review.")
-            else:
-                st.caption("Fee reconciliation and source-priority evidence tie to Sales Detail.")
-            _render_df_with_preview(accounting_fee_evidence_df, hide_index=True)
-    with st.expander("Shipping Evidence Checks", expanded=False):
-        if accounting_shipping_evidence_df.empty:
-            st.caption("No shipping evidence checks are available for the selected window.")
-        else:
-            shipping_warn_count = int((accounting_shipping_evidence_df["status"].astype(str) == "warn").sum())
-            if shipping_warn_count:
-                st.warning(f"{shipping_warn_count} shipping evidence check(s) need review.")
-            else:
-                st.caption("Shipping charged, label spend, and shipping delta tie across Sales Detail and Shipping Economics.")
-            _render_df_with_preview(accounting_shipping_evidence_df, hide_index=True)
-    with st.expander("Reconciliation Tie-Out Checks", expanded=False):
-        if accounting_reconciliation_tieout_df.empty:
-            st.caption("No reconciliation tie-out checks are available for the selected window.")
-        else:
-            reconciliation_warn_count = int(
-                (accounting_reconciliation_tieout_df["status"].astype(str) == "warn").sum()
-            )
-            if reconciliation_warn_count:
-                st.warning(f"{reconciliation_warn_count} reconciliation tie-out check(s) need review.")
-            else:
-                st.caption("Marketplace reconciliation totals tie to Sales Detail, Returns, and close flags.")
-            _render_df_with_preview(accounting_reconciliation_tieout_df, hide_index=True)
-    with st.expander("COGS Source Checks", expanded=False):
-        if accounting_cogs_source_df.empty:
-            st.caption("No COGS source checks are available for the selected window.")
-        else:
-            cogs_source_warn_count = int((accounting_cogs_source_df["status"].astype(str) == "warn").sum())
-            if cogs_source_warn_count:
-                st.warning(f"{cogs_source_warn_count} COGS source check(s) need review.")
-            else:
-                st.caption("Sold COGS source summary ties to COGS & Margin and close readiness.")
-            _render_df_with_preview(accounting_cogs_source_df, hide_index=True)
-    with st.expander("Lot Allocation Checks", expanded=False):
-        if accounting_lot_allocation_df.empty:
-            st.caption("No lot allocation checks are available for the selected window.")
-        else:
-            lot_allocation_warn_count = int((accounting_lot_allocation_df["status"].astype(str) == "warn").sum())
-            if lot_allocation_warn_count:
-                st.warning(f"{lot_allocation_warn_count} lot allocation check(s) need review.")
-            else:
-                st.caption("Lot Allocation Source Summary ties to Lot Assignment detail and close readiness.")
-            _render_df_with_preview(accounting_lot_allocation_df, hide_index=True)
-    with st.expander("Exception Queue Checks", expanded=False):
-        if accounting_exception_queue_checks_df.empty:
-            st.caption("No exception queue checks are available for the selected window.")
-        else:
-            exception_queue_warn_count = int(
-                (accounting_exception_queue_checks_df["status"].astype(str) == "warn").sum()
-            )
-            if exception_queue_warn_count:
-                st.warning(f"{exception_queue_warn_count} exception queue check(s) need review.")
-            else:
-                st.caption("Exception queue severity counts tie to close readiness.")
-            _render_df_with_preview(accounting_exception_queue_checks_df, hide_index=True)
-    with st.expander("Margin Anomaly Checks", expanded=False):
-        if accounting_margin_anomaly_checks_df.empty:
-            st.caption("No margin anomaly checks are available for the selected window.")
-        else:
-            margin_anomaly_warn_count = int(
-                (accounting_margin_anomaly_checks_df["status"].astype(str) == "warn").sum()
-            )
-            if margin_anomaly_warn_count:
-                st.warning(f"{margin_anomaly_warn_count} margin anomaly check(s) need review.")
-            else:
-                st.caption("COGS & Margin anomalies tie to close readiness and exception queue evidence.")
-            _render_df_with_preview(accounting_margin_anomaly_checks_df, hide_index=True)
-    with st.expander("Close Period Drift Checks", expanded=False):
-        if accounting_period_drift_df.empty:
-            st.caption("No close-period drift checks are available for the selected window.")
-        else:
-            drift_warn_count = int((accounting_period_drift_df["status"].astype(str) == "warn").sum())
-            if drift_warn_count:
-                st.warning(f"{drift_warn_count} close-period drift check(s) need review.")
-            else:
-                st.caption("Dashboard/report export close-period totals are aligned for available checks.")
-            if dashboard_live_drift_metrics:
-                st.caption("Includes Dashboard Live Metrics 30-day comparisons for this selected window.")
-            else:
-                st.caption(
-                    "Dashboard Live Metrics comparisons are included only when the selected range matches "
-                    "the dashboard 30-day window ending on `To Date`."
-                )
-            if slack_summary_drift_metrics:
-                st.caption("Includes Slack-style daily/weekly business summary comparisons for this selected window.")
-            else:
-                st.caption(
-                    "Slack summary comparisons are included only when the selected range matches the daily or weekly "
-                    "business summary window ending on `To Date`."
-                )
-            _render_df_with_preview(accounting_period_drift_df, hide_index=True)
-    with st.expander("Close Sign-Off Evidence Review", expanded=False):
-        _render_df_with_preview(accounting_close_signoff_review_df, hide_index=True)
-    with st.expander("AI Review Outcome Evidence", expanded=False):
-        if ai_review_outcomes_df.empty:
-            st.caption("No Reports Copilot or AI Accountant outcome audit events have been recorded yet.")
-        else:
-            _render_df_with_preview(ai_review_outcomes_df, hide_index=True)
-    with st.expander("Record Accounting Close Sign-Off", expanded=False):
-        current_close_packet_ref = f"accounting_close_packet_{from_date}_{to_date}.zip"
-        st.caption(
-            "Record sign-off only after downloading and reviewing the Accounting Close Packet for this exact date range."
+        cr6.metric("Return Refunds", f"${float(accounting_close_summary.get('returns_refund_total') or 0.0):,.2f}")
+        cr7.metric(
+            "Return COGS Reversal",
+            f"${float(accounting_close_summary.get('returns_cogs_reversal_total') or 0.0):,.2f}",
         )
-        st.code(current_accounting_close_packet_hash or "packet hash unavailable", language="text")
-        st.caption(
-            "Captured with this sign-off: "
-            f"readiness={accounting_close_summary.get('readiness_status') or 'unknown'}, "
-            f"blockers={int(_safe_float(accounting_close_summary.get('blocker_count')))}, "
-            f"drift warnings={int(_safe_float(accounting_close_summary.get('period_drift_warn_count')))}, "
-            f"AI review follow-ups={int(_safe_float(accounting_close_summary.get('ai_review_followup_count')))}."
+        cr8.metric(
+            "Return Profit Impact",
+            f"${float(accounting_close_summary.get('returns_estimated_profit_impact') or 0.0):,.2f}",
         )
-        can_record_close_signoff = has_permission(user.role, "manage_settings")
-        signoff_form_context = (
-            st.form("reports_accounting_close_signoff_form")
-            if hasattr(st, "form")
-            else st.expander("Sign-Off Fields", expanded=True)
+        cr9, cr10, cr11, cr12 = st.columns(4)
+        cr9.metric("P0 Exceptions", f"{int(accounting_close_summary.get('p0_exceptions') or 0)}")
+        cr10.metric("P1 Exceptions", f"{int(accounting_close_summary.get('p1_exceptions') or 0)}")
+        cr11.metric("Reconcile Flags", f"{int(accounting_close_summary.get('reconcile_flags') or 0)}")
+        cr12.metric(
+            "Label Coverage",
+            f"{float(accounting_close_summary.get('shipping_label_coverage_pct') or 0.0):.1f}%",
         )
-        with signoff_form_context:
-            cs1, cs2 = st.columns(2)
-            with cs1:
-                close_signoff_period = st.text_input(
-                    "Close Period",
-                    value=_default_accounting_close_period(from_date, to_date),
-                    key="reports_accounting_close_signoff_period",
-                )
-                close_signoff_owner = st.text_input(
-                    "Owner",
-                    value=str(user.username or ""),
-                    key="reports_accounting_close_signoff_owner",
-                )
-                close_signoff_date = st.date_input(
-                    "Sign-Off Date",
-                    value=utc_today(),
-                    key="reports_accounting_close_signoff_date",
-                )
-            with cs2:
-                close_signoff_status = st.selectbox(
-                    "Status",
-                    options=["approved", "blocked", "needs_followup"],
-                    index=0 if close_status == "close_ready" else 2,
-                    key="reports_accounting_close_signoff_status",
-                )
-                close_signoff_packet_ref = st.text_input(
-                    "Accounting Packet Ref",
-                    value=current_close_packet_ref,
-                    key="reports_accounting_close_signoff_packet_ref",
-                )
-                close_signoff_evidence_link = st.text_input(
-                    "Evidence Link",
-                    placeholder="ticket/runbook/shared artifact URL",
-                    key="reports_accounting_close_signoff_evidence_link",
-                )
-            if hasattr(st, "text_area"):
-                close_signoff_notes = st.text_area(
-                    "Notes",
-                    placeholder="Reviewer notes, unresolved follow-up, or approval context.",
-                    key="reports_accounting_close_signoff_notes",
-                )
+        cr13, cr14, cr15 = st.columns(3)
+        cr13.metric(
+            "Verified Sold COGS",
+            f"${float(accounting_close_summary.get('sold_verified_cogs') or 0.0):,.2f}",
+            help="Sold COGS backed by explicit assignment, weighted lot allocation, or product/default landed cost.",
+        )
+        cr14.metric(
+            "Estimated Sold COGS",
+            f"${float(accounting_close_summary.get('sold_estimated_cogs') or 0.0):,.2f}",
+            help="Sold COGS using expected lot quantity for partial lot check-in.",
+        )
+        cr15.metric(
+            "Review-Needed Sold COGS",
+            f"${float(accounting_close_summary.get('sold_review_needed_cogs') or 0.0):,.2f}",
+            help="Sold COGS using equal fallback, missing/unknown basis, or mixed FIFO basis.",
+        )
+        cr16, cr17 = st.columns(2)
+        cr16.metric(
+            "Fee Evidence Exposure",
+            f"${float(accounting_close_summary.get('sale_fee_field_fallback_fee_total') or 0.0):,.2f}",
+            help="Fee dollars currently relying on sale-field fallback instead of normalized marketplace fee evidence.",
+        )
+        cr17.metric(
+            "Label Evidence Exposure",
+            f"${float(accounting_close_summary.get('paid_shipping_missing_label_spend_charged_total') or 0.0):,.2f}",
+            help="Buyer-paid shipping dollars on rows that still need label-spend evidence.",
+        )
+        if str(accounting_close_summary.get("blockers") or "").strip():
+            st.caption("Blockers: " + str(accounting_close_summary.get("blockers")))
+        if str(accounting_close_summary.get("warnings") or "").strip():
+            st.caption("Warnings: " + str(accounting_close_summary.get("warnings")))
+        if accounting_close_checks_df is not None and not accounting_close_checks_df.empty:
+            close_blocker_detail_df = accounting_close_checks_df[
+                accounting_close_checks_df.get("status", pd.Series(dtype=str))
+                .fillna("")
+                .astype(str)
+                .str.lower()
+                .isin({"fail", "warn"})
+            ].copy()
+            if not close_blocker_detail_df.empty:
+                display_cols = [
+                    column
+                    for column in ["check", "status", "value", "expected", "observed", "details"]
+                    if column in close_blocker_detail_df.columns
+                ]
+                st.markdown("**Close Blocker / Warning Detail**")
+                _render_df_with_preview(close_blocker_detail_df[display_cols], hide_index=True)
+        if (
+            accounting_close_warning_source_detail_df is not None
+            and not accounting_close_warning_source_detail_df.empty
+        ):
+            display_cols = [
+                column
+                for column in [
+                    "category",
+                    "check",
+                    "status",
+                    "value",
+                    "expected",
+                    "observed",
+                    "delta_observed_minus_expected",
+                    "details",
+                    "expected_source",
+                    "observed_source",
+                    "formula",
+                ]
+                if column in accounting_close_warning_source_detail_df.columns
+            ]
+            st.markdown("**Close Warning Source Detail**")
+            st.caption(
+                "Exact fail/warn rows behind the aggregate close blocker buckets above."
+            )
+            _render_df_with_preview(
+                accounting_close_warning_source_detail_df[display_cols],
+                hide_index=True,
+            )
+        if accounting_close_action_detail_df is not None and not accounting_close_action_detail_df.empty:
+            display_cols = [
+                column
+                for column in [
+                    "sale_id",
+                    "sold_at",
+                    "marketplace",
+                    "sku",
+                    "product_title",
+                    "quantity",
+                    "net_before_cogs",
+                    "fifo_cogs",
+                    "fifo_margin",
+                    "fifo_cost_source",
+                    "fifo_cogs_evidence_rows",
+                    "inventory_movement_units_expected",
+                    "inventory_movement_units_recorded",
+                    "listing_lot_movement_mismatch_units",
+                    "issue",
+                    "recommended_action",
+                ]
+                if column in accounting_close_action_detail_df.columns
+            ]
+            st.markdown("**Close Action Detail**")
+            st.caption(
+                "Sale-level rows behind COGS/margin close warnings. Use this to decide whether to repair movements, add allocation evidence, or mark an intentional loss."
+            )
+            _render_df_with_preview(accounting_close_action_detail_df[display_cols], hide_index=True)
+            _render_close_action_suppression_panel(
+                repo,
+                user,
+                accounting_close_action_detail_df,
+                active_suppression_keys=active_accounting_suppression_keys,
+            )
+        if not reconciliation_flag_detail_df.empty:
+            st.warning(
+                "Marketplace reconciliation flag detail is shown below. "
+                "The current flag compares order totals against item gross and item gross plus buyer shipping."
+            )
+            _render_df_with_preview(reconciliation_flag_detail_df, hide_index=True)
+        st.caption(f"Accounting close packet evidence hash: `{current_accounting_close_packet_hash}`")
+        returns_cogs_reversal_total = float(accounting_close_summary.get("returns_cogs_reversal_total") or 0.0)
+        if returns_cogs_reversal_total > 0:
+            st.caption(
+                "Returns include estimated COGS reversal for restocked items: "
+                f"${returns_cogs_reversal_total:,.2f}; "
+                "net after returns and COGS includes this reversal."
+            )
+        close_profit_summary = {
+            "gross_sales_total": float(accounting_close_summary.get("gross_sales") or 0.0),
+            "net_before_cogs_total": float(accounting_close_summary.get("net_before_cogs") or 0.0),
+            "fifo_cogs_total": float(accounting_close_summary.get("fifo_cogs") or 0.0),
+            "profit_before_returns": _accounting_close_profit_before_returns(accounting_close_summary),
+            "returns_refund_total": float(accounting_close_summary.get("returns_refund_total") or 0.0),
+            "returns_cogs_reversal_total": float(accounting_close_summary.get("returns_cogs_reversal_total") or 0.0),
+            "returns_profit_impact": float(accounting_close_summary.get("returns_estimated_profit_impact") or 0.0),
+            "estimated_profit_after_returns": _accounting_close_estimated_profit_after_returns(accounting_close_summary),
+            "profit_formula": (
+                "estimated_profit_after_returns = profit_before_returns - returns_refund_total "
+                "+ returns_cogs_reversal_total"
+            ),
+        }
+        with st.expander("Accounting Field Semantics", expanded=False):
+            st.caption(
+                "Canonical cost-basis rules used by dashboard, Reports, close packet exports, and accounting review."
+            )
+            _render_df_with_preview(pd.DataFrame(ACCOUNTING_FIELD_SEMANTICS_ROWS), hide_index=True)
+        with st.expander("Close Readiness Checks", expanded=False):
+            _render_df_with_preview(accounting_close_checks_df, hide_index=True)
+        with st.expander("Close Consistency Checks", expanded=False):
+            if accounting_close_consistency_checks_df.empty:
+                st.caption("No close consistency checks are available for the selected window.")
             else:
-                close_signoff_notes = st.text_input(
-                    "Notes",
-                    value="",
-                    key="reports_accounting_close_signoff_notes",
+                close_consistency_warn_count = int(
+                    (accounting_close_consistency_checks_df["status"].astype(str) == "warn").sum()
                 )
-            if hasattr(st, "form_submit_button"):
-                save_close_signoff = st.form_submit_button(
-                    "Record Accounting Close Sign-Off",
-                    disabled=not can_record_close_signoff,
-                )
+                if close_consistency_warn_count:
+                    st.warning(f"{close_consistency_warn_count} close consistency check(s) need review.")
+                else:
+                    st.caption("Close readiness status, blockers, warnings, and check rows are internally consistent.")
+                _render_df_with_preview(accounting_close_consistency_checks_df, hide_index=True)
+        with st.expander("Close Packet Completeness Checks", expanded=False):
+            if accounting_close_packet_completeness_df.empty:
+                st.caption("No close packet completeness checks are available for the selected window.")
             else:
-                save_close_signoff = st.button(
-                    "Record Accounting Close Sign-Off",
-                    key="reports_accounting_close_signoff_submit_btn",
-                    disabled=not can_record_close_signoff,
+                packet_completeness_warn_count = int(
+                    (accounting_close_packet_completeness_df["status"].astype(str) == "warn").sum()
                 )
-        if not can_record_close_signoff:
-            st.caption("You need `manage_settings` permission to record accounting close sign-off evidence.")
-        if save_close_signoff:
-            try:
-                payload = _build_accounting_close_signoff_payload(
-                    target_env=settings.app_env,
-                    close_period=close_signoff_period,
-                    status=close_signoff_status,
-                    owner=close_signoff_owner,
-                    signoff_date=close_signoff_date,
-                    close_summary=accounting_close_summary,
-                    accounting_packet_ref=close_signoff_packet_ref,
-                    accounting_packet_hash=current_accounting_close_packet_hash,
-                    evidence_link=close_signoff_evidence_link,
-                    notes=close_signoff_notes,
+                if packet_completeness_warn_count:
+                    st.warning(f"{packet_completeness_warn_count} close packet artifact(s) need review.")
+                else:
+                    st.caption("Required close-packet evidence tables are present for the selected window.")
+                _render_df_with_preview(accounting_close_packet_completeness_df, hide_index=True)
+        with st.expander("Close Packet Manifest Checks", expanded=False):
+            if accounting_close_packet_manifest_df.empty:
+                st.caption("No close packet manifest checks are available for the selected window.")
+            else:
+                packet_manifest_warn_count = int(
+                    (accounting_close_packet_manifest_df["status"].astype(str) == "warn").sum()
                 )
-                repo.record_audit_event(
-                    entity_type="accounting_close_signoff",
-                    entity_id=None,
-                    action="signoff",
-                    actor=user.username,
-                    changes=payload,
+                if packet_manifest_warn_count:
+                    st.warning(f"{packet_manifest_warn_count} close packet manifest artifact(s) need review.")
+                else:
+                    st.caption("Close packet manifest row counts match the selected export dataframes.")
+                _render_df_with_preview(accounting_close_packet_manifest_df, hide_index=True)
+        with st.expander("Close Packet Hash Checks", expanded=False):
+            if accounting_close_packet_hash_df.empty:
+                st.caption("No close packet hash checks are available for the selected window.")
+            else:
+                packet_hash_warn_count = int((accounting_close_packet_hash_df["status"].astype(str) == "warn").sum())
+                if packet_hash_warn_count:
+                    st.warning(f"{packet_hash_warn_count} close packet hash artifact(s) need review.")
+                else:
+                    st.caption("Close packet CSV hashes are available for selected export dataframes.")
+                _render_df_with_preview(accounting_close_packet_hash_df, hide_index=True)
+        with st.expander("Close Packet Evidence Hash", expanded=False):
+            _render_df_with_preview(accounting_close_packet_evidence_hash_df, hide_index=True)
+        with st.expander("Accounting Formula Checks", expanded=False):
+            if accounting_close_formula_df.empty:
+                st.caption("No accounting formula checks are available for the selected window.")
+            else:
+                formula_warn_count = int((accounting_close_formula_df["status"].astype(str) == "warn").sum())
+                if formula_warn_count:
+                    st.warning(f"{formula_warn_count} accounting formula check(s) need review.")
+                else:
+                    st.caption("Core close arithmetic ties out for the selected window.")
+                _render_df_with_preview(accounting_close_formula_df, hide_index=True)
+        with st.expander("Sales Component Tie-Out Checks", expanded=False):
+            if accounting_sales_component_df.empty:
+                st.caption("No sales component tie-out checks are available for the selected window.")
+            else:
+                component_warn_count = int((accounting_sales_component_df["status"].astype(str) == "warn").sum())
+                if component_warn_count:
+                    st.warning(f"{component_warn_count} sales component tie-out check(s) need review.")
+                else:
+                    st.caption("Sales Detail components tie to COGS & Margin close totals for the selected window.")
+                _render_df_with_preview(accounting_sales_component_df, hide_index=True)
+        with st.expander("Return Tie-Out Checks", expanded=False):
+            if accounting_return_tieout_df.empty:
+                st.caption("No return tie-out checks are available for the selected window.")
+            else:
+                return_warn_count = int((accounting_return_tieout_df["status"].astype(str) == "warn").sum())
+                if return_warn_count:
+                    st.warning(f"{return_warn_count} return tie-out check(s) need review.")
+                else:
+                    st.caption("Return/refund totals tie to QBO adjustment staging and close return impact.")
+                _render_df_with_preview(accounting_return_tieout_df, hide_index=True)
+        with st.expander("Inventory Valuation Checks", expanded=False):
+            if accounting_inventory_valuation_df.empty:
+                st.caption("No inventory valuation checks are available for the selected window.")
+            else:
+                valuation_warn_count = int((accounting_inventory_valuation_df["status"].astype(str) == "warn").sum())
+                if valuation_warn_count:
+                    st.warning(f"{valuation_warn_count} inventory valuation check(s) need review.")
+                else:
+                    st.caption("Inventory Snapshot valuation ties to close readiness for stocked items.")
+                _render_df_with_preview(accounting_inventory_valuation_df, hide_index=True)
+        with st.expander("Fee Evidence Checks", expanded=False):
+            if accounting_fee_evidence_df.empty:
+                st.caption("No fee evidence checks are available for the selected window.")
+            else:
+                fee_warn_count = int((accounting_fee_evidence_df["status"].astype(str) == "warn").sum())
+                if fee_warn_count:
+                    st.warning(f"{fee_warn_count} fee evidence check(s) need review.")
+                else:
+                    st.caption("Fee reconciliation and source-priority evidence tie to Sales Detail.")
+                _render_df_with_preview(accounting_fee_evidence_df, hide_index=True)
+        with st.expander("Shipping Evidence Checks", expanded=False):
+            if accounting_shipping_evidence_df.empty:
+                st.caption("No shipping evidence checks are available for the selected window.")
+            else:
+                shipping_warn_count = int((accounting_shipping_evidence_df["status"].astype(str) == "warn").sum())
+                if shipping_warn_count:
+                    st.warning(f"{shipping_warn_count} shipping evidence check(s) need review.")
+                else:
+                    st.caption("Shipping charged, label spend, and shipping delta tie across Sales Detail and Shipping Economics.")
+                _render_df_with_preview(accounting_shipping_evidence_df, hide_index=True)
+        with st.expander("Reconciliation Tie-Out Checks", expanded=False):
+            if accounting_reconciliation_tieout_df.empty:
+                st.caption("No reconciliation tie-out checks are available for the selected window.")
+            else:
+                reconciliation_warn_count = int(
+                    (accounting_reconciliation_tieout_df["status"].astype(str) == "warn").sum()
                 )
-                st.success("Accounting close sign-off recorded.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Unable to record accounting close sign-off: {exc}")
-    with st.expander("Lot Allocation Source Summary", expanded=False):
-        if lot_allocation_source_summary_df.empty:
-            st.caption("No lot allocation source summary is available for the selected window.")
-        else:
-            explicit_sources = {
-                "assignment_unit_landed_cost",
-                "assignment_allocated_landed_cost",
-                "lot_allocation_weight",
-            }
-            fallback_sources = {
-                "lot_expected_quantity_fallback",
-                "lot_equal_quantity_fallback",
-                "missing_cost_basis",
-                "unknown",
-            }
-            explicit_total = float(
-                lot_allocation_source_summary_df[
-                    lot_allocation_source_summary_df["cost_source"].isin(explicit_sources)
-                ]["resolved_landed_total_cost"].sum()
-            )
-            fallback_total = float(
-                lot_allocation_source_summary_df[
-                    lot_allocation_source_summary_df["cost_source"].isin(fallback_sources)
-                ]["resolved_landed_total_cost"].sum()
-            )
-            as1, as2, as3 = st.columns(3)
-            as1.metric("Explicit/Weighted Basis", f"${explicit_total:,.2f}")
-            as2.metric("Fallback Basis", f"${fallback_total:,.2f}")
-            as3.metric("Allocation Sources", f"{len(lot_allocation_source_summary_df)}")
-            _render_df_with_preview(lot_allocation_source_summary_df, hide_index=True)
-    with st.expander("Sold COGS Source Summary", expanded=False):
-        if cogs_source_summary_df.empty:
-            st.caption("No sold COGS source summary is available for the selected window.")
-        else:
-            fallback_sources = {
-                "lot_equal_quantity_fallback",
-                "missing_cost_basis",
-                "unknown",
-                "mixed_fifo_cost",
-                "legacy_reports_fifo_cost_map",
-            }
-            fallback_cogs = float(
-                cogs_source_summary_df[
-                    cogs_source_summary_df["fifo_cost_source"].isin(fallback_sources)
-                ]["fifo_cogs"].sum()
-            )
-            cs1, cs2, cs3, cs4 = st.columns(4)
-            cs1.metric("Sold FIFO COGS", f"${float(cogs_source_summary_df['fifo_cogs'].sum()):,.2f}")
-            cs2.metric("Fallback/Review COGS", f"${fallback_cogs:,.2f}")
-            cs3.metric("COGS Sources", f"{len(cogs_source_summary_df)}")
-            cs4.metric(
-                "Bundle Units Sold",
-                f"{int(cogs_source_summary_df.get('bundle_inventory_units_sold', pd.Series(dtype=int)).sum())}",
-            )
-            _render_df_with_preview(cogs_source_summary_df, hide_index=True)
-
-    st.markdown("### eBay Fee Reconciliation")
-    if not load_extended_analytics:
-        st.info("Enable `Load Extended Analytics` to run fee reconciliation and calibration.")
-    elif ebay_fee_reconciliation_df.empty:
-        st.info("No eBay sales in the selected date range for fee reconciliation.")
-    else:
-        er1, er2, er3, er4 = st.columns(4)
-        sales_count = int(fee_reconciliation_summary.get("sales_count") or len(ebay_fee_reconciliation_df))
-        total_actual_fee = float(fee_reconciliation_summary.get("total_actual_fee") or 0.0)
-        total_estimated_fee = float(fee_reconciliation_summary.get("total_estimated_fee") or 0.0)
-        total_variance = float(fee_reconciliation_summary.get("total_variance") or 0.0)
-        coverage_count = int(fee_reconciliation_summary.get("estimate_coverage_count") or 0)
-        er1.metric("eBay Sales", f"{sales_count}")
-        er2.metric("Actual Fees", f"${total_actual_fee:,.2f}")
-        er3.metric("Estimated Fees", f"${total_estimated_fee:,.2f}")
-        er4.metric("Variance", f"${total_variance:,.2f}")
-        st.caption(
-            f"Estimate coverage: {coverage_count}/{sales_count} sales have listing-time fee estimates."
-        )
-        if not ebay_fee_source_priority_df.empty:
-            st.markdown("#### Actual Fee Source Priority")
-            p1, p2, p3 = st.columns(3)
-            p1.metric(
-                "Normalized Source Rows",
-                f"{int(fee_source_counts.get('normalized_source_rows') or 0)}",
-            )
-            p2.metric(
-                "Notes Fallback Rows",
-                f"{int(fee_source_counts.get('notes_fallback_rows') or 0)}",
-            )
-            p3.metric(
-                "Sale Field Fallback Rows",
-                f"{int(fee_source_counts.get('sale_field_fallback_rows') or 0)}",
-            )
-            with st.expander("Actual Fee Source Priority Breakdown", expanded=False):
-                _render_df_with_preview(ebay_fee_source_priority_df, hide_index=True)
-        if not ebay_fee_source_priority_trend_df.empty:
-            weekly_coverage_df = _build_normalized_source_weekly_coverage(ebay_fee_source_priority_trend_df)
-            if not weekly_coverage_df.empty:
-                st.markdown("#### Normalized Source Coverage Trend (Weekly)")
-                chart_df = weekly_coverage_df[["bucket_date", "normalized_coverage_pct"]].copy()
-                chart_df = chart_df.rename(columns={"bucket_date": "week_start"})
-                chart_df["week_start"] = pd.to_datetime(chart_df["week_start"], errors="coerce")
-                chart_df = chart_df.set_index("week_start").sort_index()
-                st.line_chart(chart_df, y="normalized_coverage_pct", use_container_width=True)
-                with st.expander("Normalized Source Coverage Data (Weekly)", expanded=False):
-                    _render_df_with_preview(weekly_coverage_df, hide_index=True)
-                stacked_weekly_df = _build_weekly_fee_source_count_chart_data(ebay_fee_source_priority_trend_df)
-                if not stacked_weekly_df.empty:
-                    st.markdown("#### Fee Source Counts by Week")
-                    stack_chart_df = stacked_weekly_df.copy()
-                    stack_chart_df["week_start"] = pd.to_datetime(stack_chart_df["week_start"], errors="coerce")
-                    stack_chart_df = stack_chart_df.set_index("week_start").sort_index()
-                    st.bar_chart(
-                        stack_chart_df[["normalized_source", "notes_fallback", "sale_field_fallback"]],
-                        use_container_width=True,
+                if reconciliation_warn_count:
+                    st.warning(f"{reconciliation_warn_count} reconciliation tie-out check(s) need review.")
+                else:
+                    st.caption("Marketplace reconciliation totals tie to Sales Detail, Returns, and close flags.")
+                _render_df_with_preview(accounting_reconciliation_tieout_df, hide_index=True)
+        with st.expander("COGS Source Checks", expanded=False):
+            if accounting_cogs_source_df.empty:
+                st.caption("No COGS source checks are available for the selected window.")
+            else:
+                cogs_source_warn_count = int((accounting_cogs_source_df["status"].astype(str) == "warn").sum())
+                if cogs_source_warn_count:
+                    st.warning(f"{cogs_source_warn_count} COGS source check(s) need review.")
+                else:
+                    st.caption("Sold COGS source summary ties to COGS & Margin and close readiness.")
+                _render_df_with_preview(accounting_cogs_source_df, hide_index=True)
+        with st.expander("Lot Allocation Checks", expanded=False):
+            if accounting_lot_allocation_df.empty:
+                st.caption("No lot allocation checks are available for the selected window.")
+            else:
+                lot_allocation_warn_count = int((accounting_lot_allocation_df["status"].astype(str) == "warn").sum())
+                if lot_allocation_warn_count:
+                    st.warning(f"{lot_allocation_warn_count} lot allocation check(s) need review.")
+                else:
+                    st.caption("Lot Allocation Source Summary ties to Lot Assignment detail and close readiness.")
+                _render_df_with_preview(accounting_lot_allocation_df, hide_index=True)
+        with st.expander("Exception Queue Checks", expanded=False):
+            if accounting_exception_queue_checks_df.empty:
+                st.caption("No exception queue checks are available for the selected window.")
+            else:
+                exception_queue_warn_count = int(
+                    (accounting_exception_queue_checks_df["status"].astype(str) == "warn").sum()
+                )
+                if exception_queue_warn_count:
+                    st.warning(f"{exception_queue_warn_count} exception queue check(s) need review.")
+                else:
+                    st.caption("Exception queue severity counts tie to close readiness.")
+                _render_df_with_preview(accounting_exception_queue_checks_df, hide_index=True)
+        with st.expander("Margin Anomaly Checks", expanded=False):
+            if accounting_margin_anomaly_checks_df.empty:
+                st.caption("No margin anomaly checks are available for the selected window.")
+            else:
+                margin_anomaly_warn_count = int(
+                    (accounting_margin_anomaly_checks_df["status"].astype(str) == "warn").sum()
+                )
+                if margin_anomaly_warn_count:
+                    st.warning(f"{margin_anomaly_warn_count} margin anomaly check(s) need review.")
+                else:
+                    st.caption("COGS & Margin anomalies tie to close readiness and exception queue evidence.")
+                _render_df_with_preview(accounting_margin_anomaly_checks_df, hide_index=True)
+        with st.expander("Close Period Drift Checks", expanded=False):
+            if accounting_period_drift_df.empty:
+                st.caption("No close-period drift checks are available for the selected window.")
+            else:
+                drift_warn_count = int((accounting_period_drift_df["status"].astype(str) == "warn").sum())
+                if drift_warn_count:
+                    st.warning(f"{drift_warn_count} close-period drift check(s) need review.")
+                else:
+                    st.caption("Dashboard/report export close-period totals are aligned for available checks.")
+                if dashboard_live_drift_metrics:
+                    st.caption("Includes Dashboard Live Metrics 30-day comparisons for this selected window.")
+                else:
+                    st.caption(
+                        "Dashboard Live Metrics comparisons are included only when the selected range matches "
+                        "the dashboard 30-day window ending on `To Date`."
                     )
-                    with st.expander("Fee Source Counts by Week Data", expanded=False):
-                        _render_df_with_preview(stacked_weekly_df, hide_index=True)
-        if not ebay_fee_actual_source_df.empty:
-            with st.expander("Actual Fee Source Breakdown", expanded=False):
-                _render_df_with_preview(ebay_fee_actual_source_df, hide_index=True)
-        current_final_value_rate = float(
-            get_runtime_float(repo, "ebay_fee_estimate_final_value_rate_percent", 13.25)
-        )
-        calibration = build_final_value_rate_calibration(
-            ebay_fee_reconciliation_df.to_dict(orient="records"),
-            current_final_value_rate_percent=current_final_value_rate,
-        )
-        st.markdown("#### Fee Calibration Assist")
-        cc1, cc2, cc3, cc4 = st.columns(4)
-        cc1.metric("Calibration Samples", f"{int(calibration.get('sample_count') or 0)}")
-        cc2.metric("Current Final Value %", f"{current_final_value_rate:.3f}%")
-        cc3.metric(
-            "Suggested Final Value %",
-            f"{float(calibration.get('suggested_final_value_rate_percent') or current_final_value_rate):.3f}%",
-        )
-        cc4.metric(
-            "Suggested Delta",
-            f"{float(calibration.get('delta_percent') or 0.0):+.3f}%",
-        )
-        st.caption(
-            "Suggestion is based on implied final-value rates from recent eBay sales with estimate metadata. "
-            "Use as calibration guidance, not an automatic accounting source-of-truth."
-        )
-        can_apply_calibration = has_permission(user.role, "manage_settings")
-        apply_col1, apply_col2 = st.columns([1, 3])
-        with apply_col1:
-            if st.button(
-                "Apply Suggested Final Value %",
-                key="reports_apply_fee_calibration_btn",
-                disabled=not can_apply_calibration
-                or int(calibration.get("sample_count") or 0) <= 0,
-            ):
+                if slack_summary_drift_metrics:
+                    st.caption("Includes Slack-style daily/weekly business summary comparisons for this selected window.")
+                else:
+                    st.caption(
+                        "Slack summary comparisons are included only when the selected range matches the daily or weekly "
+                        "business summary window ending on `To Date`."
+                    )
+                _render_df_with_preview(accounting_period_drift_df, hide_index=True)
+        with st.expander("Close Sign-Off Evidence Review", expanded=False):
+            _render_df_with_preview(accounting_close_signoff_review_df, hide_index=True)
+        with st.expander("AI Review Outcome Evidence", expanded=False):
+            if ai_review_outcomes_df.empty:
+                st.caption(f"No Reports Copilot or {AI_ACCOUNTANT_NAME} outcome audit events have been recorded yet.")
+            else:
+                _render_df_with_preview(ai_review_outcomes_df, hide_index=True)
+        with st.expander("Record Accounting Close Sign-Off", expanded=False):
+            current_close_packet_ref = f"accounting_close_packet_{from_date}_{to_date}.zip"
+            st.caption(
+                "Record sign-off only after downloading and reviewing the Accounting Close Packet for this exact date range."
+            )
+            st.code(current_accounting_close_packet_hash or "packet hash unavailable", language="text")
+            st.caption(
+                "Captured with this sign-off: "
+                f"readiness={accounting_close_summary.get('readiness_status') or 'unknown'}, "
+                f"blockers={int(_safe_float(accounting_close_summary.get('blocker_count')))}, "
+                f"drift warnings={int(_safe_float(accounting_close_summary.get('period_drift_warn_count')))}, "
+                f"AI review follow-ups={int(_safe_float(accounting_close_summary.get('ai_review_followup_count')))}."
+            )
+            can_record_close_signoff = has_permission(user.role, "manage_settings")
+            signoff_form_context = (
+                st.form("reports_accounting_close_signoff_form")
+                if hasattr(st, "form")
+                else st.expander("Sign-Off Fields", expanded=True)
+            )
+            with signoff_form_context:
+                cs1, cs2 = st.columns(2)
+                with cs1:
+                    close_signoff_period = st.text_input(
+                        "Close Period",
+                        value=_default_accounting_close_period(from_date, to_date),
+                        key="reports_accounting_close_signoff_period",
+                    )
+                    close_signoff_owner = st.text_input(
+                        "Owner",
+                        value=str(user.username or ""),
+                        key="reports_accounting_close_signoff_owner",
+                    )
+                    close_signoff_date = st.date_input(
+                        "Sign-Off Date",
+                        value=utc_today(),
+                        key="reports_accounting_close_signoff_date",
+                    )
+                with cs2:
+                    close_signoff_status = st.selectbox(
+                        "Status",
+                        options=["approved", "blocked", "needs_followup"],
+                        index=0 if close_status == "close_ready" else 2,
+                        key="reports_accounting_close_signoff_status",
+                    )
+                    close_signoff_packet_ref = st.text_input(
+                        "Accounting Packet Ref",
+                        value=current_close_packet_ref,
+                        key="reports_accounting_close_signoff_packet_ref",
+                    )
+                    close_signoff_evidence_link = st.text_input(
+                        "Evidence Link",
+                        placeholder="ticket/runbook/shared artifact URL",
+                        key="reports_accounting_close_signoff_evidence_link",
+                    )
+                if hasattr(st, "text_area"):
+                    close_signoff_notes = st.text_area(
+                        "Notes",
+                        placeholder="Reviewer notes, unresolved follow-up, or approval context.",
+                        key="reports_accounting_close_signoff_notes",
+                    )
+                else:
+                    close_signoff_notes = st.text_input(
+                        "Notes",
+                        value="",
+                        key="reports_accounting_close_signoff_notes",
+                    )
+                if hasattr(st, "form_submit_button"):
+                    save_close_signoff = st.form_submit_button(
+                        "Record Accounting Close Sign-Off",
+                        disabled=not can_record_close_signoff,
+                    )
+                else:
+                    save_close_signoff = st.button(
+                        "Record Accounting Close Sign-Off",
+                        key="reports_accounting_close_signoff_submit_btn",
+                        disabled=not can_record_close_signoff,
+                    )
+            if not can_record_close_signoff:
+                st.caption("You need `manage_settings` permission to record accounting close sign-off evidence.")
+            if save_close_signoff:
                 try:
-                    suggested_value = float(
-                        calibration.get("suggested_final_value_rate_percent")
-                        or current_final_value_rate
+                    payload = _build_accounting_close_signoff_payload(
+                        target_env=settings.app_env,
+                        close_period=close_signoff_period,
+                        status=close_signoff_status,
+                        owner=close_signoff_owner,
+                        signoff_date=close_signoff_date,
+                        close_summary=accounting_close_summary,
+                        accounting_packet_ref=close_signoff_packet_ref,
+                        accounting_packet_hash=current_accounting_close_packet_hash,
+                        evidence_link=close_signoff_evidence_link,
+                        notes=close_signoff_notes,
                     )
-                    repo.upsert_runtime_setting(
-                        environment=settings.app_env,
-                        key="ebay_fee_estimate_final_value_rate_percent",
-                        value=f"{suggested_value:.4f}",
-                        value_type="float",
-                        description="Calibrated from Reports fee reconciliation assist.",
-                        is_active=True,
+                    repo.record_audit_event(
+                        entity_type="accounting_close_signoff",
+                        entity_id=None,
+                        action="signoff",
                         actor=user.username,
+                        changes=payload,
                     )
-                    st.success(
-                        f"Updated `ebay_fee_estimate_final_value_rate_percent` to {suggested_value:.4f}%."
-                    )
+                    st.success("Accounting close sign-off recorded.")
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"Unable to apply fee calibration setting: {exc}")
-        with apply_col2:
-            if not can_apply_calibration:
-                    st.caption("You need `manage_settings` permission to apply runtime calibration values.")
+                    st.error(f"Unable to record accounting close sign-off: {exc}")
+        with st.expander("Lot Allocation Source Summary", expanded=False):
+            if lot_allocation_source_summary_df.empty:
+                st.caption("No lot allocation source summary is available for the selected window.")
+            else:
+                explicit_sources = {
+                    "assignment_unit_landed_cost",
+                    "assignment_allocated_landed_cost",
+                    "lot_allocation_weight",
+                }
+                fallback_sources = {
+                    "lot_expected_quantity_fallback",
+                    "lot_equal_quantity_fallback",
+                    "missing_cost_basis",
+                    "unknown",
+                }
+                explicit_total = float(
+                    lot_allocation_source_summary_df[
+                        lot_allocation_source_summary_df["cost_source"].isin(explicit_sources)
+                    ]["resolved_landed_total_cost"].sum()
+                )
+                fallback_total = float(
+                    lot_allocation_source_summary_df[
+                        lot_allocation_source_summary_df["cost_source"].isin(fallback_sources)
+                    ]["resolved_landed_total_cost"].sum()
+                )
+                as1, as2, as3 = st.columns(3)
+                as1.metric("Explicit/Weighted Basis", f"${explicit_total:,.2f}")
+                as2.metric("Fallback Basis", f"${fallback_total:,.2f}")
+                as3.metric("Allocation Sources", f"{len(lot_allocation_source_summary_df)}")
+                _render_df_with_preview(lot_allocation_source_summary_df, hide_index=True)
+        with st.expander("Lot Allocation Action Detail", expanded=not lot_allocation_action_detail_df.empty):
+            if lot_allocation_action_detail_df.empty:
+                st.caption("No equal-fallback or missing-cost lot assignments need close action.")
+            else:
+                st.warning(
+                    f"{len(lot_allocation_action_detail_df)} lot assignment row(s) need allocation evidence review."
+                )
+                _render_df_with_preview(lot_allocation_action_detail_df, hide_index=True)
+        with st.expander("Sold COGS Source Summary", expanded=False):
+            if cogs_source_summary_df.empty:
+                st.caption("No sold COGS source summary is available for the selected window.")
+            else:
+                fallback_sources = {
+                    "lot_equal_quantity_fallback",
+                    "missing_cost_basis",
+                    "unknown",
+                    "mixed_fifo_cost",
+                    "legacy_reports_fifo_cost_map",
+                }
+                fallback_cogs = float(
+                    cogs_source_summary_df[
+                        cogs_source_summary_df["fifo_cost_source"].isin(fallback_sources)
+                    ]["fifo_cogs"].sum()
+                )
+                cs1, cs2, cs3, cs4 = st.columns(4)
+                cs1.metric("Sold FIFO COGS", f"${float(cogs_source_summary_df['fifo_cogs'].sum()):,.2f}")
+                cs2.metric("Fallback/Review COGS", f"${fallback_cogs:,.2f}")
+                cs3.metric("COGS Sources", f"{len(cogs_source_summary_df)}")
+                cs4.metric(
+                    "Bundle Units Sold",
+                    f"{int(cogs_source_summary_df.get('bundle_inventory_units_sold', pd.Series(dtype=int)).sum())}",
+                )
+                _render_df_with_preview(cogs_source_summary_df, hide_index=True)
 
-    st.markdown("### Accounting Exception Queue")
-    if not load_extended_analytics:
-        st.info("Enable `Load Extended Analytics` to run accounting exception checks.")
-    elif accounting_exceptions_df.empty:
-        st.success("No accounting exceptions found for the selected date range.")
-    else:
-        severity_counts = (
-            accounting_exceptions_df.groupby(["severity"], dropna=False, as_index=False)
-            .size()
-            .rename(columns={"size": "count"})
-            .sort_values(["severity"], ascending=[True])
+        st.markdown("### eBay Fee Reconciliation")
+        if not load_extended_analytics:
+            st.info("Enable `Load Extended Analytics` to run fee reconciliation and calibration.")
+        elif ebay_fee_reconciliation_df.empty:
+            st.info("No eBay sales in the selected date range for fee reconciliation.")
+        else:
+            er1, er2, er3, er4 = st.columns(4)
+            sales_count = int(fee_reconciliation_summary.get("sales_count") or len(ebay_fee_reconciliation_df))
+            total_actual_fee = float(fee_reconciliation_summary.get("total_actual_fee") or 0.0)
+            total_estimated_fee = float(fee_reconciliation_summary.get("total_estimated_fee") or 0.0)
+            total_variance = float(fee_reconciliation_summary.get("total_variance") or 0.0)
+            coverage_count = int(fee_reconciliation_summary.get("estimate_coverage_count") or 0)
+            er1.metric("eBay Sales", f"{sales_count}")
+            er2.metric("Actual Fees", f"${total_actual_fee:,.2f}")
+            er3.metric("Estimated Fees", f"${total_estimated_fee:,.2f}")
+            er4.metric("Variance", f"${total_variance:,.2f}")
+            st.caption(
+                f"Estimate coverage: {coverage_count}/{sales_count} sales have listing-time fee estimates."
+            )
+            if not ebay_fee_source_priority_df.empty:
+                st.markdown("#### Actual Fee Source Priority")
+                p1, p2, p3 = st.columns(3)
+                p1.metric(
+                    "Normalized Source Rows",
+                    f"{int(fee_source_counts.get('normalized_source_rows') or 0)}",
+                )
+                p2.metric(
+                    "Notes Fallback Rows",
+                    f"{int(fee_source_counts.get('notes_fallback_rows') or 0)}",
+                )
+                p3.metric(
+                    "Sale Field Fallback Rows",
+                    f"{int(fee_source_counts.get('sale_field_fallback_rows') or 0)}",
+                )
+                with st.expander("Actual Fee Source Priority Breakdown", expanded=False):
+                    _render_df_with_preview(ebay_fee_source_priority_df, hide_index=True)
+            if not ebay_fee_source_priority_trend_df.empty:
+                weekly_coverage_df = _build_normalized_source_weekly_coverage(ebay_fee_source_priority_trend_df)
+                if not weekly_coverage_df.empty:
+                    st.markdown("#### Normalized Source Coverage Trend (Weekly)")
+                    chart_df = weekly_coverage_df[["bucket_date", "normalized_coverage_pct"]].copy()
+                    chart_df = chart_df.rename(columns={"bucket_date": "week_start"})
+                    chart_df["week_start"] = pd.to_datetime(chart_df["week_start"], errors="coerce")
+                    chart_df = chart_df.set_index("week_start").sort_index()
+                    st.line_chart(chart_df, y="normalized_coverage_pct", use_container_width=True)
+                    with st.expander("Normalized Source Coverage Data (Weekly)", expanded=False):
+                        _render_df_with_preview(weekly_coverage_df, hide_index=True)
+                    stacked_weekly_df = _build_weekly_fee_source_count_chart_data(ebay_fee_source_priority_trend_df)
+                    if not stacked_weekly_df.empty:
+                        st.markdown("#### Fee Source Counts by Week")
+                        stack_chart_df = stacked_weekly_df.copy()
+                        stack_chart_df["week_start"] = pd.to_datetime(stack_chart_df["week_start"], errors="coerce")
+                        stack_chart_df = stack_chart_df.set_index("week_start").sort_index()
+                        st.bar_chart(
+                            stack_chart_df[["normalized_source", "notes_fallback", "sale_field_fallback"]],
+                            use_container_width=True,
+                        )
+                        with st.expander("Fee Source Counts by Week Data", expanded=False):
+                            _render_df_with_preview(stacked_weekly_df, hide_index=True)
+            if not ebay_fee_actual_source_df.empty:
+                with st.expander("Actual Fee Source Breakdown", expanded=False):
+                    _render_df_with_preview(ebay_fee_actual_source_df, hide_index=True)
+            current_final_value_rate = float(
+                get_runtime_float(repo, "ebay_fee_estimate_final_value_rate_percent", 13.25)
+            )
+            calibration = build_final_value_rate_calibration(
+                ebay_fee_reconciliation_df.to_dict(orient="records"),
+                current_final_value_rate_percent=current_final_value_rate,
+            )
+            st.markdown("#### Fee Calibration Assist")
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("Calibration Samples", f"{int(calibration.get('sample_count') or 0)}")
+            cc2.metric("Current Final Value %", f"{current_final_value_rate:.3f}%")
+            cc3.metric(
+                "Suggested Final Value %",
+                f"{float(calibration.get('suggested_final_value_rate_percent') or current_final_value_rate):.3f}%",
+            )
+            cc4.metric(
+                "Suggested Delta",
+                f"{float(calibration.get('delta_percent') or 0.0):+.3f}%",
+            )
+            st.caption(
+                "Suggestion is based on implied final-value rates from recent eBay sales with estimate metadata. "
+                "Use as calibration guidance, not an automatic accounting source-of-truth."
+            )
+            can_apply_calibration = has_permission(user.role, "manage_settings")
+            apply_col1, apply_col2 = st.columns([1, 3])
+            with apply_col1:
+                if st.button(
+                    "Apply Suggested Final Value %",
+                    key="reports_apply_fee_calibration_btn",
+                    disabled=not can_apply_calibration
+                    or int(calibration.get("sample_count") or 0) <= 0,
+                ):
+                    try:
+                        suggested_value = float(
+                            calibration.get("suggested_final_value_rate_percent")
+                            or current_final_value_rate
+                        )
+                        repo.upsert_runtime_setting(
+                            environment=settings.app_env,
+                            key="ebay_fee_estimate_final_value_rate_percent",
+                            value=f"{suggested_value:.4f}",
+                            value_type="float",
+                            description="Calibrated from Reports fee reconciliation assist.",
+                            is_active=True,
+                            actor=user.username,
+                        )
+                        st.success(
+                            f"Updated `ebay_fee_estimate_final_value_rate_percent` to {suggested_value:.4f}%."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to apply fee calibration setting: {exc}")
+            with apply_col2:
+                if not can_apply_calibration:
+                        st.caption("You need `manage_settings` permission to apply runtime calibration values.")
+
+        st.markdown("### Accounting Exception Queue")
+        if not load_extended_analytics:
+            st.info("Enable `Load Extended Analytics` to run accounting exception checks.")
+        elif accounting_exceptions_df.empty:
+            st.success("No accounting exceptions found for the selected date range.")
+        else:
+            severity_counts = (
+                accounting_exceptions_df.groupby(["severity"], dropna=False, as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+                .sort_values(["severity"], ascending=[True])
+            )
+            exception_counts = (
+                accounting_exceptions_df.groupby(["exception_type"], dropna=False, as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+                .sort_values(["count"], ascending=[False])
+            )
+            aq1, aq2, aq3 = st.columns(3)
+            aq1.metric("Total Exceptions", f"{len(accounting_exceptions_df)}")
+            aq2.metric("P0 Exceptions", f"{int((accounting_exceptions_df['severity'] == 'P0').sum())}")
+            aq3.metric("P1 Exceptions", f"{int((accounting_exceptions_df['severity'] == 'P1').sum())}")
+            with st.expander("Accounting Exception Rows", expanded=True):
+                _render_df_with_preview(accounting_exceptions_df, hide_index=True)
+            with st.expander("Accounting Exception Summary", expanded=False):
+                _render_df_with_preview(severity_counts, hide_index=True)
+                _render_df_with_preview(exception_counts, hide_index=True)
+
+        repair_candidates = _merge_lot_listing_movement_repair_candidates(
+            _lot_listing_movement_repair_candidates(accounting_exceptions_df),
+            _lot_listing_movement_repair_candidates_from_cogs_margin(cogs_margin_df),
         )
-        exception_counts = (
-            accounting_exceptions_df.groupby(["exception_type"], dropna=False, as_index=False)
-            .size()
-            .rename(columns={"size": "count"})
-            .sort_values(["count"], ascending=[False])
+        _render_accounting_exception_auto_repair_panel(
+            repo,
+            user,
+            accounting_exceptions_df,
+            loaded=bool(load_extended_analytics),
         )
-        aq1, aq2, aq3 = st.columns(3)
-        aq1.metric("Total Exceptions", f"{len(accounting_exceptions_df)}")
-        aq2.metric("P0 Exceptions", f"{int((accounting_exceptions_df['severity'] == 'P0').sum())}")
-        aq3.metric("P1 Exceptions", f"{int((accounting_exceptions_df['severity'] == 'P1').sum())}")
-        with st.expander("Accounting Exception Rows", expanded=True):
-            _render_df_with_preview(accounting_exceptions_df, hide_index=True)
-        with st.expander("Accounting Exception Summary", expanded=False):
-            _render_df_with_preview(severity_counts, hide_index=True)
-            _render_df_with_preview(exception_counts, hide_index=True)
+        _render_accounting_exception_suppression_panel(
+            repo,
+            user,
+            accounting_exceptions_df,
+            loaded=bool(load_extended_analytics),
+        )
+        _render_lot_listing_movement_repair_panel(
+            repo,
+            user,
+            repair_candidates,
+            loaded=bool(load_extended_analytics),
+        )
+        _render_ebay_order_listing_link_backfill_panel(repo, user)
 
     st.markdown("### Shipping Economics (Charged vs Label Spend)")
     if not load_shipping_tax_analytics:
-        st.caption(
-            "Shipping economics is deferred. Enable `Load Shipping + Tax Analytics (slower)` to compute this section."
-        )
+        if tax_workspace:
+            st.caption(
+                "Shipping economics is deferred. Enable `Load Shipping + Tax Analytics (slower)` to compute this section."
+            )
+        else:
+            st.caption("Shipping/tax drilldowns are available from the dedicated Taxes page.")
     elif shipping_economics_df.empty:
         st.info("No sales in selected range with shipping economics data.")
     else:
@@ -9111,776 +10905,780 @@ def render_reports(repo: InventoryRepository) -> None:
         if not shipping_econ_summary_df.empty:
             _render_df_with_preview(shipping_econ_summary_df, hide_index=True)
 
-    st.markdown("### Economics Intelligence Drilldowns + Alerts")
-    if economics_intel_df.empty:
-        st.info("No estimate-vs-actual economics rows in selected date range.")
-    else:
-        ed1, ed2, ed3 = st.columns(3)
-        with ed1:
-            economics_min_margin_alert_pct = float(
+    if not tax_workspace:
+        st.markdown("### Economics Intelligence Drilldowns + Alerts")
+        if economics_intel_df.empty:
+            st.info("No estimate-vs-actual economics rows in selected date range.")
+        else:
+            ed1, ed2, ed3 = st.columns(3)
+            with ed1:
+                economics_min_margin_alert_pct = float(
+                    st.number_input(
+                        "Min Actual Margin % Alert",
+                        min_value=-100.0,
+                        max_value=100.0,
+                        value=5.0,
+                        step=0.5,
+                        key="reports_econ_min_margin_alert_pct",
+                    )
+                )
+            with ed2:
+                economics_max_fee_variance_alert_usd = float(
+                    st.number_input(
+                        "Max Avg Fee Variance Alert ($)",
+                        min_value=0.0,
+                        value=3.0,
+                        step=0.25,
+                        key="reports_econ_max_fee_variance_alert_usd",
+                    )
+                )
+            with ed3:
+                economics_min_group_sales_for_alert = int(
+                    st.number_input(
+                        "Min Sales per Group for Alert",
+                        min_value=1,
+                        value=3,
+                        step=1,
+                        key="reports_econ_min_group_sales_for_alert",
+                    )
+                )
+            economics_drilldowns = _build_economics_intelligence_drilldowns(
+                economics_intel_df,
+                min_margin_alert_pct=float(economics_min_margin_alert_pct),
+                max_fee_variance_alert_usd=float(economics_max_fee_variance_alert_usd),
+                min_group_sales_for_alert=int(economics_min_group_sales_for_alert),
+            )
+            economics_intel_by_sku_df = economics_drilldowns.get("by_sku", pd.DataFrame())
+            economics_intel_by_marketplace_df = economics_drilldowns.get("by_marketplace", pd.DataFrame())
+            economics_intel_alerts_df = economics_drilldowns.get("alerts", pd.DataFrame())
+
+            total_groups = int(len(economics_intel_by_sku_df))
+            sku_alert_groups = (
+                int(economics_intel_by_sku_df["alert_any"].astype(bool).sum())
+                if (not economics_intel_by_sku_df.empty and "alert_any" in economics_intel_by_sku_df.columns)
+                else 0
+            )
+            channel_alert_groups = (
+                int(economics_intel_by_marketplace_df["alert_any"].astype(bool).sum())
+                if (not economics_intel_by_marketplace_df.empty and "alert_any" in economics_intel_by_marketplace_df.columns)
+                else 0
+            )
+            alert_rows = int(len(economics_intel_alerts_df))
+            ea1, ea2, ea3, ea4 = st.columns(4)
+            ea1.metric("SKU Groups", total_groups)
+            ea2.metric("SKU Alert Groups", sku_alert_groups)
+            ea3.metric("Marketplace Alert Groups", channel_alert_groups)
+            ea4.metric("Alert Sale Rows", alert_rows)
+
+            with st.expander("Economics by SKU", expanded=False):
+                _render_df_with_preview(economics_intel_by_sku_df, hide_index=True)
+            with st.expander("Economics by Marketplace", expanded=False):
+                _render_df_with_preview(economics_intel_by_marketplace_df, hide_index=True)
+            with st.expander("Economics Alert Rows", expanded=False):
+                _render_df_with_preview(economics_intel_alerts_df, hide_index=True)
+
+    if not tax_workspace:
+        st.markdown("### Purchase Document -> Lot Apply Audit")
+        load_purchase_doc_apply_audit = st.checkbox(
+            "Load Purchase-Document Lot-Apply Audit (slower)",
+            value=False,
+            key="reports_load_purchase_doc_lot_apply_audit",
+        )
+        if not load_purchase_doc_apply_audit:
+            st.caption(
+                "Audit table is deferred. Enable `Load Purchase-Document Lot-Apply Audit (slower)` to query events."
+            )
+        else:
+            purchase_doc_audit_limit = int(
                 st.number_input(
-                    "Min Actual Margin % Alert",
-                    min_value=-100.0,
-                    max_value=100.0,
-                    value=5.0,
-                    step=0.5,
-                    key="reports_econ_min_margin_alert_pct",
+                    "Purchase-Document Audit Lookback Rows",
+                    min_value=100,
+                    max_value=5000,
+                    value=1000,
+                    step=100,
+                    key="reports_purchase_doc_apply_audit_limit",
                 )
             )
-        with ed2:
-            economics_max_fee_variance_alert_usd = float(
-                st.number_input(
-                    "Max Avg Fee Variance Alert ($)",
-                    min_value=0.0,
-                    value=3.0,
-                    step=0.25,
-                    key="reports_econ_max_fee_variance_alert_usd",
+            audit_rows = repo.list_audit_logs(limit=purchase_doc_audit_limit)
+            event_rows: list[dict] = []
+            for row in audit_rows:
+                if str(getattr(row, "entity_type", "") or "").strip().lower() != "purchase_document":
+                    continue
+                action = str(getattr(row, "action", "") or "").strip().lower()
+                if action not in {"auto_apply_extracted_fields_to_lot", "manual_apply_extracted_fields_to_lot"}:
+                    continue
+                created_at = getattr(row, "created_at", None)
+                if created_at is None:
+                    continue
+                if created_at < start_dt or created_at > end_dt:
+                    continue
+                payload: dict = {}
+                try:
+                    parsed = json.loads(str(getattr(row, "changes_json", "") or "{}"))
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = {}
+                applied_fields_raw = payload.get("applied_fields")
+                if isinstance(applied_fields_raw, list):
+                    applied_fields = [str(v).strip() for v in applied_fields_raw if str(v).strip()]
+                else:
+                    applied_fields = []
+                event_rows.append(
+                    {
+                        "created_at": created_at.isoformat(),
+                        "actor": str(getattr(row, "actor", "") or "").strip(),
+                        "action": action,
+                        "mode": str(payload.get("mode") or "").strip().lower(),
+                        "workflow": str(payload.get("workflow") or "").strip(),
+                        "purchase_document_id": int(getattr(row, "entity_id", 0) or 0),
+                        "lot_id": int(payload.get("lot_id") or 0) if payload.get("lot_id") is not None else 0,
+                        "applied_field_count": int(len(applied_fields)),
+                        "applied_fields": ", ".join(applied_fields),
+                    }
                 )
-            )
-        with ed3:
-            economics_min_group_sales_for_alert = int(
-                st.number_input(
-                    "Min Sales per Group for Alert",
-                    min_value=1,
-                    value=3,
-                    step=1,
-                    key="reports_econ_min_group_sales_for_alert",
-                )
-            )
-        economics_drilldowns = _build_economics_intelligence_drilldowns(
-            economics_intel_df,
-            min_margin_alert_pct=float(economics_min_margin_alert_pct),
-            max_fee_variance_alert_usd=float(economics_max_fee_variance_alert_usd),
-            min_group_sales_for_alert=int(economics_min_group_sales_for_alert),
-        )
-        economics_intel_by_sku_df = economics_drilldowns.get("by_sku", pd.DataFrame())
-        economics_intel_by_marketplace_df = economics_drilldowns.get("by_marketplace", pd.DataFrame())
-        economics_intel_alerts_df = economics_drilldowns.get("alerts", pd.DataFrame())
-
-        total_groups = int(len(economics_intel_by_sku_df))
-        sku_alert_groups = (
-            int(economics_intel_by_sku_df["alert_any"].astype(bool).sum())
-            if (not economics_intel_by_sku_df.empty and "alert_any" in economics_intel_by_sku_df.columns)
-            else 0
-        )
-        channel_alert_groups = (
-            int(economics_intel_by_marketplace_df["alert_any"].astype(bool).sum())
-            if (not economics_intel_by_marketplace_df.empty and "alert_any" in economics_intel_by_marketplace_df.columns)
-            else 0
-        )
-        alert_rows = int(len(economics_intel_alerts_df))
-        ea1, ea2, ea3, ea4 = st.columns(4)
-        ea1.metric("SKU Groups", total_groups)
-        ea2.metric("SKU Alert Groups", sku_alert_groups)
-        ea3.metric("Marketplace Alert Groups", channel_alert_groups)
-        ea4.metric("Alert Sale Rows", alert_rows)
-
-        with st.expander("Economics by SKU", expanded=False):
-            _render_df_with_preview(economics_intel_by_sku_df, hide_index=True)
-        with st.expander("Economics by Marketplace", expanded=False):
-            _render_df_with_preview(economics_intel_by_marketplace_df, hide_index=True)
-        with st.expander("Economics Alert Rows", expanded=False):
-            _render_df_with_preview(economics_intel_alerts_df, hide_index=True)
-
-    st.markdown("### Purchase Document -> Lot Apply Audit")
-    load_purchase_doc_apply_audit = st.checkbox(
-        "Load Purchase-Document Lot-Apply Audit (slower)",
-        value=False,
-        key="reports_load_purchase_doc_lot_apply_audit",
-    )
-    if not load_purchase_doc_apply_audit:
-        st.caption(
-            "Audit table is deferred. Enable `Load Purchase-Document Lot-Apply Audit (slower)` to query events."
-        )
-    else:
-        purchase_doc_audit_limit = int(
-            st.number_input(
-                "Purchase-Document Audit Lookback Rows",
-                min_value=100,
-                max_value=5000,
-                value=1000,
-                step=100,
-                key="reports_purchase_doc_apply_audit_limit",
-            )
-        )
-        audit_rows = repo.list_audit_logs(limit=purchase_doc_audit_limit)
-        event_rows: list[dict] = []
-        for row in audit_rows:
-            if str(getattr(row, "entity_type", "") or "").strip().lower() != "purchase_document":
-                continue
-            action = str(getattr(row, "action", "") or "").strip().lower()
-            if action not in {"auto_apply_extracted_fields_to_lot", "manual_apply_extracted_fields_to_lot"}:
-                continue
-            created_at = getattr(row, "created_at", None)
-            if created_at is None:
-                continue
-            if created_at < start_dt or created_at > end_dt:
-                continue
-            payload: dict = {}
-            try:
-                parsed = json.loads(str(getattr(row, "changes_json", "") or "{}"))
-                if isinstance(parsed, dict):
-                    payload = parsed
-            except Exception:
-                payload = {}
-            applied_fields_raw = payload.get("applied_fields")
-            if isinstance(applied_fields_raw, list):
-                applied_fields = [str(v).strip() for v in applied_fields_raw if str(v).strip()]
+            if not event_rows:
+                st.info("No purchase-document lot-apply audit events found in selected date range.")
             else:
-                applied_fields = []
-            event_rows.append(
+                events_df = pd.DataFrame(event_rows).sort_values("created_at", ascending=False)
+                auto_count = int(
+                    (events_df["action"].astype(str) == "auto_apply_extracted_fields_to_lot").sum()
+                )
+                manual_count = int(
+                    (events_df["action"].astype(str) == "manual_apply_extracted_fields_to_lot").sum()
+                )
+                pd1, pd2, pd3, pd4 = st.columns(4)
+                pd1.metric("Events", int(len(events_df)))
+                pd2.metric("Auto", auto_count)
+                pd3.metric("Manual", manual_count)
+                pd4.metric("Distinct Lots", int(events_df["lot_id"].replace(0, pd.NA).dropna().nunique()))
+                _render_df_with_preview(events_df, hide_index=True)
+                st.download_button(
+                    "Download Purchase-Document Lot-Apply Audit CSV",
+                    data=events_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"purchase_document_lot_apply_audit_{settings.app_env}.csv",
+                    mime="text/csv",
+                    key="reports_purchase_doc_lot_apply_audit_download",
+                )
+
+    colorado_suts_packet_artifacts: list[tuple[str, bytes]] = []
+    if tax_workspace:
+        st.markdown("### Tax Drilldown")
+        if not load_shipping_tax_analytics:
+            st.caption(
+                "Tax drilldown is deferred. Enable `Load Shipping + Tax Analytics (slower)` to compute this section."
+            )
+        elif tax_detail_df.empty:
+            st.info("No tax detail rows in selected date range/scope.")
+        else:
+            if not tax_exceptions_df.empty:
+                with st.expander("Tax Exceptions / Advisor Review", expanded=False):
+                    st.caption(
+                        "Tax exception rows are operational review aids. Validate jurisdiction, marketplace "
+                        "facilitator, shipping-taxability, and bullion/coin exemption treatment with your tax advisor."
+                    )
+                    _render_df_with_preview(tax_exceptions_df, hide_index=True)
+            drill_marketplace_options = ["all"] + sorted(
                 {
-                    "created_at": created_at.isoformat(),
-                    "actor": str(getattr(row, "actor", "") or "").strip(),
-                    "action": action,
-                    "mode": str(payload.get("mode") or "").strip().lower(),
-                    "workflow": str(payload.get("workflow") or "").strip(),
-                    "purchase_document_id": int(getattr(row, "entity_id", 0) or 0),
-                    "lot_id": int(payload.get("lot_id") or 0) if payload.get("lot_id") is not None else 0,
-                    "applied_field_count": int(len(applied_fields)),
-                    "applied_fields": ", ".join(applied_fields),
+                    str(v).strip().lower()
+                    for v in tax_detail_df["marketplace"].dropna().unique().tolist()
+                    if str(v).strip()
                 }
             )
-        if not event_rows:
-            st.info("No purchase-document lot-apply audit events found in selected date range.")
-        else:
-            events_df = pd.DataFrame(event_rows).sort_values("created_at", ascending=False)
-            auto_count = int(
-                (events_df["action"].astype(str) == "auto_apply_extracted_fields_to_lot").sum()
-            )
-            manual_count = int(
-                (events_df["action"].astype(str) == "manual_apply_extracted_fields_to_lot").sum()
-            )
-            pd1, pd2, pd3, pd4 = st.columns(4)
-            pd1.metric("Events", int(len(events_df)))
-            pd2.metric("Auto", auto_count)
-            pd3.metric("Manual", manual_count)
-            pd4.metric("Distinct Lots", int(events_df["lot_id"].replace(0, pd.NA).dropna().nunique()))
-            _render_df_with_preview(events_df, hide_index=True)
-            st.download_button(
-                "Download Purchase-Document Lot-Apply Audit CSV",
-                data=events_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"purchase_document_lot_apply_audit_{settings.app_env}.csv",
-                mime="text/csv",
-                key="reports_purchase_doc_lot_apply_audit_download",
-            )
-
-    st.markdown("### Tax Drilldown")
-    colorado_suts_packet_artifacts: list[tuple[str, bytes]] = []
-    if not load_shipping_tax_analytics:
-        st.caption(
-            "Tax drilldown is deferred. Enable `Load Shipping + Tax Analytics (slower)` to compute this section."
-        )
-    elif tax_detail_df.empty:
-        st.info("No tax detail rows in selected date range/scope.")
-    else:
-        if not tax_exceptions_df.empty:
-            with st.expander("Tax Exceptions / Advisor Review", expanded=False):
-                st.caption(
-                    "Tax exception rows are operational review aids. Validate jurisdiction, marketplace "
-                    "facilitator, shipping-taxability, and bullion/coin exemption treatment with your tax advisor."
+            td1, td2 = st.columns(2)
+            with td1:
+                drill_marketplace = st.selectbox(
+                    "Drilldown Marketplace",
+                    options=drill_marketplace_options,
+                    index=0,
+                    key="reports_tax_drill_marketplace",
                 )
-                _render_df_with_preview(tax_exceptions_df, hide_index=True)
-        drill_marketplace_options = ["all"] + sorted(
-            {
-                str(v).strip().lower()
-                for v in tax_detail_df["marketplace"].dropna().unique().tolist()
-                if str(v).strip()
-            }
-        )
-        td1, td2 = st.columns(2)
-        with td1:
-            drill_marketplace = st.selectbox(
-                "Drilldown Marketplace",
-                options=drill_marketplace_options,
-                index=0,
-                key="reports_tax_drill_marketplace",
-            )
-        with td2:
-            drill_taxability = st.selectbox(
-                "Drilldown Segment",
-                options=["all", "taxable_only", "exempt_only"],
-                index=0,
-                key="reports_tax_drill_taxability",
-            )
-        filtered_tax_detail = _filter_tax_drilldown_rows(
-            tax_detail_df,
-            marketplace=drill_marketplace,
-            taxability=drill_taxability,
-        )
-        tax_drill_kpis = _tax_drilldown_kpis(filtered_tax_detail)
-        dt1, dt2, dt3 = st.columns(3)
-        dt1.metric("Rows", int(tax_drill_kpis.get("rows") or 0))
-        dt2.metric(
-            "Taxable Subtotal",
-            f"${float(tax_drill_kpis.get('taxable_subtotal') or 0.0):,.2f}",
-        )
-        dt3.metric(
-            "Estimated Tax",
-            f"${float(tax_drill_kpis.get('estimated_tax') or 0.0):,.2f}",
-        )
-        sale_option_rows = _build_tax_drilldown_sale_option_rows(filtered_tax_detail)
-        sale_option_map = {str(row.get("label") or ""): int(row.get("sale_id") or 0) for row in sale_option_rows}
-        if sale_option_map:
-            hx1, hx2 = st.columns([3, 1])
-            with hx1:
-                selected_sale_label = st.selectbox(
-                    "Create Invoice From Sale",
-                    options=list(sale_option_map.keys()),
-                    key="reports_tax_drill_sale_pick",
+            with td2:
+                drill_taxability = st.selectbox(
+                    "Drilldown Segment",
+                    options=["all", "taxable_only", "exempt_only"],
+                    index=0,
+                    key="reports_tax_drill_taxability",
                 )
-            with hx2:
-                if st.button("Open in Documents", key="reports_tax_drill_to_documents_btn"):
-                    handoff_to_documents_draft(
-                        source_type="Sale",
-                        source_id=int(sale_option_map[selected_sale_label]),
-                        doc_type="invoice",
-                        handoff_from="reports_tax_drilldown",
-                        tax_jurisdiction=str(tax_jurisdiction or "").strip(),
-                        tax_rate_percent=float(tax_rate_percent or 0.0),
-                        tax_shipping_taxable=bool(tax_shipping_taxable),
-                        repo=repo,
-                        actor=user.username,
+            filtered_tax_detail = _filter_tax_drilldown_rows(
+                tax_detail_df,
+                marketplace=drill_marketplace,
+                taxability=drill_taxability,
+            )
+            tax_drill_kpis = _tax_drilldown_kpis(filtered_tax_detail)
+            dt1, dt2, dt3 = st.columns(3)
+            dt1.metric("Rows", int(tax_drill_kpis.get("rows") or 0))
+            dt2.metric(
+                "Taxable Subtotal",
+                f"${float(tax_drill_kpis.get('taxable_subtotal') or 0.0):,.2f}",
+            )
+            dt3.metric(
+                "Estimated Tax",
+                f"${float(tax_drill_kpis.get('estimated_tax') or 0.0):,.2f}",
+            )
+            sale_option_rows = _build_tax_drilldown_sale_option_rows(filtered_tax_detail)
+            sale_option_map = {str(row.get("label") or ""): int(row.get("sale_id") or 0) for row in sale_option_rows}
+            if sale_option_map:
+                hx1, hx2 = st.columns([3, 1])
+                with hx1:
+                    selected_sale_label = st.selectbox(
+                        "Create Invoice From Sale",
+                        options=list(sale_option_map.keys()),
+                        key="reports_tax_drill_sale_pick",
                     )
-        _render_df_with_preview(filtered_tax_detail)
-        dx1, dx2 = st.columns(2)
-        with dx1:
-            st.download_button(
-                label="Download Tax Drilldown CSV",
-                data=filtered_tax_detail.to_csv(index=False).encode("utf-8"),
-                file_name=f"tax_drilldown_{from_date}_{to_date}.csv",
-                mime="text/csv",
-                disabled=filtered_tax_detail.empty,
+                with hx2:
+                    if st.button("Open in Documents", key="reports_tax_drill_to_documents_btn"):
+                        handoff_to_documents_draft(
+                            source_type="Sale",
+                            source_id=int(sale_option_map[selected_sale_label]),
+                            doc_type="invoice",
+                            handoff_from="reports_tax_drilldown",
+                            tax_jurisdiction=str(tax_jurisdiction or "").strip(),
+                            tax_rate_percent=float(tax_rate_percent or 0.0),
+                            tax_shipping_taxable=bool(tax_shipping_taxable),
+                            repo=repo,
+                            actor=user.username,
+                        )
+            _render_df_with_preview(filtered_tax_detail)
+            dx1, dx2 = st.columns(2)
+            with dx1:
+                st.download_button(
+                    label="Download Tax Drilldown CSV",
+                    data=filtered_tax_detail.to_csv(index=False).encode("utf-8"),
+                    file_name=f"tax_drilldown_{from_date}_{to_date}.csv",
+                    mime="text/csv",
+                    disabled=filtered_tax_detail.empty,
+                )
+            with dx2:
+                st.download_button(
+                    label="Download Tax Drilldown XLSX",
+                    data=dataframe_to_xlsx_bytes(filtered_tax_detail, sheet_name="tax_drilldown"),
+                    file_name=f"tax_drilldown_{from_date}_{to_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    disabled=filtered_tax_detail.empty,
+                )
+            st.markdown("#### Colorado SUTS Upload")
+            st.caption(
+                "Creates a Colorado SUTS workbook from the official template. Gross sales are written as text, "
+                "account numbers are numeric, A1 is blank, and deduction/exemption columns are left blank for "
+                "advisor review because local deduction codes vary by jurisdiction. Marketplace-facilitator "
+                "channels such as eBay are excluded by default in Tax Reporting Scope; include only channels your "
+                "tax advisor says you must report."
             )
-        with dx2:
-            st.download_button(
-                label="Download Tax Drilldown XLSX",
-                data=dataframe_to_xlsx_bytes(filtered_tax_detail, sheet_name="tax_drilldown"),
-                file_name=f"tax_drilldown_{from_date}_{to_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                disabled=filtered_tax_detail.empty,
+            st.info(
+                "SUTS gross sales use the Tax Marketplace Filter above. For normal filing, leave eBay/facilitator "
+                "channels unselected; selecting eBay will add those marketplace sales to this SUTS upload."
             )
-        st.markdown("#### Colorado SUTS Upload")
-        st.caption(
-            "Creates a Colorado SUTS workbook from the official template. Gross sales are written as text, "
-            "account numbers are numeric, A1 is blank, and deduction/exemption columns are left blank for "
-            "advisor review because local deduction codes vary by jurisdiction. Marketplace-facilitator "
-            "channels such as eBay are excluded by default in Tax Reporting Scope; include only channels your "
-            "tax advisor says you must report."
-        )
-        st.info(
-            "SUTS gross sales use the Tax Marketplace Filter above. For normal filing, leave eBay/facilitator "
-            "channels unselected; selecting eBay will add those marketplace sales to this SUTS upload."
-        )
-        suts_options = _load_colorado_suts_jurisdiction_options()
-        if not suts_options:
-            st.warning("Colorado SUTS template could not be loaded from app assets.")
-        else:
-            suts_month_value = st.text_input(
-                "SUTS Filing Month (YYYY-MM)",
-                value=from_date.strftime("%Y-%m"),
-                key="reports_colorado_suts_filing_month",
-                help="Generates the SUTS workbook for the selected filing month using the current Tax Reporting Scope.",
-            )
-            suts_month_valid = True
-            try:
-                suts_month_start, suts_month_end = _month_bounds_from_yyyy_mm(suts_month_value)
-                suts_tax_detail_df = _filter_tax_detail_for_month(tax_detail_df, month_value=suts_month_value)
-            except Exception as exc:
-                suts_month_valid = False
-                suts_month_start, suts_month_end = start_dt, end_dt
-                suts_tax_detail_df = pd.DataFrame()
-                st.warning(f"Colorado SUTS filing month is invalid: {exc}")
-            suts_excluded_facilitator_df = pd.DataFrame()
-            if suts_month_valid and hasattr(repo, "report_tax_estimate_detail_rows"):
+            suts_options = _load_colorado_suts_jurisdiction_options()
+            if not suts_options:
+                st.warning("Colorado SUTS template could not be loaded from app assets.")
+            else:
+                suts_month_value = st.text_input(
+                    "SUTS Filing Month (YYYY-MM)",
+                    value=from_date.strftime("%Y-%m"),
+                    key="reports_colorado_suts_filing_month",
+                    help="Generates the SUTS workbook for the selected filing month using the current Tax Reporting Scope.",
+                )
+                suts_month_valid = True
                 try:
-                    suts_month_rows = repo.report_tax_estimate_detail_rows(
-                        start_dt=suts_month_start,
-                        end_dt=suts_month_end,
-                        tax_rate_percent=float(tax_rate_percent),
-                        shipping_taxable=bool(tax_shipping_taxable),
-                        tax_exempt_categories=tax_exempt_categories,
-                        marketplaces=tax_query_marketplace_set,
-                    )
-                    suts_tax_detail_df = pd.DataFrame(suts_month_rows or [])
-                except Exception:
-                    _rollback_report_session()
-                excluded_facilitator_scope = set(facilitator_channels) - set(selected_tax_marketplace_set)
-                if excluded_facilitator_scope:
+                    suts_month_start, suts_month_end = _month_bounds_from_yyyy_mm(suts_month_value)
+                    suts_tax_detail_df = _filter_tax_detail_for_month(tax_detail_df, month_value=suts_month_value)
+                except Exception as exc:
+                    suts_month_valid = False
+                    suts_month_start, suts_month_end = start_dt, end_dt
+                    suts_tax_detail_df = pd.DataFrame()
+                    st.warning(f"Colorado SUTS filing month is invalid: {exc}")
+                suts_excluded_facilitator_df = pd.DataFrame()
+                if suts_month_valid and hasattr(repo, "report_tax_estimate_detail_rows"):
                     try:
-                        excluded_facilitator_rows = repo.report_tax_estimate_detail_rows(
+                        suts_month_rows = repo.report_tax_estimate_detail_rows(
                             start_dt=suts_month_start,
                             end_dt=suts_month_end,
                             tax_rate_percent=float(tax_rate_percent),
                             shipping_taxable=bool(tax_shipping_taxable),
                             tax_exempt_categories=tax_exempt_categories,
-                            marketplaces=excluded_facilitator_scope,
+                            marketplaces=tax_query_marketplace_set,
                         )
-                        suts_excluded_facilitator_df = pd.DataFrame(excluded_facilitator_rows or [])
+                        suts_tax_detail_df = pd.DataFrame(suts_month_rows or [])
                     except Exception:
                         _rollback_report_session()
-            suts_scope_summary_df = pd.DataFrame(
-                _build_colorado_suts_scope_summary_rows(
-                    suts_tax_detail_df,
-                    suts_excluded_facilitator_df,
-                    selected_marketplaces=selected_tax_marketplace_set,
-                    facilitator_channels=facilitator_channels,
-                )
-            )
-            if not suts_scope_summary_df.empty:
-                st.markdown("##### SUTS Scope Check")
-                _render_df_with_preview(suts_scope_summary_df, hide_index=True)
-            suts_labels = [str(row["label"]) for row in suts_options]
-            suts_code_by_label = {
-                str(row["label"]): str(row["jurisdiction_code"])
-                for row in suts_options
-            }
-            suts_key_by_label = {
-                str(row["label"]): _suts_jurisdiction_key(row["jurisdiction_code"], row.get("account_type"))
-                for row in suts_options
-            }
-            suts_custom_jurisdictions: list[dict[str, object]] = []
-            suts_account_override_by_key: dict[str, str] = {}
-            suts_allow_blank_account_keys: set[str] = set()
-            include_golden_custom = st.checkbox(
-                "Include Golden SUTS rows (11-0042)",
-                value=True,
-                key="reports_colorado_suts_include_golden_custom",
-                help="The provided SUTS template does not include Golden; this appends the Golden State and Local rows shown in SUTS.",
-            )
-            if include_golden_custom:
-                golden_state_key = _suts_jurisdiction_key("110042", "STATE")
-                golden_local_key = _suts_jurisdiction_key("110042", "LOCAL")
-                golden_state_label = "110042 | GOLDEN | STATE (custom)"
-                golden_local_label = "110042 | GOLDEN | LOCAL (custom)"
-                suts_labels.extend([golden_state_label, golden_local_label])
-                suts_code_by_label[golden_state_label] = "110042"
-                suts_code_by_label[golden_local_label] = "110042"
-                suts_key_by_label[golden_state_label] = golden_state_key
-                suts_key_by_label[golden_local_label] = golden_local_key
-                golden_state_account_number = st.text_input(
-                    "Golden State Account Number",
-                    value=COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER,
-                    key="reports_colorado_suts_golden_state_account_number",
-                    help=(
-                        "Use the Local Account # shown by SUTS for the selected Golden location. "
-                        "Your SUTS State location shows 970074130001 for Golden 110042."
-                    ),
-                )
-                if "".join(ch for ch in str(golden_state_account_number or "") if ch.isdigit()):
-                    suts_account_override_by_key[golden_state_key] = golden_state_account_number
-                golden_local_account_number = st.text_input(
-                    "Golden Local/Self-Collected Account Number",
-                    value="",
-                    key="reports_colorado_suts_golden_local_account_number",
-                    help=(
-                        "Your SUTS Local/Self-Collected Golden row shows no local account number. "
-                        "Leave blank for zero filings if SUTS accepts it, or enter the local account number if one is assigned."
-                    ),
-                )
-                if "".join(ch for ch in str(golden_local_account_number or "") if ch.isdigit()):
-                    suts_account_override_by_key[golden_local_key] = golden_local_account_number
-                else:
-                    suts_allow_blank_account_keys.add(golden_local_key)
-                suts_custom_jurisdictions.extend(
-                    [
-                        {"account_type": "STATE", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
-                        {"account_type": "LOCAL", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
-                    ]
-                )
-            suts_default_index = suts_labels.index(golden_state_label) if include_golden_custom and golden_state_label in suts_labels else 0
-            s1, s2 = st.columns([1, 2])
-            with s1:
-                suts_account_number = st.text_input(
-                    "Colorado SUTS Account Number",
-                    value=COLORADO_SUTS_ACCOUNT_NUMBER,
-                    key="reports_colorado_suts_account_number",
-                )
-            with s2:
-                default_gross_labels = [suts_labels[suts_default_index]] if suts_labels else []
-                if include_golden_custom and not suts_tax_detail_df.empty:
-                    default_gross_labels = [
-                        label
-                        for label in [golden_state_label, golden_local_label]
-                        if label in suts_labels
-                    ]
-                suts_gross_labels = st.multiselect(
-                    "Gross Sales Jurisdiction Rows",
-                    options=suts_labels,
-                    default=[] if suts_tax_detail_df.empty else default_gross_labels,
-                    key="reports_colorado_suts_gross_jurisdictions",
-                    help="Choose all SUTS jurisdiction rows that should receive the selected report scope's gross sales.",
-                )
-            suts_zero_options = (
-                suts_labels
-                if suts_tax_detail_df.empty
-                else [label for label in suts_labels if label not in set(suts_gross_labels)]
-            )
-            suts_zero_labels = st.multiselect(
-                "Zero Filing Jurisdiction Rows",
-                options=suts_zero_options,
-                default=default_gross_labels if suts_tax_detail_df.empty else [],
-                key="reports_colorado_suts_zero_jurisdictions",
-                help="Use only for jurisdictions where you have a filing obligation but zero gross sales.",
-            )
-            try:
-                if not suts_month_valid:
-                    raise ValueError("Enter a valid SUTS filing month in YYYY-MM format.")
-                gross_codes = [
-                    suts_code_by_label[label]
-                    for label in suts_gross_labels
-                    if label in suts_code_by_label
-                ]
-                gross_keys = [
-                    suts_key_by_label[label]
-                    for label in suts_gross_labels
-                    if label in suts_key_by_label
-                ]
-                zero_codes = [
-                    suts_code_by_label[label]
-                    for label in suts_zero_labels
-                    if label in suts_code_by_label
-                ]
-                zero_keys = [
-                    suts_key_by_label[label]
-                    for label in suts_zero_labels
-                    if label in suts_key_by_label
-                ]
-                golden_state_key = _suts_jurisdiction_key("110042", "STATE")
-                if (
-                    (golden_state_key in gross_keys or golden_state_key in zero_keys)
-                    and golden_state_key not in suts_account_override_by_key
-                ):
-                    raise ValueError(
-                        "Golden STATE (110042) requires the account number shown in SUTS before exporting."
+                    excluded_facilitator_scope = set(facilitator_channels) - set(selected_tax_marketplace_set)
+                    if excluded_facilitator_scope:
+                        try:
+                            excluded_facilitator_rows = repo.report_tax_estimate_detail_rows(
+                                start_dt=suts_month_start,
+                                end_dt=suts_month_end,
+                                tax_rate_percent=float(tax_rate_percent),
+                                shipping_taxable=bool(tax_shipping_taxable),
+                                tax_exempt_categories=tax_exempt_categories,
+                                marketplaces=excluded_facilitator_scope,
+                            )
+                            suts_excluded_facilitator_df = pd.DataFrame(excluded_facilitator_rows or [])
+                        except Exception:
+                            _rollback_report_session()
+                suts_scope_summary_df = pd.DataFrame(
+                    _build_colorado_suts_scope_summary_rows(
+                        suts_tax_detail_df,
+                        suts_excluded_facilitator_df,
+                        selected_marketplaces=selected_tax_marketplace_set,
+                        facilitator_channels=facilitator_channels,
                     )
-                suts_bytes, suts_summary_df = _build_colorado_suts_upload_workbook(
-                    suts_tax_detail_df,
-                    account_number=suts_account_number,
-                    gross_jurisdiction_codes=gross_codes,
-                    gross_jurisdiction_keys=gross_keys,
-                    zero_filing_jurisdiction_codes=zero_codes,
-                    zero_filing_jurisdiction_keys=zero_keys,
-                    account_number_by_jurisdiction_key=suts_account_override_by_key,
-                    allow_blank_account_jurisdiction_keys=suts_allow_blank_account_keys,
-                    custom_jurisdictions=suts_custom_jurisdictions,
                 )
-                if not suts_summary_df.empty:
-                    _render_df_with_preview(suts_summary_df, hide_index=True)
-                for warning in _colorado_suts_summary_warnings(suts_summary_df):
-                    st.warning(warning)
-                colorado_suts_filename = f"colorado_suts_upload_{suts_month_value}.xlsx"
-                colorado_suts_packet_artifacts = [(colorado_suts_filename, suts_bytes)]
-                st.download_button(
-                    label="Download Colorado SUTS Upload XLSX",
-                    data=suts_bytes,
-                    file_name=colorado_suts_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="reports_colorado_suts_upload_xlsx",
+                if not suts_scope_summary_df.empty:
+                    st.markdown("##### SUTS Scope Check")
+                    _render_df_with_preview(suts_scope_summary_df, hide_index=True)
+                suts_labels = [str(row["label"]) for row in suts_options]
+                suts_code_by_label = {
+                    str(row["label"]): str(row["jurisdiction_code"])
+                    for row in suts_options
+                }
+                suts_key_by_label = {
+                    str(row["label"]): _suts_jurisdiction_key(row["jurisdiction_code"], row.get("account_type"))
+                    for row in suts_options
+                }
+                suts_custom_jurisdictions: list[dict[str, object]] = []
+                suts_account_override_by_key: dict[str, str] = {}
+                suts_allow_blank_account_keys: set[str] = set()
+                include_golden_custom = st.checkbox(
+                    "Include Golden SUTS rows (11-0042)",
+                    value=True,
+                    key="reports_colorado_suts_include_golden_custom",
+                    help="The provided SUTS template does not include Golden; this appends the Golden State and Local rows shown in SUTS.",
                 )
-            except Exception as exc:
-                st.warning(f"Colorado SUTS upload workbook could not be generated: {exc}")
-    if load_shipping_tax_analytics and tax_detail_df.empty:
-        st.markdown("#### Colorado SUTS Upload")
-        st.caption(
-            "Creates a Colorado SUTS workbook from the official template. This remains available when "
-            "the selected report scope has no tax rows so you can generate zero-filing uploads for "
-            "jurisdictions where you still have a filing obligation."
-        )
-        st.info(
-            "SUTS gross sales use the Tax Marketplace Filter above. For normal filing, leave eBay/facilitator "
-            "channels unselected; selecting eBay will add those marketplace sales to this SUTS upload."
-        )
-        suts_options = _load_colorado_suts_jurisdiction_options()
-        if not suts_options:
-            st.warning("Colorado SUTS template could not be loaded from app assets.")
-        else:
-            suts_month_value = st.text_input(
-                "SUTS Filing Month (YYYY-MM)",
-                value=from_date.strftime("%Y-%m"),
-                key="reports_colorado_suts_empty_filing_month",
-                help="Generates the SUTS workbook for the selected filing month using the current Tax Reporting Scope.",
-            )
-            suts_month_valid = True
-            try:
-                suts_month_start, suts_month_end = _month_bounds_from_yyyy_mm(suts_month_value)
-                suts_tax_detail_df = _filter_tax_detail_for_month(tax_detail_df, month_value=suts_month_value)
-            except Exception as exc:
-                suts_month_valid = False
-                suts_month_start, suts_month_end = start_dt, end_dt
-                suts_tax_detail_df = pd.DataFrame()
-                st.warning(f"Colorado SUTS filing month is invalid: {exc}")
-            suts_excluded_facilitator_df = pd.DataFrame()
-            if suts_month_valid and hasattr(repo, "report_tax_estimate_detail_rows"):
+                if include_golden_custom:
+                    golden_state_key = _suts_jurisdiction_key("110042", "STATE")
+                    golden_local_key = _suts_jurisdiction_key("110042", "LOCAL")
+                    golden_state_label = "110042 | GOLDEN | STATE (custom)"
+                    golden_local_label = "110042 | GOLDEN | LOCAL (custom)"
+                    suts_labels.extend([golden_state_label, golden_local_label])
+                    suts_code_by_label[golden_state_label] = "110042"
+                    suts_code_by_label[golden_local_label] = "110042"
+                    suts_key_by_label[golden_state_label] = golden_state_key
+                    suts_key_by_label[golden_local_label] = golden_local_key
+                    golden_state_account_number = st.text_input(
+                        "Golden State Account Number",
+                        value=COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER,
+                        key="reports_colorado_suts_golden_state_account_number",
+                        help=(
+                            "Use the Local Account # shown by SUTS for the selected Golden location. "
+                            "Your SUTS State location shows 970074130001 for Golden 110042."
+                        ),
+                    )
+                    if "".join(ch for ch in str(golden_state_account_number or "") if ch.isdigit()):
+                        suts_account_override_by_key[golden_state_key] = golden_state_account_number
+                    golden_local_account_number = st.text_input(
+                        "Golden Local/Self-Collected Account Number",
+                        value="",
+                        key="reports_colorado_suts_golden_local_account_number",
+                        help=(
+                            "Your SUTS Local/Self-Collected Golden row shows no local account number. "
+                            "Leave blank for zero filings if SUTS accepts it, or enter the local account number if one is assigned."
+                        ),
+                    )
+                    if "".join(ch for ch in str(golden_local_account_number or "") if ch.isdigit()):
+                        suts_account_override_by_key[golden_local_key] = golden_local_account_number
+                    else:
+                        suts_allow_blank_account_keys.add(golden_local_key)
+                    suts_custom_jurisdictions.extend(
+                        [
+                            {"account_type": "STATE", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
+                            {"account_type": "LOCAL", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
+                        ]
+                    )
+                suts_default_index = suts_labels.index(golden_state_label) if include_golden_custom and golden_state_label in suts_labels else 0
+                s1, s2 = st.columns([1, 2])
+                with s1:
+                    suts_account_number = st.text_input(
+                        "Colorado SUTS Account Number",
+                        value=COLORADO_SUTS_ACCOUNT_NUMBER,
+                        key="reports_colorado_suts_account_number",
+                    )
+                with s2:
+                    default_gross_labels = [suts_labels[suts_default_index]] if suts_labels else []
+                    if include_golden_custom and not suts_tax_detail_df.empty:
+                        default_gross_labels = [
+                            label
+                            for label in [golden_state_label, golden_local_label]
+                            if label in suts_labels
+                        ]
+                    suts_gross_labels = st.multiselect(
+                        "Gross Sales Jurisdiction Rows",
+                        options=suts_labels,
+                        default=[] if suts_tax_detail_df.empty else default_gross_labels,
+                        key="reports_colorado_suts_gross_jurisdictions",
+                        help="Choose all SUTS jurisdiction rows that should receive the selected report scope's gross sales.",
+                    )
+                suts_zero_options = (
+                    suts_labels
+                    if suts_tax_detail_df.empty
+                    else [label for label in suts_labels if label not in set(suts_gross_labels)]
+                )
+                suts_zero_labels = st.multiselect(
+                    "Zero Filing Jurisdiction Rows",
+                    options=suts_zero_options,
+                    default=default_gross_labels if suts_tax_detail_df.empty else [],
+                    key="reports_colorado_suts_zero_jurisdictions",
+                    help="Use only for jurisdictions where you have a filing obligation but zero gross sales.",
+                )
                 try:
-                    suts_month_rows = repo.report_tax_estimate_detail_rows(
-                        start_dt=suts_month_start,
-                        end_dt=suts_month_end,
-                        tax_rate_percent=float(tax_rate_percent),
-                        shipping_taxable=bool(tax_shipping_taxable),
-                        tax_exempt_categories=tax_exempt_categories,
-                        marketplaces=tax_query_marketplace_set,
+                    if not suts_month_valid:
+                        raise ValueError("Enter a valid SUTS filing month in YYYY-MM format.")
+                    gross_codes = [
+                        suts_code_by_label[label]
+                        for label in suts_gross_labels
+                        if label in suts_code_by_label
+                    ]
+                    gross_keys = [
+                        suts_key_by_label[label]
+                        for label in suts_gross_labels
+                        if label in suts_key_by_label
+                    ]
+                    zero_codes = [
+                        suts_code_by_label[label]
+                        for label in suts_zero_labels
+                        if label in suts_code_by_label
+                    ]
+                    zero_keys = [
+                        suts_key_by_label[label]
+                        for label in suts_zero_labels
+                        if label in suts_key_by_label
+                    ]
+                    golden_state_key = _suts_jurisdiction_key("110042", "STATE")
+                    if (
+                        (golden_state_key in gross_keys or golden_state_key in zero_keys)
+                        and golden_state_key not in suts_account_override_by_key
+                    ):
+                        raise ValueError(
+                            "Golden STATE (110042) requires the account number shown in SUTS before exporting."
+                        )
+                    suts_bytes, suts_summary_df = _build_colorado_suts_upload_workbook(
+                        suts_tax_detail_df,
+                        account_number=suts_account_number,
+                        gross_jurisdiction_codes=gross_codes,
+                        gross_jurisdiction_keys=gross_keys,
+                        zero_filing_jurisdiction_codes=zero_codes,
+                        zero_filing_jurisdiction_keys=zero_keys,
+                        account_number_by_jurisdiction_key=suts_account_override_by_key,
+                        allow_blank_account_jurisdiction_keys=suts_allow_blank_account_keys,
+                        custom_jurisdictions=suts_custom_jurisdictions,
                     )
-                    suts_tax_detail_df = pd.DataFrame(suts_month_rows or [])
-                except Exception:
-                    _rollback_report_session()
-                excluded_facilitator_scope = set(facilitator_channels) - set(selected_tax_marketplace_set)
-                if excluded_facilitator_scope:
+                    if not suts_summary_df.empty:
+                        _render_df_with_preview(suts_summary_df, hide_index=True)
+                    for warning in _colorado_suts_summary_warnings(suts_summary_df):
+                        st.warning(warning)
+                    colorado_suts_filename = f"colorado_suts_upload_{suts_month_value}.xlsx"
+                    colorado_suts_packet_artifacts = [(colorado_suts_filename, suts_bytes)]
+                    st.download_button(
+                        label="Download Colorado SUTS Upload XLSX",
+                        data=suts_bytes,
+                        file_name=colorado_suts_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="reports_colorado_suts_upload_xlsx",
+                    )
+                except Exception as exc:
+                    st.warning(f"Colorado SUTS upload workbook could not be generated: {exc}")
+        if load_shipping_tax_analytics and tax_detail_df.empty:
+            st.markdown("#### Colorado SUTS Upload")
+            st.caption(
+                "Creates a Colorado SUTS workbook from the official template. This remains available when "
+                "the selected report scope has no tax rows so you can generate zero-filing uploads for "
+                "jurisdictions where you still have a filing obligation."
+            )
+            st.info(
+                "SUTS gross sales use the Tax Marketplace Filter above. For normal filing, leave eBay/facilitator "
+                "channels unselected; selecting eBay will add those marketplace sales to this SUTS upload."
+            )
+            suts_options = _load_colorado_suts_jurisdiction_options()
+            if not suts_options:
+                st.warning("Colorado SUTS template could not be loaded from app assets.")
+            else:
+                suts_month_value = st.text_input(
+                    "SUTS Filing Month (YYYY-MM)",
+                    value=from_date.strftime("%Y-%m"),
+                    key="reports_colorado_suts_empty_filing_month",
+                    help="Generates the SUTS workbook for the selected filing month using the current Tax Reporting Scope.",
+                )
+                suts_month_valid = True
+                try:
+                    suts_month_start, suts_month_end = _month_bounds_from_yyyy_mm(suts_month_value)
+                    suts_tax_detail_df = _filter_tax_detail_for_month(tax_detail_df, month_value=suts_month_value)
+                except Exception as exc:
+                    suts_month_valid = False
+                    suts_month_start, suts_month_end = start_dt, end_dt
+                    suts_tax_detail_df = pd.DataFrame()
+                    st.warning(f"Colorado SUTS filing month is invalid: {exc}")
+                suts_excluded_facilitator_df = pd.DataFrame()
+                if suts_month_valid and hasattr(repo, "report_tax_estimate_detail_rows"):
                     try:
-                        excluded_facilitator_rows = repo.report_tax_estimate_detail_rows(
+                        suts_month_rows = repo.report_tax_estimate_detail_rows(
                             start_dt=suts_month_start,
                             end_dt=suts_month_end,
                             tax_rate_percent=float(tax_rate_percent),
                             shipping_taxable=bool(tax_shipping_taxable),
                             tax_exempt_categories=tax_exempt_categories,
-                            marketplaces=excluded_facilitator_scope,
+                            marketplaces=tax_query_marketplace_set,
                         )
-                        suts_excluded_facilitator_df = pd.DataFrame(excluded_facilitator_rows or [])
+                        suts_tax_detail_df = pd.DataFrame(suts_month_rows or [])
                     except Exception:
                         _rollback_report_session()
-            suts_scope_summary_df = pd.DataFrame(
-                _build_colorado_suts_scope_summary_rows(
-                    suts_tax_detail_df,
-                    suts_excluded_facilitator_df,
-                    selected_marketplaces=selected_tax_marketplace_set,
-                    facilitator_channels=facilitator_channels,
-                )
-            )
-            if not suts_scope_summary_df.empty:
-                st.markdown("##### SUTS Scope Check")
-                _render_df_with_preview(suts_scope_summary_df, hide_index=True)
-            suts_labels = [str(row["label"]) for row in suts_options]
-            suts_code_by_label = {
-                str(row["label"]): str(row["jurisdiction_code"])
-                for row in suts_options
-            }
-            suts_key_by_label = {
-                str(row["label"]): _suts_jurisdiction_key(row["jurisdiction_code"], row.get("account_type"))
-                for row in suts_options
-            }
-            suts_custom_jurisdictions: list[dict[str, object]] = []
-            suts_account_override_by_key: dict[str, str] = {}
-            suts_allow_blank_account_keys: set[str] = set()
-            include_golden_custom = st.checkbox(
-                "Include Golden SUTS rows (11-0042)",
-                value=True,
-                key="reports_colorado_suts_empty_include_golden_custom",
-                help="The provided SUTS template does not include Golden; this appends the Golden State and Local rows shown in SUTS.",
-            )
-            if include_golden_custom:
-                golden_state_key = _suts_jurisdiction_key("110042", "STATE")
-                golden_local_key = _suts_jurisdiction_key("110042", "LOCAL")
-                golden_state_label = "110042 | GOLDEN | STATE (custom)"
-                golden_local_label = "110042 | GOLDEN | LOCAL (custom)"
-                suts_labels.extend([golden_state_label, golden_local_label])
-                suts_code_by_label[golden_state_label] = "110042"
-                suts_code_by_label[golden_local_label] = "110042"
-                suts_key_by_label[golden_state_label] = golden_state_key
-                suts_key_by_label[golden_local_label] = golden_local_key
-                golden_state_account_number = st.text_input(
-                    "Golden State Account Number",
-                    value=COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER,
-                    key="reports_colorado_suts_empty_golden_state_account_number",
-                    help=(
-                        "Use the Local Account # shown by SUTS for the selected Golden location. "
-                        "Your SUTS State location shows 970074130001 for Golden 110042."
-                    ),
-                )
-                if "".join(ch for ch in str(golden_state_account_number or "") if ch.isdigit()):
-                    suts_account_override_by_key[golden_state_key] = golden_state_account_number
-                golden_local_account_number = st.text_input(
-                    "Golden Local/Self-Collected Account Number",
-                    value="",
-                    key="reports_colorado_suts_empty_golden_local_account_number",
-                    help=(
-                        "Your SUTS Local/Self-Collected Golden row shows no local account number. "
-                        "Leave blank for zero filings if SUTS accepts it, or enter the local account number if one is assigned."
-                    ),
-                )
-                if "".join(ch for ch in str(golden_local_account_number or "") if ch.isdigit()):
-                    suts_account_override_by_key[golden_local_key] = golden_local_account_number
-                else:
-                    suts_allow_blank_account_keys.add(golden_local_key)
-                suts_custom_jurisdictions.extend(
-                    [
-                        {"account_type": "STATE", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
-                        {"account_type": "LOCAL", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
-                    ]
-                )
-            suts_default_index = suts_labels.index(golden_state_label) if include_golden_custom and golden_state_label in suts_labels else 0
-            s1, s2 = st.columns([1, 2])
-            with s1:
-                suts_account_number = st.text_input(
-                    "Colorado SUTS Account Number",
-                    value=COLORADO_SUTS_ACCOUNT_NUMBER,
-                    key="reports_colorado_suts_empty_account_number",
-                )
-            with s2:
-                default_gross_labels = [suts_labels[suts_default_index]] if suts_labels else []
-                if include_golden_custom and not suts_tax_detail_df.empty:
-                    default_gross_labels = [
-                        label
-                        for label in [golden_state_label, golden_local_label]
-                        if label in suts_labels
-                    ]
-                suts_gross_labels = st.multiselect(
-                    "Gross Sales Jurisdiction Rows",
-                    options=suts_labels,
-                    default=[] if suts_tax_detail_df.empty else default_gross_labels,
-                    key="reports_colorado_suts_empty_gross_jurisdictions",
-                    help="Choose all SUTS jurisdiction rows that should receive the selected report scope's gross sales.",
-                )
-            suts_zero_options = (
-                suts_labels
-                if suts_tax_detail_df.empty
-                else [label for label in suts_labels if label not in set(suts_gross_labels)]
-            )
-            suts_zero_labels = st.multiselect(
-                "Zero Filing Jurisdiction Rows",
-                options=suts_zero_options,
-                default=default_gross_labels if suts_tax_detail_df.empty else [],
-                key="reports_colorado_suts_empty_zero_jurisdictions",
-                help="Use only for jurisdictions where you have a filing obligation but zero gross sales.",
-            )
-            try:
-                if not suts_month_valid:
-                    raise ValueError("Enter a valid SUTS filing month in YYYY-MM format.")
-                gross_codes = [
-                    suts_code_by_label[label]
-                    for label in suts_gross_labels
-                    if label in suts_code_by_label
-                ]
-                gross_keys = [
-                    suts_key_by_label[label]
-                    for label in suts_gross_labels
-                    if label in suts_key_by_label
-                ]
-                zero_codes = [
-                    suts_code_by_label[label]
-                    for label in suts_zero_labels
-                    if label in suts_code_by_label
-                ]
-                zero_keys = [
-                    suts_key_by_label[label]
-                    for label in suts_zero_labels
-                    if label in suts_key_by_label
-                ]
-                golden_state_key = _suts_jurisdiction_key("110042", "STATE")
-                if (
-                    (golden_state_key in gross_keys or golden_state_key in zero_keys)
-                    and golden_state_key not in suts_account_override_by_key
-                ):
-                    raise ValueError(
-                        "Golden STATE (110042) requires the account number shown in SUTS before exporting."
+                    excluded_facilitator_scope = set(facilitator_channels) - set(selected_tax_marketplace_set)
+                    if excluded_facilitator_scope:
+                        try:
+                            excluded_facilitator_rows = repo.report_tax_estimate_detail_rows(
+                                start_dt=suts_month_start,
+                                end_dt=suts_month_end,
+                                tax_rate_percent=float(tax_rate_percent),
+                                shipping_taxable=bool(tax_shipping_taxable),
+                                tax_exempt_categories=tax_exempt_categories,
+                                marketplaces=excluded_facilitator_scope,
+                            )
+                            suts_excluded_facilitator_df = pd.DataFrame(excluded_facilitator_rows or [])
+                        except Exception:
+                            _rollback_report_session()
+                suts_scope_summary_df = pd.DataFrame(
+                    _build_colorado_suts_scope_summary_rows(
+                        suts_tax_detail_df,
+                        suts_excluded_facilitator_df,
+                        selected_marketplaces=selected_tax_marketplace_set,
+                        facilitator_channels=facilitator_channels,
                     )
-                suts_bytes, suts_summary_df = _build_colorado_suts_upload_workbook(
-                    suts_tax_detail_df,
-                    account_number=suts_account_number,
-                    gross_jurisdiction_codes=gross_codes,
-                    gross_jurisdiction_keys=gross_keys,
-                    zero_filing_jurisdiction_codes=zero_codes,
-                    zero_filing_jurisdiction_keys=zero_keys,
-                    account_number_by_jurisdiction_key=suts_account_override_by_key,
-                    allow_blank_account_jurisdiction_keys=suts_allow_blank_account_keys,
-                    custom_jurisdictions=suts_custom_jurisdictions,
                 )
-                if not suts_summary_df.empty:
-                    _render_df_with_preview(suts_summary_df, hide_index=True)
-                for warning in _colorado_suts_summary_warnings(suts_summary_df):
-                    st.warning(warning)
-                colorado_suts_filename = f"colorado_suts_upload_{suts_month_value}.xlsx"
-                colorado_suts_packet_artifacts = [(colorado_suts_filename, suts_bytes)]
-                st.download_button(
-                    label="Download Colorado SUTS Upload XLSX",
-                    data=suts_bytes,
-                    file_name=colorado_suts_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="reports_colorado_suts_empty_upload_xlsx",
+                if not suts_scope_summary_df.empty:
+                    st.markdown("##### SUTS Scope Check")
+                    _render_df_with_preview(suts_scope_summary_df, hide_index=True)
+                suts_labels = [str(row["label"]) for row in suts_options]
+                suts_code_by_label = {
+                    str(row["label"]): str(row["jurisdiction_code"])
+                    for row in suts_options
+                }
+                suts_key_by_label = {
+                    str(row["label"]): _suts_jurisdiction_key(row["jurisdiction_code"], row.get("account_type"))
+                    for row in suts_options
+                }
+                suts_custom_jurisdictions: list[dict[str, object]] = []
+                suts_account_override_by_key: dict[str, str] = {}
+                suts_allow_blank_account_keys: set[str] = set()
+                include_golden_custom = st.checkbox(
+                    "Include Golden SUTS rows (11-0042)",
+                    value=True,
+                    key="reports_colorado_suts_empty_include_golden_custom",
+                    help="The provided SUTS template does not include Golden; this appends the Golden State and Local rows shown in SUTS.",
                 )
-            except Exception as exc:
-                st.warning(f"Colorado SUTS upload workbook could not be generated: {exc}")
-
-    st.markdown("### Document Draft Handoff")
-    st.caption("Open Documents with prefilled source context from either a sale or an order.")
-    h1, h2, h3 = st.columns([1, 2, 1])
-    with h1:
-        handoff_source_type = st.selectbox(
-            "Source Type",
-            options=["Sale", "Order"],
-            index=0,
-            key="reports_documents_handoff_source_type",
-        )
-    with h2:
-        handoff_doc_type = st.selectbox(
-            "Document Type",
-            options=["invoice", "receipt"],
-            index=0,
-            key="reports_documents_handoff_doc_type",
-        )
-    source_option_map: dict[str, int] = {}
-    if handoff_source_type == "Sale":
-        source_option_rows = _build_documents_handoff_sale_option_rows(sales_df)
-        source_option_map = {
-            str(row.get("label") or ""): int(row.get("source_id") or 0)
-            for row in source_option_rows
-        }
-    else:
-        source_option_rows = _build_documents_handoff_order_option_rows(orders_df)
-        source_option_map = {
-            str(row.get("label") or ""): int(row.get("source_id") or 0)
-            for row in source_option_rows
-        }
-    if source_option_map:
-        selected_source_label = st.selectbox(
-            "Select Source",
-            options=list(source_option_map.keys()),
-            key="reports_documents_handoff_source_pick",
-        )
-        with h3:
-            if st.button(
-                "Open in Documents",
-                key="reports_documents_handoff_open_btn",
-            ):
-                source_id = source_option_map.get(str(selected_source_label or ""))
-                if source_id:
-                    handoff_to_documents_draft(
-                        source_type=handoff_source_type,
-                        source_id=int(source_id),
-                        doc_type=handoff_doc_type,
-                        handoff_from="reports_documents_handoff",
-                        tax_jurisdiction=str(tax_jurisdiction or "").strip(),
-                        tax_rate_percent=float(tax_rate_percent or 0.0),
-                        tax_shipping_taxable=bool(tax_shipping_taxable),
-                        repo=repo,
-                        actor=user.username,
+                if include_golden_custom:
+                    golden_state_key = _suts_jurisdiction_key("110042", "STATE")
+                    golden_local_key = _suts_jurisdiction_key("110042", "LOCAL")
+                    golden_state_label = "110042 | GOLDEN | STATE (custom)"
+                    golden_local_label = "110042 | GOLDEN | LOCAL (custom)"
+                    suts_labels.extend([golden_state_label, golden_local_label])
+                    suts_code_by_label[golden_state_label] = "110042"
+                    suts_code_by_label[golden_local_label] = "110042"
+                    suts_key_by_label[golden_state_label] = golden_state_key
+                    suts_key_by_label[golden_local_label] = golden_local_key
+                    golden_state_account_number = st.text_input(
+                        "Golden State Account Number",
+                        value=COLORADO_SUTS_GOLDEN_STATE_ACCOUNT_NUMBER,
+                        key="reports_colorado_suts_empty_golden_state_account_number",
+                        help=(
+                            "Use the Local Account # shown by SUTS for the selected Golden location. "
+                            "Your SUTS State location shows 970074130001 for Golden 110042."
+                        ),
                     )
-    else:
-        st.info(f"No {handoff_source_type.lower()} records in selected date range.")
+                    if "".join(ch for ch in str(golden_state_account_number or "") if ch.isdigit()):
+                        suts_account_override_by_key[golden_state_key] = golden_state_account_number
+                    golden_local_account_number = st.text_input(
+                        "Golden Local/Self-Collected Account Number",
+                        value="",
+                        key="reports_colorado_suts_empty_golden_local_account_number",
+                        help=(
+                            "Your SUTS Local/Self-Collected Golden row shows no local account number. "
+                            "Leave blank for zero filings if SUTS accepts it, or enter the local account number if one is assigned."
+                        ),
+                    )
+                    if "".join(ch for ch in str(golden_local_account_number or "") if ch.isdigit()):
+                        suts_account_override_by_key[golden_local_key] = golden_local_account_number
+                    else:
+                        suts_allow_blank_account_keys.add(golden_local_key)
+                    suts_custom_jurisdictions.extend(
+                        [
+                            {"account_type": "STATE", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
+                            {"account_type": "LOCAL", "jurisdiction_code": "110042", "jurisdiction_name": "GOLDEN"},
+                        ]
+                    )
+                suts_default_index = suts_labels.index(golden_state_label) if include_golden_custom and golden_state_label in suts_labels else 0
+                s1, s2 = st.columns([1, 2])
+                with s1:
+                    suts_account_number = st.text_input(
+                        "Colorado SUTS Account Number",
+                        value=COLORADO_SUTS_ACCOUNT_NUMBER,
+                        key="reports_colorado_suts_empty_account_number",
+                    )
+                with s2:
+                    default_gross_labels = [suts_labels[suts_default_index]] if suts_labels else []
+                    if include_golden_custom and not suts_tax_detail_df.empty:
+                        default_gross_labels = [
+                            label
+                            for label in [golden_state_label, golden_local_label]
+                            if label in suts_labels
+                        ]
+                    suts_gross_labels = st.multiselect(
+                        "Gross Sales Jurisdiction Rows",
+                        options=suts_labels,
+                        default=[] if suts_tax_detail_df.empty else default_gross_labels,
+                        key="reports_colorado_suts_empty_gross_jurisdictions",
+                        help="Choose all SUTS jurisdiction rows that should receive the selected report scope's gross sales.",
+                    )
+                suts_zero_options = (
+                    suts_labels
+                    if suts_tax_detail_df.empty
+                    else [label for label in suts_labels if label not in set(suts_gross_labels)]
+                )
+                suts_zero_labels = st.multiselect(
+                    "Zero Filing Jurisdiction Rows",
+                    options=suts_zero_options,
+                    default=default_gross_labels if suts_tax_detail_df.empty else [],
+                    key="reports_colorado_suts_empty_zero_jurisdictions",
+                    help="Use only for jurisdictions where you have a filing obligation but zero gross sales.",
+                )
+                try:
+                    if not suts_month_valid:
+                        raise ValueError("Enter a valid SUTS filing month in YYYY-MM format.")
+                    gross_codes = [
+                        suts_code_by_label[label]
+                        for label in suts_gross_labels
+                        if label in suts_code_by_label
+                    ]
+                    gross_keys = [
+                        suts_key_by_label[label]
+                        for label in suts_gross_labels
+                        if label in suts_key_by_label
+                    ]
+                    zero_codes = [
+                        suts_code_by_label[label]
+                        for label in suts_zero_labels
+                        if label in suts_code_by_label
+                    ]
+                    zero_keys = [
+                        suts_key_by_label[label]
+                        for label in suts_zero_labels
+                        if label in suts_key_by_label
+                    ]
+                    golden_state_key = _suts_jurisdiction_key("110042", "STATE")
+                    if (
+                        (golden_state_key in gross_keys or golden_state_key in zero_keys)
+                        and golden_state_key not in suts_account_override_by_key
+                    ):
+                        raise ValueError(
+                            "Golden STATE (110042) requires the account number shown in SUTS before exporting."
+                        )
+                    suts_bytes, suts_summary_df = _build_colorado_suts_upload_workbook(
+                        suts_tax_detail_df,
+                        account_number=suts_account_number,
+                        gross_jurisdiction_codes=gross_codes,
+                        gross_jurisdiction_keys=gross_keys,
+                        zero_filing_jurisdiction_codes=zero_codes,
+                        zero_filing_jurisdiction_keys=zero_keys,
+                        account_number_by_jurisdiction_key=suts_account_override_by_key,
+                        allow_blank_account_jurisdiction_keys=suts_allow_blank_account_keys,
+                        custom_jurisdictions=suts_custom_jurisdictions,
+                    )
+                    if not suts_summary_df.empty:
+                        _render_df_with_preview(suts_summary_df, hide_index=True)
+                    for warning in _colorado_suts_summary_warnings(suts_summary_df):
+                        st.warning(warning)
+                    colorado_suts_filename = f"colorado_suts_upload_{suts_month_value}.xlsx"
+                    colorado_suts_packet_artifacts = [(colorado_suts_filename, suts_bytes)]
+                    st.download_button(
+                        label="Download Colorado SUTS Upload XLSX",
+                        data=suts_bytes,
+                        file_name=colorado_suts_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="reports_colorado_suts_empty_upload_xlsx",
+                    )
+                except Exception as exc:
+                    st.warning(f"Colorado SUTS upload workbook could not be generated: {exc}")
 
-    st.markdown("### Rebuy Cost Trend (Weighted/Lot)")
-    if not load_inventory_cycle_analytics:
-        st.caption("Enable `Load Inventory Cycle + Rebuy Analytics` to run cycle and rebuy trend reports.")
-    elif rebuy_cost_trend_df.empty:
-        st.info("No acquisition events with unit cost found for trend analysis.")
-    else:
-        sku_options = sorted({str(v) for v in rebuy_cost_trend_df["sku"].dropna().unique() if str(v).strip()})
-        selected_sku = st.selectbox(
-            "Trend SKU",
-            options=sku_options,
-            index=0,
-            key="reports_rebuy_cost_trend_sku",
-        )
-        sku_rows = rebuy_cost_trend_df[rebuy_cost_trend_df["sku"] == selected_sku].copy()
-        if sku_rows.empty:
-            st.info("No rows for selected SKU.")
+    if not tax_workspace:
+        st.markdown("### Document Draft Handoff")
+        st.caption("Open Documents with prefilled source context from either a sale or an order.")
+        h1, h2, h3 = st.columns([1, 2, 1])
+        with h1:
+            handoff_source_type = st.selectbox(
+                "Source Type",
+                options=["Sale", "Order"],
+                index=0,
+                key="reports_documents_handoff_source_type",
+            )
+        with h2:
+            handoff_doc_type = st.selectbox(
+                "Document Type",
+                options=["invoice", "receipt"],
+                index=0,
+                key="reports_documents_handoff_doc_type",
+            )
+        source_option_map: dict[str, int] = {}
+        if handoff_source_type == "Sale":
+            source_option_rows = _build_documents_handoff_sale_option_rows(sales_df)
+            source_option_map = {
+                str(row.get("label") or ""): int(row.get("source_id") or 0)
+                for row in source_option_rows
+            }
         else:
-            chart_df = sku_rows[["as_of", "weighted_unit_cost", "unit_cost"]].copy()
-            chart_df = chart_df.rename(
-                columns={"weighted_unit_cost": "weighted_unit_cost_running", "unit_cost": "event_unit_cost"}
+            source_option_rows = _build_documents_handoff_order_option_rows(orders_df)
+            source_option_map = {
+                str(row.get("label") or ""): int(row.get("source_id") or 0)
+                for row in source_option_rows
+            }
+        if source_option_map:
+            selected_source_label = st.selectbox(
+                "Select Source",
+                options=list(source_option_map.keys()),
+                key="reports_documents_handoff_source_pick",
             )
-            chart_df = chart_df.set_index("as_of")
-            st.line_chart(chart_df, use_container_width=True)
-            _render_df_with_preview(sku_rows)
+            with h3:
+                if st.button(
+                    "Open in Documents",
+                    key="reports_documents_handoff_open_btn",
+                ):
+                    source_id = source_option_map.get(str(selected_source_label or ""))
+                    if source_id:
+                        handoff_to_documents_draft(
+                            source_type=handoff_source_type,
+                            source_id=int(source_id),
+                            doc_type=handoff_doc_type,
+                            handoff_from="reports_documents_handoff",
+                            tax_jurisdiction=str(tax_jurisdiction or "").strip(),
+                            tax_rate_percent=float(tax_rate_percent or 0.0),
+                            tax_shipping_taxable=bool(tax_shipping_taxable),
+                            repo=repo,
+                            actor=user.username,
+                        )
+        else:
+            st.info(f"No {handoff_source_type.lower()} records in selected date range.")
+
+        st.markdown("### Rebuy Cost Trend (Weighted/Lot)")
+        if not load_inventory_cycle_analytics:
+            st.caption("Enable `Load Inventory Cycle + Rebuy Analytics` to run cycle and rebuy trend reports.")
+        elif rebuy_cost_trend_df.empty:
+            st.info("No acquisition events with unit cost found for trend analysis.")
+        else:
+            sku_options = sorted({str(v) for v in rebuy_cost_trend_df["sku"].dropna().unique() if str(v).strip()})
+            selected_sku = st.selectbox(
+                "Trend SKU",
+                options=sku_options,
+                index=0,
+                key="reports_rebuy_cost_trend_sku",
+            )
+            sku_rows = rebuy_cost_trend_df[rebuy_cost_trend_df["sku"] == selected_sku].copy()
+            if sku_rows.empty:
+                st.info("No rows for selected SKU.")
+            else:
+                chart_df = sku_rows[["as_of", "weighted_unit_cost", "unit_cost"]].copy()
+                chart_df = chart_df.rename(
+                    columns={"weighted_unit_cost": "weighted_unit_cost_running", "unit_cost": "event_unit_cost"}
+                )
+                chart_df = chart_df.set_index("as_of")
+                st.line_chart(chart_df, use_container_width=True)
+                _render_df_with_preview(sku_rows)
 
     tax_evidence_reports = [
         ("Tax Summary (Estimated)", tax_summary_df, "tax_summary_estimated"),
@@ -9888,6 +11686,24 @@ def render_reports(repo: InventoryRepository) -> None:
         ("Tax Detail (Estimated)", tax_detail_df, "tax_detail_estimated"),
         ("Tax Exceptions / Advisor Review", tax_exceptions_df, "tax_exceptions_advisor_review"),
         ("Tax Reporting Sign-Off Evidence", tax_signoff_df, "tax_reporting_signoffs"),
+        ("Quarterly Estimated Tax Summary", quarterly_tax_summary_df, "quarterly_estimated_tax_summary"),
+        ("Quarterly Estimated Tax Payments", quarterly_tax_payment_df, "quarterly_estimated_tax_payments"),
+        ("Quarterly Estimated Tax Sales Detail", quarterly_tax_sales_df, "quarterly_estimated_tax_sales_detail"),
+        ("Quarterly Estimated Tax Fee Summary", quarterly_tax_fee_summary_df, "quarterly_estimated_tax_fee_summary"),
+        ("Quarterly Estimated Tax Fee Detail", quarterly_tax_fee_df, "quarterly_estimated_tax_fee_detail"),
+        ("Quarterly Estimated Tax COGS Detail", quarterly_tax_cogs_df, "quarterly_estimated_tax_cogs_detail"),
+        ("Quarterly Estimated Tax Return Adjustments", quarterly_tax_returns_df, "quarterly_estimated_tax_returns"),
+        ("Quarterly Estimated Tax Local Tax Detail", quarterly_tax_local_tax_df, "quarterly_estimated_tax_local_tax"),
+        (
+            "Quarterly Estimated Tax Payment Evidence",
+            quarterly_estimated_tax_payment_df,
+            "quarterly_estimated_tax_payment_evidence",
+        ),
+        (
+            "Quarterly Estimated Tax Payment Review",
+            quarterly_estimated_tax_payment_review_df,
+            "quarterly_estimated_tax_payment_review",
+        ),
     ]
     current_tax_packet_hash = _tax_review_packet_evidence_hash_from_reports(
         reports=tax_evidence_reports,
@@ -9916,852 +11732,872 @@ def render_reports(repo: InventoryRepository) -> None:
         to_date=to_date,
     )
 
-    st.markdown("### Reports Copilot")
-    st.caption("AI narrative summary for margin anomalies, reconciliation risk, and export recommendations.")
-    if not load_extended_analytics:
-        st.caption("Enable `Load Extended Analytics` to run Reports Copilot on full fee/margin context.")
-    if st.button(
-        "Analyze Report Snapshot",
-        key="reports_copilot_analyze_btn",
-        disabled=not load_extended_analytics,
-    ):
-        if not ensure_permission(user, "ai_comp_use", "Use Reports Copilot"):
-            st.stop()
-        try:
-            context = {
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "table_row_counts": dict(report_scalar_cache.get("table_row_counts") or {}),
-                "margin_snapshot": {
-                    "gross_sales_total": float(report_scalar_cache.get("cogs_gross_sales_total") or 0.0),
-                    "fifo_margin_before_returns_total": float(
-                        report_scalar_cache.get("cogs_fifo_margin_total") or 0.0
+    if not tax_workspace:
+        st.markdown("### Reports Copilot")
+        st.caption("AI narrative summary for margin anomalies, reconciliation risk, and export recommendations.")
+        if not load_extended_analytics:
+            st.caption("Enable `Load Extended Analytics` to run Reports Copilot on full fee/margin context.")
+        if st.button(
+            "Analyze Report Snapshot",
+            key="reports_copilot_analyze_btn",
+            disabled=not load_extended_analytics,
+        ):
+            if not ensure_permission(user, "ai_comp_use", "Use Reports Copilot"):
+                st.stop()
+            try:
+                context = {
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "table_row_counts": dict(report_scalar_cache.get("table_row_counts") or {}),
+                    "margin_snapshot": {
+                        "gross_sales_total": float(report_scalar_cache.get("cogs_gross_sales_total") or 0.0),
+                        "fifo_margin_before_returns_total": float(
+                            report_scalar_cache.get("cogs_fifo_margin_total") or 0.0
+                        ),
+                        "lot_margin_total": float(report_scalar_cache.get("cogs_lot_margin_total") or 0.0),
+                        "negative_fifo_margin_rows": int(report_scalar_cache.get("cogs_negative_fifo_rows") or 0),
+                    },
+                    "profit_after_returns_summary": close_profit_summary,
+                    "reconciliation_flags": int(report_scalar_cache.get("reconcile_flags") or 0),
+                    "accounting_close_readiness": dict(accounting_close_summary),
+                    "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
+                    "accounting_close_formula_checks": (
+                        accounting_close_formula_df.to_dict("records")
+                        if not accounting_close_formula_df.empty
+                        else []
                     ),
-                    "lot_margin_total": float(report_scalar_cache.get("cogs_lot_margin_total") or 0.0),
-                    "negative_fifo_margin_rows": int(report_scalar_cache.get("cogs_negative_fifo_rows") or 0),
-                },
-                "profit_after_returns_summary": close_profit_summary,
-                "reconciliation_flags": int(report_scalar_cache.get("reconcile_flags") or 0),
-                "accounting_close_readiness": dict(accounting_close_summary),
-                "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
-                "accounting_close_formula_checks": (
-                    accounting_close_formula_df.to_dict("records")
-                    if not accounting_close_formula_df.empty
-                    else []
-                ),
-                "accounting_sales_component_checks": (
-                    accounting_sales_component_df.to_dict("records")
-                    if not accounting_sales_component_df.empty
-                    else []
-                ),
-                "accounting_return_tieout_checks": (
-                    accounting_return_tieout_df.to_dict("records")
-                    if not accounting_return_tieout_df.empty
-                    else []
-                ),
-                "accounting_inventory_valuation_checks": (
-                    accounting_inventory_valuation_df.to_dict("records")
-                    if not accounting_inventory_valuation_df.empty
-                    else []
-                ),
-                "accounting_fee_evidence_checks": (
-                    accounting_fee_evidence_df.to_dict("records")
-                    if not accounting_fee_evidence_df.empty
-                    else []
-                ),
-                "accounting_shipping_evidence_checks": (
-                    accounting_shipping_evidence_df.to_dict("records")
-                    if not accounting_shipping_evidence_df.empty
-                    else []
-                ),
-                "accounting_reconciliation_tieout_checks": (
-                    accounting_reconciliation_tieout_df.to_dict("records")
-                    if not accounting_reconciliation_tieout_df.empty
-                    else []
-                ),
-                "accounting_cogs_source_checks": (
-                    accounting_cogs_source_df.to_dict("records")
-                    if not accounting_cogs_source_df.empty
-                    else []
-                ),
-                "sale_fifo_cogs_evidence_rows": (
-                    sale_fifo_cogs_evidence_df.head(50).to_dict("records")
-                    if not sale_fifo_cogs_evidence_df.empty
-                    else []
-                ),
-                "accounting_lot_allocation_checks": (
-                    accounting_lot_allocation_df.to_dict("records")
-                    if not accounting_lot_allocation_df.empty
-                    else []
-                ),
-                "accounting_exception_queue_checks": (
-                    accounting_exception_queue_checks_df.to_dict("records")
-                    if not accounting_exception_queue_checks_df.empty
-                    else []
-                ),
-                "accounting_margin_anomaly_checks": (
-                    accounting_margin_anomaly_checks_df.to_dict("records")
-                    if not accounting_margin_anomaly_checks_df.empty
-                    else []
-                ),
-                "accounting_close_consistency_checks": (
-                    accounting_close_consistency_checks_df.to_dict("records")
-                    if not accounting_close_consistency_checks_df.empty
-                    else []
-                ),
-                "accounting_close_packet_completeness_checks": (
-                    accounting_close_packet_completeness_df.to_dict("records")
-                    if not accounting_close_packet_completeness_df.empty
-                    else []
-                ),
-                "accounting_close_packet_manifest_checks": (
-                    accounting_close_packet_manifest_df.to_dict("records")
-                    if not accounting_close_packet_manifest_df.empty
-                    else []
-                ),
-                "accounting_close_packet_hash_checks": (
-                    accounting_close_packet_hash_df.to_dict("records")
-                    if not accounting_close_packet_hash_df.empty
-                    else []
-                ),
-                "accounting_close_packet_evidence_hash_rows": (
-                    accounting_close_packet_evidence_hash_df.to_dict("records")
-                    if not accounting_close_packet_evidence_hash_df.empty
-                    else []
-                ),
-                "accounting_period_drift_checks": (
-                    accounting_period_drift_df.to_dict("records")
-                    if not accounting_period_drift_df.empty
-                    else []
-                ),
-                "tax_review_summary": {
-                    "jurisdiction": str(tax_jurisdiction or tax_default_jurisdiction or ""),
-                    "tax_rate_percent": float(tax_rate_percent or 0.0),
-                    "shipping_taxable": bool(tax_shipping_taxable),
-                    "tax_packet_evidence_hash": current_tax_packet_hash,
-                    "marketplace_scope": tax_marketplace_scope_label,
-                    "facilitator_channels": sorted(facilitator_channels),
-                    "tax_exempt_categories": sorted(tax_exempt_categories),
-                    "tax_exception_count": int(len(tax_exceptions_df)),
-                },
-                "tax_profile_evidence": selected_tax_profile_context,
-                "tax_reporting_signoff_rows": (
-                    tax_signoff_df.head(20).to_dict("records")
-                    if not tax_signoff_df.empty
-                    else []
-                ),
-                "tax_reporting_signoff_review": (
-                    tax_reporting_signoff_review_df.to_dict("records")
-                    if not tax_reporting_signoff_review_df.empty
-                    else []
-                ),
-                "top_negative_fifo_margin_rows": _top_n_records(
-                    cogs_margin_df,
-                    sort_by="fifo_margin",
-                    ascending=True,
-                    n=10,
-                ),
-                "accounting_exception_rows": (
-                    accounting_exceptions_df.head(20).to_dict("records")
-                    if not accounting_exceptions_df.empty
-                    else []
-                ),
-                "top_margin_by_sku_rows": _top_n_records(
-                    margin_by_sku_df,
-                    sort_by="fifo_margin",
-                    ascending=False,
-                    n=10,
-                ),
-                "marketplace_reconciliation_rows": _top_n_by_abs_records(
-                    reconciliation_df,
-                    value_col="delta_order_total_vs_sales_gross",
-                    n=10,
-                ),
-                "validation_issue_rows": (
-                    accounting_validation_df.head(20).to_dict("records")
-                    if not accounting_validation_df.empty
-                    else []
-                ),
-            }
-            copilot_system_message = get_runtime_str(
-                repo,
-                "comp_llm_system_message",
-                "You are an accounting and operations reporting copilot.",
-            ).strip()
-            copilot_instruction = (
-                "Return ONLY JSON with keys: `executive_summary`, `margin_anomalies`, "
-                "`reconciliation_findings`, `tax_review_findings`, `recommended_exports`, `next_actions`. "
-                "Each key must be an array of concise bullet strings. When discussing profit, use "
-                "`profit_after_returns_summary.estimated_profit_after_returns` as the final estimated profit "
-                "and label `margin_snapshot.fifo_margin_before_returns_total` as before-return margin."
-            )
-            copilot_prompt = "Reports narrative summary and export recommendations"
-            copilot_started = time.perf_counter()
-            copilot_prompt_hash = _stable_json_sha256(
-                {
-                    "query": copilot_prompt,
-                    "system_message": copilot_system_message,
-                    "instruction": copilot_instruction,
+                    "accounting_sales_component_checks": (
+                        accounting_sales_component_df.to_dict("records")
+                        if not accounting_sales_component_df.empty
+                        else []
+                    ),
+                    "accounting_return_tieout_checks": (
+                        accounting_return_tieout_df.to_dict("records")
+                        if not accounting_return_tieout_df.empty
+                        else []
+                    ),
+                    "accounting_inventory_valuation_checks": (
+                        accounting_inventory_valuation_df.to_dict("records")
+                        if not accounting_inventory_valuation_df.empty
+                        else []
+                    ),
+                    "accounting_fee_evidence_checks": (
+                        accounting_fee_evidence_df.to_dict("records")
+                        if not accounting_fee_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_shipping_evidence_checks": (
+                        accounting_shipping_evidence_df.to_dict("records")
+                        if not accounting_shipping_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_reconciliation_tieout_checks": (
+                        accounting_reconciliation_tieout_df.to_dict("records")
+                        if not accounting_reconciliation_tieout_df.empty
+                        else []
+                    ),
+                    "accounting_cogs_source_checks": (
+                        accounting_cogs_source_df.to_dict("records")
+                        if not accounting_cogs_source_df.empty
+                        else []
+                    ),
+                    "sale_fifo_cogs_evidence_rows": (
+                        sale_fifo_cogs_evidence_df.head(50).to_dict("records")
+                        if not sale_fifo_cogs_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_lot_allocation_checks": (
+                        accounting_lot_allocation_df.to_dict("records")
+                        if not accounting_lot_allocation_df.empty
+                        else []
+                    ),
+                    "accounting_exception_queue_checks": (
+                        accounting_exception_queue_checks_df.to_dict("records")
+                        if not accounting_exception_queue_checks_df.empty
+                        else []
+                    ),
+                    "accounting_margin_anomaly_checks": (
+                        accounting_margin_anomaly_checks_df.to_dict("records")
+                        if not accounting_margin_anomaly_checks_df.empty
+                        else []
+                    ),
+                    "accounting_close_consistency_checks": (
+                        accounting_close_consistency_checks_df.to_dict("records")
+                        if not accounting_close_consistency_checks_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_completeness_checks": (
+                        accounting_close_packet_completeness_df.to_dict("records")
+                        if not accounting_close_packet_completeness_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_manifest_checks": (
+                        accounting_close_packet_manifest_df.to_dict("records")
+                        if not accounting_close_packet_manifest_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_hash_checks": (
+                        accounting_close_packet_hash_df.to_dict("records")
+                        if not accounting_close_packet_hash_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_evidence_hash_rows": (
+                        accounting_close_packet_evidence_hash_df.to_dict("records")
+                        if not accounting_close_packet_evidence_hash_df.empty
+                        else []
+                    ),
+                    "accounting_period_drift_checks": (
+                        accounting_period_drift_df.to_dict("records")
+                        if not accounting_period_drift_df.empty
+                        else []
+                    ),
+                    "tax_review_summary": {
+                        "jurisdiction": str(tax_jurisdiction or tax_default_jurisdiction or ""),
+                        "tax_rate_percent": float(tax_rate_percent or 0.0),
+                        "shipping_taxable": bool(tax_shipping_taxable),
+                        "tax_packet_evidence_hash": current_tax_packet_hash,
+                        "marketplace_scope": tax_marketplace_scope_label,
+                        "facilitator_channels": sorted(facilitator_channels),
+                        "tax_exempt_categories": sorted(tax_exempt_categories),
+                        "tax_exception_count": int(len(tax_exceptions_df)),
+                    },
+                    "tax_profile_evidence": selected_tax_profile_context,
+                    "tax_reporting_signoff_rows": (
+                        tax_signoff_df.head(20).to_dict("records")
+                        if not tax_signoff_df.empty
+                        else []
+                    ),
+                    "tax_reporting_signoff_review": (
+                        tax_reporting_signoff_review_df.to_dict("records")
+                        if not tax_reporting_signoff_review_df.empty
+                        else []
+                    ),
+                    "top_negative_fifo_margin_rows": _top_n_records(
+                        cogs_margin_df,
+                        sort_by="fifo_margin",
+                        ascending=True,
+                        n=10,
+                    ),
+                    "accounting_exception_rows": (
+                        accounting_exceptions_df.head(20).to_dict("records")
+                        if not accounting_exceptions_df.empty
+                        else []
+                    ),
+                    "top_margin_by_sku_rows": _top_n_records(
+                        margin_by_sku_df,
+                        sort_by="fifo_margin",
+                        ascending=False,
+                        n=10,
+                    ),
+                    "marketplace_reconciliation_rows": _top_n_by_abs_records(
+                        reconciliation_df,
+                        value_col="delta_order_total_vs_sales_gross",
+                        n=10,
+                    ),
+                    "validation_issue_rows": (
+                        accounting_validation_df.head(20).to_dict("records")
+                        if not accounting_validation_df.empty
+                        else []
+                    ),
                 }
-            )
-            copilot_data_scope = {
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "context_keys": sorted(context.keys()),
-                "context_hash_sha256": _stable_json_sha256(context),
-                "tax_packet_evidence_hash": current_tax_packet_hash,
-                "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
-                "row_counts": {
-                    "accounting_close_formula_checks": int(len(accounting_close_formula_df)),
-                    "accounting_sales_component_checks": int(len(accounting_sales_component_df)),
-                    "accounting_period_drift_checks": int(len(accounting_period_drift_df)),
-                    "accounting_exception_queue": int(len(accounting_exceptions_df)),
-                    "tax_reporting_signoffs": int(len(tax_signoff_df)),
-                    "tax_reporting_signoff_review": int(len(tax_reporting_signoff_review_df)),
-                    "validation_issue_rows": int(len(accounting_validation_df)),
-                },
-            }
-            result = execute_comp_summary(
-                repo,
-                query=copilot_prompt,
-                ebay_rows=[],
-                web_rows=[],
-                spot_context=context,
-                system_message=copilot_system_message,
-                instruction=copilot_instruction,
-            )
-            copilot_text = str(result.text or "").strip()
-            st.session_state["reports_copilot_raw"] = copilot_text
-            copilot_review_metadata = {
-                "event_type": "reports_copilot_review",
-                "surface": "reports",
-                "read_only": True,
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "prompt_hash_sha256": copilot_prompt_hash,
-                "data_scope_hash_sha256": str(copilot_data_scope.get("context_hash_sha256") or ""),
-                "data_scope": copilot_data_scope,
-                "context_keys": sorted(context.keys()),
-                "ai_citation": dict(getattr(result, "citation", {}) or {}),
-            }
-            st.session_state["reports_copilot_metadata"] = copilot_review_metadata
-            if hasattr(repo, "log_ai_chat_interaction"):
-                try:
-                    repo.log_ai_chat_interaction(
-                        actor=user.username,
-                        prompt=copilot_prompt,
-                        intent="reports_copilot_review",
-                        allowed_domains=["accounting", "reports", "sales", "orders", "inventory", "tax"],
-                        citations=[
-                            {
-                                "table": "accounting_close_readiness_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_checks_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_period_drift_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_period_drift_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_exception_queue",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_exceptions_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "tax_reporting_signoff_review",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(tax_reporting_signoff_review_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                        ],
-                        answer_preview=copilot_text,
-                        denied=False,
-                        elapsed_ms=int((time.perf_counter() - copilot_started) * 1000),
-                        metadata=copilot_review_metadata,
-                    )
-                except Exception:
-                    pass
-            st.success("Reports copilot analysis complete.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Reports copilot analysis failed: {exc}")
-
-    raw_reports_ai = str(st.session_state.get("reports_copilot_raw") or "").strip()
-    if raw_reports_ai:
-        with st.expander("Reports Copilot Result", expanded=False):
-            _render_ai_json_sections(
-                raw_reports_ai,
-                [
-                    ("executive_summary", "Executive Summary"),
-                    ("margin_anomalies", "Margin Anomalies"),
-                    ("reconciliation_findings", "Reconciliation Findings"),
-                    ("tax_review_findings", "Tax Review Findings"),
-                    ("recommended_exports", "Recommended Exports"),
-                    ("next_actions", "Next Actions"),
-                ],
-            )
-            st.code(raw_reports_ai, language="json")
-            feedback_cols = st.columns(3)
-            with feedback_cols[0]:
-                if st.button("Accept Copilot Review", key="reports_copilot_accept_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="reports_copilot_review",
-                        outcome="accepted",
-                        answer_text=raw_reports_ai,
-                        review_metadata=st.session_state.get("reports_copilot_metadata") or {},
-                    )
-                    st.success("Reports Copilot review acceptance recorded.")
-                    st.rerun()
-            with feedback_cols[1]:
-                if st.button("Copilot Needs Edits", key="reports_copilot_edit_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="reports_copilot_review",
-                        outcome="edited",
-                        answer_text=raw_reports_ai,
-                        review_metadata=st.session_state.get("reports_copilot_metadata") or {},
-                    )
-                    st.success("Reports Copilot review edit outcome recorded.")
-                    st.rerun()
-            with feedback_cols[2]:
-                if st.button("Reject Copilot Review", key="reports_copilot_reject_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="reports_copilot_review",
-                        outcome="rejected",
-                        answer_text=raw_reports_ai,
-                        review_metadata=st.session_state.get("reports_copilot_metadata") or {},
-                    )
-                    st.success("Reports Copilot review rejection recorded.")
-                    st.rerun()
-
-    st.markdown("### AI Accountant")
-    st.caption(
-        "Read-only accounting review with source-table citations. Drafted recommendations require human approval before any write action."
-    )
-    if st.button(
-        "Run AI Accountant Review",
-        key="reports_accountant_review_btn",
-        disabled=not load_extended_analytics,
-    ):
-        if not ensure_permission(user, "ai_accountant_use", "Use AI Accountant"):
-            st.stop()
-        try:
-            accountant_started = time.perf_counter()
-            accountant_context = {
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "accounting_close_readiness": dict(accounting_close_summary),
-                "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
-                "close_readiness_checks": (
-                    accounting_close_checks_df.to_dict("records")
-                    if not accounting_close_checks_df.empty
-                    else []
-                ),
-                "accounting_close_formula_checks": (
-                    accounting_close_formula_df.to_dict("records")
-                    if not accounting_close_formula_df.empty
-                    else []
-                ),
-                "accounting_sales_component_checks": (
-                    accounting_sales_component_df.to_dict("records")
-                    if not accounting_sales_component_df.empty
-                    else []
-                ),
-                "accounting_return_tieout_checks": (
-                    accounting_return_tieout_df.to_dict("records")
-                    if not accounting_return_tieout_df.empty
-                    else []
-                ),
-                "accounting_inventory_valuation_checks": (
-                    accounting_inventory_valuation_df.to_dict("records")
-                    if not accounting_inventory_valuation_df.empty
-                    else []
-                ),
-                "accounting_fee_evidence_checks": (
-                    accounting_fee_evidence_df.to_dict("records")
-                    if not accounting_fee_evidence_df.empty
-                    else []
-                ),
-                "accounting_shipping_evidence_checks": (
-                    accounting_shipping_evidence_df.to_dict("records")
-                    if not accounting_shipping_evidence_df.empty
-                    else []
-                ),
-                "accounting_reconciliation_tieout_checks": (
-                    accounting_reconciliation_tieout_df.to_dict("records")
-                    if not accounting_reconciliation_tieout_df.empty
-                    else []
-                ),
-                "accounting_cogs_source_checks": (
-                    accounting_cogs_source_df.to_dict("records")
-                    if not accounting_cogs_source_df.empty
-                    else []
-                ),
-                "sale_fifo_cogs_evidence_rows": (
-                    sale_fifo_cogs_evidence_df.head(50).to_dict("records")
-                    if not sale_fifo_cogs_evidence_df.empty
-                    else []
-                ),
-                "accounting_lot_allocation_checks": (
-                    accounting_lot_allocation_df.to_dict("records")
-                    if not accounting_lot_allocation_df.empty
-                    else []
-                ),
-                "accounting_exception_queue_checks": (
-                    accounting_exception_queue_checks_df.to_dict("records")
-                    if not accounting_exception_queue_checks_df.empty
-                    else []
-                ),
-                "accounting_margin_anomaly_checks": (
-                    accounting_margin_anomaly_checks_df.to_dict("records")
-                    if not accounting_margin_anomaly_checks_df.empty
-                    else []
-                ),
-                "accounting_close_consistency_checks": (
-                    accounting_close_consistency_checks_df.to_dict("records")
-                    if not accounting_close_consistency_checks_df.empty
-                    else []
-                ),
-                "accounting_close_packet_completeness_checks": (
-                    accounting_close_packet_completeness_df.to_dict("records")
-                    if not accounting_close_packet_completeness_df.empty
-                    else []
-                ),
-                "accounting_close_packet_manifest_checks": (
-                    accounting_close_packet_manifest_df.to_dict("records")
-                    if not accounting_close_packet_manifest_df.empty
-                    else []
-                ),
-                "accounting_close_packet_hash_checks": (
-                    accounting_close_packet_hash_df.to_dict("records")
-                    if not accounting_close_packet_hash_df.empty
-                    else []
-                ),
-                "accounting_close_packet_evidence_hash_rows": (
-                    accounting_close_packet_evidence_hash_df.to_dict("records")
-                    if not accounting_close_packet_evidence_hash_df.empty
-                    else []
-                ),
-                "accounting_period_drift_checks": (
-                    accounting_period_drift_df.to_dict("records")
-                    if not accounting_period_drift_df.empty
-                    else []
-                ),
-                "accounting_period_drift_summary": {
-                    "check_count": int(len(accounting_period_drift_df)),
-                    "warn_count": (
-                        int((accounting_period_drift_df["status"].astype(str) == "warn").sum())
-                        if not accounting_period_drift_df.empty and "status" in accounting_period_drift_df.columns
-                        else 0
-                    ),
-                },
-                "accounting_exception_rows": (
-                    accounting_exceptions_df.head(50).to_dict("records")
-                    if not accounting_exceptions_df.empty
-                    else []
-                ),
-                "lot_allocation_source_summary": (
-                    lot_allocation_source_summary_df.to_dict("records")
-                    if not lot_allocation_source_summary_df.empty
-                    else []
-                ),
-                "sold_cogs_source_summary": (
-                    cogs_source_summary_df.to_dict("records")
-                    if not cogs_source_summary_df.empty
-                    else []
-                ),
-                "cogs_margin_summary": {
-                    "gross_sales_total": float(report_scalar_cache.get("cogs_gross_sales_total") or 0.0),
-                    "fifo_margin_before_returns_total": float(
-                        report_scalar_cache.get("cogs_fifo_margin_total") or 0.0
-                    ),
-                    "lot_margin_total": float(report_scalar_cache.get("cogs_lot_margin_total") or 0.0),
-                    "negative_fifo_margin_rows": int(report_scalar_cache.get("cogs_negative_fifo_rows") or 0),
-                },
-                "profit_after_returns_summary": close_profit_summary,
-                "reconciliation_flags": int(report_scalar_cache.get("reconcile_flags") or 0),
-                "shipping_economics_rows": (
-                    shipping_economics_df.head(30).to_dict("records")
-                    if not shipping_economics_df.empty
-                    else []
-                ),
-                "fee_reconciliation_rows": (
-                    ebay_fee_reconciliation_df.head(30).to_dict("records")
-                    if not ebay_fee_reconciliation_df.empty
-                    else []
-                ),
-                "tax_review_summary": {
-                    "jurisdiction": str(tax_jurisdiction or tax_default_jurisdiction or ""),
-                    "tax_rate_percent": float(tax_rate_percent or 0.0),
-                    "shipping_taxable": bool(tax_shipping_taxable),
+                copilot_system_message = get_runtime_str(
+                    repo,
+                    "comp_llm_system_message",
+                    "You are an accounting and operations reporting copilot.",
+                ).strip()
+                copilot_instruction = (
+                    "Return ONLY JSON with keys: `executive_summary`, `margin_anomalies`, "
+                    "`reconciliation_findings`, `tax_review_findings`, `recommended_exports`, `next_actions`. "
+                    "Each key must be an array of concise bullet strings. When discussing profit, use "
+                    "`profit_after_returns_summary.estimated_profit_after_returns` as the final estimated profit "
+                    "and label `margin_snapshot.fifo_margin_before_returns_total` as before-return margin."
+                )
+                copilot_prompt = "Reports narrative summary and export recommendations"
+                copilot_started = time.perf_counter()
+                copilot_prompt_hash = _stable_json_sha256(
+                    {
+                        "query": copilot_prompt,
+                        "system_message": copilot_system_message,
+                        "instruction": copilot_instruction,
+                    }
+                )
+                copilot_data_scope = {
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "context_keys": sorted(context.keys()),
+                    "context_hash_sha256": _stable_json_sha256(context),
                     "tax_packet_evidence_hash": current_tax_packet_hash,
-                    "marketplace_scope": tax_marketplace_scope_label,
-                    "facilitator_channels": sorted(facilitator_channels),
-                    "tax_exempt_categories": sorted(tax_exempt_categories),
-                    "tax_exception_count": int(len(tax_exceptions_df)),
-                },
-                "tax_profile_evidence": selected_tax_profile_context,
-                "tax_reporting_signoff_rows": (
-                    tax_signoff_df.head(20).to_dict("records")
-                    if not tax_signoff_df.empty
-                    else []
-                ),
-                "tax_reporting_signoff_review": (
-                    tax_reporting_signoff_review_df.to_dict("records")
-                    if not tax_reporting_signoff_review_df.empty
-                    else []
-                ),
-                "accounting_close_signoff_rows": (
-                    accounting_close_signoff_df.head(20).to_dict("records")
-                    if not accounting_close_signoff_df.empty
-                    else []
-                ),
-                "accounting_close_signoff_review": (
-                    accounting_close_signoff_review_df.to_dict("records")
-                    if not accounting_close_signoff_review_df.empty
-                    else []
-                ),
-                "ai_review_outcome_rows": (
-                    ai_review_outcomes_df.head(20).to_dict("records")
-                    if not ai_review_outcomes_df.empty
-                    else []
-                ),
-            }
-            accountant_system_message = get_runtime_str(
-                repo,
-                "accountant_llm_system_message",
-                (
-                    "You are GoldenStackers' read-only AI Accountant. Cite source tables/rows, "
-                    "label estimated versus actual values, and never provide tax/legal conclusions."
-                ),
-            ).strip()
-            accountant_instruction = (
-                "Return ONLY JSON with keys: `close_status`, `profit_basis_notes`, "
-                "`lot_cost_findings`, `fee_shipping_findings`, `recommended_human_actions`, "
-                "`unsupported_tax_or_legal_items`. Values must be concise arrays or strings. "
-                "Explicitly review `accounting_period_drift_checks` for dashboard/QBO drift. "
-                "Review `accounting_close_formula_checks` to confirm close arithmetic ties out before sign-off. "
-                "When discussing profit, use `profit_after_returns_summary.estimated_profit_after_returns` as final estimated profit "
-                "and label `cogs_margin_summary.fifo_margin_before_returns_total` as before-return margin. "
-                "Review `accounting_sales_component_checks` to confirm Sales Detail fee/shipping/label components tie to COGS & Margin close totals. "
-                "Review `accounting_return_tieout_checks` to confirm refund totals, return COGS reversals, and QBO adjustment staging tie out. "
-                "Review `accounting_inventory_valuation_checks` to confirm stocked inventory has landed cost and inventory value ties to close readiness. "
-                "Review `accounting_fee_evidence_checks` to confirm fee reconciliation/source-priority evidence ties to Sales Detail and identify fallback fee rows. "
-                "Review `accounting_shipping_evidence_checks` to confirm shipping charged, label spend, and shipping delta tie across Sales Detail and Shipping Economics. "
-                "Review `accounting_reconciliation_tieout_checks` to confirm marketplace reconciliation totals tie to Sales Detail, Returns, and close flags. "
-                "Review `accounting_cogs_source_checks` to confirm sold COGS source totals tie to COGS & Margin and identify fallback/missing-basis COGS. "
-                "When COGS evidence checks warn, review `sale_fifo_cogs_evidence_rows` to trace sale COGS back to product, lot, assignment, quantity, unit cost, total cost, and source. "
-                "Review `accounting_lot_allocation_checks` to confirm Lot Allocation Source Summary ties to Lot Assignment detail and identify fallback/missing-basis assignments. "
-                "Review `accounting_exception_queue_checks` to confirm exception counts and severities tie to close readiness and P0 exceptions remain blocking. "
-                "Review `accounting_margin_anomaly_checks` to confirm nonpositive COGS & Margin rows tie to exception evidence and negative margin rows remain close blockers. "
-                "Review `accounting_close_consistency_checks` to confirm close readiness status, blocker/warning counts, and close-check statuses are internally consistent. "
-                "Review `accounting_close_packet_completeness_checks` to confirm required close-packet evidence artifacts are present before relying on sign-off evidence. "
-                "Review `accounting_close_packet_manifest_checks` to confirm close-packet manifest row counts match selected export dataframes. "
-                "Review `accounting_close_packet_hash_checks` to confirm close-packet CSV hashes are available for integrity review. "
-                "Review `accounting_close_packet_evidence_hash_rows` to identify the current packet evidence hash for sign-off comparison. "
-                    "Review `accounting_close_signoff_rows` and `accounting_close_signoff_review` for owner/date/packet evidence, packet evidence hash match, and stale or contradictory approval evidence before saying a period is sign-off ready. "
-                    "Review `ai_review_outcome_rows` for accepted, edited, or rejected Copilot/AI Accountant feedback tied to prior review evidence. "
-                    "Review `tax_reporting_signoff_review` for selected tax profile/jurisdiction, exception count, advisor evidence, and Tax Review Packet hash mismatches; "
-                "use tax profile/sign-off evidence only to summarize configured assumptions and advisor-review status; "
-                "route filing/remittance/legal conclusions to `unsupported_tax_or_legal_items`. "
-                "Do not propose direct writes; draft only human-review recommendations."
-            )
-            accountant_prompt = "AI Accountant close-readiness review"
-            accountant_prompt_hash = _stable_json_sha256(
-                {
-                    "query": accountant_prompt,
-                    "system_message": accountant_system_message,
-                    "instruction": accountant_instruction,
+                    "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
+                    "row_counts": {
+                        "accounting_close_formula_checks": int(len(accounting_close_formula_df)),
+                        "accounting_sales_component_checks": int(len(accounting_sales_component_df)),
+                        "accounting_period_drift_checks": int(len(accounting_period_drift_df)),
+                        "accounting_exception_queue": int(len(accounting_exceptions_df)),
+                        "tax_reporting_signoffs": int(len(tax_signoff_df)),
+                        "tax_reporting_signoff_review": int(len(tax_reporting_signoff_review_df)),
+                        "validation_issue_rows": int(len(accounting_validation_df)),
+                    },
                 }
-            )
-            accountant_data_scope = {
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "context_keys": sorted(accountant_context.keys()),
-                "context_hash_sha256": _stable_json_sha256(accountant_context),
-                "tax_packet_evidence_hash": current_tax_packet_hash,
-                "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
-                "row_counts": {
-                    "accounting_close_readiness_checks": int(len(accounting_close_checks_df)),
-                    "accounting_period_drift_checks": int(len(accounting_period_drift_df)),
-                    "accounting_exception_queue": int(len(accounting_exceptions_df)),
-                    "sale_fifo_cogs_evidence": int(len(sale_fifo_cogs_evidence_df)),
-                    "accounting_close_signoffs": int(len(accounting_close_signoff_df)),
-                    "accounting_close_signoff_review": int(len(accounting_close_signoff_review_df)),
-                    "ai_review_outcomes": int(len(ai_review_outcomes_df)),
-                    "tax_reporting_signoffs": int(len(tax_signoff_df)),
-                    "tax_reporting_signoff_review": int(len(tax_reporting_signoff_review_df)),
-                },
-            }
-            result = execute_comp_summary(
-                repo,
-                query=accountant_prompt,
-                ebay_rows=[],
-                web_rows=[],
-                spot_context=accountant_context,
-                system_message=accountant_system_message,
-                instruction=accountant_instruction,
-            )
-            accountant_text = str(result.text or "").strip()
-            st.session_state["reports_accountant_raw"] = accountant_text
-            accountant_elapsed_ms = int((time.perf_counter() - accountant_started) * 1000)
-            accountant_review_metadata = {
-                "event_type": "ai_accountant_review",
-                "surface": "reports",
-                "read_only": True,
-                "requires_human_approval_for_writes": True,
-                "tax_legal_guardrail": "unsupported conclusions routed to human review",
-                "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
-                "prompt_hash_sha256": accountant_prompt_hash,
-                "data_scope_hash_sha256": str(
-                    accountant_data_scope.get("context_hash_sha256") or ""
-                ),
-                "data_scope": accountant_data_scope,
-                "context_keys": sorted(accountant_context.keys()),
-                "ai_citation": dict(getattr(result, "citation", {}) or {}),
-            }
-            st.session_state["reports_accountant_metadata"] = accountant_review_metadata
-            if hasattr(repo, "log_ai_chat_interaction"):
-                try:
-                    repo.log_ai_chat_interaction(
-                        actor=user.username,
-                        prompt="AI Accountant close-readiness review",
-                        intent="reports_ai_accountant_review",
-                        allowed_domains=["accounting", "reports", "sales", "orders", "inventory", "tax"],
-                        citations=[
-                            {
-                                "table": "accounting_close_readiness_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_checks_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_exception_queue",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_exceptions_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_period_drift_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_period_drift_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_formula_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_formula_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_sales_component_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_sales_component_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_return_tieout_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_return_tieout_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_inventory_valuation_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_inventory_valuation_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_fee_evidence_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_fee_evidence_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_shipping_evidence_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_shipping_evidence_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_reconciliation_tieout_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_reconciliation_tieout_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_cogs_source_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_cogs_source_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "sale_fifo_cogs_evidence",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(sale_fifo_cogs_evidence_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_lot_allocation_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_lot_allocation_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_exception_queue_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_exception_queue_checks_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_margin_anomaly_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_margin_anomaly_checks_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_consistency_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_consistency_checks_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_packet_completeness_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_packet_completeness_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_packet_manifest_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_packet_manifest_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_packet_hash_checks",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_packet_hash_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_packet_evidence_hash",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_packet_evidence_hash_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_signoffs",
-                                "filters": "latest_audit_records",
-                                "rows_considered": int(len(accounting_close_signoff_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "accounting_close_signoff_review",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(accounting_close_signoff_review_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "ai_review_outcomes",
-                                "filters": "latest_audit_records",
-                                "rows_considered": int(len(ai_review_outcomes_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "lot_allocation_source_summary",
-                                "filters": "grouped_by=cost_source",
-                                "rows_considered": int(len(lot_allocation_source_summary_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "tax_profile",
-                                "filters": "selected_saved_profile",
-                                "rows_considered": 1 if selected_tax_profile_context else 0,
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "tax_reporting_signoffs",
-                                "filters": "latest_audit_records",
-                                "rows_considered": int(len(tax_signoff_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                            {
-                                "table": "tax_reporting_signoff_review",
-                                "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
-                                "rows_considered": int(len(tax_reporting_signoff_review_df)),
-                                "as_of_utc": datetime.now(timezone.utc).isoformat(),
-                            },
-                        ],
-                        answer_preview=accountant_text,
-                        denied=False,
-                        elapsed_ms=accountant_elapsed_ms,
-                        metadata=accountant_review_metadata,
-                    )
-                except Exception:
-                    pass
-            st.success("AI Accountant review complete.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"AI Accountant review failed: {exc}")
+                result = execute_comp_summary(
+                    repo,
+                    query=copilot_prompt,
+                    ebay_rows=[],
+                    web_rows=[],
+                    spot_context=context,
+                    system_message=copilot_system_message,
+                    instruction=copilot_instruction,
+                )
+                copilot_text = str(result.text or "").strip()
+                st.session_state["reports_copilot_raw"] = copilot_text
+                copilot_review_metadata = {
+                    "event_type": "reports_copilot_review",
+                    "surface": "reports",
+                    "read_only": True,
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "prompt_hash_sha256": copilot_prompt_hash,
+                    "data_scope_hash_sha256": str(copilot_data_scope.get("context_hash_sha256") or ""),
+                    "data_scope": copilot_data_scope,
+                    "context_keys": sorted(context.keys()),
+                    "ai_citation": dict(getattr(result, "citation", {}) or {}),
+                }
+                st.session_state["reports_copilot_metadata"] = copilot_review_metadata
+                if hasattr(repo, "log_ai_chat_interaction"):
+                    try:
+                        repo.log_ai_chat_interaction(
+                            actor=user.username,
+                            prompt=copilot_prompt,
+                            intent="reports_copilot_review",
+                            allowed_domains=["accounting", "reports", "sales", "orders", "inventory", "tax"],
+                            citations=[
+                                {
+                                    "table": "accounting_close_readiness_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_checks_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_period_drift_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_period_drift_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_exception_queue",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_exceptions_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "tax_reporting_signoff_review",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(tax_reporting_signoff_review_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                            ],
+                            answer_preview=copilot_text,
+                            denied=False,
+                            elapsed_ms=int((time.perf_counter() - copilot_started) * 1000),
+                            metadata=copilot_review_metadata,
+                        )
+                    except Exception:
+                        pass
+                st.success("Reports copilot analysis complete.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Reports copilot analysis failed: {exc}")
 
-    raw_accountant_ai = str(st.session_state.get("reports_accountant_raw") or "").strip()
-    if raw_accountant_ai:
-        with st.expander("AI Accountant Result", expanded=False):
-            _render_ai_json_sections(
-                raw_accountant_ai,
-                [
-                    ("close_status", "Close Status"),
-                    ("profit_basis_notes", "Profit Basis Notes"),
-                    ("lot_cost_findings", "Lot Cost Findings"),
-                    ("fee_shipping_findings", "Fee and Shipping Findings"),
-                    ("recommended_human_actions", "Recommended Human Actions"),
-                    ("unsupported_tax_or_legal_items", "Unsupported Tax or Legal Items"),
-                ],
-            )
-            st.code(raw_accountant_ai, language="json")
-            feedback_cols = st.columns(3)
-            with feedback_cols[0]:
-                if st.button("Accept AI Accountant Review", key="reports_accountant_accept_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="ai_accountant_review",
-                        outcome="accepted",
-                        answer_text=raw_accountant_ai,
-                        review_metadata=st.session_state.get("reports_accountant_metadata") or {},
-                    )
-                    st.success("AI Accountant review acceptance recorded.")
-                    st.rerun()
-            with feedback_cols[1]:
-                if st.button("AI Accountant Needs Edits", key="reports_accountant_edit_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="ai_accountant_review",
-                        outcome="edited",
-                        answer_text=raw_accountant_ai,
-                        review_metadata=st.session_state.get("reports_accountant_metadata") or {},
-                    )
-                    st.success("AI Accountant review edit outcome recorded.")
-                    st.rerun()
-            with feedback_cols[2]:
-                if st.button("Reject AI Accountant Review", key="reports_accountant_reject_btn"):
-                    _log_reports_ai_outcome(
-                        repo,
-                        actor=user.username,
-                        review_type="ai_accountant_review",
-                        outcome="rejected",
-                        answer_text=raw_accountant_ai,
-                        review_metadata=st.session_state.get("reports_accountant_metadata") or {},
-                    )
-                    st.success("AI Accountant review rejection recorded.")
-                    st.rerun()
+        raw_reports_ai = str(st.session_state.get("reports_copilot_raw") or "").strip()
+        if raw_reports_ai:
+            with st.expander("Reports Copilot Result", expanded=False):
+                _render_ai_json_sections(
+                    raw_reports_ai,
+                    [
+                        ("executive_summary", "Executive Summary"),
+                        ("margin_anomalies", "Margin Anomalies"),
+                        ("reconciliation_findings", "Reconciliation Findings"),
+                        ("tax_review_findings", "Tax Review Findings"),
+                        ("recommended_exports", "Recommended Exports"),
+                        ("next_actions", "Next Actions"),
+                    ],
+                )
+                st.code(raw_reports_ai, language="json")
+                feedback_cols = st.columns(3)
+                with feedback_cols[0]:
+                    if st.button("Accept Copilot Review", key="reports_copilot_accept_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="reports_copilot_review",
+                            outcome="accepted",
+                            answer_text=raw_reports_ai,
+                            review_metadata=st.session_state.get("reports_copilot_metadata") or {},
+                        )
+                        st.success("Reports Copilot review acceptance recorded.")
+                        st.rerun()
+                with feedback_cols[1]:
+                    if st.button("Copilot Needs Edits", key="reports_copilot_edit_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="reports_copilot_review",
+                            outcome="edited",
+                            answer_text=raw_reports_ai,
+                            review_metadata=st.session_state.get("reports_copilot_metadata") or {},
+                        )
+                        st.success("Reports Copilot review edit outcome recorded.")
+                        st.rerun()
+                with feedback_cols[2]:
+                    if st.button("Reject Copilot Review", key="reports_copilot_reject_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="reports_copilot_review",
+                            outcome="rejected",
+                            answer_text=raw_reports_ai,
+                            review_metadata=st.session_state.get("reports_copilot_metadata") or {},
+                        )
+                        st.success("Reports Copilot review rejection recorded.")
+                        st.rerun()
 
-    reports = [
+        st.markdown(f"### {AI_ACCOUNTANT_NAME}")
+        st.caption(
+            "Read-only accounting review with source-table citations. Drafted recommendations require human approval before any write action."
+        )
+        if st.button(
+            f"Run {AI_ACCOUNTANT_NAME} Review",
+            key="reports_accountant_review_btn",
+            disabled=not load_extended_analytics,
+        ):
+            if not ensure_permission(user, "ai_accountant_use", f"Use {AI_ACCOUNTANT_NAME}"):
+                st.stop()
+            try:
+                accountant_started = time.perf_counter()
+                accountant_context = {
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "accounting_close_readiness": dict(accounting_close_summary),
+                    "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
+                    "close_readiness_checks": (
+                        accounting_close_checks_df.to_dict("records")
+                        if not accounting_close_checks_df.empty
+                        else []
+                    ),
+                    "accounting_close_formula_checks": (
+                        accounting_close_formula_df.to_dict("records")
+                        if not accounting_close_formula_df.empty
+                        else []
+                    ),
+                    "accounting_sales_component_checks": (
+                        accounting_sales_component_df.to_dict("records")
+                        if not accounting_sales_component_df.empty
+                        else []
+                    ),
+                    "accounting_return_tieout_checks": (
+                        accounting_return_tieout_df.to_dict("records")
+                        if not accounting_return_tieout_df.empty
+                        else []
+                    ),
+                    "accounting_inventory_valuation_checks": (
+                        accounting_inventory_valuation_df.to_dict("records")
+                        if not accounting_inventory_valuation_df.empty
+                        else []
+                    ),
+                    "accounting_fee_evidence_checks": (
+                        accounting_fee_evidence_df.to_dict("records")
+                        if not accounting_fee_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_shipping_evidence_checks": (
+                        accounting_shipping_evidence_df.to_dict("records")
+                        if not accounting_shipping_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_reconciliation_tieout_checks": (
+                        accounting_reconciliation_tieout_df.to_dict("records")
+                        if not accounting_reconciliation_tieout_df.empty
+                        else []
+                    ),
+                    "accounting_cogs_source_checks": (
+                        accounting_cogs_source_df.to_dict("records")
+                        if not accounting_cogs_source_df.empty
+                        else []
+                    ),
+                    "sale_fifo_cogs_evidence_rows": (
+                        sale_fifo_cogs_evidence_df.head(50).to_dict("records")
+                        if not sale_fifo_cogs_evidence_df.empty
+                        else []
+                    ),
+                    "accounting_lot_allocation_checks": (
+                        accounting_lot_allocation_df.to_dict("records")
+                        if not accounting_lot_allocation_df.empty
+                        else []
+                    ),
+                    "accounting_exception_queue_checks": (
+                        accounting_exception_queue_checks_df.to_dict("records")
+                        if not accounting_exception_queue_checks_df.empty
+                        else []
+                    ),
+                    "accounting_margin_anomaly_checks": (
+                        accounting_margin_anomaly_checks_df.to_dict("records")
+                        if not accounting_margin_anomaly_checks_df.empty
+                        else []
+                    ),
+                    "accounting_close_consistency_checks": (
+                        accounting_close_consistency_checks_df.to_dict("records")
+                        if not accounting_close_consistency_checks_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_completeness_checks": (
+                        accounting_close_packet_completeness_df.to_dict("records")
+                        if not accounting_close_packet_completeness_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_manifest_checks": (
+                        accounting_close_packet_manifest_df.to_dict("records")
+                        if not accounting_close_packet_manifest_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_hash_checks": (
+                        accounting_close_packet_hash_df.to_dict("records")
+                        if not accounting_close_packet_hash_df.empty
+                        else []
+                    ),
+                    "accounting_close_packet_evidence_hash_rows": (
+                        accounting_close_packet_evidence_hash_df.to_dict("records")
+                        if not accounting_close_packet_evidence_hash_df.empty
+                        else []
+                    ),
+                    "accounting_period_drift_checks": (
+                        accounting_period_drift_df.to_dict("records")
+                        if not accounting_period_drift_df.empty
+                        else []
+                    ),
+                    "accounting_period_drift_summary": {
+                        "check_count": int(len(accounting_period_drift_df)),
+                        "warn_count": (
+                            int((accounting_period_drift_df["status"].astype(str) == "warn").sum())
+                            if not accounting_period_drift_df.empty and "status" in accounting_period_drift_df.columns
+                            else 0
+                        ),
+                    },
+                    "accounting_exception_rows": (
+                        accounting_exceptions_df.head(50).to_dict("records")
+                        if not accounting_exceptions_df.empty
+                        else []
+                    ),
+                    "lot_allocation_source_summary": (
+                        lot_allocation_source_summary_df.to_dict("records")
+                        if not lot_allocation_source_summary_df.empty
+                        else []
+                    ),
+                    "sold_cogs_source_summary": (
+                        cogs_source_summary_df.to_dict("records")
+                        if not cogs_source_summary_df.empty
+                        else []
+                    ),
+                    "cogs_margin_summary": {
+                        "gross_sales_total": float(report_scalar_cache.get("cogs_gross_sales_total") or 0.0),
+                        "fifo_margin_before_returns_total": float(
+                            report_scalar_cache.get("cogs_fifo_margin_total") or 0.0
+                        ),
+                        "lot_margin_total": float(report_scalar_cache.get("cogs_lot_margin_total") or 0.0),
+                        "negative_fifo_margin_rows": int(report_scalar_cache.get("cogs_negative_fifo_rows") or 0),
+                    },
+                    "profit_after_returns_summary": close_profit_summary,
+                    "sold_cogs_evidence_split": {
+                        "verified_amount": float(accounting_close_summary.get("sold_verified_cogs") or 0.0),
+                        "estimated_amount": float(accounting_close_summary.get("sold_estimated_cogs") or 0.0),
+                        "review_needed_amount": float(accounting_close_summary.get("sold_review_needed_cogs") or 0.0),
+                        "mixed_verified_amount": float(
+                            accounting_close_summary.get("sold_mixed_verified_fifo_cogs") or 0.0
+                        ),
+                        "mixed_estimate_amount": float(
+                            accounting_close_summary.get("sold_mixed_estimate_fifo_cogs") or 0.0
+                        ),
+                        "mixed_review_needed_amount": float(accounting_close_summary.get("sold_mixed_fifo_cogs") or 0.0),
+                        "verified_sale_count": int(_safe_float(accounting_close_summary.get("sold_verified_sale_count"))),
+                        "estimated_sale_count": int(_safe_float(accounting_close_summary.get("sold_estimated_sale_count"))),
+                        "review_needed_sale_count": int(
+                            _safe_float(accounting_close_summary.get("sold_review_needed_sale_count"))
+                        ),
+                    },
+                    "reconciliation_flags": int(report_scalar_cache.get("reconcile_flags") or 0),
+                    "shipping_economics_rows": (
+                        shipping_economics_df.head(30).to_dict("records")
+                        if not shipping_economics_df.empty
+                        else []
+                    ),
+                    "fee_reconciliation_rows": (
+                        ebay_fee_reconciliation_df.head(30).to_dict("records")
+                        if not ebay_fee_reconciliation_df.empty
+                        else []
+                    ),
+                    "tax_review_summary": {
+                        "jurisdiction": str(tax_jurisdiction or tax_default_jurisdiction or ""),
+                        "tax_rate_percent": float(tax_rate_percent or 0.0),
+                        "shipping_taxable": bool(tax_shipping_taxable),
+                        "tax_packet_evidence_hash": current_tax_packet_hash,
+                        "marketplace_scope": tax_marketplace_scope_label,
+                        "facilitator_channels": sorted(facilitator_channels),
+                        "tax_exempt_categories": sorted(tax_exempt_categories),
+                        "tax_exception_count": int(len(tax_exceptions_df)),
+                    },
+                    "tax_profile_evidence": selected_tax_profile_context,
+                    "tax_reporting_signoff_rows": (
+                        tax_signoff_df.head(20).to_dict("records")
+                        if not tax_signoff_df.empty
+                        else []
+                    ),
+                    "tax_reporting_signoff_review": (
+                        tax_reporting_signoff_review_df.to_dict("records")
+                        if not tax_reporting_signoff_review_df.empty
+                        else []
+                    ),
+                    "accounting_close_signoff_rows": (
+                        accounting_close_signoff_df.head(20).to_dict("records")
+                        if not accounting_close_signoff_df.empty
+                        else []
+                    ),
+                    "accounting_close_signoff_review": (
+                        accounting_close_signoff_review_df.to_dict("records")
+                        if not accounting_close_signoff_review_df.empty
+                        else []
+                    ),
+                    "ai_review_outcome_rows": (
+                        ai_review_outcomes_df.head(20).to_dict("records")
+                        if not ai_review_outcomes_df.empty
+                        else []
+                    ),
+                }
+                accountant_system_message = get_runtime_str(
+                    repo,
+                    "accountant_llm_system_message",
+                    (
+                        f"You are {AI_ACCOUNTANT_NAME}, GoldenStackers' read-only accounting specialist. Cite source tables/rows, "
+                        "label estimated versus actual values, and never provide tax/legal conclusions."
+                    ),
+                ).strip()
+                accountant_instruction = (
+                    "Return ONLY JSON with keys: `close_status`, `profit_basis_notes`, "
+                    "`lot_cost_findings`, `fee_shipping_findings`, `recommended_human_actions`, "
+                    "`unsupported_tax_or_legal_items`. Values must be concise arrays or strings. "
+                    "Explicitly review `accounting_period_drift_checks` for dashboard/QBO drift. "
+                    "Review `accounting_close_formula_checks` to confirm close arithmetic ties out before sign-off. "
+                    "When discussing profit, use `profit_after_returns_summary.estimated_profit_after_returns` as final estimated profit "
+                    "and label `cogs_margin_summary.fifo_margin_before_returns_total` as before-return margin. "
+                    "Review `sold_cogs_evidence_split` before trusting profit: verified COGS is strongest, estimated COGS needs final lot allocation review, "
+                    "and review-needed COGS must be corrected or explicitly accepted before close sign-off. "
+                    "Review `accounting_sales_component_checks` to confirm Sales Detail fee/shipping/label components tie to COGS & Margin close totals. "
+                    "Review `accounting_return_tieout_checks` to confirm refund totals, return COGS reversals, and QBO adjustment staging tie out. "
+                    "Review `accounting_inventory_valuation_checks` to confirm stocked inventory has landed cost and inventory value ties to close readiness. "
+                    "Review `accounting_fee_evidence_checks` to confirm fee reconciliation/source-priority evidence ties to Sales Detail and identify fallback fee rows. "
+                    "Review `accounting_shipping_evidence_checks` to confirm shipping charged, label spend, and shipping delta tie across Sales Detail and Shipping Economics. "
+                    "Review `accounting_reconciliation_tieout_checks` to confirm marketplace reconciliation totals tie to Sales Detail, Returns, and close flags. "
+                    "Review `accounting_cogs_source_checks` to confirm sold COGS source totals tie to COGS & Margin and identify fallback/missing-basis COGS. "
+                    "When COGS evidence checks warn, review `sale_fifo_cogs_evidence_rows` to trace sale COGS back to product, lot, assignment, quantity, unit cost, total cost, and source. "
+                    "Review `accounting_lot_allocation_checks` to confirm Lot Allocation Source Summary ties to Lot Assignment detail and identify fallback/missing-basis assignments. "
+                    "Review `accounting_exception_queue_checks` to confirm exception counts and severities tie to close readiness and P0 exceptions remain blocking. "
+                    "Review `accounting_margin_anomaly_checks` to confirm nonpositive COGS & Margin rows tie to exception evidence and negative margin rows remain close blockers. "
+                    "Review `accounting_close_consistency_checks` to confirm close readiness status, blocker/warning counts, and close-check statuses are internally consistent. "
+                    "Review `accounting_close_packet_completeness_checks` to confirm required close-packet evidence artifacts are present before relying on sign-off evidence. "
+                    "Review `accounting_close_packet_manifest_checks` to confirm close-packet manifest row counts match selected export dataframes. "
+                    "Review `accounting_close_packet_hash_checks` to confirm close-packet CSV hashes are available for integrity review. "
+                    "Review `accounting_close_packet_evidence_hash_rows` to identify the current packet evidence hash for sign-off comparison. "
+                        "Review `accounting_close_signoff_rows` and `accounting_close_signoff_review` for owner/date/packet evidence, packet evidence hash match, and stale or contradictory approval evidence before saying a period is sign-off ready. "
+                        f"Review `ai_review_outcome_rows` for accepted, edited, or rejected Copilot/{AI_ACCOUNTANT_NAME} feedback tied to prior review evidence. "
+                        "Review `tax_reporting_signoff_review` for selected tax profile/jurisdiction, exception count, advisor evidence, and Tax Review Packet hash mismatches; "
+                    "use tax profile/sign-off evidence only to summarize configured assumptions and advisor-review status; "
+                    "route filing/remittance/legal conclusions to `unsupported_tax_or_legal_items`. "
+                    "Do not propose direct writes; draft only human-review recommendations."
+                )
+                accountant_prompt = f"{AI_ACCOUNTANT_NAME} close-readiness review"
+                accountant_prompt_hash = _stable_json_sha256(
+                    {
+                        "query": accountant_prompt,
+                        "system_message": accountant_system_message,
+                        "instruction": accountant_instruction,
+                    }
+                )
+                accountant_data_scope = {
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "context_keys": sorted(accountant_context.keys()),
+                    "context_hash_sha256": _stable_json_sha256(accountant_context),
+                    "tax_packet_evidence_hash": current_tax_packet_hash,
+                    "accounting_close_packet_evidence_hash": current_accounting_close_packet_hash,
+                    "row_counts": {
+                        "accounting_close_readiness_checks": int(len(accounting_close_checks_df)),
+                        "accounting_period_drift_checks": int(len(accounting_period_drift_df)),
+                        "accounting_exception_queue": int(len(accounting_exceptions_df)),
+                        "sale_fifo_cogs_evidence": int(len(sale_fifo_cogs_evidence_df)),
+                        "accounting_close_signoffs": int(len(accounting_close_signoff_df)),
+                        "accounting_close_signoff_review": int(len(accounting_close_signoff_review_df)),
+                        "ai_review_outcomes": int(len(ai_review_outcomes_df)),
+                        "tax_reporting_signoffs": int(len(tax_signoff_df)),
+                        "tax_reporting_signoff_review": int(len(tax_reporting_signoff_review_df)),
+                    },
+                }
+                result = execute_comp_summary(
+                    repo,
+                    query=accountant_prompt,
+                    ebay_rows=[],
+                    web_rows=[],
+                    spot_context=accountant_context,
+                    system_message=accountant_system_message,
+                    instruction=accountant_instruction,
+                )
+                accountant_text = str(result.text or "").strip()
+                st.session_state["reports_accountant_raw"] = accountant_text
+                accountant_elapsed_ms = int((time.perf_counter() - accountant_started) * 1000)
+                accountant_review_metadata = {
+                    "event_type": "ai_accountant_review",
+                    "surface": "reports",
+                    "read_only": True,
+                    "requires_human_approval_for_writes": True,
+                    "tax_legal_guardrail": "unsupported conclusions routed to human review",
+                    "date_range": {"from": from_date.isoformat(), "to": to_date.isoformat()},
+                    "prompt_hash_sha256": accountant_prompt_hash,
+                    "data_scope_hash_sha256": str(
+                        accountant_data_scope.get("context_hash_sha256") or ""
+                    ),
+                    "data_scope": accountant_data_scope,
+                    "context_keys": sorted(accountant_context.keys()),
+                    "ai_citation": dict(getattr(result, "citation", {}) or {}),
+                }
+                st.session_state["reports_accountant_metadata"] = accountant_review_metadata
+                if hasattr(repo, "log_ai_chat_interaction"):
+                    try:
+                        repo.log_ai_chat_interaction(
+                            actor=user.username,
+                            prompt=f"{AI_ACCOUNTANT_NAME} close-readiness review",
+                            intent="reports_ai_accountant_review",
+                            allowed_domains=["accounting", "reports", "sales", "orders", "inventory", "tax"],
+                            citations=[
+                                {
+                                    "table": "accounting_close_readiness_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_checks_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_exception_queue",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_exceptions_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_period_drift_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_period_drift_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_formula_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_formula_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_sales_component_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_sales_component_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_return_tieout_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_return_tieout_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_inventory_valuation_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_inventory_valuation_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_fee_evidence_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_fee_evidence_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_shipping_evidence_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_shipping_evidence_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_reconciliation_tieout_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_reconciliation_tieout_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_cogs_source_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_cogs_source_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "sale_fifo_cogs_evidence",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(sale_fifo_cogs_evidence_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_lot_allocation_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_lot_allocation_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_exception_queue_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_exception_queue_checks_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_margin_anomaly_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_margin_anomaly_checks_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_consistency_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_consistency_checks_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_packet_completeness_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_packet_completeness_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_packet_manifest_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_packet_manifest_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_packet_hash_checks",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_packet_hash_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_packet_evidence_hash",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_packet_evidence_hash_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_signoffs",
+                                    "filters": "latest_audit_records",
+                                    "rows_considered": int(len(accounting_close_signoff_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "accounting_close_signoff_review",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(accounting_close_signoff_review_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "ai_review_outcomes",
+                                    "filters": "latest_audit_records",
+                                    "rows_considered": int(len(ai_review_outcomes_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "lot_allocation_source_summary",
+                                    "filters": "grouped_by=cost_source",
+                                    "rows_considered": int(len(lot_allocation_source_summary_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "tax_profile",
+                                    "filters": "selected_saved_profile",
+                                    "rows_considered": 1 if selected_tax_profile_context else 0,
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "tax_reporting_signoffs",
+                                    "filters": "latest_audit_records",
+                                    "rows_considered": int(len(tax_signoff_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                                {
+                                    "table": "tax_reporting_signoff_review",
+                                    "filters": f"from={from_date.isoformat()};to={to_date.isoformat()}",
+                                    "rows_considered": int(len(tax_reporting_signoff_review_df)),
+                                    "as_of_utc": datetime.now(timezone.utc).isoformat(),
+                                },
+                            ],
+                            answer_preview=accountant_text,
+                            denied=False,
+                            elapsed_ms=accountant_elapsed_ms,
+                            metadata=accountant_review_metadata,
+                        )
+                    except Exception:
+                        pass
+                st.success(f"{AI_ACCOUNTANT_NAME} review complete.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"{AI_ACCOUNTANT_NAME} review failed: {exc}")
+
+        raw_accountant_ai = str(st.session_state.get("reports_accountant_raw") or "").strip()
+        if raw_accountant_ai:
+            with st.expander(f"{AI_ACCOUNTANT_NAME} Result", expanded=False):
+                _render_ai_json_sections(
+                    raw_accountant_ai,
+                    [
+                        ("close_status", "Close Status"),
+                        ("profit_basis_notes", "Profit Basis Notes"),
+                        ("lot_cost_findings", "Lot Cost Findings"),
+                        ("fee_shipping_findings", "Fee and Shipping Findings"),
+                        ("recommended_human_actions", "Recommended Human Actions"),
+                        ("unsupported_tax_or_legal_items", "Unsupported Tax or Legal Items"),
+                    ],
+                )
+                st.code(raw_accountant_ai, language="json")
+                feedback_cols = st.columns(3)
+                with feedback_cols[0]:
+                    if st.button(f"Accept {AI_ACCOUNTANT_NAME} Review", key="reports_accountant_accept_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="ai_accountant_review",
+                            outcome="accepted",
+                            answer_text=raw_accountant_ai,
+                            review_metadata=st.session_state.get("reports_accountant_metadata") or {},
+                        )
+                        st.success(f"{AI_ACCOUNTANT_NAME} review acceptance recorded.")
+                        st.rerun()
+                with feedback_cols[1]:
+                    if st.button(f"{AI_ACCOUNTANT_NAME} Needs Edits", key="reports_accountant_edit_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="ai_accountant_review",
+                            outcome="edited",
+                            answer_text=raw_accountant_ai,
+                            review_metadata=st.session_state.get("reports_accountant_metadata") or {},
+                        )
+                        st.success(f"{AI_ACCOUNTANT_NAME} review edit outcome recorded.")
+                        st.rerun()
+                with feedback_cols[2]:
+                    if st.button(f"Reject {AI_ACCOUNTANT_NAME} Review", key="reports_accountant_reject_btn"):
+                        _log_reports_ai_outcome(
+                            repo,
+                            actor=user.username,
+                            review_type="ai_accountant_review",
+                            outcome="rejected",
+                            answer_text=raw_accountant_ai,
+                            review_metadata=st.session_state.get("reports_accountant_metadata") or {},
+                        )
+                        st.success(f"{AI_ACCOUNTANT_NAME} review rejection recorded.")
+                        st.rerun()
+
+    all_reports = [
         ("Sales Detail", sales_df, "sales_detail"),
         ("Tax Summary (Estimated)", tax_summary_df, "tax_summary_estimated"),
         ("Tax by Marketplace (Estimated)", tax_by_marketplace_df, "tax_by_marketplace_estimated"),
@@ -10769,6 +12605,20 @@ def render_reports(repo: InventoryRepository) -> None:
         ("Tax Exceptions / Advisor Review", tax_exceptions_df, "tax_exceptions_advisor_review"),
         ("Tax Reporting Sign-Off Evidence", tax_signoff_df, "tax_reporting_signoffs"),
         ("Tax Reporting Sign-Off Review", tax_reporting_signoff_review_df, "tax_reporting_signoff_review"),
+        ("Quarterly Estimated Tax Summary", quarterly_tax_summary_df, "quarterly_estimated_tax_summary"),
+        ("Quarterly Estimated Tax Payments", quarterly_tax_payment_df, "quarterly_estimated_tax_payments"),
+        ("Quarterly Estimated Tax Sales Detail", quarterly_tax_sales_df, "quarterly_estimated_tax_sales_detail"),
+        ("Quarterly Estimated Tax Fee Summary", quarterly_tax_fee_summary_df, "quarterly_estimated_tax_fee_summary"),
+        ("Quarterly Estimated Tax Fee Detail", quarterly_tax_fee_df, "quarterly_estimated_tax_fee_detail"),
+        ("Quarterly Estimated Tax COGS Detail", quarterly_tax_cogs_df, "quarterly_estimated_tax_cogs_detail"),
+        ("Quarterly Estimated Tax Return Adjustments", quarterly_tax_returns_df, "quarterly_estimated_tax_returns"),
+        ("Quarterly Estimated Tax Local Tax Detail", quarterly_tax_local_tax_df, "quarterly_estimated_tax_local_tax"),
+        ("Quarterly Estimated Tax Payment Evidence", quarterly_estimated_tax_payment_df, "quarterly_estimated_tax_payment_evidence"),
+        (
+            "Quarterly Estimated Tax Payment Review",
+            quarterly_estimated_tax_payment_review_df,
+            "quarterly_estimated_tax_payment_review",
+        ),
         ("Inventory Snapshot", inventory_df, "inventory_snapshot"),
         ("Listing Snapshot", listings_df, "listing_snapshot"),
         ("Orders", orders_df, "orders"),
@@ -10777,15 +12627,51 @@ def render_reports(repo: InventoryRepository) -> None:
         ("Returns", returns_df, "returns"),
         ("Lot Assignment", lots_df, "lot_assignment"),
         ("Lot Allocation Source Summary", lot_allocation_source_summary_df, "lot_allocation_source_summary"),
+        ("Lot Allocation Action Detail", lot_allocation_action_detail_df, "lot_allocation_action_detail"),
         ("Sold COGS Source Summary", cogs_source_summary_df, "cogs_source_summary"),
         ("Sale FIFO COGS Evidence", sale_fifo_cogs_evidence_df, "sale_fifo_cogs_evidence"),
         ("Inventory Movements", movements_df, "inventory_movements"),
         ("QuickBooks Sales Export", qbo_sales_df, "qbo_sales_export"),
+        (
+            "QuickBooks SalesReceipt Payloads",
+            quickbooks_salesreceipt_payloads_df,
+            "quickbooks_salesreceipt_payloads",
+        ),
+        (
+            "QuickBooks Fee Purchase Payloads",
+            quickbooks_fee_purchase_payloads_df,
+            "quickbooks_fee_purchase_payloads",
+        ),
+        (
+            "QuickBooks Shipping Label Purchase Payloads",
+            quickbooks_shipping_label_purchase_payloads_df,
+            "quickbooks_shipping_label_purchase_payloads",
+        ),
+        (
+            "QuickBooks Payload Readiness",
+            quickbooks_payload_readiness_df,
+            "quickbooks_payload_readiness",
+        ),
         ("QuickBooks Refund/Adjustment Export", qbo_adjustments_df, "qbo_adjustments_export"),
         ("Reconciliation by Marketplace", reconciliation_df, "reconciliation_marketplace"),
+        (
+            "Reconciliation Flag Detail",
+            reconciliation_flag_detail_df,
+            "accounting_reconciliation_flag_detail",
+        ),
         ("Accounting Validation Flags", accounting_validation_df, "accounting_validation_flags"),
         ("Accounting Exception Queue", accounting_exceptions_df, "accounting_exception_queue"),
         ("Accounting Close Readiness Checks", accounting_close_checks_df, "accounting_close_readiness_checks"),
+        (
+            "Accounting Close Warning Source Detail",
+            accounting_close_warning_source_detail_df,
+            "accounting_close_warning_source_detail",
+        ),
+        (
+            "Accounting Close Action Detail",
+            accounting_close_action_detail_df,
+            "accounting_close_action_detail",
+        ),
         ("Accounting Close Formula Checks", accounting_close_formula_df, "accounting_close_formula_checks"),
         ("Accounting Sales Component Checks", accounting_sales_component_df, "accounting_sales_component_checks"),
         ("Accounting Return Tie-Out Checks", accounting_return_tieout_df, "accounting_return_tieout_checks"),
@@ -10941,160 +12827,176 @@ def render_reports(repo: InventoryRepository) -> None:
             "economics_intelligence_alert_rows",
         ),
     ]
-    accounting_close_packet = _build_accounting_close_export_packet(
-        reports=reports,
-        close_summary=accounting_close_summary,
-        from_date=from_date,
-        to_date=to_date,
-    )
-    st.download_button(
-        label="Download Accounting Close Packet ZIP",
-        data=accounting_close_packet,
-        file_name=f"accounting_close_packet_{from_date}_{to_date}.zip",
-        mime="application/zip",
-        key="reports_accounting_close_packet_zip",
-    )
-    tax_review_packet = _build_tax_review_export_packet(
-        reports=reports,
-        from_date=from_date,
-        to_date=to_date,
-        tax_jurisdiction=tax_jurisdiction or tax_default_jurisdiction,
-        tax_rate_percent=float(tax_rate_percent),
-        shipping_taxable=bool(tax_shipping_taxable),
-        marketplace_scope=tax_marketplace_scope_label,
-        facilitator_channels=facilitator_channels,
-        tax_exempt_categories=tax_exempt_categories,
-        tax_profile=selected_tax_profile_context,
-    )
-    st.download_button(
-        label="Download Tax Review Packet ZIP",
-        data=tax_review_packet,
-        file_name=f"tax_review_packet_{from_date}_{to_date}.zip",
-        mime="application/zip",
-        key="reports_tax_review_packet_zip",
-    )
-    with st.expander("Tax Reporting Sign-Off Review", expanded=False):
-        _render_df_with_preview(tax_reporting_signoff_review_df, hide_index=True)
-    with st.expander("Record Tax Reporting Sign-Off", expanded=False):
-        current_tax_packet_ref = f"tax_review_packet_{from_date}_{to_date}.zip"
-        selected_profile_key = str(selected_tax_profile_context.get("profile_key") or "").strip().lower()
-        st.caption(
-            "Record tax sign-off only after advisor/human review of the Tax Review Packet. "
-            "These outputs remain estimates and do not replace tax-advisor validation."
+    tax_report_prefixes = tax_review_packet_prefixes()
+    if tax_workspace:
+        display_reports = [
+            (label, df, file_prefix)
+            for label, df, file_prefix in all_reports
+            if str(file_prefix or "").strip() in tax_report_prefixes
+        ]
+    else:
+        display_reports = [
+            (label, df, file_prefix)
+            for label, df, file_prefix in all_reports
+            if str(file_prefix or "").strip() not in tax_report_prefixes
+        ]
+    if not tax_workspace:
+        accounting_close_packet = _build_accounting_close_export_packet(
+            reports=display_reports,
+            close_summary=accounting_close_summary,
+            from_date=from_date,
+            to_date=to_date,
         )
-        st.code(current_tax_packet_hash or "tax packet hash unavailable", language="text")
-        can_record_tax_signoff = has_permission(user.role, "manage_settings")
-        tax_signoff_context = (
-            st.form("reports_tax_reporting_signoff_form")
-            if hasattr(st, "form")
-            else st.expander("Tax Sign-Off Fields", expanded=True)
+        st.download_button(
+            label="Download Accounting Close Packet ZIP",
+            data=accounting_close_packet,
+            file_name=f"accounting_close_packet_{from_date}_{to_date}.zip",
+            mime="application/zip",
+            key="reports_accounting_close_packet_zip",
         )
-        with tax_signoff_context:
-            ts1, ts2 = st.columns(2)
-            with ts1:
-                reports_tax_signoff_period = st.text_input(
-                    "Tax Period",
-                    value=_default_accounting_close_period(from_date, to_date),
-                    key="reports_tax_signoff_period",
-                )
-                reports_tax_signoff_jurisdiction = st.text_input(
-                    "Sign-Off Jurisdiction",
-                    value=str(tax_jurisdiction or tax_default_jurisdiction or ""),
-                    key="reports_tax_signoff_jurisdiction",
-                )
-                reports_tax_signoff_profile_key = st.text_input(
-                    "Tax Profile Key Used",
-                    value=selected_profile_key,
-                    key="reports_tax_signoff_profile_key",
-                )
-                reports_tax_signoff_owner = st.text_input(
-                    "Owner",
-                    value=str(user.username or ""),
-                    key="reports_tax_signoff_owner",
-                )
-            with ts2:
-                reports_tax_signoff_status = st.selectbox(
-                    "Status",
-                    options=["approved", "blocked", "needs_followup"],
-                    index=0 if tax_exceptions_df.empty else 2,
-                    key="reports_tax_signoff_status",
-                )
-                reports_tax_signoff_date = st.date_input(
-                    "Sign-Off Date",
-                    value=utc_today(),
-                    key="reports_tax_signoff_date",
-                )
-                reports_tax_exception_count = st.number_input(
-                    "Tax Exception Count",
-                    min_value=0,
-                    max_value=1000000,
-                    value=int(len(tax_exceptions_df)),
-                    step=1,
-                    key="reports_tax_signoff_exception_count",
-                )
-                reports_tax_packet_ref = st.text_input(
-                    "Tax Packet Reference",
-                    value=current_tax_packet_ref,
-                    key="reports_tax_signoff_packet_ref",
-                )
-            reports_tax_advisor_evidence = st.text_input(
-                "Advisor / Evidence Link",
-                placeholder="advisor email, review ticket, or filing workpaper reference",
-                key="reports_tax_signoff_advisor_evidence",
+    if tax_workspace:
+        tax_review_packet = _build_tax_review_export_packet(
+            reports=all_reports,
+            from_date=from_date,
+            to_date=to_date,
+            tax_jurisdiction=tax_jurisdiction or tax_default_jurisdiction,
+            tax_rate_percent=float(tax_rate_percent),
+            shipping_taxable=bool(tax_shipping_taxable),
+            marketplace_scope=tax_marketplace_scope_label,
+            facilitator_channels=facilitator_channels,
+            tax_exempt_categories=tax_exempt_categories,
+            tax_profile=selected_tax_profile_context,
+            extra_artifacts=colorado_suts_packet_artifacts,
+        )
+        st.download_button(
+            label="Download Tax Review Packet ZIP",
+            data=tax_review_packet,
+            file_name=f"tax_review_packet_{from_date}_{to_date}.zip",
+            mime="application/zip",
+            key="reports_tax_review_packet_zip",
+        )
+        with st.expander("Tax Reporting Sign-Off Review", expanded=False):
+            _render_df_with_preview(tax_reporting_signoff_review_df, hide_index=True)
+        with st.expander("Record Tax Reporting Sign-Off", expanded=False):
+            current_tax_packet_ref = f"tax_review_packet_{from_date}_{to_date}.zip"
+            selected_profile_key = str(selected_tax_profile_context.get("profile_key") or "").strip().lower()
+            st.caption(
+                "Record tax sign-off only after advisor/human review of the Tax Review Packet. "
+                "These outputs remain estimates and do not replace tax-advisor validation."
             )
-            if hasattr(st, "text_area"):
-                reports_tax_signoff_notes = st.text_area(
-                    "Notes",
-                    placeholder="Advisor comments, exemption/shipping/facilitator assumptions, or filing caveats.",
-                    key="reports_tax_signoff_notes",
+            st.code(current_tax_packet_hash or "tax packet hash unavailable", language="text")
+            can_record_tax_signoff = has_permission(user.role, "manage_settings")
+            tax_signoff_context = (
+                st.form("reports_tax_reporting_signoff_form")
+                if hasattr(st, "form")
+                else st.expander("Tax Sign-Off Fields", expanded=True)
+            )
+            with tax_signoff_context:
+                ts1, ts2 = st.columns(2)
+                with ts1:
+                    reports_tax_signoff_period = st.text_input(
+                        "Tax Period",
+                        value=_default_accounting_close_period(from_date, to_date),
+                        key="reports_tax_signoff_period",
+                    )
+                    reports_tax_signoff_jurisdiction = st.text_input(
+                        "Sign-Off Jurisdiction",
+                        value=str(tax_jurisdiction or tax_default_jurisdiction or ""),
+                        key="reports_tax_signoff_jurisdiction",
+                    )
+                    reports_tax_signoff_profile_key = st.text_input(
+                        "Tax Profile Key Used",
+                        value=selected_profile_key,
+                        key="reports_tax_signoff_profile_key",
+                    )
+                    reports_tax_signoff_owner = st.text_input(
+                        "Owner",
+                        value=str(user.username or ""),
+                        key="reports_tax_signoff_owner",
+                    )
+                with ts2:
+                    reports_tax_signoff_status = st.selectbox(
+                        "Status",
+                        options=["approved", "blocked", "needs_followup"],
+                        index=0 if tax_exceptions_df.empty else 2,
+                        key="reports_tax_signoff_status",
+                    )
+                    reports_tax_signoff_date = st.date_input(
+                        "Sign-Off Date",
+                        value=utc_today(),
+                        key="reports_tax_signoff_date",
+                    )
+                    reports_tax_exception_count = st.number_input(
+                        "Tax Exception Count",
+                        min_value=0,
+                        max_value=1000000,
+                        value=int(len(tax_exceptions_df)),
+                        step=1,
+                        key="reports_tax_signoff_exception_count",
+                    )
+                    reports_tax_packet_ref = st.text_input(
+                        "Tax Packet Reference",
+                        value=current_tax_packet_ref,
+                        key="reports_tax_signoff_packet_ref",
+                    )
+                reports_tax_advisor_evidence = st.text_input(
+                    "Advisor / Evidence Link",
+                    placeholder="advisor email, review ticket, or filing workpaper reference",
+                    key="reports_tax_signoff_advisor_evidence",
                 )
-            else:
-                reports_tax_signoff_notes = st.text_input(
-                    "Notes",
-                    value="",
-                    key="reports_tax_signoff_notes",
-                )
-            if hasattr(st, "form_submit_button"):
-                save_tax_signoff = st.form_submit_button(
-                    "Record Tax Reporting Sign-Off",
-                    disabled=not can_record_tax_signoff,
-                )
-            else:
-                save_tax_signoff = st.button(
-                    "Record Tax Reporting Sign-Off",
-                    key="reports_tax_signoff_submit_btn",
-                    disabled=not can_record_tax_signoff,
-                )
-        if not can_record_tax_signoff:
-            st.caption("You need `manage_settings` permission to record tax reporting sign-off evidence.")
-        if save_tax_signoff:
-            try:
-                payload = _build_tax_reporting_signoff_payload(
-                    target_env=settings.app_env,
-                    tax_period=reports_tax_signoff_period,
-                    jurisdiction=reports_tax_signoff_jurisdiction,
-                    profile_key=reports_tax_signoff_profile_key,
-                    status=reports_tax_signoff_status,
-                    owner=reports_tax_signoff_owner,
-                    signoff_date=reports_tax_signoff_date,
-                    tax_packet_ref=reports_tax_packet_ref,
-                    tax_packet_hash=current_tax_packet_hash,
-                    advisor_evidence_link=reports_tax_advisor_evidence,
-                    tax_exception_count=int(reports_tax_exception_count or 0),
-                    notes=reports_tax_signoff_notes,
-                )
-                repo.record_audit_event(
-                    entity_type="tax_reporting_signoff",
-                    entity_id=None,
-                    action="record",
-                    actor=user.username,
-                    changes=payload,
-                )
-                st.success("Tax reporting sign-off recorded.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Unable to record tax reporting sign-off: {exc}")
-    for label, df, file_prefix in reports:
+                if hasattr(st, "text_area"):
+                    reports_tax_signoff_notes = st.text_area(
+                        "Notes",
+                        placeholder="Advisor comments, exemption/shipping/facilitator assumptions, or filing caveats.",
+                        key="reports_tax_signoff_notes",
+                    )
+                else:
+                    reports_tax_signoff_notes = st.text_input(
+                        "Notes",
+                        value="",
+                        key="reports_tax_signoff_notes",
+                    )
+                if hasattr(st, "form_submit_button"):
+                    save_tax_signoff = st.form_submit_button(
+                        "Record Tax Reporting Sign-Off",
+                        disabled=not can_record_tax_signoff,
+                    )
+                else:
+                    save_tax_signoff = st.button(
+                        "Record Tax Reporting Sign-Off",
+                        key="reports_tax_signoff_submit_btn",
+                        disabled=not can_record_tax_signoff,
+                    )
+            if not can_record_tax_signoff:
+                st.caption("You need `manage_settings` permission to record tax reporting sign-off evidence.")
+            if save_tax_signoff:
+                try:
+                    payload = _build_tax_reporting_signoff_payload(
+                        target_env=settings.app_env,
+                        tax_period=reports_tax_signoff_period,
+                        jurisdiction=reports_tax_signoff_jurisdiction,
+                        profile_key=reports_tax_signoff_profile_key,
+                        status=reports_tax_signoff_status,
+                        owner=reports_tax_signoff_owner,
+                        signoff_date=reports_tax_signoff_date,
+                        tax_packet_ref=reports_tax_packet_ref,
+                        tax_packet_hash=current_tax_packet_hash,
+                        advisor_evidence_link=reports_tax_advisor_evidence,
+                        tax_exception_count=int(reports_tax_exception_count or 0),
+                        notes=reports_tax_signoff_notes,
+                    )
+                    repo.record_audit_event(
+                        entity_type="tax_reporting_signoff",
+                        entity_id=None,
+                        action="record",
+                        actor=user.username,
+                        changes=payload,
+                    )
+                    st.success("Tax reporting sign-off recorded.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to record tax reporting sign-off: {exc}")
+    for label, df, file_prefix in display_reports:
         st.markdown(f"### {label}")
         if df.empty:
             st.info("No records for this report in the selected date range.")
@@ -11124,6 +13026,6 @@ def render_reports(repo: InventoryRepository) -> None:
     render_workspace_feedback(
         repo=repo,
         actor=user.username,
-        workspace_key="reports",
-        section_title="Workspace Feedback: Reports",
+        workspace_key="taxes" if tax_workspace else "reports",
+        section_title="Workspace Feedback: Taxes" if tax_workspace else "Workspace Feedback: Reports",
     )

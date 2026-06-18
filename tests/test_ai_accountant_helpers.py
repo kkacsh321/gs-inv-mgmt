@@ -68,6 +68,16 @@ class AIAccountantHelperTests(unittest.TestCase):
                 },
                 {
                     "severity": "P1",
+                    "exception_type": "listing_lot_inventory_movement_mismatch",
+                    "entity_type": "sale",
+                    "entity_id": 30,
+                    "sku": "SKU-LOT",
+                    "reference": "ORDER-LOT-20",
+                    "amount": 19,
+                    "details": "Lot of 20 consumed only 1 inventory unit.",
+                },
+                {
+                    "severity": "P1",
                     "exception_type": "active_bundle_listing_stock_shortage",
                     "entity_type": "listing",
                     "entity_id": 22,
@@ -88,6 +98,8 @@ class AIAccountantHelperTests(unittest.TestCase):
                 "sales_30d_cogs_review_count": 2,
                 "sales_30d_profit_before_returns": 67.5,
                 "sales_30d_est_profit": -12.5,
+                "sales_30d_cogs_review_sale_ids": [15, 21],
+                "sales_30d_cogs_estimate_sale_ids": [22],
                 "sales_30d_bundle_sale_count": 1,
                 "sales_30d_bundle_inventory_units_sold": 10,
                 "returns_30d_count": 2,
@@ -102,11 +114,14 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertIn("missing_cost_basis", by_type)
         self.assertIn("dashboard_profit_basis_review", by_type)
         self.assertIn("Add product landed cost", by_type["missing_cost_basis"]["recommended_action"])
+        self.assertIn("inferred lot quantity", by_type["listing_lot_inventory_movement_mismatch"]["recommended_action"])
         self.assertIn("Reduce/end", by_type["active_bundle_listing_stock_shortage"]["recommended_action"])
         self.assertIn("restock", by_type["active_bundle_listing_stock_shortage"]["recommended_action"])
         self.assertIn("overlapping active bundle listings", by_type["active_bundle_component_overcommitted"]["recommended_action"])
         self.assertIn("expected lot quantity", by_type["dashboard_profit_basis_review"]["recommended_action"])
         self.assertIn("Bundle accounting detected 1 sale", by_type["dashboard_profit_basis_review"]["details"])
+        self.assertIn("Review-needed sale IDs: 15, 21", by_type["dashboard_profit_basis_review"]["details"])
+        self.assertIn("Estimate-basis sale IDs: 22", by_type["dashboard_profit_basis_review"]["details"])
         self.assertIn("Profit before returns $67.50", by_type["dashboard_profit_basis_review"]["details"])
         self.assertIn(
             "estimated profit after returns $-12.50",
@@ -122,18 +137,41 @@ class AIAccountantHelperTests(unittest.TestCase):
     def test_build_ai_accountant_message_summarizes_severity_mix(self):
         message = ai_accountant.build_ai_accountant_message(
             [
-                {"severity": "P0", "task_type": "missing_cost_basis", "entity_type": "sale", "entity_id": 1},
-                {"severity": "P1", "task_type": "missing_fee_evidence", "entity_type": "sale", "entity_id": 2},
-                {"severity": "P2", "task_type": "fee_source_fallback", "entity_type": "sale", "entity_id": 3},
+                {
+                    "severity": "P0",
+                    "task_type": "missing_cost_basis",
+                    "entity_type": "sale",
+                    "entity_id": 1,
+                    "recommended_action": "Add cost basis.",
+                    "details": "Sale evidence: product_id=1; listing_id=2.",
+                    "amount": 0.0,
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "missing_fee_evidence",
+                    "entity_type": "sale",
+                    "entity_id": 2,
+                    "amount": 6.5,
+                },
+                {
+                    "severity": "P2",
+                    "task_type": "missing_shipping_label_spend",
+                    "entity_type": "sale",
+                    "entity_id": 3,
+                    "amount": 5.0,
+                },
             ],
             period_label="2026-04-01 to 2026-04-30",
         )
 
-        self.assertIn("AI Accountant monitor for 2026-04-01 to 2026-04-30", message)
+        self.assertIn("Goldie (AI Accountant) monitor for 2026-04-01 to 2026-04-30", message)
         self.assertIn("P0=1, P1=1, P2=1", message)
+        self.assertIn("Fee/shipping evidence exposure: fee rows $6.50; shipping-label rows $5.00.", message)
         self.assertIn("missing_cost_basis", message)
+        self.assertIn("Sale evidence: product_id=1", message)
         self.assertIn("Question status: unanswered=3.", message)
         self.assertIn("Questions to answer in Ask or Slack", message)
+        self.assertIn("Evidence: amount=0.00 | Sale evidence: product_id=1", message)
         self.assertIn("accountant answer missing_cost_basis sale#1", message)
 
     def test_build_ai_accountant_message_marks_recently_answered_questions(self):
@@ -159,7 +197,7 @@ class AIAccountantHelperTests(unittest.TestCase):
 
         self.assertNotIn("Questions to answer in Ask or Slack", message)
         self.assertIn("Question status: answered=1.", message)
-        self.assertIn("Recently answered AI Accountant questions", message)
+        self.assertIn("Recently answered Goldie questions", message)
         self.assertIn("Use lot 8 landed cost", message)
 
     def test_build_ai_accountant_message_reasks_when_answer_needs_more_info(self):
@@ -186,7 +224,7 @@ class AIAccountantHelperTests(unittest.TestCase):
 
         self.assertIn("Questions to answer in Ask or Slack", message)
         self.assertIn("Question status: needs_more_info=1.", message)
-        self.assertNotIn("Recently answered AI Accountant questions", message)
+        self.assertNotIn("Recently answered Goldie questions", message)
 
     def test_build_ai_accountant_question_rows_turns_monitor_items_into_operator_questions(self):
         rows = ai_accountant_monitor.build_ai_accountant_question_rows(
@@ -211,7 +249,87 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(rows[0]["question"], "Which product should sale#3 be linked to?")
         self.assertIn("SKU/product ID", rows[0]["suggested_answer_format"])
         self.assertEqual(rows[0]["reply_prompt"], "accountant answer missing_product_link sale#3: ")
+        self.assertIn("evidence_preview", rows[0])
         self.assertIn("How should the lot cost be allocated", rows[1]["question"])
+
+    def test_build_ai_accountant_question_rows_prioritizes_profit_questions_before_lot_noise(self):
+        rows = ai_accountant_monitor.build_ai_accountant_question_rows(
+            [
+                {
+                    "severity": "P1",
+                    "task_type": "lot_underallocated",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 3,
+                    "amount": 2.93,
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "listing_lot_inventory_movement_mismatch",
+                    "entity_type": "sale",
+                    "entity_id": 56,
+                    "amount": 19,
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "nonpositive_margin",
+                    "entity_type": "sale",
+                    "entity_id": 15,
+                    "amount": -8.92,
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "dashboard_profit_basis_review",
+                    "entity_type": "dashboard",
+                    "entity_id": 0,
+                    "reference": "30d_profit_after_returns",
+                    "amount": 1785.36,
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "lot_underallocated",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 4,
+                    "amount": 2.76,
+                },
+            ],
+            max_rows=3,
+        )
+
+        self.assertEqual(
+            [row["task_type"] for row in rows],
+            ["dashboard_profit_basis_review", "nonpositive_margin", "listing_lot_inventory_movement_mismatch"],
+        )
+        self.assertEqual(rows[1]["reply_prompt"], "accountant answer nonpositive_margin sale#15: ")
+        self.assertIn("inferred lot quantity", rows[2]["question"])
+
+    def test_build_ai_accountant_question_rows_handles_lot_listing_movement_mismatch(self):
+        rows = ai_accountant_monitor.build_ai_accountant_question_rows(
+            [
+                {
+                    "severity": "P1",
+                    "task_type": "listing_lot_inventory_movement_mismatch",
+                    "entity_type": "sale",
+                    "entity_id": 56,
+                    "reference": "ORDER-LOT-20",
+                    "amount": 19,
+                    "recommended_action": "Reconcile movement.",
+                    "details": "Listing appears to represent 20 inventory units but consumed 1.",
+                }
+            ],
+            max_rows=1,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["question"],
+            "Should sale#56 consume the inferred lot quantity or the recorded movement quantity?",
+        )
+        self.assertIn("correct inventory units consumed", rows[0]["suggested_answer_format"])
+        self.assertIn("stock and FIFO COGS", rows[0]["why_needed"])
+        self.assertEqual(
+            rows[0]["reply_prompt"],
+            "accountant answer listing_lot_inventory_movement_mismatch sale#56: ",
+        )
 
     def test_build_ai_accountant_question_rows_handles_answer_followup(self):
         rows = ai_accountant_monitor.build_ai_accountant_question_rows(
@@ -229,7 +347,7 @@ class AIAccountantHelperTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertIn("replacement answer or evidence", rows[0]["question"])
-        self.assertIn("prior AI Accountant answer", rows[0]["why_needed"])
+        self.assertIn("prior Goldie answer", rows[0]["why_needed"])
         self.assertEqual(rows[0]["reply_prompt"], "accountant answer ai_accountant_answer_followup sale#3: ")
 
     def test_parse_ai_accountant_answer_prompt_extracts_target_and_answer(self):
@@ -244,6 +362,16 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(parsed["entity_id"], 3)
         self.assertIn("$12.50", parsed["answer_text"])
         self.assertEqual(len(parsed["answer_hash_sha256"]), 64)
+
+    def test_parse_ai_accountant_answer_prompt_accepts_goldie_alias(self):
+        parsed = ai_accountant_monitor.parse_ai_accountant_answer_prompt(
+            "goldie answer missing_cost_basis sale#3: Use lot 39 assignment at $12.50 landed."
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["task_type"], "missing_cost_basis")
+        self.assertEqual(parsed["reference"], "sale#3")
 
     def test_record_ai_accountant_answer_persists_read_only_audit_event(self):
         class Repo:
@@ -373,6 +501,13 @@ class AIAccountantHelperTests(unittest.TestCase):
                 "message": "Monitor run",
                 "period": "2026-04-08 to 2026-05-08",
                 "item_count": 2,
+                "question_status_counts": {
+                    "unanswered": 2,
+                    "needs_more_info": 1,
+                    "obsolete": 1,
+                    "answered": 3,
+                    "applied": 4,
+                },
                 "min_severity": "P1",
                 "requested_min_severity": "URGENT",
                 "min_severity_fallback_applied": True,
@@ -400,6 +535,11 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(parsed["min_severity"], "P1")
         self.assertEqual(parsed["requested_min_severity"], "URGENT")
         self.assertTrue(parsed["min_severity_fallback_applied"])
+        self.assertEqual(parsed["questions_unanswered"], 2)
+        self.assertEqual(parsed["questions_needs_more_info"], 1)
+        self.assertEqual(parsed["questions_obsolete"], 1)
+        self.assertEqual(parsed["questions_answered"], 3)
+        self.assertEqual(parsed["questions_applied"], 4)
         self.assertEqual(parsed["slack_outbox_id"], 99)
         self.assertTrue(parsed["review_enabled"])
         self.assertEqual(parsed["review_status"], "completed")
@@ -458,6 +598,7 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(summary["fallback_count"], 1)
         self.assertEqual(summary["latest_requested_min_severity"], "URGENT")
         self.assertEqual(summary["latest_effective_min_severity"], "P1")
+        self.assertIn("Goldie", summary["warning"])
         self.assertIn("ai_accountant_monitor_min_severity", summary["warning"])
 
     def test_summarize_message_thresholds_is_quiet_without_fallback(self):
@@ -466,6 +607,54 @@ class AIAccountantHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["fallback_count"], 0)
+        self.assertEqual(summary["warning"], "")
+
+    def test_summarize_message_question_status_flags_unresolved_questions(self):
+        summary = ai_accountant.summarize_ai_accountant_message_question_status(
+            [
+                {
+                    "created_at": "2026-05-20T12:00:00",
+                    "period": "2026-04-20 to 2026-05-20",
+                    "questions_unanswered": 2,
+                    "questions_needs_more_info": 1,
+                    "questions_obsolete": 1,
+                    "questions_answered": 3,
+                    "questions_applied": 4,
+                },
+                {
+                    "questions_unanswered": 0,
+                    "questions_needs_more_info": 0,
+                    "questions_obsolete": 0,
+                    "questions_answered": 1,
+                    "questions_applied": 1,
+                },
+            ]
+        )
+
+        self.assertEqual(summary["unresolved_count"], 4)
+        self.assertEqual(summary["unanswered"], 2)
+        self.assertEqual(summary["needs_more_info"], 1)
+        self.assertEqual(summary["obsolete"], 1)
+        self.assertEqual(summary["answered"], 4)
+        self.assertEqual(summary["applied"], 5)
+        self.assertEqual(summary["latest_unresolved_period"], "2026-04-20 to 2026-05-20")
+        self.assertIn("Goldie", summary["warning"])
+        self.assertIn("unresolved question", summary["warning"])
+
+    def test_summarize_message_question_status_is_quiet_when_resolved(self):
+        summary = ai_accountant.summarize_ai_accountant_message_question_status(
+            [
+                {
+                    "questions_unanswered": 0,
+                    "questions_needs_more_info": 0,
+                    "questions_obsolete": 0,
+                    "questions_answered": 2,
+                    "questions_applied": 3,
+                }
+            ]
+        )
+
+        self.assertEqual(summary["unresolved_count"], 0)
         self.assertEqual(summary["warning"], "")
 
     def test_monitor_rows_include_ai_review_followup_for_rejected_latest_outcome(self):
@@ -665,6 +854,29 @@ class AIAccountantHelperTests(unittest.TestCase):
             period_label="2026-05-01 to 2026-05-31",
         )
         self.assertEqual(packet_summary["action_summary_task_counts"]["evidence_packet_integrity_review"], 1)
+
+    def test_message_question_action_rows_flag_unresolved_questions(self):
+        self.assertEqual(ai_accountant.build_ai_accountant_message_question_action_rows({}), [])
+
+        rows = ai_accountant.build_ai_accountant_message_question_action_rows(
+            {
+                "unresolved_count": 4,
+                "unanswered": 2,
+                "needs_more_info": 1,
+                "obsolete": 1,
+                "latest_unresolved_period": "2026-04-20 to 2026-05-20",
+            }
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["severity"], "P1")
+        self.assertEqual(rows[0]["task_type"], "ai_accountant_unresolved_questions")
+        self.assertIn("unanswered=2", rows[0]["reference"])
+        self.assertIn("needs_more_info=1", rows[0]["reference"])
+        self.assertIn("Ask/Slack", rows[0]["recommended_action"])
+        summary = ai_accountant.build_ai_accountant_action_summary(rows)
+        self.assertEqual(summary[0]["task_type"], "ai_accountant_unresolved_questions")
+        self.assertEqual(summary[0]["P1"], 1)
 
     def test_summarize_monitor_run_result_survives_rerun(self):
         empty = ai_accountant.summarize_monitor_run_result(None)
@@ -1183,9 +1395,25 @@ class AIAccountantHelperTests(unittest.TestCase):
         summary = ai_accountant.build_ai_accountant_evidence_summary(
             period_label="2026-04-01 to 2026-04-30",
             action_summary=[{"task_type": "missing_cost_basis", "item_count": 1}],
-            monitor_rows=[{"severity": "P0", "task_type": "missing_cost_basis"}],
-            exception_rows=[{"exception_type": "missing_cost_basis"}],
-            messages=[{"actor": "admin", "message": "Review"}],
+            monitor_rows=[
+                {"severity": "P0", "task_type": "missing_cost_basis"},
+                {"severity": "P1", "task_type": "missing_fee_evidence", "amount": 6.5},
+            ],
+            exception_rows=[
+                {"exception_type": "missing_cost_basis"},
+                {"exception_type": "missing_shipping_label_spend", "amount": 5.0},
+            ],
+            messages=[
+                {
+                    "actor": "admin",
+                    "message": "Review",
+                    "questions_unanswered": 2,
+                    "questions_needs_more_info": 1,
+                    "questions_obsolete": 0,
+                    "questions_answered": 3,
+                    "questions_applied": 4,
+                }
+            ],
             review_outcomes=[{"outcome": "accepted", "actor": "admin"}],
             answer_rows=[
                 {"task_type": "missing_cost_basis", "reference": "sale#3", "followup_status": "applied"},
@@ -1193,18 +1421,56 @@ class AIAccountantHelperTests(unittest.TestCase):
             ],
             answer_followup_rows=[{"outcome": "applied", "answer_hash_sha256": "a" * 64}],
             review_hash_index=[{"source": "ai_accountant_review_outcomes"}],
-            dashboard_metrics={"sales_30d_profit_basis_status": "review_needed"},
+            dashboard_metrics={
+                "sales_30d_profit_basis_status": "review_needed",
+                "sales_30d_cogs_verified_amount": 60.0,
+                "sales_30d_cogs_estimate_amount": 25.0,
+                "sales_30d_cogs_review_amount": 15.0,
+                "sales_30d_cogs_review_count": 1,
+                "sales_30d_cogs_review_sale_ids": [7],
+                "sales_30d_cogs_estimate_sale_ids": [8, 9],
+            },
             sale_fifo_cogs_evidence_rows=[{"sale_id": 7, "total_cost": 12.5}],
             artifact_hashes={"artifact.csv": "a" * 64},
         )
         self.assertEqual(summary["row_counts"]["sale_fifo_cogs_evidence"], 1)
-        self.assertEqual(summary["row_counts"]["accounting_exception_rows"], 1)
+        self.assertEqual(summary["row_counts"]["accounting_exception_rows"], 2)
         self.assertEqual(summary["row_counts"]["answers"], 2)
         self.assertEqual(summary["row_counts"]["answer_followups"], 1)
         self.assertEqual(summary["row_counts"]["review_hash_index"], 1)
         self.assertEqual(summary["answer_followup_status_counts"], {"applied": 1, "needs_more_info": 1})
+        self.assertEqual(
+            summary["fee_shipping_evidence_exposure"],
+            {
+                "fee_evidence_amount": 6.5,
+                "shipping_label_evidence_amount": 5.0,
+                "total_evidence_amount": 11.5,
+            },
+        )
+        self.assertEqual(
+            summary["message_question_status_counts"],
+            {
+                "unanswered": 2,
+                "needs_more_info": 1,
+                "obsolete": 0,
+                "answered": 3,
+                "applied": 4,
+                "unresolved_count": 3,
+            },
+        )
         self.assertEqual(summary["action_summary_task_counts"]["missing_cost_basis"], 1)
         self.assertEqual(summary["dashboard_profit_basis_status"], "review_needed")
+        self.assertEqual(
+            summary["dashboard_cogs_evidence_split"],
+            {
+                "verified_amount": 60.0,
+                "estimated_amount": 25.0,
+                "review_needed_amount": 15.0,
+                "review_needed_count": 1,
+                "review_sale_ids": [7],
+                "estimate_sale_ids": [8, 9],
+            },
+        )
         self.assertEqual(summary["packet_schema_version"], "ai_accountant_evidence_packet_v1")
         self.assertEqual(summary["artifact_count"], 1)
         self.assertEqual(summary["artifact_names"], ["artifact.csv"])
@@ -1224,6 +1490,11 @@ class AIAccountantHelperTests(unittest.TestCase):
                     "evidence_packet_manifest_rows": 9,
                     "evidence_packet_manifest_expected_rows": 9,
                     "evidence_packet_action_summary_task_counts": '{"missing_cost_basis": 1}',
+                    "questions_unanswered": 2,
+                    "questions_needs_more_info": 1,
+                    "questions_obsolete": 0,
+                    "questions_answered": 3,
+                    "questions_applied": 4,
                 }
             ],
             review_outcomes=[
@@ -1246,6 +1517,9 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(hash_index[0]["evidence_packet_integrity_status"], "verified")
         self.assertEqual(hash_index[0]["evidence_packet_integrity_error_count"], 0)
         self.assertEqual(hash_index[0]["evidence_packet_manifest_status"], "verified")
+        self.assertEqual(hash_index[0]["questions_unanswered"], 2)
+        self.assertEqual(hash_index[0]["questions_needs_more_info"], 1)
+        self.assertEqual(hash_index[0]["questions_answered"], 3)
         self.assertIn("missing_cost_basis", hash_index[0]["evidence_packet_action_summary_task_counts"])
         self.assertEqual(hash_index[1]["evidence_packet_integrity_status"], "review_needed")
         self.assertEqual(hash_index[1]["evidence_packet_integrity_error_count"], 2)
@@ -1261,7 +1535,17 @@ class AIAccountantHelperTests(unittest.TestCase):
             action_summary=[{"task_type": "missing_cost_basis", "item_count": 1}],
             monitor_rows=[{"severity": "P0", "task_type": "missing_cost_basis"}],
             exception_rows=[{"exception_type": "missing_cost_basis", "entity_type": "sale"}],
-            messages=[{"actor": "admin", "message": "Review"}],
+            messages=[
+                {
+                    "actor": "admin",
+                    "message": "Review",
+                    "questions_unanswered": 1,
+                    "questions_needs_more_info": 1,
+                    "questions_obsolete": 0,
+                    "questions_answered": 2,
+                    "questions_applied": 3,
+                }
+            ],
             review_outcomes=[{"outcome": "accepted", "actor": "admin"}],
             answer_rows=[
                 {
@@ -1327,6 +1611,9 @@ class AIAccountantHelperTests(unittest.TestCase):
             self.assertEqual(evidence_summary["row_counts"]["answer_followups"], 1)
             self.assertEqual(evidence_summary["row_counts"]["review_hash_index"], 2)
             self.assertEqual(evidence_summary["answer_followup_status_counts"], {"applied": 1})
+            self.assertEqual(evidence_summary["message_question_status_counts"]["unresolved_count"], 2)
+            self.assertEqual(evidence_summary["message_question_status_counts"]["answered"], 2)
+            self.assertEqual(evidence_summary["message_question_status_counts"]["applied"], 3)
             self.assertEqual(evidence_summary["action_summary_task_counts"]["missing_cost_basis"], 1)
             self.assertEqual(evidence_summary["dashboard_profit_basis_status"], "review_needed")
             self.assertEqual(evidence_summary["packet_schema_version"], "ai_accountant_evidence_packet_v1")
@@ -1390,6 +1677,26 @@ class AIAccountantHelperTests(unittest.TestCase):
             any("manifest_hash_mismatch" in error for error in tampered_summary["packet_integrity_errors"])
         )
 
+    def test_fee_shipping_evidence_exposure_rolls_up_monitor_and_exception_rows(self):
+        exposure = ai_accountant.build_ai_accountant_fee_shipping_evidence_exposure(
+            [
+                {"task_type": "missing_fee_evidence", "amount": 6.5},
+                {"task_type": "fee_source_fallback", "amount": 2.0},
+                {"exception_type": "missing_shipping_label_spend", "amount": 5.0},
+                {"exception_type": "unmatched_shipping_label_finance_entry", "amount": 3.25},
+                {"task_type": "missing_cost_basis", "amount": 99.0},
+            ]
+        )
+
+        self.assertEqual(
+            exposure,
+            {
+                "fee_evidence_amount": 8.5,
+                "shipping_label_evidence_amount": 8.25,
+                "total_evidence_amount": 16.75,
+            },
+        )
+
     def test_deterministic_review_fallback_returns_structured_json(self):
         raw = ai_accountant.build_deterministic_ai_accountant_review(
             monitor_rows=[
@@ -1397,6 +1704,18 @@ class AIAccountantHelperTests(unittest.TestCase):
                     "severity": "P1",
                     "task_type": "dashboard_profit_basis_review",
                     "recommended_action": "Review sold COGS source mix.",
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "missing_fee_evidence",
+                    "amount": 6.5,
+                    "recommended_action": "Import/link marketplace fee evidence.",
+                },
+                {
+                    "severity": "P1",
+                    "task_type": "missing_shipping_label_spend",
+                    "amount": 5.0,
+                    "recommended_action": "Import/link shipping label spend.",
                 }
             ],
             action_summary=[
@@ -1427,10 +1746,15 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertIn("deterministic evidence fallback", payload["close_status"])
         self.assertIn("recommended_human_actions", payload)
         self.assertIn("Review sold COGS source mix.", payload["recommended_human_actions"])
+        self.assertIn(
+            "Resolve fee/shipping evidence exposure before close sign-off: fee $6.50; label $5.00.",
+            payload["recommended_human_actions"],
+        )
         self.assertIn("unsupported_tax_or_legal_items", payload)
         joined_notes = "\n".join(payload["profit_basis_notes"])
         self.assertIn("estimated profit after returns: $-9.00", joined_notes)
         self.assertIn("profit impact $-75.00", joined_notes)
+        self.assertIn("Fee/shipping evidence exposure: fee $6.50; label $5.00; total $11.50.", joined_notes)
 
     def test_execute_ai_accountant_workspace_review_uses_accounting_workflow_and_limits(self):
         calls = []
@@ -1684,6 +2008,7 @@ class AIAccountantHelperTests(unittest.TestCase):
             period_label="2026-04",
             rows=[{"severity": "P0"}, {"severity": "P2"}],
             slack_outbox_id=42,
+            question_status_counts={"unanswered": 1, "applied": 2},
         )
 
         self.assertEqual(row.id, 7)
@@ -1691,6 +2016,7 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(calls[0]["action"], "create")
         self.assertEqual(calls[0]["changes"]["item_count"], 2)
         self.assertEqual(calls[0]["changes"]["severity_counts"], {"P0": 1, "P1": 0, "P2": 1})
+        self.assertEqual(calls[0]["changes"]["question_status_counts"], {"applied": 2, "unanswered": 1})
         self.assertEqual(calls[0]["changes"]["slack_outbox_id"], 42)
 
     def test_review_context_and_metadata_include_hashes_and_guardrails(self):
@@ -2080,6 +2406,8 @@ class AIAccountantHelperTests(unittest.TestCase):
         self.assertEqual(calls["audit"][0]["changes"]["min_severity"], "P1")
         self.assertEqual(calls["audit"][0]["changes"]["requested_min_severity"], "P1")
         self.assertFalse(calls["audit"][0]["changes"]["min_severity_fallback_applied"])
+        self.assertEqual(result["question_status_counts"], {"unanswered": 1})
+        self.assertEqual(calls["audit"][0]["changes"]["question_status_counts"], {"unanswered": 1})
         payload = json.loads(calls["outbox"][0]["payload_json"])
         self.assertEqual(payload["channel"], "#accounting")
         self.assertIn("missing_fee_evidence", payload["text"])
@@ -2222,7 +2550,7 @@ class AIAccountantHelperTests(unittest.TestCase):
 
         self.assertTrue(result["review_enabled"])
         self.assertEqual(len(result["review_hash"]), 64)
-        self.assertIn("AI Accountant automated review", result["message"])
+        self.assertIn("Goldie automated review", result["message"])
         self.assertEqual(calls["chat"][0]["intent"], "ai_accountant_scheduled_monitor_review")
         self.assertEqual(calls["chat"][0]["metadata"]["event_type"], "ai_accountant_automated_review")
         self.assertEqual(calls["audit"][0]["changes"]["automated_review"]["answer_hash_sha256"], result["review_hash"])

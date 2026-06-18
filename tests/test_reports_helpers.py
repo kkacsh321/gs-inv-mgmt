@@ -27,12 +27,13 @@ def _bootstrap_views_package() -> None:
         fake_botocore_exceptions.ClientError = Exception
         sys.modules["botocore.exceptions"] = fake_botocore_exceptions
 
+    root = Path(__file__).resolve().parents[1]
+    views_dir = root / "app" / "components" / "views"
     if "app.components.views" not in sys.modules:
         pkg = types.ModuleType("app.components.views")
-        pkg.__path__ = []
+        pkg.__path__ = [str(views_dir)]
         sys.modules["app.components.views"] = pkg
 
-    root = Path(__file__).resolve().parents[1]
     for name in ("shared", "workspace_shell"):
         full = f"app.components.views.{name}"
         if full in sys.modules:
@@ -86,6 +87,55 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(summary["listing_bundle_component_count"], 2)
         self.assertEqual(summary["listing_bundle_units_per_listing"], 5)
         self.assertEqual(summary["listing_bundle_inventory_units_sold"], 10)
+
+    def test_sale_listing_bundle_summary_infers_full_tube_units(self):
+        sale = SimpleNamespace(
+            quantity_sold=1,
+            listing=SimpleNamespace(
+                product_id=2,
+                listing_title="Full Tube of 20 1 oz American Prospector Copper Tribute Coins Rounds Collectible",
+                marketplace_details=json.dumps({"bundle": {"enabled": False, "components": []}}),
+            ),
+        )
+
+        summary = reports._sale_listing_bundle_summary(sale)
+
+        self.assertTrue(summary["listing_is_bundle"])
+        self.assertEqual(summary["listing_bundle_kind"], "single_product_lot")
+        self.assertEqual(summary["listing_bundle_units_per_listing"], 20)
+        self.assertEqual(summary["listing_bundle_inventory_units_sold"], 20)
+
+    def test_sale_listing_bundle_summary_infers_lot_without_of_units(self):
+        sale = SimpleNamespace(
+            quantity_sold=1,
+            listing=SimpleNamespace(
+                product_id=117,
+                listing_title="Lot 13 Washington Silver Quarters Pre 1964 90% Silver Coins Vintage Collectible",
+                marketplace_details=json.dumps({"bundle": {"enabled": False, "components": []}}),
+            ),
+        )
+
+        summary = reports._sale_listing_bundle_summary(sale)
+
+        self.assertTrue(summary["listing_is_bundle"])
+        self.assertEqual(summary["listing_bundle_units_per_listing"], 13)
+        self.assertEqual(summary["listing_bundle_inventory_units_sold"], 13)
+
+    def test_sale_listing_bundle_summary_does_not_infer_percent_as_lot_quantity(self):
+        sale = SimpleNamespace(
+            quantity_sold=1,
+            listing=SimpleNamespace(
+                product_id=117,
+                listing_title="Lot 90% Silver Washington Quarters Vintage Collectible",
+                marketplace_details=json.dumps({"bundle": {"enabled": False, "components": []}}),
+            ),
+        )
+
+        summary = reports._sale_listing_bundle_summary(sale)
+
+        self.assertFalse(summary["listing_is_bundle"])
+        self.assertEqual(summary["listing_bundle_units_per_listing"], 0)
+        self.assertEqual(summary["listing_bundle_inventory_units_sold"], 0)
 
     def test_parse_ai_json_sections_keeps_tax_review_findings_visible(self):
         sections = reports._parse_ai_json_sections(
@@ -316,6 +366,28 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(len(bounded), 3)
 
+    def test_arrow_safe_dataframe_normalizes_mixed_display_columns(self):
+        df = reports.pd.DataFrame(
+            [
+                {"field": "Quarter", "value": "Q1", "amount": b"10.00"},
+                {"field": "Sales", "value": 125.50, "amount": 125.50},
+                {"field": "Notes", "value": {"source": "advisor"}, "amount": None},
+            ]
+        )
+
+        safe_df = reports._arrow_safe_dataframe(df)
+
+        self.assertEqual(str(safe_df["value"].dtype), "string")
+        self.assertEqual(str(safe_df["amount"].dtype), "string")
+        self.assertEqual(safe_df.loc[0, "amount"], "10.00")
+        self.assertEqual(safe_df.loc[1, "amount"], "125.5")
+        try:
+            import pyarrow as pa
+        except Exception:
+            pa = None
+        if pa is not None:
+            pa.Table.from_pandas(safe_df)
+
     def test_safe_float_and_csv_set_and_presets(self):
         self.assertEqual(reports._safe_float(None), 0.0)
         self.assertEqual(reports._safe_float("bad"), 0.0)
@@ -500,6 +572,8 @@ class ReportsHelpersTests(unittest.TestCase):
                     '"close_readiness_status":"close_ready","exception_count":0,'
                     '"unresolved_blocker_count":0,"period_drift_warn_count":0,'
                     '"ai_review_followup_count":0,'
+                    '"sale_fee_field_fallback_fee_total":6.5,'
+                    '"paid_shipping_missing_label_spend_charged_total":5.0,'
                     '"accounting_packet_ref":"accounting_close_packet.zip",'
                     '"accounting_packet_hash":"abc123","evidence_link":"close-ticket",'
                     '"notes":"Reviewed"}'
@@ -515,6 +589,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(out[0]["close_period"], "2026-04")
         self.assertEqual(out[0]["period_drift_warn_count"], 0)
         self.assertEqual(out[0]["ai_review_followup_count"], 0)
+        self.assertEqual(out[0]["sale_fee_field_fallback_fee_total"], 6.5)
+        self.assertEqual(out[0]["paid_shipping_missing_label_spend_charged_total"], 5.0)
         self.assertEqual(out[0]["accounting_packet_ref"], "accounting_close_packet.zip")
         self.assertEqual(out[0]["accounting_packet_hash"], "abc123")
 
@@ -541,6 +617,8 @@ class ReportsHelpersTests(unittest.TestCase):
                 "blocker_count": 0,
                 "period_drift_warn_count": 0,
                 "ai_review_followup_count": 0,
+                "sale_fee_field_fallback_fee_total": 6.5,
+                "paid_shipping_missing_label_spend_charged_total": 5.0,
             },
             accounting_packet_ref="accounting_close_packet_2026-04-01_2026-04-30.zip",
             accounting_packet_hash="abc123",
@@ -553,6 +631,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(payload["signoff_date"], "2026-05-01")
         self.assertEqual(payload["close_readiness_status"], "close_ready")
         self.assertEqual(payload["ai_review_followup_count"], 0)
+        self.assertEqual(payload["sale_fee_field_fallback_fee_total"], 6.5)
+        self.assertEqual(payload["paid_shipping_missing_label_spend_charged_total"], 5.0)
         self.assertEqual(payload["accounting_packet_hash"], "abc123")
         self.assertEqual(payload["accounting_close_packet_evidence_hash_sha256"], "abc123")
 
@@ -886,6 +966,408 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(start.isoformat(), "2026-05-01T00:00:00")
         self.assertEqual(end.month, 5)
 
+    def test_estimated_tax_periods_use_irs_income_windows(self):
+        q2 = reports._estimated_tax_period_for_quarter(2026, "Q2")
+        q4 = reports._estimated_tax_period_for_quarter(2026, "Q4")
+
+        self.assertEqual(q2["income_period"], "2026-04-01 to 2026-05-31")
+        self.assertEqual(q2["federal_due_date"].date().isoformat(), "2026-06-15")
+        self.assertEqual(q4["income_period"], "2026-09-01 to 2026-12-31")
+        self.assertEqual(q4["federal_due_date"].date().isoformat(), "2027-01-15")
+
+    def test_quarterly_estimated_tax_scope_notice_flags_page_range_mismatch(self):
+        q2 = reports._estimated_tax_period_for_quarter(2026, "Q2")
+
+        notice = reports._quarterly_estimated_tax_scope_notice(
+            report_from_date=reports.datetime(2026, 6, 1).date(),
+            report_to_date=reports.datetime(2026, 6, 8).date(),
+            period=q2,
+        )
+
+        self.assertEqual(notice["status"], "mismatch")
+        self.assertIn("Q2 income period 2026-04-01 to 2026-05-31", notice["message"])
+        self.assertIn("2026-06-01 to 2026-06-08", notice["message"])
+
+    def test_quarterly_estimated_tax_scope_notice_passes_when_page_range_matches(self):
+        q2 = reports._estimated_tax_period_for_quarter(2026, "Q2")
+
+        notice = reports._quarterly_estimated_tax_scope_notice(
+            report_from_date=reports.datetime(2026, 4, 1).date(),
+            report_to_date=reports.datetime(2026, 5, 31).date(),
+            period=q2,
+        )
+
+        self.assertEqual(notice["status"], "match")
+        self.assertIn("both scoped", notice["message"])
+
+    def test_build_quarterly_estimated_tax_payload_uses_profit_and_returns(self):
+        payload = reports._build_quarterly_estimated_tax_payload(
+            tax_year=2026,
+            quarter="Q2",
+            sales_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "gross_sales": 100.0,
+                        "actual_shipping_charged": 5.0,
+                        "actual_fee": 10.0,
+                        "actual_shipping_label_cost": 4.0,
+                        "actual_net_before_cogs": 91.0,
+                        "marketplace": "ebay",
+                        "sku": "SKU-1",
+                        "title": "Test eBay sale",
+                        "actual_fee_source": "order_finance_entries",
+                    },
+                    {
+                        "sale_id": 2,
+                        "sold_at": "2026-06-01T12:00:00",
+                        "gross_sales": 999.0,
+                    },
+                ]
+            ),
+            cogs_margin_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "net_before_cogs": 91.0,
+                        "fifo_cogs": 40.0,
+                        "fifo_cost_source": "explicit_assignment_landed_cost",
+                    }
+                ]
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(
+                [
+                    {
+                        "txn_date": "2026-05-01",
+                        "net_adjustment": -10.0,
+                        "cogs_reversal_estimate": 4.0,
+                    }
+                ]
+            ),
+            tax_detail_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sold_at": "2026-04-15T12:00:00",
+                        "gross_sales": 100.0,
+                        "taxable_subtotal": 50.0,
+                        "estimated_tax_collected": 3.75,
+                    }
+                ]
+            ),
+            federal_income_tax_rate_percent=20.0,
+            colorado_income_tax_rate_percent=4.0,
+            self_employment_tax_rate_percent=15.0,
+            self_employment_net_earnings_multiplier_percent=90.0,
+            owner_allocation_percent=60.0,
+            prior_estimated_payments=5.0,
+            other_income_adjustments=9.0,
+            deductible_adjustments=4.0,
+        )
+
+        summary = {row["field"]: row["value"] for row in payload["summary_rows"]}
+        self.assertEqual(summary["Sale rows"], 1)
+        self.assertEqual(summary["Profit before returns"], 51.0)
+        self.assertEqual(summary["Returns refund impact"], -10.0)
+        self.assertEqual(summary["Returns COGS reversal"], 4.0)
+        self.assertEqual(summary["Estimated business income"], 50.0)
+        self.assertEqual(summary["Federal income tax reserve"], 10.0)
+        self.assertEqual(summary["Colorado income tax reserve"], 2.0)
+        self.assertEqual(summary["Self-employment net earnings estimate"], 45.0)
+        self.assertEqual(summary["Self-employment tax reserve"], 6.75)
+        self.assertEqual(summary["Total estimated tax reserve"], 18.75)
+        self.assertEqual(summary["Suggested payment after prior payments"], 13.75)
+        self.assertEqual(summary["Local/SUTS tax estimate in selected tax scope"], 3.75)
+        self.assertEqual(summary["Owner/member allocation to you %"], 60.0)
+        self.assertEqual(summary["Spouse/other member allocation %"], 40.0)
+        checklist = {row["area"]: row for row in payload["advisor_checklist_rows"]}
+        self.assertIn("spouse-owned LLC", checklist["Entity/taxpayer treatment"]["detail"])
+        self.assertEqual(checklist["Spouse/member allocation"]["status"], "advisor_review")
+        self.assertEqual(checklist["Spouse/member allocation"]["amount"], 30.0)
+        self.assertEqual(checklist["Safe harbor"]["status"], "advisor_review")
+        self.assertEqual(checklist["Manual adjustments"]["status"], "advisor_review")
+        self.assertEqual(checklist["Local/SUTS tax scope"]["status"], "advisor_review")
+        self.assertEqual(checklist["Payment evidence"]["amount"], 13.75)
+        self.assertEqual(checklist["Marketplace fees"]["status"], "advisor_review")
+        self.assertEqual(checklist["Marketplace fees"]["amount"], 10.0)
+        fee_detail = payload["fee_detail_df"]
+        self.assertEqual(len(fee_detail), 1)
+        self.assertEqual(fee_detail.iloc[0]["sku"], "SKU-1")
+        self.assertEqual(fee_detail.iloc[0]["deductible_fee_planning_amount"], 10.0)
+        self.assertEqual(fee_detail.iloc[0]["tax_planning_category"], "marketplace_commissions_and_fees")
+        self.assertTrue(bool(fee_detail.iloc[0]["advisor_review_required"]))
+        fee_summary = payload["fee_summary_df"]
+        self.assertEqual(len(fee_summary), 1)
+        self.assertEqual(fee_summary.iloc[0]["marketplace"], "ebay")
+        self.assertEqual(fee_summary.iloc[0]["actual_fee_source"], "order_finance_entries")
+        self.assertEqual(fee_summary.iloc[0]["fee_planning_amount"], 10.0)
+        self.assertEqual(fee_summary.iloc[0]["sale_rows"], 1)
+
+    def test_build_quarterly_estimated_tax_payload_counts_cogs_basis_buckets(self):
+        payload = reports._build_quarterly_estimated_tax_payload(
+            tax_year=2026,
+            quarter="Q2",
+            sales_df=reports.pd.DataFrame(
+                [
+                    {"sale_id": 1, "sold_at": "2026-04-15T12:00:00", "gross_sales": 100.0},
+                    {"sale_id": 2, "sold_at": "2026-05-15T12:00:00", "gross_sales": 100.0},
+                    {"sale_id": 3, "sold_at": "2026-05-20T12:00:00", "gross_sales": 100.0},
+                ]
+            ),
+            cogs_margin_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "net_before_cogs": 90.0,
+                        "fifo_cogs": 50.0,
+                        "fifo_cost_source": "lot_equal_quantity_fallback",
+                        "cogs_basis_bucket": "review",
+                        "basis_review_required": "TRUE",
+                        "basis_is_estimate": "FALSE",
+                    },
+                    {
+                        "sale_id": 2,
+                        "sold_at": "2026-05-15T12:00:00",
+                        "net_before_cogs": 90.0,
+                        "fifo_cogs": 15.0,
+                        "fifo_cost_source": "lot_expected_quantity_fallback",
+                        "cogs_basis_bucket": "estimate",
+                        "basis_review_required": "FALSE",
+                        "basis_is_estimate": "TRUE",
+                    },
+                    {
+                        "sale_id": 3,
+                        "sold_at": "2026-05-20T12:00:00",
+                        "net_before_cogs": 90.0,
+                        "fifo_cogs": 0.0,
+                        "fifo_cost_source": "missing_cost_basis",
+                        "cogs_basis_bucket": "review",
+                    },
+                ]
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+            tax_detail_df=reports.pd.DataFrame(),
+            federal_income_tax_rate_percent=20.0,
+            colorado_income_tax_rate_percent=4.0,
+            self_employment_tax_rate_percent=15.0,
+        )
+
+        summary = {row["field"]: row["value"] for row in payload["summary_rows"]}
+        self.assertEqual(summary["COGS review-needed sale rows"], 2)
+        self.assertEqual(summary["COGS review-needed amount"], 50.0)
+        self.assertEqual(summary["COGS estimate sale rows"], 1)
+        self.assertEqual(summary["COGS estimate amount"], 15.0)
+        self.assertEqual(summary["Missing/unknown COGS sale rows"], 1)
+        self.assertEqual(summary["Missing/unknown COGS amount"], 0.0)
+        self.assertEqual(payload["review"]["cogs_review_needed_amount"], 50.0)
+        self.assertEqual(payload["review"]["cogs_estimate_amount"], 15.0)
+        checklist = {row["area"]: row for row in payload["advisor_checklist_rows"]}
+        self.assertEqual(checklist["COGS basis"]["status"], "review_needed")
+        self.assertEqual(checklist["COGS basis"]["amount"], 50.0)
+
+    def test_build_quarterly_estimated_tax_payload_limits_social_security_for_w2_wages(self):
+        payload = reports._build_quarterly_estimated_tax_payload(
+            tax_year=2026,
+            quarter="Q2",
+            sales_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "gross_sales": 1000.0,
+                        "actual_net_before_cogs": 1000.0,
+                    }
+                ]
+            ),
+            cogs_margin_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "net_before_cogs": 1000.0,
+                        "fifo_cogs": 0.0,
+                        "fifo_cost_source": "explicit_assignment_landed_cost",
+                    }
+                ]
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+            tax_detail_df=reports.pd.DataFrame(),
+            federal_income_tax_rate_percent=0.0,
+            colorado_income_tax_rate_percent=0.0,
+            self_employment_tax_rate_percent=15.3,
+            self_employment_net_earnings_multiplier_percent=92.35,
+            include_self_employment_tax=True,
+            w2_social_security_wages=1000.0,
+            spouse_w2_social_security_wages=1000.0,
+            social_security_wage_base=1000.0,
+            owner_allocation_percent=50.0,
+        )
+
+        summary = {row["field"]: row["value"] for row in payload["summary_rows"]}
+        self.assertEqual(summary["Self-employment tax included"], "yes")
+        self.assertEqual(summary["Your Social Security wage base remaining"], 0.0)
+        self.assertEqual(summary["Spouse Social Security wage base remaining"], 0.0)
+        self.assertEqual(summary["Your SE net earnings share"], 461.75)
+        self.assertEqual(summary["Spouse SE net earnings share"], 461.75)
+        self.assertEqual(summary["SE Social Security tax reserve"], 0.0)
+        self.assertEqual(summary["SE Medicare tax reserve"], 26.78)
+        self.assertEqual(summary["Self-employment tax reserve"], 26.78)
+
+    def test_build_quarterly_estimated_tax_payload_splits_social_security_by_spouse(self):
+        payload = reports._build_quarterly_estimated_tax_payload(
+            tax_year=2026,
+            quarter="Q2",
+            sales_df=reports.pd.DataFrame(
+                [{"sale_id": 1, "sold_at": "2026-04-15T12:00:00", "gross_sales": 1000.0}]
+            ),
+            cogs_margin_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "net_before_cogs": 1000.0,
+                        "fifo_cogs": 0.0,
+                        "fifo_cost_source": "explicit_assignment_landed_cost",
+                    }
+                ]
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+            tax_detail_df=reports.pd.DataFrame(),
+            federal_income_tax_rate_percent=0.0,
+            colorado_income_tax_rate_percent=0.0,
+            self_employment_tax_rate_percent=15.3,
+            self_employment_net_earnings_multiplier_percent=100.0,
+            include_self_employment_tax=True,
+            w2_social_security_wages=1000.0,
+            spouse_w2_social_security_wages=0.0,
+            social_security_wage_base=1000.0,
+            owner_allocation_percent=50.0,
+        )
+
+        summary = {row["field"]: row["value"] for row in payload["summary_rows"]}
+        self.assertEqual(summary["Your SE Social Security taxable earnings"], 0.0)
+        self.assertEqual(summary["Spouse SE Social Security taxable earnings"], 500.0)
+        self.assertEqual(summary["SE Social Security taxable earnings"], 500.0)
+        self.assertEqual(summary["SE Social Security tax reserve"], 62.0)
+        self.assertEqual(summary["SE Medicare tax reserve"], 29.0)
+        self.assertEqual(summary["Self-employment tax reserve"], 91.0)
+
+    def test_build_quarterly_estimated_tax_payload_can_disable_self_employment_tax(self):
+        payload = reports._build_quarterly_estimated_tax_payload(
+            tax_year=2026,
+            quarter="Q2",
+            sales_df=reports.pd.DataFrame(
+                [{"sale_id": 1, "sold_at": "2026-04-15T12:00:00", "gross_sales": 1000.0}]
+            ),
+            cogs_margin_df=reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 1,
+                        "sold_at": "2026-04-15T12:00:00",
+                        "net_before_cogs": 1000.0,
+                        "fifo_cogs": 0.0,
+                        "fifo_cost_source": "explicit_assignment_landed_cost",
+                    }
+                ]
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+            tax_detail_df=reports.pd.DataFrame(),
+            federal_income_tax_rate_percent=0.0,
+            colorado_income_tax_rate_percent=0.0,
+            self_employment_tax_rate_percent=15.3,
+            include_self_employment_tax=False,
+        )
+
+        summary = {row["field"]: row["value"] for row in payload["summary_rows"]}
+        self.assertEqual(summary["Self-employment tax included"], "no")
+        self.assertEqual(summary["Self-employment net earnings estimate"], 0.0)
+        self.assertEqual(summary["Self-employment tax reserve"], 0.0)
+
+    def test_dataframes_to_xlsx_bytes_writes_multiple_sheets(self):
+        payload = reports._dataframes_to_xlsx_bytes(
+            {
+                "summary": reports.pd.DataFrame([{"field": "Tax year", "value": 2026}]),
+                "payment/worksheet": reports.pd.DataFrame([{"jurisdiction": "Federal IRS"}]),
+                "advisor_checklist": reports.pd.DataFrame([{"area": "Safe harbor"}]),
+            }
+        )
+
+        wb = reports.load_workbook(BytesIO(payload), data_only=True)
+        self.assertIn("summary", wb.sheetnames)
+        self.assertIn("payment_worksheet", wb.sheetnames)
+        self.assertIn("advisor_checklist", wb.sheetnames)
+        self.assertEqual(wb["summary"].cell(2, 1).value, "Tax year")
+
+    def test_build_quarterly_estimated_tax_payment_payload(self):
+        payload = reports._build_quarterly_estimated_tax_payment_payload(
+            target_env="Prod",
+            tax_year=2026,
+            quarter="q2",
+            jurisdiction="Federal IRS",
+            payment_type="estimated_tax",
+            status="Paid",
+            payment_date=date(2026, 6, 15),
+            amount=123.456,
+            confirmation_ref="CONF-123",
+            evidence_link="https://example.test/receipt",
+            packet_ref="quarterly_estimated_tax_2026_Q2.xlsx",
+            packet_hash="hash-123",
+            notes="Recorded from IRS Direct Pay.",
+        )
+
+        self.assertEqual(payload["target_env"], "prod")
+        self.assertEqual(payload["quarter"], "Q2")
+        self.assertEqual(payload["status"], "paid")
+        self.assertEqual(payload["amount"], 123.46)
+        self.assertEqual(payload["payment_date"], "2026-06-15")
+
+    def test_build_quarterly_estimated_tax_payment_review_compares_paid_evidence(self):
+        review = reports._build_quarterly_estimated_tax_payment_review(
+            payment_df=reports.pd.DataFrame(
+                [
+                    {
+                        "tax_year": 2026,
+                        "quarter": "Q2",
+                        "jurisdiction": "Federal IRS",
+                        "status": "paid",
+                        "amount": 80.0,
+                        "confirmation_ref": "IRS-1",
+                        "evidence_link": "https://example.test/irs",
+                        "packet_hash": "hash-irs",
+                    },
+                    {
+                        "tax_year": 2026,
+                        "quarter": "Q2",
+                        "jurisdiction": "Colorado",
+                        "status": "planned",
+                        "amount": 10.0,
+                        "confirmation_ref": "",
+                    },
+                ]
+            ),
+            payment_worksheet_df=reports.pd.DataFrame(
+                [
+                    {"jurisdiction": "Federal IRS", "estimated_amount": 75.0},
+                    {"jurisdiction": "Colorado", "estimated_amount": 10.0},
+                ]
+            ),
+            tax_year=2026,
+            quarter="Q2",
+        )
+
+        by_jurisdiction = {row["jurisdiction"]: row for row in review.to_dict("records")}
+        self.assertEqual(by_jurisdiction["Federal IRS"]["status"], "pass")
+        self.assertEqual(by_jurisdiction["Federal IRS"]["recorded_paid_amount"], 80.0)
+        self.assertEqual(by_jurisdiction["Federal IRS"]["remaining_amount"], 0.0)
+        self.assertEqual(by_jurisdiction["Federal IRS"]["confirmation_refs_present"], 1)
+        self.assertEqual(by_jurisdiction["Federal IRS"]["evidence_links_present"], 1)
+        self.assertEqual(by_jurisdiction["Federal IRS"]["packet_hashes_present"], 1)
+        self.assertEqual(by_jurisdiction["Colorado"]["status"], "warn")
+        self.assertEqual(by_jurisdiction["Colorado"]["recorded_paid_amount"], 0.0)
+        self.assertEqual(by_jurisdiction["Colorado"]["remaining_amount"], 10.0)
+
     def test_colorado_suts_jurisdiction_options_load_from_template(self):
         reports._load_colorado_suts_jurisdiction_options.clear()
         options = reports._load_colorado_suts_jurisdiction_options()
@@ -945,6 +1427,158 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(summary["shipping_label_spend_total"], 7.0)
         self.assertEqual(summary["shipping_delta_total"], 3.0)
         self.assertEqual(summary["fee_total"], 8.0)
+        self.assertTrue((checks["status"] == "pass").all())
+
+    def test_accounting_close_readiness_summary_uses_shipping_economics_current_column(self):
+        summary, checks = reports._build_accounting_close_readiness_summary(
+            inventory_df=reports.pd.DataFrame(),
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "gross_sales": [120.0],
+                    "net_before_cogs": [113.0],
+                    "fifo_cogs": [50.0],
+                    "fifo_margin": [63.0],
+                }
+            ),
+            returns_df=reports.pd.DataFrame(),
+            reconciliation_df=reports.pd.DataFrame({"reconcile_flag": [False]}),
+            shipping_economics_df=reports.pd.DataFrame(
+                {
+                    "shipping_charged_to_buyer": [10.0],
+                    "shipping_label_spend": [7.0],
+                }
+            ),
+            ebay_fee_source_priority_df=reports.pd.DataFrame(
+                {
+                    "actual_fee_source": ["normalized_order_finance_entries_marketplace_fee_sum"],
+                    "sales_count": [1],
+                    "actual_fee_total": [10.0],
+                }
+            ),
+            accounting_exceptions_df=reports.pd.DataFrame(),
+        )
+
+        self.assertEqual(summary["shipping_charged_total"], 10.0)
+        self.assertEqual(summary["shipping_label_spend_total"], 7.0)
+        self.assertEqual(summary["shipping_delta_total"], 3.0)
+        self.assertEqual(summary["profit_before_returns"], 63.0)
+        self.assertTrue((checks["status"] == "pass").all())
+
+    def test_accounting_period_drift_checks_allow_immaterial_amount_rounding(self):
+        checks = reports._build_accounting_period_drift_checks(
+            close_summary={
+                "sales_count": 1,
+                "gross_sales": 6400.20,
+                "net_before_cogs": 5453.55,
+                "fifo_cogs": 3591.57,
+                "profit_before_returns": 1861.98,
+                "estimated_profit_after_returns": 1861.98,
+                "returns_refund_total": 0.0,
+                "returns_cogs_reversal_total": 0.0,
+            },
+            qbo_sales_df=reports.pd.DataFrame(
+                {
+                    "amount": [6400.20],
+                    "shipping_cost": [474.01],
+                    "fees": [526.57],
+                    "shipping_label_cost": [894.09],
+                    "net_amount": [5453.55],
+                    "cogs_input_estimate": [3591.52],
+                    "profit_before_returns_estimate": [1862.03],
+                }
+            ),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["fifo_cogs_close_vs_qbo"]["status"], "pass")
+        self.assertEqual(by_check["profit_before_returns_close_vs_qbo"]["status"], "pass")
+        self.assertEqual(by_check["net_after_returns_and_cogs_close_vs_qbo"]["status"], "pass")
+        self.assertGreater(by_check["fifo_cogs_close_vs_qbo"]["tolerance"], 0.01)
+
+    def test_accounting_close_readiness_summary_ignores_reviewed_margin_and_mixed_cogs_for_status(self):
+        summary, checks = reports._build_accounting_close_readiness_summary(
+            inventory_df=reports.pd.DataFrame(),
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "sale_id": [59],
+                    "gross_sales": [7.8],
+                    "net_before_cogs": [5.69],
+                    "fifo_cogs": [195.13],
+                    "fifo_margin": [-189.44],
+                    "fifo_cost_source": ["mixed_fifo_cost"],
+                }
+            ),
+            returns_df=reports.pd.DataFrame(),
+            reconciliation_df=reports.pd.DataFrame({"reconcile_flag": [False]}),
+            shipping_economics_df=reports.pd.DataFrame({"shipping_label_spend": [1.0]}),
+            ebay_fee_source_priority_df=reports.pd.DataFrame(
+                {
+                    "actual_fee_source": ["normalized_order_finance_entries_marketplace_fee_sum"],
+                    "sales_count": [1],
+                    "actual_fee_total": [2.0],
+                }
+            ),
+            accounting_exceptions_df=reports.pd.DataFrame(),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": ["mixed_fifo_cost"],
+                    "sale_count": [1],
+                    "quantity": [1],
+                    "fifo_cogs": [195.13],
+                    "fifo_margin": [-189.44],
+                }
+            ),
+            active_suppression_keys={
+                ("nonpositive_margin", "sale", 59),
+                ("mixed_fifo_cost_review", "sale", 59),
+            },
+        )
+
+        self.assertEqual(summary["readiness_status"], "close_ready")
+        self.assertEqual(summary["negative_margin_rows"], 1)
+        self.assertEqual(summary["unreviewed_negative_margin_rows"], 0)
+        self.assertEqual(summary["sold_mixed_fifo_cogs"], 195.13)
+        self.assertEqual(summary["unreviewed_sold_mixed_fifo_cogs"], 0.0)
+        self.assertEqual(summary["warnings"], "")
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["Negative FIFO Margin Rows"]["status"], "pass")
+        self.assertEqual(by_check["Negative FIFO Margin Rows"]["value"], 0)
+
+    def test_accounting_close_readiness_summary_falls_back_from_zero_shipping_economics(self):
+        summary, checks = reports._build_accounting_close_readiness_summary(
+            inventory_df=reports.pd.DataFrame(),
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "gross_sales": [900.0],
+                    "shipping_cost": [90.86],
+                    "actual_shipping_alloc": [79.56],
+                    "net_before_cogs": [892.74],
+                    "fifo_cogs": [100.0],
+                    "fifo_margin": [792.74],
+                }
+            ),
+            returns_df=reports.pd.DataFrame(),
+            reconciliation_df=reports.pd.DataFrame({"reconcile_flag": [False]}),
+            shipping_economics_df=reports.pd.DataFrame(
+                {
+                    "shipping_charged_to_buyer": [0.0],
+                    "shipping_label_spend": [0.0],
+                }
+            ),
+            ebay_fee_source_priority_df=reports.pd.DataFrame(
+                {
+                    "actual_fee_source": ["normalized_order_finance_entries_marketplace_fee_sum"],
+                    "sales_count": [1],
+                    "actual_fee_total": [18.56],
+                }
+            ),
+            accounting_exceptions_df=reports.pd.DataFrame(),
+        )
+
+        self.assertEqual(summary["shipping_charged_total"], 90.86)
+        self.assertEqual(summary["shipping_label_spend_total"], 79.56)
+        self.assertEqual(summary["shipping_delta_total"], 11.3)
         self.assertTrue((checks["status"] == "pass").all())
 
     def test_accounting_close_profit_helpers_prefer_clear_fields_with_legacy_fallback(self):
@@ -1093,6 +1727,121 @@ class ReportsHelpersTests(unittest.TestCase):
         formula_row = checks[checks["check"] == "Accounting Formula Warnings"].iloc[0]
         self.assertEqual(formula_row["status"], "fail")
         self.assertEqual(formula_row["value"], 1)
+
+    def test_accounting_close_warning_source_detail_flattens_source_rows(self):
+        detail = reports._build_accounting_close_warning_source_detail_rows(
+            {
+                "accounting_close_formula_checks": reports.pd.DataFrame(
+                    {
+                        "check": ["net_before_cogs_component_formula", "shipping_delta_total_formula"],
+                        "status": ["warn", "pass"],
+                        "expected": [100.0, 5.0],
+                        "observed": [99.0, 5.0],
+                        "delta_observed_minus_expected": [-1.0, 0.0],
+                        "formula": [
+                            "gross + shipping - fees - label",
+                            "shipping charged - label spend",
+                        ],
+                    }
+                ),
+                "accounting_shipping_evidence_checks": reports.pd.DataFrame(
+                    {
+                        "check": ["paid_shipping_rows_missing_label_spend"],
+                        "status": ["warn"],
+                        "observed": [2.0],
+                        "details": ["2 paid-shipping rows have no label spend."],
+                    }
+                ),
+                "accounting_cogs_source_checks": reports.pd.DataFrame(
+                    {"check": ["all_good"], "status": ["pass"], "observed": [0.0]}
+                ),
+            }
+        )
+
+        self.assertEqual(len(detail), 2)
+        records = detail.to_dict("records")
+        self.assertEqual(records[0]["category"], "accounting_close_formula_checks")
+        self.assertEqual(records[0]["check"], "net_before_cogs_component_formula")
+        self.assertEqual(records[0]["formula"], "gross + shipping - fees - label")
+        self.assertEqual(records[1]["category"], "accounting_shipping_evidence_checks")
+        self.assertEqual(records[1]["details"], "2 paid-shipping rows have no label spend.")
+
+    def test_accounting_close_action_detail_names_sale_level_work(self):
+        detail = reports._build_accounting_close_action_detail_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 55,
+                        "sold_at": "2026-06-01T21:57:23",
+                        "marketplace": "ebay",
+                        "sku": "SKU-MIX",
+                        "product_title": "Lot of 22 Dimes",
+                        "quantity": 1,
+                        "net_before_cogs": 80.58,
+                        "fifo_cogs": 190.47,
+                        "fifo_margin": -109.89,
+                        "fifo_cost_source": "mixed_fifo_cost",
+                        "fifo_cogs_evidence_rows": 3,
+                        "inventory_movement_units_expected": 22,
+                        "inventory_movement_units_recorded": 1,
+                        "listing_lot_movement_mismatch": True,
+                        "listing_lot_movement_mismatch_units": 21,
+                    },
+                    {
+                        "sale_id": 60,
+                        "sku": "SKU-OK",
+                        "fifo_margin": 12.0,
+                        "fifo_cost_source": "assignment_unit_landed_cost",
+                        "listing_lot_movement_mismatch": False,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(detail), 1)
+        row = detail.iloc[0].to_dict()
+        self.assertEqual(row["sale_id"], 55)
+        self.assertEqual(row["sku"], "SKU-MIX")
+        self.assertEqual(row["listing_lot_movement_mismatch_units"], 21)
+        self.assertIn("lot/listing movement mismatch", row["issue"])
+        self.assertIn("mixed fallback FIFO COGS", row["issue"])
+        self.assertIn("nonpositive FIFO margin", row["issue"])
+        self.assertIn("Preview/apply lot-listing movement repair", row["recommended_action"])
+        self.assertIn("add explicit lot allocation", row["recommended_action"])
+        self.assertIn("intentionally low-margin/loss", row["recommended_action"])
+
+    def test_accounting_close_action_detail_names_regular_missing_sale_movement(self):
+        detail = reports._build_accounting_close_action_detail_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 65,
+                        "sku": "GS-CO-CO-26129-FC52",
+                        "quantity": 1,
+                        "net_before_cogs": 39.18,
+                        "fifo_cogs": 12.09,
+                        "fifo_margin": 27.09,
+                        "fifo_cost_source": "lot_allocation_weight",
+                        "fifo_cogs_evidence_rows": 1,
+                        "inventory_movement_units_expected": 1,
+                        "inventory_movement_units_recorded": 0,
+                        "inventory_movement_mismatch": True,
+                        "inventory_movement_mismatch_units": 1,
+                        "listing_lot_movement_mismatch": False,
+                        "listing_lot_movement_mismatch_units": 0,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(detail), 1)
+        row = detail.iloc[0].to_dict()
+        self.assertEqual(row["sale_id"], 65)
+        self.assertEqual(row["listing_lot_movement_mismatch_units"], 0)
+        self.assertEqual(row["inventory_movement_mismatch_units"], 1)
+        self.assertIn("sale inventory movement missing", row["issue"])
+        self.assertIn("recreate the regular sale inventory movement", row["recommended_action"])
+        self.assertNotIn("lot-listing movement repair", row["recommended_action"])
 
     def test_accounting_sales_component_checks_tie_sales_detail_to_margin(self):
         checks = reports._build_accounting_sales_component_checks(
@@ -1245,9 +1994,12 @@ class ReportsHelpersTests(unittest.TestCase):
             ),
             fee_source_priority_df=reports.pd.DataFrame(
                 {
-                    "actual_fee_source": ["normalized_order_finance_entries_marketplace_fee_sum"],
-                    "sales_count": [1],
-                    "actual_fee_total": [8.0],
+                    "actual_fee_source": [
+                        "normalized_order_finance_entries_marketplace_fee_sum",
+                        "sale_fees_field",
+                    ],
+                    "sales_count": [1, 0],
+                    "actual_fee_total": [8.0, 0.0],
                 }
             ),
         )
@@ -1256,6 +2008,7 @@ class ReportsHelpersTests(unittest.TestCase):
         by_check = {row["check"]: row for row in checks.to_dict("records")}
         self.assertEqual(by_check["fee_reconciliation_total_matches_sales_detail"]["observed"], 8.0)
         self.assertEqual(by_check["sale_fee_field_fallback_rows"]["observed"], 0.0)
+        self.assertEqual(by_check["sale_fee_field_fallback_fee_total"]["observed"], 0.0)
 
     def test_fee_evidence_warnings_block_close_readiness(self):
         summary, checks = reports._apply_fee_evidence_checks_to_close_readiness(
@@ -1267,18 +2020,20 @@ class ReportsHelpersTests(unittest.TestCase):
             reports.pd.DataFrame({"check": ["P0 Exceptions"], "status": ["pass"], "value": [0]}),
             reports.pd.DataFrame(
                 {
-                    "check": ["sale_fee_field_fallback_rows"],
-                    "status": ["warn"],
+                    "check": ["sale_fee_field_fallback_rows", "sale_fee_field_fallback_fee_total"],
+                    "status": ["warn", "warn"],
+                    "observed": [2.0, 6.5],
                 }
             ),
         )
 
         self.assertEqual(summary["readiness_status"], "blocked")
-        self.assertEqual(summary["fee_evidence_warn_count"], 1)
+        self.assertEqual(summary["fee_evidence_warn_count"], 2)
+        self.assertEqual(summary["sale_fee_field_fallback_fee_total"], 6.5)
         self.assertIn("fee evidence warnings", summary["blockers"])
         fee_row = checks[checks["check"] == "Fee Evidence Warnings"].iloc[0]
         self.assertEqual(fee_row["status"], "fail")
-        self.assertEqual(fee_row["value"], 1)
+        self.assertEqual(fee_row["value"], 2)
 
     def test_accounting_shipping_evidence_checks_tie_shipping_tables(self):
         checks = reports._build_accounting_shipping_evidence_checks(
@@ -1308,6 +2063,33 @@ class ReportsHelpersTests(unittest.TestCase):
         by_check = {row["check"]: row for row in checks.to_dict("records")}
         self.assertEqual(by_check["shipping_economics_delta_formula"]["expected"], 1.0)
         self.assertEqual(by_check["paid_shipping_rows_missing_label_spend"]["observed"], 0.0)
+        self.assertEqual(by_check["paid_shipping_missing_label_spend_charged_total"]["observed"], 0.0)
+
+    def test_accounting_shipping_evidence_checks_fall_back_from_zero_shipping_economics(self):
+        checks = reports._build_accounting_shipping_evidence_checks(
+            sales_df=reports.pd.DataFrame(
+                {
+                    "actual_shipping_charged": [90.86],
+                    "actual_shipping_label_cost": [79.56],
+                }
+            ),
+            shipping_economics_df=reports.pd.DataFrame(
+                {
+                    "shipping_charged_to_buyer": [0.0],
+                    "shipping_label_spend": [0.0],
+                    "shipping_delta_charged_minus_spend": [0.0],
+                }
+            ),
+            shipping_econ_summary_df=reports.pd.DataFrame(),
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["shipping_charged_sales_detail_matches_shipping_economics"]["status"], "pass")
+        self.assertEqual(by_check["label_spend_sales_detail_matches_shipping_economics"]["status"], "pass")
+        self.assertEqual(by_check["shipping_economics_delta_formula"]["status"], "pass")
+        self.assertEqual(by_check["shipping_economics_delta_formula"]["expected"], 11.3)
+        self.assertEqual(by_check["shipping_summary_charged_matches_detail"]["status"], "pass")
+        self.assertEqual(by_check["shipping_summary_label_spend_matches_detail"]["status"], "pass")
 
     def test_shipping_evidence_warnings_block_close_readiness(self):
         summary, checks = reports._apply_shipping_evidence_checks_to_close_readiness(
@@ -1319,18 +2101,23 @@ class ReportsHelpersTests(unittest.TestCase):
             reports.pd.DataFrame({"check": ["P0 Exceptions"], "status": ["pass"], "value": [0]}),
             reports.pd.DataFrame(
                 {
-                    "check": ["paid_shipping_rows_missing_label_spend"],
-                    "status": ["warn"],
+                    "check": [
+                        "paid_shipping_rows_missing_label_spend",
+                        "paid_shipping_missing_label_spend_charged_total",
+                    ],
+                    "status": ["warn", "warn"],
+                    "observed": [1.0, 5.0],
                 }
             ),
         )
 
         self.assertEqual(summary["readiness_status"], "blocked")
-        self.assertEqual(summary["shipping_evidence_warn_count"], 1)
+        self.assertEqual(summary["shipping_evidence_warn_count"], 2)
+        self.assertEqual(summary["paid_shipping_missing_label_spend_charged_total"], 5.0)
         self.assertIn("shipping evidence warnings", summary["blockers"])
         shipping_row = checks[checks["check"] == "Shipping Evidence Warnings"].iloc[0]
         self.assertEqual(shipping_row["status"], "fail")
-        self.assertEqual(shipping_row["value"], 1)
+        self.assertEqual(shipping_row["value"], 2)
 
     def test_accounting_reconciliation_tieout_checks_tie_marketplace_rows(self):
         checks = reports._build_accounting_reconciliation_tieout_checks(
@@ -1418,6 +2205,12 @@ class ReportsHelpersTests(unittest.TestCase):
                 "fifo_cogs": 50.0,
                 "sold_equal_fallback_cogs": 0.0,
                 "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 0.0,
+                "sold_mixed_estimate_fifo_cogs": 0.0,
+                "sold_mixed_verified_fifo_cogs": 0.0,
+                "sold_review_needed_cogs": 0.0,
+                "sold_estimated_cogs": 50.0,
+                "sold_verified_cogs": 0.0,
             },
         )
 
@@ -1428,6 +2221,50 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_check["fifo_cogs_evidence_sale_count_matches_margin_detail"]["observed"], 1.0)
         self.assertEqual(by_check["fifo_cogs_evidence_row_count_matches_margin_detail"]["observed"], 2.0)
         self.assertEqual(by_check["sold_equal_fallback_cogs_present"]["observed"], 0.0)
+        self.assertEqual(by_check["sold_estimated_cogs_matches_close_summary"]["observed"], 50.0)
+        self.assertEqual(by_check["sold_cogs_evidence_split_matches_fifo_cogs"]["status"], "pass")
+
+    def test_accounting_cogs_source_checks_allow_displayed_cent_tolerance(self):
+        checks = reports._build_accounting_cogs_source_checks(
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "sale_id": [1],
+                    "quantity": [1],
+                    "fifo_cogs": [3591.57],
+                    "fifo_margin": [1861.98],
+                    "fifo_cogs_evidence_rows": [1],
+                    "fifo_cost_source": ["assignment_allocated_landed_cost"],
+                }
+            ),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": ["assignment_allocated_landed_cost"],
+                    "sale_count": [1],
+                    "quantity": [1],
+                    "fifo_cogs": [3591.56],
+                    "fifo_margin": [1861.99],
+                }
+            ),
+            sale_fifo_cogs_evidence_df=reports.pd.DataFrame(
+                [{"sale_id": 1, "quantity": 1, "total_cost": 3591.57}]
+            ),
+            close_summary={
+                "fifo_cogs": 3591.57,
+                "sold_equal_fallback_cogs": 0.0,
+                "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 0.0,
+                "sold_mixed_estimate_fifo_cogs": 0.0,
+                "sold_mixed_verified_fifo_cogs": 0.0,
+                "sold_review_needed_cogs": 0.0,
+                "sold_estimated_cogs": 0.0,
+                "sold_verified_cogs": 3591.56,
+            },
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["cogs_source_fifo_cogs_matches_margin_detail"]["status"], "pass")
+        self.assertEqual(by_check["cogs_source_fifo_cogs_matches_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["cogs_source_fifo_margin_matches_margin_detail"]["status"], "pass")
 
     def test_accounting_cogs_source_checks_warn_when_fifo_evidence_is_missing(self):
         checks = reports._build_accounting_cogs_source_checks(
@@ -1453,6 +2290,12 @@ class ReportsHelpersTests(unittest.TestCase):
                 "fifo_cogs": 25.0,
                 "sold_equal_fallback_cogs": 0.0,
                 "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 0.0,
+                "sold_mixed_estimate_fifo_cogs": 0.0,
+                "sold_mixed_verified_fifo_cogs": 0.0,
+                "sold_review_needed_cogs": 0.0,
+                "sold_estimated_cogs": 0.0,
+                "sold_verified_cogs": 25.0,
             },
         )
 
@@ -1460,6 +2303,150 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_check["fifo_cogs_evidence_total_matches_margin_detail"]["status"], "warn")
         self.assertEqual(by_check["fifo_cogs_evidence_sale_count_matches_margin_detail"]["status"], "warn")
         self.assertEqual(by_check["fifo_cogs_evidence_row_count_matches_margin_detail"]["status"], "warn")
+
+    def test_accounting_cogs_source_checks_warn_when_lot_listing_movements_drift(self):
+        checks = reports._build_accounting_cogs_source_checks(
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "quantity": [20],
+                    "fifo_cogs": [72.2],
+                    "fifo_margin": [6.87],
+                    "fifo_cogs_evidence_rows": [20],
+                }
+            ),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": ["lot_equal_quantity_fallback"],
+                    "sale_count": [1],
+                    "quantity": [20],
+                    "fifo_cogs": [72.2],
+                    "fifo_margin": [6.87],
+                    "lot_listing_movement_mismatch_count": [1],
+                    "lot_listing_movement_mismatch_units": [19],
+                }
+            ),
+            sale_fifo_cogs_evidence_df=reports.pd.DataFrame(
+                [
+                    {"sale_id": 56, "quantity": 1, "total_cost": 3.61}
+                    for _ in range(20)
+                ]
+            ),
+            close_summary={
+                "fifo_cogs": 72.2,
+                "sold_equal_fallback_cogs": 72.2,
+                "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 0.0,
+                "sold_mixed_estimate_fifo_cogs": 0.0,
+                "sold_mixed_verified_fifo_cogs": 0.0,
+                "sold_review_needed_cogs": 72.2,
+                "sold_estimated_cogs": 0.0,
+                "sold_verified_cogs": 0.0,
+            },
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["sold_lot_listing_movement_mismatches_present"]["status"], "warn")
+        self.assertEqual(by_check["sold_lot_listing_movement_mismatches_present"]["observed"], 1.0)
+
+    def test_accounting_cogs_source_checks_validate_sold_cogs_evidence_split(self):
+        checks = reports._build_accounting_cogs_source_checks(
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "quantity": [3],
+                    "fifo_cogs": [100.0],
+                    "fifo_margin": [20.0],
+                    "fifo_cogs_evidence_rows": [3],
+                }
+            ),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": [
+                        "assignment_unit_landed_cost",
+                        "lot_expected_quantity_fallback",
+                        "mixed_estimate_fifo_cost",
+                        "mixed_verified_fifo_cost",
+                        "mixed_fifo_cost",
+                    ],
+                    "sale_count": [1, 1, 1, 1, 1],
+                    "quantity": [1, 1, 1, 1, 1],
+                    "fifo_cogs": [60.0, 25.0, 10.0, 20.0, 15.0],
+                    "fifo_margin": [10.0, 5.0, 3.0, 7.0, 5.0],
+                }
+            ),
+            sale_fifo_cogs_evidence_df=reports.pd.DataFrame(
+                [
+                    {"sale_id": 1, "quantity": 1, "total_cost": 60.0},
+                    {"sale_id": 2, "quantity": 1, "total_cost": 25.0},
+                    {"sale_id": 3, "quantity": 1, "total_cost": 10.0},
+                    {"sale_id": 4, "quantity": 1, "total_cost": 20.0},
+                    {"sale_id": 5, "quantity": 1, "total_cost": 15.0},
+                ]
+            ),
+            close_summary={
+                "fifo_cogs": 130.0,
+                "sold_equal_fallback_cogs": 0.0,
+                "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 15.0,
+                "sold_mixed_estimate_fifo_cogs": 10.0,
+                "sold_mixed_verified_fifo_cogs": 20.0,
+                "sold_review_needed_cogs": 15.0,
+                "sold_estimated_cogs": 35.0,
+                "sold_verified_cogs": 80.0,
+            },
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["sold_mixed_fifo_cogs_matches_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["sold_mixed_estimate_fifo_cogs_matches_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["sold_mixed_verified_fifo_cogs_matches_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["sold_review_needed_cogs_matches_close_summary"]["observed"], 15.0)
+        self.assertEqual(by_check["sold_estimated_cogs_matches_close_summary"]["observed"], 35.0)
+        self.assertEqual(by_check["sold_verified_cogs_matches_close_summary"]["observed"], 80.0)
+        self.assertEqual(by_check["sold_cogs_evidence_split_matches_fifo_cogs"]["status"], "pass")
+        self.assertEqual(by_check["sold_mixed_fifo_cogs_present"]["status"], "warn")
+
+    def test_accounting_cogs_source_checks_ignore_suppressed_mixed_fifo_sale_for_present_policy(self):
+        checks = reports._build_accounting_cogs_source_checks(
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "sale_id": [59],
+                    "quantity": [1],
+                    "fifo_cogs": [195.13],
+                    "fifo_margin": [-189.44],
+                    "fifo_cost_source": ["mixed_fifo_cost"],
+                    "fifo_cogs_evidence_rows": [5],
+                }
+            ),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": ["mixed_fifo_cost"],
+                    "sale_count": [1],
+                    "quantity": [1],
+                    "fifo_cogs": [195.13],
+                    "fifo_margin": [-189.44],
+                }
+            ),
+            sale_fifo_cogs_evidence_df=reports.pd.DataFrame(
+                [{"sale_id": 59, "quantity": 1, "total_cost": 195.13}]
+            ),
+            close_summary={
+                "fifo_cogs": 195.13,
+                "sold_equal_fallback_cogs": 0.0,
+                "sold_missing_cost_cogs": 0.0,
+                "sold_mixed_fifo_cogs": 195.13,
+                "sold_mixed_estimate_fifo_cogs": 0.0,
+                "sold_mixed_verified_fifo_cogs": 0.0,
+                "sold_review_needed_cogs": 195.13,
+                "sold_estimated_cogs": 0.0,
+                "sold_verified_cogs": 0.0,
+            },
+            active_suppression_keys={("mixed_fifo_cost_review", "sale", 59)},
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["sold_mixed_fifo_cogs_matches_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["sold_mixed_fifo_cogs_present"]["status"], "pass")
+        self.assertEqual(by_check["sold_mixed_fifo_cogs_present"]["observed"], 0.0)
 
     def test_cogs_source_summary_includes_bundle_inventory_evidence(self):
         summary = reports._build_cogs_source_summary(
@@ -1470,6 +2457,8 @@ class ReportsHelpersTests(unittest.TestCase):
                         "quantity": 2,
                         "listing_is_bundle": True,
                         "listing_bundle_inventory_units_sold": 10,
+                        "listing_lot_movement_mismatch": True,
+                        "listing_lot_movement_mismatch_units": 3,
                         "gross_sales": 100.0,
                         "net_before_cogs": 90.0,
                         "fifo_cogs": 50.0,
@@ -1480,6 +2469,8 @@ class ReportsHelpersTests(unittest.TestCase):
                         "quantity": 1,
                         "listing_is_bundle": False,
                         "listing_bundle_inventory_units_sold": 0,
+                        "listing_lot_movement_mismatch": False,
+                        "listing_lot_movement_mismatch_units": 0,
                         "gross_sales": 25.0,
                         "net_before_cogs": 20.0,
                         "fifo_cogs": 10.0,
@@ -1493,6 +2484,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(int(row["sale_count"]), 2)
         self.assertEqual(int(row["bundle_sale_count"]), 1)
         self.assertEqual(int(row["bundle_inventory_units_sold"]), 10)
+        self.assertEqual(int(row["lot_listing_movement_mismatch_count"]), 1)
+        self.assertEqual(int(row["lot_listing_movement_mismatch_units"]), 3)
 
     def test_cogs_source_warnings_block_close_readiness(self):
         summary, checks = reports._apply_cogs_source_checks_to_close_readiness(
@@ -1571,14 +2564,18 @@ class ReportsHelpersTests(unittest.TestCase):
         checks = reports._build_accounting_exception_queue_checks(
             accounting_exceptions_df=reports.pd.DataFrame(
                 {
-                    "severity": ["P0", "P1"],
-                    "exception_type": ["missing_cost_basis", "missing_label_spend"],
+                    "severity": ["P0", "P1", "P1"],
+                    "exception_type": [
+                        "missing_cost_basis",
+                        "missing_label_spend",
+                        "listing_lot_inventory_movement_mismatch",
+                    ],
                 }
             ),
             close_summary={
-                "total_exceptions": 2,
+                "total_exceptions": 3,
                 "p0_exceptions": 1,
-                "p1_exceptions": 1,
+                "p1_exceptions": 2,
             },
         )
 
@@ -1589,6 +2586,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_check["p0_exceptions_present"]["status"], "warn")
         self.assertEqual(by_check["p0_exceptions_present"]["observed"], 1.0)
         self.assertEqual(by_check["exception_rows_have_type"]["status"], "pass")
+        self.assertEqual(by_check["lot_listing_inventory_movement_mismatches_present"]["status"], "warn")
+        self.assertEqual(by_check["lot_listing_inventory_movement_mismatches_present"]["observed"], 1.0)
 
     def test_exception_queue_warnings_block_close_readiness(self):
         summary, checks = reports._apply_exception_queue_checks_to_close_readiness(
@@ -1630,6 +2629,28 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_check["nonpositive_fifo_margin_rows_have_exception"]["status"], "pass")
         self.assertEqual(by_check["negative_fifo_margin_rows_present"]["status"], "warn")
         self.assertEqual(by_check["nonpositive_fifo_margin_rows_present"]["status"], "warn")
+
+    def test_accounting_margin_anomaly_checks_ignore_suppressed_margin_sales_for_present_policy(self):
+        checks = reports._build_accounting_margin_anomaly_checks(
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "sale_id": [55, 57],
+                    "fifo_margin": [-109.89, -48.11],
+                }
+            ),
+            accounting_exceptions_df=reports.pd.DataFrame(),
+            close_summary={"negative_margin_rows": 2},
+            active_suppression_keys={
+                ("nonpositive_margin", "sale", 55),
+                ("nonpositive_margin", "sale", 57),
+            },
+        )
+
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["negative_fifo_margin_rows_match_close_summary"]["status"], "pass")
+        self.assertEqual(by_check["nonpositive_fifo_margin_rows_have_exception"]["status"], "pass")
+        self.assertEqual(by_check["negative_fifo_margin_rows_present"]["status"], "pass")
+        self.assertEqual(by_check["nonpositive_fifo_margin_rows_present"]["status"], "pass")
 
     def test_margin_anomaly_warnings_block_close_readiness(self):
         summary, checks = reports._apply_margin_anomaly_checks_to_close_readiness(
@@ -2015,6 +3036,11 @@ class ReportsHelpersTests(unittest.TestCase):
                 "sales_30d_shipping_label_spend": 3.0,
                 "sales_30d_shipping_delta": 5.0,
                 "sales_30d_est_cogs": 60.0,
+                "sales_30d_cogs_verified_amount": 50.0,
+                "sales_30d_cogs_estimate_amount": 10.0,
+                "sales_30d_cogs_review_amount": 0.0,
+                "sales_30d_cogs_review_count": 0,
+                "sales_30d_profit_basis_status": "partial_lot_estimate",
                 "sales_30d_profit_before_returns": 57.0,
                 "sales_30d_est_profit": 57.0,
             },
@@ -2029,8 +3055,49 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_check["dashboard_30d_net_formula"]["status"], "pass")
         self.assertEqual(by_check["dashboard_30d_shipping_delta_formula"]["status"], "pass")
         self.assertEqual(by_check["dashboard_30d_profit_formula"]["status"], "pass")
+        self.assertEqual(by_check["dashboard_30d_cogs_evidence_split_formula"]["status"], "pass")
+        self.assertEqual(by_check["dashboard_30d_cogs_review_status_formula"]["status"], "pass")
+        self.assertEqual(by_check["dashboard_30d_cogs_partial_estimate_status_formula"]["status"], "pass")
         self.assertEqual(by_check["profit_before_returns_close_vs_dashboard_30d"]["observed"], 57.0)
         self.assertEqual(by_check["estimated_profit_after_returns_close_vs_dashboard_30d"]["observed"], 57.0)
+
+    def test_accounting_period_drift_checks_warn_on_dashboard_cogs_evidence_mismatch(self):
+        drift = reports._build_accounting_period_drift_checks(
+            close_summary={
+                "sales_count": 1,
+                "gross_sales": 120.0,
+                "net_before_cogs": 117.0,
+                "fee_total": 8.0,
+                "shipping_charged_total": 8.0,
+                "shipping_label_spend_total": 3.0,
+                "shipping_delta_total": 5.0,
+                "fifo_cogs": 60.0,
+                "fifo_margin": 57.0,
+            },
+            qbo_sales_df=reports.pd.DataFrame(),
+            qbo_adjustments_df=reports.pd.DataFrame(),
+            dashboard_live_metrics={
+                "sales_30d_count": 1,
+                "sales_30d_gross": 120.0,
+                "sales_30d_net": 117.0,
+                "ebay_fees_30d_total": 8.0,
+                "sales_30d_shipping_charged": 8.0,
+                "sales_30d_shipping_label_spend": 3.0,
+                "sales_30d_shipping_delta": 5.0,
+                "sales_30d_est_cogs": 60.0,
+                "sales_30d_cogs_verified_amount": 40.0,
+                "sales_30d_cogs_estimate_amount": 10.0,
+                "sales_30d_cogs_review_amount": 5.0,
+                "sales_30d_cogs_review_count": 1,
+                "sales_30d_profit_basis_status": "ok",
+                "sales_30d_profit_before_returns": 57.0,
+                "sales_30d_est_profit": 57.0,
+            },
+        )
+
+        by_check = {row["check"]: row for row in drift.to_dict("records")}
+        self.assertEqual(by_check["dashboard_30d_cogs_evidence_split_formula"]["status"], "warn")
+        self.assertEqual(by_check["dashboard_30d_cogs_review_status_formula"]["status"], "warn")
 
     def test_accounting_period_drift_checks_include_dashboard_return_impact(self):
         drift = reports._build_accounting_period_drift_checks(
@@ -2349,6 +3416,36 @@ class ReportsHelpersTests(unittest.TestCase):
         )
         self.assertEqual(by_check["ai_accounting_30d_profit_before_returns_formula"]["status"], "pass")
 
+    def test_cogs_basis_review_fields_classify_sources(self):
+        review = reports._cogs_basis_review_fields("lot_equal_quantity_fallback")
+        self.assertTrue(review["basis_review_required"])
+        self.assertFalse(review["basis_is_estimate"])
+        self.assertEqual(review["basis_review_severity"], "review")
+        self.assertIn("equal-quantity fallback", review["basis_review_reason"])
+
+        estimate = reports._cogs_basis_review_fields("lot_expected_quantity_fallback")
+        self.assertFalse(estimate["basis_review_required"])
+        self.assertTrue(estimate["basis_is_estimate"])
+        self.assertEqual(estimate["basis_review_severity"], "estimate")
+
+        mixed_estimate = reports._cogs_basis_review_fields("mixed_estimate_fifo_cost")
+        self.assertFalse(mixed_estimate["basis_review_required"])
+        self.assertTrue(mixed_estimate["basis_is_estimate"])
+        self.assertEqual(mixed_estimate["basis_review_severity"], "estimate")
+        self.assertIn("expected-quantity lot estimates", mixed_estimate["basis_review_reason"])
+
+        mixed_verified = reports._cogs_basis_review_fields("mixed_verified_fifo_cost")
+        self.assertFalse(mixed_verified["basis_review_required"])
+        self.assertFalse(mixed_verified["basis_is_estimate"])
+        self.assertEqual(mixed_verified["basis_review_severity"], "ok")
+        self.assertIn("multiple verified FIFO", mixed_verified["basis_review_reason"])
+
+        verified = reports._cogs_basis_review_fields("assignment_unit_landed_cost")
+        self.assertFalse(verified["basis_review_required"])
+        self.assertFalse(verified["basis_is_estimate"])
+        self.assertEqual(verified["basis_review_severity"], "ok")
+        self.assertEqual(verified["basis_review_reason"], "")
+
     def test_lot_allocation_source_summary_rolls_up_cost_basis(self):
         lots_df = reports.pd.DataFrame(
             [
@@ -2377,6 +3474,56 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(by_source["lot_allocation_weight"]["quantity_acquired"], 1)
         self.assertEqual(by_source["lot_equal_quantity_fallback"]["resolved_landed_total_cost"], 30.0)
         self.assertAlmostEqual(by_source["lot_allocation_weight"]["cost_share_pct"], 60.0)
+
+    def test_lot_allocation_action_detail_filters_fallback_and_missing_rows(self):
+        detail = reports._build_lot_allocation_action_detail(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "assignment_id": 10,
+                        "lot_id": 4,
+                        "lot_code": "LOT-4",
+                        "sku": "GS-A",
+                        "product_title": "Fallback coin",
+                        "quantity_acquired": 1,
+                        "cost_source": "lot_equal_quantity_fallback",
+                        "lot_landed_total": 43.26,
+                        "lot_expected_total_quantity": None,
+                        "allocation_weight": None,
+                        "resolved_landed_unit_cost": 43.26,
+                        "resolved_landed_total_cost": 43.26,
+                    },
+                    {
+                        "assignment_id": 11,
+                        "lot_id": 5,
+                        "lot_code": "LOT-5",
+                        "sku": "GS-B",
+                        "product_title": "Missing basis coin",
+                        "quantity_acquired": 1,
+                        "cost_source": "missing_cost_basis",
+                        "lot_landed_total": 0.0,
+                        "resolved_landed_unit_cost": 0.0,
+                        "resolved_landed_total_cost": 0.0,
+                    },
+                    {
+                        "assignment_id": 12,
+                        "lot_id": 6,
+                        "lot_code": "LOT-6",
+                        "sku": "GS-C",
+                        "product_title": "Good row",
+                        "quantity_acquired": 1,
+                        "cost_source": "assignment_allocated_landed_cost",
+                        "resolved_landed_total_cost": 99.0,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(detail), 2)
+        by_assignment = {int(row["assignment_id"]): row for row in detail.to_dict("records")}
+        self.assertIn("approve equal-fallback allocation repair", by_assignment[10]["suggested_action"])
+        self.assertIn("Add lot landed total", by_assignment[11]["suggested_action"])
+        self.assertNotIn(12, by_assignment)
 
     def test_cogs_source_summary_rolls_up_sold_cogs_basis(self):
         cogs_margin_df = reports.pd.DataFrame(
@@ -2443,6 +3590,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(summary["negative_margin_rows"], 1)
         self.assertEqual(summary["lot_equal_fallback_assignments"], 2)
         self.assertEqual(summary["sold_equal_fallback_cogs"], 25.0)
+        self.assertEqual(summary["sold_review_needed_cogs"], 25.0)
+        self.assertEqual(summary["sold_review_needed_sale_count"], 0)
         self.assertTrue(
             any(
                 row.get("check") == "Lot Equal Fallback Assignments" and row.get("status") == "warn"
@@ -2456,6 +3605,56 @@ class ReportsHelpersTests(unittest.TestCase):
             )
         )
         self.assertIn("warn", set(checks["status"]))
+
+    def test_accounting_close_readiness_splits_sold_cogs_evidence_buckets(self):
+        summary, checks = reports._build_accounting_close_readiness_summary(
+            inventory_df=reports.pd.DataFrame(),
+            cogs_margin_df=reports.pd.DataFrame(
+                {
+                    "gross_sales": [150.0],
+                    "net_before_cogs": [130.0],
+                    "fifo_cogs": [130.0],
+                    "fifo_margin": [0.0],
+                }
+            ),
+            returns_df=reports.pd.DataFrame(),
+            reconciliation_df=reports.pd.DataFrame({"reconcile_flag": [False]}),
+            shipping_economics_df=reports.pd.DataFrame(),
+            ebay_fee_source_priority_df=reports.pd.DataFrame(),
+            accounting_exceptions_df=reports.pd.DataFrame(),
+            cogs_source_summary_df=reports.pd.DataFrame(
+                {
+                    "fifo_cost_source": [
+                        "assignment_unit_landed_cost",
+                        "lot_expected_quantity_fallback",
+                        "mixed_estimate_fifo_cost",
+                        "mixed_verified_fifo_cost",
+                        "mixed_fifo_cost",
+                    ],
+                    "fifo_cogs": [60.0, 25.0, 10.0, 20.0, 15.0],
+                    "sale_count": [3, 2, 1, 1, 1],
+                }
+            ),
+        )
+
+        self.assertEqual(summary["readiness_status"], "review_needed")
+        self.assertEqual(summary["sold_verified_cogs"], 80.0)
+        self.assertEqual(summary["sold_estimated_cogs"], 35.0)
+        self.assertEqual(summary["sold_review_needed_cogs"], 15.0)
+        self.assertEqual(summary["sold_mixed_fifo_cogs"], 15.0)
+        self.assertEqual(summary["sold_mixed_estimate_fifo_cogs"], 10.0)
+        self.assertEqual(summary["sold_mixed_verified_fifo_cogs"], 20.0)
+        self.assertEqual(summary["sold_verified_sale_count"], 4)
+        self.assertEqual(summary["sold_estimated_sale_count"], 3)
+        self.assertEqual(summary["sold_review_needed_sale_count"], 1)
+        self.assertIn("sold COGS uses mixed fallback FIFO basis", summary["warnings"])
+        by_check = {row["check"]: row for row in checks.to_dict("records")}
+        self.assertEqual(by_check["Sold Mixed Fallback FIFO COGS"]["status"], "warn")
+        self.assertEqual(by_check["Sold Mixed Estimated FIFO COGS"]["status"], "info")
+        self.assertEqual(by_check["Sold Mixed Verified FIFO COGS"]["value"], 20.0)
+        self.assertEqual(by_check["Sold Review-Needed COGS"]["value"], 15.0)
+        self.assertEqual(by_check["Sold Estimated COGS"]["status"], "info")
+        self.assertEqual(by_check["Sold Verified COGS"]["value"], 80.0)
 
     def test_accounting_close_readiness_summary_blocked(self):
         summary, checks = reports._build_accounting_close_readiness_summary(
@@ -2677,6 +3876,48 @@ class ReportsHelpersTests(unittest.TestCase):
 
         statuses = {row["check"]: row["status"] for row in review.to_dict("records")}
         self.assertEqual(statuses["Approved Sign-Off AI Review Follow-Up Count"], "warn")
+
+    def test_accounting_close_signoff_review_compares_fee_shipping_exposure(self):
+        review = reports._build_accounting_close_signoff_review(
+            signoff_df=reports.pd.DataFrame(
+                [
+                    {
+                        "close_period": "2026-04",
+                        "signoff_type": "monthly_close_review",
+                        "status": "approved",
+                        "close_readiness_status": "blocked",
+                        "exception_count": 0,
+                        "unresolved_blocker_count": 1,
+                        "period_drift_warn_count": 0,
+                        "ai_review_followup_count": 0,
+                        "sale_fee_field_fallback_fee_total": 6.5,
+                        "paid_shipping_missing_label_spend_charged_total": 5.0,
+                        "accounting_packet_ref": "accounting_close_packet_2026-04.zip",
+                        "accounting_packet_hash": "abc123",
+                        "owner": "Finance Owner",
+                        "signoff_date": "2026-04-30",
+                    }
+                ]
+            ),
+            close_summary={
+                "readiness_status": "blocked",
+                "total_exceptions": 0,
+                "blocker_count": 1,
+                "period_drift_warn_count": 0,
+                "ai_review_followup_count": 0,
+                "sale_fee_field_fallback_fee_total": 8.5,
+                "paid_shipping_missing_label_spend_charged_total": 5.0,
+            },
+            from_date=date(2026, 4, 1),
+            to_date=date(2026, 4, 30),
+            current_packet_hash="abc123",
+        )
+
+        by_check = {row["check"]: row for row in review.to_dict("records")}
+        self.assertEqual(by_check["Approved Sign-Off Fee Evidence Exposure"]["status"], "warn")
+        self.assertEqual(by_check["Approved Sign-Off Fee Evidence Exposure"]["expected"], 8.5)
+        self.assertEqual(by_check["Approved Sign-Off Fee Evidence Exposure"]["observed"], 6.5)
+        self.assertEqual(by_check["Approved Sign-Off Label Evidence Exposure"]["status"], "pass")
 
     def test_accounting_close_signoff_review_uses_latest_approved_signoff(self):
         review = reports._build_accounting_close_signoff_review(
@@ -2934,6 +4175,8 @@ class ReportsHelpersTests(unittest.TestCase):
                 "readiness_status": "blocked",
                 "p0_exceptions": 1,
                 "net_after_returns_and_cogs": 30.0,
+                "sale_fee_field_fallback_fee_total": 6.5,
+                "paid_shipping_missing_label_spend_charged_total": 5.0,
             },
             from_date="2026-04-01",
             to_date="2026-04-26",
@@ -2972,11 +4215,16 @@ class ReportsHelpersTests(unittest.TestCase):
             manifest = zf.read("manifest.csv").decode("utf-8")
             self.assertIn("readiness_status,blocked", manifest)
             self.assertIn("net_after_returns_and_cogs,30.0", manifest)
+            self.assertIn("sale_fee_field_fallback_fee_total,6.5", manifest)
+            self.assertIn("paid_shipping_missing_label_spend_charged_total,5.0", manifest)
             self.assertIn("accounting_close_packet_evidence_hash_sha256,", manifest)
             self.assertIn("sha256_sales_detail,", manifest)
             readme = zf.read("README.txt").decode("utf-8")
             self.assertIn("Profit convention before returns", readme)
             self.assertIn("Estimated profit after returns", readme)
+            self.assertIn("Fee evidence exposure", readme)
+            self.assertIn("sale_fee_field_fallback_fee_total", readme)
+            self.assertIn("paid_shipping_missing_label_spend_charged_total", readme)
             self.assertIn("profit_before_returns_estimate", readme)
 
     def test_accounting_close_packet_evidence_hash_is_stable_for_same_inputs(self):
@@ -3045,6 +4293,16 @@ class ReportsHelpersTests(unittest.TestCase):
                     "tax_reporting_signoff_review",
                 ),
                 (
+                    "Quarterly Estimated Tax Summary",
+                    reports.pd.DataFrame({"field": ["Tax year"], "value": [2026]}),
+                    "quarterly_estimated_tax_summary",
+                ),
+                (
+                    "Quarterly Estimated Tax Payment Review",
+                    reports.pd.DataFrame({"jurisdiction": ["Federal"], "status": ["pass"]}),
+                    "quarterly_estimated_tax_payment_review",
+                ),
+                (
                     "Sales Detail",
                     reports.pd.DataFrame({"sale_id": [1]}),
                     "sales_detail",
@@ -3071,12 +4329,16 @@ class ReportsHelpersTests(unittest.TestCase):
             self.assertIn("tax_exceptions_advisor_review.csv", names)
             self.assertIn("tax_reporting_signoffs.csv", names)
             self.assertIn("tax_reporting_signoff_review.csv", names)
+            self.assertIn("quarterly_estimated_tax_summary.csv", names)
+            self.assertIn("quarterly_estimated_tax_payment_review.csv", names)
             self.assertIn("colorado_suts_upload_2026-04-01_2026-04-30.xlsx", names)
             self.assertNotIn("sales_detail.csv", names)
             manifest = zf.read("manifest.csv").decode("utf-8")
             self.assertIn("tax_jurisdiction,\"Golden, Colorado\"", manifest)
             self.assertIn("shipping_taxable,true", manifest)
             self.assertIn("tax_packet_evidence_hash_sha256,", manifest)
+            self.assertIn("row_count_quarterly_estimated_tax_summary,1", manifest)
+            self.assertIn("row_count_quarterly_estimated_tax_payment_review,1", manifest)
             self.assertIn("sha256_colorado_suts_upload_2026-04-01_2026-04-30.xlsx,", manifest)
             readme = zf.read("README.txt").decode("utf-8")
             self.assertIn("tax advisor", readme)
@@ -3253,6 +4515,11 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["gross_margin_estimate"], 52.25)
         self.assertAlmostEqual(rows[0]["profit_before_returns_estimate"], 52.25)
         self.assertEqual(rows[0]["cogs_source"], "lot_expected_quantity_fallback")
+        self.assertEqual(rows[0]["cogs_basis_bucket"], "estimate")
+        self.assertFalse(rows[0]["basis_review_required"])
+        self.assertTrue(rows[0]["basis_is_estimate"])
+        self.assertEqual(rows[0]["basis_review_severity"], "estimate")
+        self.assertIn("expected lot quantity", rows[0]["basis_review_reason"])
         self.assertEqual(rows[0]["fee_source"], "normalized_order_finance_entries_marketplace_fee_sum")
         self.assertEqual(rows[0]["item_product_source"], "sale_product")
         self.assertTrue(rows[0]["listing_is_bundle"])
@@ -3261,14 +4528,400 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["listing_bundle_units_per_listing"], 5)
         self.assertEqual(rows[0]["listing_bundle_inventory_units_sold"], 5)
 
+    def test_sale_inventory_movement_summary_flags_lot_listing_drift(self):
+        product = SimpleNamespace(id=101, sku="SKU-LOT", title="Lot Product")
+        sale = SimpleNamespace(
+            id=56,
+            product_id=101,
+            quantity_sold=1,
+            product=product,
+            listing=SimpleNamespace(
+                product_id=101,
+                listing_title="Lot of 20 Mercury Silver Dimes 90% Silver Coins",
+                marketplace_details=json.dumps({"bundle": {"enabled": False, "components": []}}),
+            ),
+        )
+
+        summary = reports._sale_inventory_movement_summary(sale, {(56, 101): 1})
+
+        self.assertEqual(summary["inventory_movement_units_expected"], 20)
+        self.assertEqual(summary["inventory_movement_units_recorded"], 1)
+        self.assertEqual(summary["listing_lot_movement_mismatch_units"], 19)
+        self.assertTrue(summary["listing_lot_movement_mismatch"])
+
+    def test_sale_inventory_movement_summary_handles_regular_sale_without_drift(self):
+        sale = SimpleNamespace(
+            id=57,
+            product_id=102,
+            quantity_sold=3,
+            product=SimpleNamespace(id=102, sku="SKU-REG", title="Regular Product"),
+            listing=None,
+        )
+
+        summary = reports._sale_inventory_movement_summary(sale, {(57, 102): 3})
+
+        self.assertEqual(summary["inventory_movement_units_expected"], 3)
+        self.assertEqual(summary["inventory_movement_units_recorded"], 3)
+        self.assertEqual(summary["listing_lot_movement_mismatch_units"], 0)
+        self.assertFalse(summary["listing_lot_movement_mismatch"])
+
+    def test_sale_inventory_movement_summary_uses_listing_product_when_sale_product_missing(self):
+        sale = SimpleNamespace(
+            id=66,
+            product_id=None,
+            quantity_sold=1,
+            product=None,
+            listing=SimpleNamespace(
+                product_id=2,
+                product=SimpleNamespace(id=2, sku="DOC-3-0407"),
+                marketplace_details="{}",
+            ),
+        )
+
+        summary = reports._sale_inventory_movement_summary(sale, {(66, 2): 1})
+
+        self.assertEqual(summary["inventory_movement_units_expected"], 1)
+        self.assertEqual(summary["inventory_movement_units_recorded"], 1)
+        self.assertEqual(summary["inventory_movement_mismatch_units"], 0)
+        self.assertFalse(summary["inventory_movement_mismatch"])
+        self.assertEqual(summary["listing_lot_movement_mismatch_units"], 0)
+        self.assertFalse(summary["listing_lot_movement_mismatch"])
+
+    def test_sale_inventory_movement_summary_separates_regular_missing_movement_from_lot_repair(self):
+        sale = SimpleNamespace(
+            id=65,
+            product_id=186,
+            quantity_sold=1,
+            product=SimpleNamespace(id=186, sku="GS-CO-CO-26129-FC52"),
+            listing=SimpleNamespace(
+                product_id=186,
+                product=SimpleNamespace(id=186, sku="GS-CO-CO-26129-FC52"),
+                listing_title="1907 U.S. Coin Collection Barber Half, Quarter, Dime, Nickel, and Indian Penny",
+                marketplace_details="{}",
+            ),
+        )
+
+        summary = reports._sale_inventory_movement_summary(sale, {})
+
+        self.assertEqual(summary["inventory_movement_units_expected"], 1)
+        self.assertEqual(summary["inventory_movement_units_recorded"], 0)
+        self.assertEqual(summary["inventory_movement_mismatch_units"], 1)
+        self.assertTrue(summary["inventory_movement_mismatch"])
+        self.assertEqual(summary["listing_lot_movement_mismatch_units"], 0)
+        self.assertFalse(summary["listing_lot_movement_mismatch"])
+
+    def test_lot_listing_movement_repair_candidates_extract_sale_rows(self):
+        candidates = reports._lot_listing_movement_repair_candidates(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "severity": "P1",
+                        "exception_type": "listing_lot_inventory_movement_mismatch",
+                        "entity_id": 56,
+                        "sku": "GS-CO-CO-26120-604B",
+                        "reference": "EBAY-LOT-20",
+                        "amount": 19.0,
+                        "details": "Expected 20 and recorded 1.",
+                    },
+                    {
+                        "severity": "P1",
+                        "exception_type": "lot_underallocated",
+                        "entity_id": 3,
+                        "amount": 2.5,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["sale_id"], 56)
+        self.assertEqual(candidates[0]["missing_units"], 19)
+        self.assertEqual(candidates[0]["reference"], "EBAY-LOT-20")
+
+    def test_lot_listing_movement_repair_candidates_include_cogs_margin_rows(self):
+        candidates = reports._lot_listing_movement_repair_candidates_from_cogs_margin(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 66,
+                        "marketplace": "ebay",
+                        "sku": "DOC-3-0407",
+                        "quantity": 1,
+                        "listing_is_bundle": True,
+                        "inventory_movement_units_expected": 20,
+                        "inventory_movement_units_recorded": 1,
+                        "listing_lot_movement_mismatch_units": 19,
+                        "listing_lot_movement_mismatch": True,
+                    },
+                    {
+                        "sale_id": 67,
+                        "sku": "OK",
+                        "quantity": 1,
+                        "inventory_movement_units_expected": 1,
+                        "inventory_movement_units_recorded": 1,
+                        "listing_lot_movement_mismatch_units": 0,
+                        "listing_lot_movement_mismatch": False,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["sale_id"], 66)
+        self.assertEqual(candidates[0]["sku"], "DOC-3-0407")
+        self.assertEqual(candidates[0]["missing_units"], 19)
+        self.assertIn("expected movement units=20", candidates[0]["details"])
+
+    def test_lot_listing_movement_repair_candidates_skip_regular_missing_movement_rows(self):
+        candidates = reports._lot_listing_movement_repair_candidates_from_cogs_margin(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "sale_id": 65,
+                        "marketplace": "ebay",
+                        "sku": "GS-CO-CO-26129-FC52",
+                        "quantity": 1,
+                        "listing_is_bundle": False,
+                        "inventory_movement_units_expected": 1,
+                        "inventory_movement_units_recorded": 0,
+                        "inventory_movement_mismatch_units": 1,
+                        "inventory_movement_mismatch": True,
+                        "listing_lot_movement_mismatch_units": 0,
+                        "listing_lot_movement_mismatch": False,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_lot_listing_movement_repair_candidates_merge_exception_and_cogs_sources(self):
+        merged = reports._merge_lot_listing_movement_repair_candidates(
+            [{"sale_id": 55, "sku": "A", "missing_units": 2, "details": "exception"}],
+            [{"sale_id": 55, "sku": "A", "missing_units": 5, "reference": "ebay", "details": "cogs"}],
+            [{"sale_id": 56, "sku": "B", "missing_units": 1}],
+        )
+
+        self.assertEqual([row["sale_id"] for row in merged], [56, 55])
+        sale55 = next(row for row in merged if row["sale_id"] == 55)
+        self.assertEqual(sale55["missing_units"], 5)
+        self.assertEqual(sale55["details"], "exception")
+        self.assertEqual(sale55["reference"], "ebay")
+
     def test_report_context_caption_explains_qbo_profit_fields(self):
         caption = reports._report_context_caption("qbo_sales_export")
         self.assertIn("profit_before_returns_estimate", caption)
         self.assertIn("gross_margin_estimate", caption)
 
+        salesreceipt_caption = reports._report_context_caption("quickbooks_salesreceipt_payloads")
+        self.assertIn("SalesReceipt JSON payloads", salesreceipt_caption)
+        self.assertIn("Custom App Clearing Account", salesreceipt_caption)
+
+        fee_purchase_caption = reports._report_context_caption("quickbooks_fee_purchase_payloads")
+        self.assertIn("Purchase JSON payloads", fee_purchase_caption)
+        self.assertIn("order-level eBay fees", fee_purchase_caption)
+
+        shipping_label_purchase_caption = reports._report_context_caption(
+            "quickbooks_shipping_label_purchase_payloads"
+        )
+        self.assertIn("shipping-label spend", shipping_label_purchase_caption)
+        self.assertIn("eBay Shipping Expense", shipping_label_purchase_caption)
+
+        quarterly_fee_caption = reports._report_context_caption("quarterly_estimated_tax_fee_detail")
+        self.assertIn("Marketplace fee detail", quarterly_fee_caption)
+        self.assertIn("tax-advisor review", quarterly_fee_caption)
+
+        quarterly_fee_summary_caption = reports._report_context_caption("quarterly_estimated_tax_fee_summary")
+        self.assertIn("Marketplace fee rollup", quarterly_fee_summary_caption)
+        self.assertIn("advisor review", quarterly_fee_summary_caption)
+
         cogs_caption = reports._report_context_caption("cogs_margin_detail")
         self.assertIn("before-return profit", cogs_caption)
         self.assertIn("Est. Profit After Returns", cogs_caption)
+        self.assertIn("listing_bundle_inventory_units_sold", cogs_caption)
+        self.assertIn("inventory_movement_units_expected", cogs_caption)
+
+    def test_quickbooks_salesreceipt_payload_rows_from_qbo_sales_export(self):
+        rows = reports._build_quickbooks_salesreceipt_payload_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-11",
+                        "item_sku": "SKU-1",
+                        "quantity": 2,
+                        "amount": 25.5,
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["endpoint"], "POST /v3/company/{realmId}/salesreceipt")
+        self.assertEqual(rows[0]["payload_type"], "SalesReceipt")
+        self.assertEqual(rows[0]["source_doc_number"], "EO-11")
+        self.assertEqual(rows[0]["clearing_account_ref"], "Custom App Clearing Account")
+        self.assertEqual(rows[0]["customer_ref"], "eBay Sales Customer")
+        self.assertEqual(rows[0]["payment_method_ref"], "eBay Payout")
+        self.assertEqual(rows[0]["item_ref"], "SKU-1")
+        self.assertEqual(rows[0]["quantity"], 2)
+        self.assertEqual(rows[0]["amount"], 25.5)
+        self.assertEqual(rows[0]["tax_code_ref"], "NON")
+        self.assertEqual(rows[0]["validation_status"], "ok")
+        payload = json.loads(rows[0]["payload_json"])
+        self.assertEqual(payload["DepositToAccountRef"]["value"], "Custom App Clearing Account")
+        self.assertEqual(payload["Line"][0]["SalesItemLineDetail"]["ItemRef"]["value"], "SKU-1")
+
+    def test_quickbooks_fee_purchase_payload_rows_skip_zero_fees_and_flag_payload(self):
+        rows = reports._build_quickbooks_fee_purchase_payload_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-11",
+                        "fees": 3.25,
+                    },
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-12",
+                        "fees": 0,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["endpoint"], "POST /v3/company/{realmId}/purchase")
+        self.assertEqual(rows[0]["payload_type"], "Purchase")
+        self.assertEqual(rows[0]["source_doc_number"], "EO-11")
+        self.assertEqual(rows[0]["clearing_account_ref"], "Custom App Clearing Account")
+        self.assertEqual(rows[0]["vendor_ref"], "eBay Vendor")
+        self.assertEqual(rows[0]["expense_account_ref"], "Merchant Account Fees")
+        self.assertEqual(rows[0]["amount"], 3.25)
+        self.assertEqual(rows[0]["validation_status"], "ok")
+        payload = json.loads(rows[0]["payload_json"])
+        self.assertEqual(payload["AccountRef"]["value"], "Custom App Clearing Account")
+        self.assertEqual(
+            payload["Line"][0]["AccountBasedExpenseLineDetail"]["AccountRef"]["value"],
+            "Merchant Account Fees",
+        )
+
+    def test_quickbooks_shipping_label_purchase_payload_rows_skip_zero_labels(self):
+        rows = reports._build_quickbooks_shipping_label_purchase_payload_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-11",
+                        "shipping_label_cost": 6.07,
+                        "shipping_label_source": "normalized_order_finance_entries_shipping_label_sum",
+                    },
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-12",
+                        "shipping_label_cost": 0,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["endpoint"], "POST /v3/company/{realmId}/purchase")
+        self.assertEqual(rows[0]["payload_type"], "Purchase")
+        self.assertEqual(rows[0]["source_doc_number"], "EO-11")
+        self.assertEqual(rows[0]["source"], "normalized_order_finance_entries_shipping_label_sum")
+        self.assertEqual(rows[0]["clearing_account_ref"], "Custom App Clearing Account")
+        self.assertEqual(rows[0]["vendor_ref"], "eBay Vendor")
+        self.assertEqual(rows[0]["expense_account_ref"], "eBay Shipping Expense")
+        self.assertEqual(rows[0]["amount"], 6.07)
+        self.assertEqual(rows[0]["validation_status"], "ok")
+        payload = json.loads(rows[0]["payload_json"])
+        self.assertEqual(payload["AccountRef"]["value"], "Custom App Clearing Account")
+        self.assertEqual(
+            payload["Line"][0]["AccountBasedExpenseLineDetail"]["AccountRef"]["value"],
+            "eBay Shipping Expense",
+        )
+
+    def test_quickbooks_salesreceipt_payload_rows_mark_missing_sku_for_review(self):
+        rows = reports._build_quickbooks_salesreceipt_payload_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "txn_date": "2026-06-09",
+                        "doc_number": "EO-13",
+                        "item_sku": "",
+                        "quantity": 1,
+                        "amount": 10.0,
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(rows[0]["validation_status"], "review")
+        self.assertIn("line_0_missing_item_ref", rows[0]["validation_issues"])
+
+    def test_quickbooks_payload_readiness_summarizes_review_counts(self):
+        sales_rows = reports.pd.DataFrame(
+            reports._build_quickbooks_salesreceipt_payload_rows(
+                reports.pd.DataFrame(
+                    [
+                        {
+                            "txn_date": "2026-06-09",
+                            "doc_number": "EO-11",
+                            "item_sku": "SKU-1",
+                            "quantity": 2,
+                            "amount": 25.5,
+                        },
+                        {
+                            "txn_date": "2026-06-09",
+                            "doc_number": "EO-12",
+                            "item_sku": "",
+                            "quantity": 1,
+                            "amount": 10.0,
+                        },
+                    ]
+                )
+            )
+        )
+        fee_rows = reports.pd.DataFrame(
+            reports._build_quickbooks_fee_purchase_payload_rows(
+                reports.pd.DataFrame(
+                    [
+                        {"txn_date": "2026-06-09", "doc_number": "EO-11", "fees": 3.25},
+                        {"txn_date": "2026-06-09", "doc_number": "EO-12", "fees": 0},
+                    ]
+                )
+            )
+        )
+        label_rows = reports.pd.DataFrame(
+            reports._build_quickbooks_shipping_label_purchase_payload_rows(
+                reports.pd.DataFrame(
+                    [
+                        {"txn_date": "2026-06-09", "doc_number": "EO-11", "shipping_label_cost": 6.07},
+                        {"txn_date": "2026-06-09", "doc_number": "EO-12", "shipping_label_cost": 0},
+                    ]
+                )
+            )
+        )
+
+        rows = reports._build_quickbooks_payload_readiness_rows(sales_rows, fee_rows, label_rows)
+        by_check = {row["check"]: row for row in rows}
+
+        self.assertEqual(by_check["salesreceipt_payload_rows"]["status"], "pass")
+        self.assertEqual(by_check["salesreceipt_payload_rows"]["observed"], 2)
+        self.assertAlmostEqual(by_check["salesreceipt_payload_rows"]["amount"], 35.5)
+        self.assertEqual(by_check["salesreceipt_payload_review_rows"]["status"], "warn")
+        self.assertEqual(by_check["salesreceipt_payload_review_rows"]["observed"], 1)
+        self.assertEqual(by_check["salesreceipt_missing_item_refs"]["status"], "warn")
+        self.assertEqual(by_check["salesreceipt_missing_item_refs"]["observed"], 1)
+        self.assertEqual(by_check["fee_purchase_payload_rows"]["status"], "pass")
+        self.assertEqual(by_check["fee_purchase_payload_rows"]["observed"], 1)
+        self.assertAlmostEqual(by_check["fee_purchase_payload_rows"]["amount"], 3.25)
+        self.assertEqual(by_check["fee_purchase_payload_review_rows"]["status"], "pass")
+        self.assertEqual(by_check["shipping_label_purchase_payload_rows"]["status"], "pass")
+        self.assertEqual(by_check["shipping_label_purchase_payload_rows"]["observed"], 1)
+        self.assertAlmostEqual(by_check["shipping_label_purchase_payload_rows"]["amount"], 6.07)
+        self.assertEqual(by_check["shipping_label_purchase_payload_review_rows"]["status"], "pass")
 
     def test_qbo_sales_export_uses_listing_product_for_productless_bundle_sale(self):
         sale = SimpleNamespace(
@@ -3312,6 +4965,10 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["item_product_source"], "listing_product")
         self.assertTrue(rows[0]["listing_is_bundle"])
         self.assertEqual(rows[0]["cogs_source"], "mixed_fifo_cost")
+        self.assertEqual(rows[0]["cogs_basis_bucket"], "review")
+        self.assertTrue(rows[0]["basis_review_required"])
+        self.assertFalse(rows[0]["basis_is_estimate"])
+        self.assertEqual(rows[0]["basis_review_severity"], "review")
 
     def test_qbo_adjustment_export_includes_return_cogs_reversal_source(self):
         rows = reports._build_qbo_adjustment_export_rows(
@@ -3343,6 +5000,9 @@ class ReportsHelpersTests(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["cogs_source"], "lot_expected_quantity_fallback")
+        self.assertEqual(rows[0]["cogs_basis_bucket"], "estimate")
+        self.assertFalse(rows[0]["basis_review_required"])
+        self.assertTrue(rows[0]["basis_is_estimate"])
         self.assertEqual(rows[0]["returned_listing_units"], 2)
         self.assertEqual(rows[0]["returned_inventory_units"], 10)
         self.assertAlmostEqual(rows[0]["cogs_per_returned_listing"], 12.5)
@@ -3403,6 +5063,8 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertTrue(rows[0]["listing_is_bundle"])
         self.assertEqual(rows[0]["listing_bundle_inventory_units_returned"], 5)
         self.assertEqual(rows[0]["cogs_source"], "mixed_fifo_cost")
+        self.assertEqual(rows[0]["cogs_basis_bucket"], "review")
+        self.assertTrue(rows[0]["basis_review_required"])
 
     def test_marketplace_reconciliation_fallback_prefers_actual_economics(self):
         sale = SimpleNamespace(
@@ -3439,6 +5101,82 @@ class ReportsHelpersTests(unittest.TestCase):
         self.assertAlmostEqual(row["sales_shipping_label_cost"], 4.25)
         self.assertAlmostEqual(row["sales_net_before_returns"], 93.25)
         self.assertAlmostEqual(row["net_after_returns"], 80.25)
+        self.assertEqual(row["reconcile_basis"], "order_total_sum - (sales_gross + sales_shipping_cost)")
+        self.assertAlmostEqual(row["delta_order_total_vs_sales_gross_plus_shipping"], 0.0)
+        self.assertAlmostEqual(row["reconcile_delta"], 0.0)
+        self.assertIn("Reconciliation accepts", row["reconcile_note"])
+
+    def test_marketplace_reconciliation_fallback_treats_immaterial_period_delta_as_noise(self):
+        sale = SimpleNamespace(
+            id=12,
+            marketplace="ebay",
+            sold_price=1000.0,
+            fees=10.0,
+            shipping_cost=0.0,
+            shipping_label_cost=4.25,
+        )
+        order = SimpleNamespace(marketplace="ebay", total_amount=1000.50)
+
+        rows = reports._build_marketplace_reconciliation_fallback_rows(
+            [sale],
+            [order],
+            reports.pd.DataFrame(),
+        )
+
+        row = rows[0]
+        self.assertAlmostEqual(row["reconcile_delta"], 0.5)
+        self.assertAlmostEqual(row["reconcile_tolerance"], 1.0)
+        self.assertLess(row["reconcile_materiality_pct"], 0.1)
+        self.assertFalse(row["reconcile_flag"])
+
+    def test_close_tolerance_uses_reported_cent_precision(self):
+        self.assertTrue(reports._within_close_tolerance(-0.0100000000002, 0.01))
+        self.assertFalse(reports._within_close_tolerance(0.02, 0.01))
+
+    def test_build_reconciliation_flag_detail_rows_names_flagged_marketplace_and_delta(self):
+        detail = reports._build_reconciliation_flag_detail_rows(
+            reports.pd.DataFrame(
+                [
+                    {
+                        "marketplace": "ebay",
+                        "sales_count": 3,
+                        "orders_count": 3,
+                        "sales_gross": 100.0,
+                        "sales_shipping_cost": 7.5,
+                        "order_total_sum": 112.5,
+                        "delta_order_total_vs_sales_gross": 12.5,
+                        "delta_order_total_vs_sales_gross_plus_shipping": 5.0,
+                        "reconcile_delta": 5.0,
+                        "reconcile_tolerance": 1.0,
+                        "reconcile_materiality_pct": 4.4444,
+                        "reconcile_flag": True,
+                        "reconcile_basis": "order_total_sum - (sales_gross + sales_shipping_cost)",
+                        "reconcile_note": "Review eBay order totals.",
+                    },
+                    {
+                        "marketplace": "local",
+                        "sales_count": 1,
+                        "orders_count": 1,
+                        "sales_gross": 20.0,
+                        "sales_shipping_cost": 0.0,
+                        "order_total_sum": 20.0,
+                        "delta_order_total_vs_sales_gross": 0.0,
+                        "reconcile_flag": False,
+                    },
+                ]
+            )
+        )
+
+        self.assertEqual(len(detail), 1)
+        row = detail.iloc[0].to_dict()
+        self.assertEqual(row["marketplace"], "ebay")
+        self.assertEqual(row["basis"], "order_total_sum - (sales_gross + sales_shipping_cost)")
+        self.assertAlmostEqual(float(row["delta_order_total_vs_sales_gross"]), 12.5)
+        self.assertAlmostEqual(float(row["delta_order_total_vs_sales_gross_plus_shipping"]), 5.0)
+        self.assertAlmostEqual(float(row["reconcile_delta"]), 5.0)
+        self.assertAlmostEqual(float(row["reconcile_tolerance"]), 1.0)
+        self.assertAlmostEqual(float(row["reconcile_materiality_pct"]), 4.4444)
+        self.assertIn("Review eBay", row["review_note"])
 
     def test_build_fifo_unit_cost_map_ignores_lots_acquired_after_sale(self):
         assignments = [

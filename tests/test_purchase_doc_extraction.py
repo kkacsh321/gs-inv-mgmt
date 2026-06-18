@@ -185,6 +185,61 @@ class PurchaseDocExtractionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no ExpenseDocuments"):
                 pde.extract_with_textract(file_bytes=b"x", content_type="application/pdf")
 
+    @patch("app.services.purchase_doc_extraction.boto3.session.Session")
+    def test_extract_with_textract_normalizes_unsupported_document_error(self, session_cls: Mock) -> None:
+        class UnsupportedDocError(Exception):
+            response = {"Error": {"Code": "UnsupportedDocumentException"}}
+
+        client = Mock()
+        client.analyze_expense.side_effect = UnsupportedDocError("Request has unsupported document format")
+        session = Mock()
+        session.client.return_value = client
+        session_cls.return_value = session
+
+        with patch(
+            "app.services.purchase_doc_extraction.settings",
+            SimpleNamespace(aws_access_key_id="", aws_secret_access_key="", aws_region="us-east-1"),
+        ):
+            with self.assertRaisesRegex(pde.PurchaseDocTextractUnsupportedError, "does not support"):
+                pde.extract_with_textract(file_bytes=b"x", content_type="application/pdf")
+
+    def test_extract_with_textract_best_effort_returns_success_payload(self) -> None:
+        result = pde.PurchaseDocExtractResult(
+            payload={"vendor_name": "Dealer", "provider": "aws_textract"},
+            summary_text='{"vendor_name":"Dealer"}',
+            raw_provider="aws_textract",
+        )
+        with patch("app.services.purchase_doc_extraction.extract_with_textract", return_value=result):
+            payload, summary, error = pde.extract_with_textract_best_effort(b"x", "application/pdf")
+
+        self.assertEqual(payload["vendor_name"], "Dealer")
+        self.assertIn("Dealer", summary)
+        self.assertEqual(error, "")
+
+    def test_extract_with_textract_best_effort_keeps_upload_nonfatal_on_unsupported(self) -> None:
+        with patch(
+            "app.services.purchase_doc_extraction.extract_with_textract",
+            side_effect=pde.PurchaseDocTextractUnsupportedError("unsupported"),
+        ):
+            payload, summary, error = pde.extract_with_textract_best_effort(b"x", "application/pdf")
+
+        self.assertEqual(payload["provider"], "aws_textract")
+        self.assertEqual(payload["confidence"], "low")
+        self.assertIn("unsupported", payload["extraction_error"])
+        self.assertIn("Textract skipped", summary)
+        self.assertIn("unsupported", error)
+
+    def test_extract_with_textract_best_effort_skips_unsupported_content_type_before_aws(self) -> None:
+        with patch("app.services.purchase_doc_extraction.extract_with_textract") as extract:
+            payload, summary, error = pde.extract_with_textract_best_effort(b"x", "image/webp")
+
+        extract.assert_not_called()
+        self.assertEqual(payload["provider"], "aws_textract")
+        self.assertEqual(payload["confidence"], "low")
+        self.assertIn("unsupported content type", payload["extraction_error"])
+        self.assertIn("Textract skipped", summary)
+        self.assertIn("image/webp", error)
+
     def test_merge_llm_and_textract_sets_provider(self) -> None:
         merged = pde.merge_llm_and_textract(
             {"vendor_name": "LLM", "line_items": [{"description": "L"}]},

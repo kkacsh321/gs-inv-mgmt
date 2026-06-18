@@ -97,7 +97,7 @@ class SlackOpsBotTests(unittest.TestCase):
         self.assertEqual(e1.environment, "prod")
 
     def test_build_envelope_normalizes_ai_accountant_aliases(self) -> None:
-        aliases = ["accountant", "accounting", "tax", "ai-accountant", "ai_accountant", "aiaccountant"]
+        aliases = ["accountant", "accounting", "tax", "ai-accountant", "ai_accountant", "aiaccountant", "goldie"]
         for alias in aliases:
             with self.subTest(alias=alias):
                 env = slack_ops_bot.build_slack_command_envelope(
@@ -110,6 +110,44 @@ class SlackOpsBotTests(unittest.TestCase):
                 )
                 self.assertEqual(env.intent, "accountant")
                 self.assertEqual(env.args, ["review", "local", "tax", "and", "profit"])
+
+    def test_build_envelope_normalizes_kurt_and_murdock_aliases(self) -> None:
+        kurt = slack_ops_bot.build_slack_command_envelope(
+            {
+                "text": "kurt 1881 morgan dollar qty=1",
+                "message_ts": "2.1",
+                "app_role": "ops",
+            },
+            default_env="prod",
+        )
+        self.assertEqual(kurt.intent, "intake")
+        self.assertEqual(kurt.args, ["1881", "morgan", "dollar", "qty=1"])
+
+        murdock = slack_ops_bot.build_slack_command_envelope(
+            {
+                "text": "murdock product_id=123 write listing",
+                "message_ts": "2.2",
+                "app_role": "ops",
+            },
+            default_env="prod",
+        )
+        self.assertEqual(murdock.intent, "listing")
+        self.assertEqual(murdock.args, ["product_id=123", "write", "listing"])
+
+    def test_build_envelope_normalizes_customer_aliases(self) -> None:
+        aliases = ["customer", "customers", "repeat-buyer", "repeat_buyers"]
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                env = slack_ops_bot.build_slack_command_envelope(
+                    {
+                        "text": f"{alias} who are repeat buyers with notes",
+                        "message_ts": f"3.{len(alias)}",
+                        "app_role": "ops",
+                    },
+                    default_env="prod",
+                )
+                self.assertEqual(env.intent, "customer")
+                self.assertEqual(env.args, ["who", "are", "repeat", "buyers", "with", "notes"])
 
     def test_route_rejects_unsupported_intent(self) -> None:
         repo = _FakeRepo()
@@ -125,6 +163,8 @@ class SlackOpsBotTests(unittest.TestCase):
         out = slack_ops_bot.route_slack_command_request(repo, envelope=env, actor="slack-bot")
         self.assertEqual(out["status"], "rejected")
         self.assertEqual(out["reason"], "unsupported_intent")
+        self.assertIn("kurt answer handoff 88 quantity: 20", out["help_text"])
+        self.assertIn("murdock answer draft #321 condition_id: 3000", out["help_text"])
         self.assertTrue(repo.audit_events)
         self.assertEqual(repo.audit_events[-1]["action"], "rejected")
 
@@ -143,8 +183,19 @@ class SlackOpsBotTests(unittest.TestCase):
         self.assertEqual(out["status"], "denied")
         self.assertEqual(out["reason"], "role_not_allowed")
         self.assertEqual(out["role"], "viewer")
+        self.assertIn("Answer-only commands are evidence capture", out["help_text"])
         self.assertTrue(repo.audit_events)
         self.assertEqual(repo.audit_events[-1]["action"], "denied")
+
+    def test_slack_ops_help_text_documents_agent_answer_syntax(self) -> None:
+        help_text = slack_ops_bot.build_slack_ops_help_text()
+
+        self.assertIn("kurt ...", help_text)
+        self.assertIn("murdock ...", help_text)
+        self.assertIn("goldie ...", help_text)
+        self.assertIn("kurt answer handoff 88 quantity: 20", help_text)
+        self.assertIn("murdock answer draft #321 condition_id: 3000", help_text)
+        self.assertIn("do not create products, listings, or publish", help_text)
 
     def test_route_accepts_allowed_intent_and_logs(self) -> None:
         repo = _FakeRepo()
@@ -229,6 +280,33 @@ class SlackOpsBotTests(unittest.TestCase):
         payload = json.loads(repo.queue_jobs[0].payload_json)
         self.assertEqual(payload["command"]["intent"], "accountant")
 
+    def test_ingest_queues_customer_read_intent_for_ops(self) -> None:
+        repo = _FakeRepo()
+        result = slack_ops_bot.ingest_slack_command_request(
+            repo,
+            payload={
+                "environment": "prod",
+                "team_id": "T1",
+                "channel_id": "C1",
+                "channel_name": "ops",
+                "thread_ts": "101.25",
+                "message_ts": "101.25",
+                "user_id": "U1",
+                "user_name": "ops-user",
+                "app_username": "ops-user",
+                "app_role": "ops",
+                "text": "customer repeat buyers with notes",
+            },
+            actor="slack-bot",
+            default_env="local",
+        )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["intent"], "customer")
+        payload = json.loads(repo.queue_jobs[0].payload_json)
+        self.assertEqual(payload["command"]["intent"], "customer")
+        self.assertFalse(payload["route"]["write_intent"])
+
     def test_ingest_records_ai_accountant_answer_metadata(self) -> None:
         repo = _FakeRepo()
         result = slack_ops_bot.ingest_slack_command_request(
@@ -257,6 +335,34 @@ class SlackOpsBotTests(unittest.TestCase):
         self.assertEqual(len(answer_events), 1)
         self.assertEqual(answer_events[0]["entity_id"], 3)
         self.assertIn("lot 39", answer_events[0]["changes"]["answer_text"])
+
+    def test_ingest_records_ai_agent_answer_metadata(self) -> None:
+        repo = _FakeRepo()
+        result = slack_ops_bot.ingest_slack_command_request(
+            repo,
+            payload={
+                "environment": "prod",
+                "team_id": "T1",
+                "channel_id": "C1",
+                "channel_name": "ops",
+                "thread_ts": "101.4",
+                "message_ts": "101.4",
+                "user_id": "U1",
+                "user_name": "ops-user",
+                "app_username": "ops-user",
+                "app_role": "ops",
+                "text": "kurt answer quantity: 20",
+            },
+            actor="slack-bot",
+            default_env="local",
+        )
+
+        self.assertEqual(result["status"], "pending_approval")
+        payload = json.loads(repo.queue_jobs[0].payload_json)
+        self.assertEqual(payload["command"]["intent"], "intake")
+        self.assertEqual(payload["command"]["ai_agent_answer"]["agent"], "kurt")
+        self.assertEqual(payload["command"]["ai_agent_answer"]["field"], "quantity")
+        self.assertEqual(payload["command"]["ai_agent_answer"]["answer"], "20")
 
     def test_ingest_dedupes_by_idempotency_key(self) -> None:
         repo = _FakeRepo()

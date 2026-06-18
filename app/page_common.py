@@ -49,10 +49,13 @@ QUICK_ACTION_PAGE_MAP: dict[str, str] = {
     "inventory-movements": "pages/12_Inventory_Movements.py",
     "sources": "pages/13_Sources.py",
     "orders": "pages/14_Orders.py",
+    "customers": "pages/29_Customers.py",
     "returns": "pages/15_Returns.py",
     "documents": "pages/16_Documents.py",
     "admin": "pages/17_Admin.py",
     "sync": "pages/18_Sync.py",
+    "business-chat": "pages/19_Business_Chat_Room.py",
+    "business-room": "pages/19_Business_Chat_Room.py",
     "ebay-ops": "pages/22_eBay_Workspace.py",
     "ebay-workspace": "pages/22_eBay_Workspace.py",
     "ebay-user-details": "pages/24_eBay_User_Details.py",
@@ -61,7 +64,8 @@ QUICK_ACTION_PAGE_MAP: dict[str, str] = {
     "coin-intake": "pages/20_Coin_Intake_Wizard.py",
     "inventory-intake": "pages/23_Inventory_Intake_Wizard.py",
     "ask-gs": "pages/21_Ask_GoldenStackers.py",
-    "ai-accountant": "pages/28_AI_Accountant.py",
+    "ai-accountant": "pages/28_Goldie.py",
+    "goldie": "pages/28_Goldie.py",
     "health": "pages/17_Admin.py",
 }
 QUICK_ACTION_ALIASES: dict[str, str] = {
@@ -92,9 +96,12 @@ QUICK_ACTION_ALIASES: dict[str, str] = {
     "ci": "coin-intake",
     "ii": "inventory-intake",
     "ask": "ask-gs",
-    "chat": "ask-gs",
+    "chat": "business-chat",
+    "ask-chat": "ask-gs",
+    "room": "business-chat",
     "acct": "ai-accountant",
     "accountant": "ai-accountant",
+    "goldie": "ai-accountant",
     "he": "health",
 }
 
@@ -134,19 +141,20 @@ ROLE_WORKFLOW_GROUPS: dict[str, list[tuple[str, list[tuple[str, str, str]]]]] = 
     "admin": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory"), ("Sources", "pages/13_Sources.py", "workspace_inventory")]),
         ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("eBay Templates", "pages/25_eBay_Templates.py", "workspace_ebay"), ("Listing Wizard", "pages/26_Listing_Wizard.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
-        ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
-        ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Documents", "pages/16_Documents.py", "workspace_revenue"), ("Reports", "pages/09_Reports.py", "workspace_revenue"), ("AI Accountant", "pages/28_AI_Accountant.py", "workspace_revenue")]),
-        ("Admin", [("Operations Home", "pages/00_Operations_Home.py", ""), ("Admin", "pages/17_Admin.py", ""), ("Search & Edit", "pages/10_Search_Edit.py", ""), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
+        ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Customers", "pages/29_Customers.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
+        ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Documents", "pages/16_Documents.py", "workspace_revenue"), ("Reports", "pages/09_Reports.py", "workspace_revenue"), ("Goldie", "pages/28_Goldie.py", "workspace_revenue")]),
+        ("Admin", [("Operations Home", "pages/00_Operations_Home.py", ""), ("Business Chat Room", "pages/19_Business_Chat_Room.py", ""), ("Admin", "pages/17_Admin.py", ""), ("Search & Edit", "pages/10_Search_Edit.py", ""), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
     ],
     "ops": [
         ("Intake", [("Inventory Intake Wizard", "pages/23_Inventory_Intake_Wizard.py", "workspace_inventory"), ("Products", "pages/02_Products.py", "workspace_inventory"), ("Lots", "pages/08_Lots.py", "workspace_inventory")]),
         ("Listing", [("eBay Workspace", "pages/22_eBay_Workspace.py", "workspace_ebay"), ("eBay User Details", "pages/24_eBay_User_Details.py", "workspace_ebay"), ("eBay Templates", "pages/25_eBay_Templates.py", "workspace_ebay"), ("Listing Wizard", "pages/26_Listing_Wizard.py", "workspace_ebay"), ("Listings", "pages/03_Listings.py", "workspace_ebay"), ("Media", "pages/05_Media.py", "workspace_ebay"), ("Tools", "pages/06_Tools.py", "workspace_ebay")]),
-        ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
-        ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Reports", "pages/09_Reports.py", "workspace_revenue"), ("AI Accountant", "pages/28_AI_Accountant.py", "workspace_revenue")]),
+        ("Fulfillment", [("Orders", "pages/14_Orders.py", "workspace_fulfillment"), ("Customers", "pages/29_Customers.py", "workspace_fulfillment"), ("Shipping", "pages/11_Shipping.py", "workspace_fulfillment"), ("Returns", "pages/15_Returns.py", "workspace_fulfillment")]),
+        ("Reconcile", [("Sales", "pages/04_Sales.py", "workspace_revenue"), ("Sync", "pages/18_Sync.py", "workspace_sync"), ("Reports", "pages/09_Reports.py", "workspace_revenue"), ("Goldie", "pages/28_Goldie.py", "workspace_revenue")]),
+        ("Support", [("Business Chat Room", "pages/19_Business_Chat_Room.py", "workspace_sync"), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "workspace_sync")]),
     ],
     "viewer": [
         ("Overview", [("Dashboard", "pages/01_Dashboard.py", ""), ("Reports", "pages/09_Reports.py", "workspace_revenue"), ("Search & Edit", "pages/10_Search_Edit.py", "")]),
-        ("Support", [("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
+        ("Support", [("Business Chat Room", "pages/19_Business_Chat_Room.py", ""), ("Ask GoldenStackers", "pages/21_Ask_GoldenStackers.py", "")]),
     ],
 }
 
@@ -375,7 +383,7 @@ def _render_quick_actions_sidebar(user_role: str, *, nav_mode: str) -> None:
             submitted = st.form_submit_button("Go")
         st.caption(
             "Shortcuts: `/p` Products, `/l` Listings, `/sa` Sales, `/sh` Shipping, "
-            "`/sy` Sync, `/a` Admin, `/op` Operations, `/doc` Documents, `/ci` Coin Intake, `/ii` Inventory Intake, `/ask` Chat, `/he` Health (Admin tab), `/eud` eBay User Details."
+            "`/sy` Sync, `/a` Admin, `/op` Operations, `/doc` Documents, `/ci` Coin Intake, `/ii` Inventory Intake, `/chat` Business Chat, `/ask` Ask, `/he` Health (Admin tab), `/eud` eBay User Details."
         )
         if submitted:
             normalized = _normalize_quick_action(command)

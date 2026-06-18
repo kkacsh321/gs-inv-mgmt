@@ -68,6 +68,9 @@ class _FakeSt:
     def metric(self, *a, **k):
         self.calls.append(("metric", a, k))
 
+    def json(self, *a, **k):
+        self.calls.append(("json", a, k))
+
     def line_chart(self, *a, **k):
         self.calls.append(("line_chart", a, k))
 
@@ -76,6 +79,10 @@ class _FakeSt:
         return [_Ctx() for _ in range(count)]
 
     def expander(self, *_a, **_k):
+        self.calls.append(("expander", _a, _k))
+        return _Ctx()
+
+    def form(self, *_a, **_k):
         return _Ctx()
 
     def date_input(self, _label, value=None, **_kwargs):
@@ -84,8 +91,15 @@ class _FakeSt:
     def text_input(self, _label, value="", **_kwargs):
         return value
 
+    def text_area(self, _label, value="", **_kwargs):
+        return value
+
     def number_input(self, _label, min_value=None, value=0.0, step=None, **_kwargs):
         _ = (min_value, step)
+        return value
+
+    def slider(self, _label, min_value=None, max_value=None, value=0.0, step=None, **_kwargs):
+        _ = (min_value, max_value, step)
         return value
 
     def checkbox(self, _label, value=False, **_kwargs):
@@ -107,6 +121,12 @@ class _FakeSt:
         return list(options)
 
     def button(self, _label, **kwargs):
+        key = kwargs.get("key")
+        if key in self._button_key_map:
+            return bool(self._button_key_map[key])
+        return False
+
+    def form_submit_button(self, _label, **kwargs):
         key = kwargs.get("key")
         if key in self._button_key_map:
             return bool(self._button_key_map[key])
@@ -135,12 +155,13 @@ def _bootstrap_views_package() -> None:
         fake_botocore_exceptions.BotoCoreError = Exception
         fake_botocore_exceptions.ClientError = Exception
         sys.modules["botocore.exceptions"] = fake_botocore_exceptions
+    root = Path(__file__).resolve().parents[1]
+    views_dir = root / "app" / "components" / "views"
     if "app.components.views" not in sys.modules:
         pkg = types.ModuleType("app.components.views")
-        pkg.__path__ = []
+        pkg.__path__ = [str(views_dir)]
         sys.modules["app.components.views"] = pkg
 
-    root = Path(__file__).resolve().parents[1]
     for name in ("shared", "workspace_shell"):
         full = f"app.components.views.{name}"
         if full in sys.modules:
@@ -199,6 +220,55 @@ class ReportsViewTests(unittest.TestCase):
         ):
             reports_view.render_reports(repo)
         self.assertTrue(any(c[0] == "info" for c in fake_st.calls))
+        rendered_text = "\n".join(
+            str(arg)
+            for _kind, args, _kwargs in fake_st.calls
+            for arg in args
+        )
+        self.assertIn("Lot Listing Movement Repair", rendered_text)
+        self.assertIn("Enable `Load Extended Analytics` to auto-detect repair candidates", rendered_text)
+        self.assertNotIn("### Tax Reporting Scope", rendered_text)
+        self.assertNotIn("### Quarterly Estimated Tax Planning", rendered_text)
+        self.assertNotIn("### Tax Drilldown", rendered_text)
+        self.assertNotIn("Download Tax Review Packet ZIP", rendered_text)
+
+    def test_render_taxes_workspace_hides_operational_report_widgets(self):
+        fake_st = _FakeSt()
+        repo = self._repo_stub()
+        user = SimpleNamespace(username="admin", role="admin")
+        with patch.object(reports_view, "st", fake_st), patch.object(
+            reports_view, "current_user", return_value=user
+        ), patch.object(
+            reports_view, "render_help_panel", return_value=None
+        ), patch.object(
+            reports_view, "render_workspace_feedback", return_value=None
+        ) as feedback, patch.object(
+            reports_view, "get_runtime_str", return_value=""
+        ), patch.object(
+            reports_view, "get_runtime_bool", return_value=False
+        ), patch.object(
+            reports_view, "utc_today", return_value=reports_view.datetime(2026, 4, 30).date()
+        ):
+            reports_view.render_reports(repo, tax_workspace=True)
+        rendered_text = "\n".join(
+            str(arg)
+            for _kind, args, _kwargs in fake_st.calls
+            for arg in args
+        )
+        self.assertIn("Taxes", rendered_text)
+        self.assertIn("### Tax Reporting Scope", rendered_text)
+        self.assertIn("### Quarterly Estimated Tax Planning", rendered_text)
+        self.assertIn("### Tax Drilldown", rendered_text)
+        self.assertNotIn("### Accounting Review / Close Readiness", rendered_text)
+        self.assertNotIn("### eBay Fee Reconciliation", rendered_text)
+        self.assertNotIn("### Accounting Exception Queue", rendered_text)
+        self.assertNotIn("### Economics Intelligence Drilldowns + Alerts", rendered_text)
+        self.assertNotIn("### Purchase Document -> Lot Apply Audit", rendered_text)
+        self.assertNotIn("### Reports Copilot", rendered_text)
+        self.assertNotIn("### Document Draft Handoff", rendered_text)
+        self.assertNotIn("### Rebuy Cost Trend (Weighted/Lot)", rendered_text)
+        feedback.assert_called_once()
+        self.assertEqual(feedback.call_args.kwargs.get("workspace_key"), "taxes")
 
     def test_render_reports_rolls_back_after_failed_optional_rollup(self):
         fake_st = _FakeSt()
@@ -608,6 +678,239 @@ class ReportsViewTests(unittest.TestCase):
         self.assertIn("tax_reporting_signoffs", citation_tables)
         self.assertIn("tax_reporting_signoff_review", citation_tables)
         self.assertTrue(fake_st_ok.rerun_called)
+
+    def test_accounting_exception_auto_repair_panel_renders_review_only_rows(self):
+        fake_st = _FakeSt()
+        repo = SimpleNamespace()
+        user = SimpleNamespace(username="admin", role="admin")
+        exceptions_df = reports_view.pd.DataFrame(
+            [
+                {
+                    "exception_type": "nonpositive_margin",
+                    "entity_type": "sale",
+                    "entity_id": 66,
+                    "severity": "P1",
+                    "amount": -2.5,
+                    "details": "Margin needs review.",
+                }
+            ]
+        )
+
+        with patch.object(reports_view, "st", fake_st):
+            reports_view._render_accounting_exception_auto_repair_panel(
+                repo,
+                user,
+                exceptions_df,
+                loaded=True,
+            )
+
+        rendered_text = "\n".join(
+            str(arg)
+            for _kind, args, _kwargs in fake_st.calls
+            for arg in args
+        )
+        self.assertIn("Review-only exception types", rendered_text)
+        self.assertTrue(any(kind == "dataframe" for kind, _args, _kwargs in fake_st.calls))
+
+    def test_accounting_exception_repair_candidates_prioritize_lot_subtotal_repair(self):
+        exceptions_df = reports_view.pd.DataFrame(
+            [
+                {
+                    "exception_type": "lot_underallocated",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 28,
+                    "severity": "P1",
+                    "amount": 41.06,
+                    "details": "Generic underallocation.",
+                },
+                {
+                    "exception_type": "lot_total_cost_includes_landed_components",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 28,
+                    "severity": "P1",
+                    "amount": 20.53,
+                    "details": "Subtotal repair first.",
+                },
+                {
+                    "exception_type": "lot_equal_fallback_review_needed",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 56,
+                    "severity": "P2",
+                    "amount": 341.26,
+                    "details": "Accept equal quantity allocation.",
+                },
+            ]
+        )
+
+        candidates = reports_view._accounting_exception_repair_candidates(exceptions_df)
+
+        self.assertEqual(
+            [row["exception_type"] for row in candidates],
+            [
+                "lot_total_cost_includes_landed_components",
+                "lot_underallocated",
+                "lot_equal_fallback_review_needed",
+            ],
+        )
+        self.assertEqual([row["repair_order"] for row in candidates], [0, 10, 15])
+        self.assertEqual([row["repair_scope"] for row in candidates], ["cost_basis", "cost_basis", "cost_basis"])
+
+    def test_accounting_exception_cost_repair_bulk_skips_inventory_listing_repairs(self):
+        fake_st = _FakeSt()
+        fake_st.set_button_key_value("reports_accounting_exception_repair_apply_cost_basis", True)
+        user = SimpleNamespace(username="admin", role="admin")
+
+        class _Repo:
+            def __init__(self):
+                self.cost_lots = []
+                self.bundle_listings = []
+
+            def repair_purchase_lot_equal_quantity_allocation_weights(self, lot_id: int, **kwargs):
+                self.cost_lots.append({"lot_id": lot_id, **kwargs})
+                return {"lot_id": lot_id, "dry_run": bool(kwargs.get("dry_run"))}
+
+            def repair_active_bundle_listing_stock_shortage(self, listing_id: int, **kwargs):
+                self.bundle_listings.append({"listing_id": listing_id, **kwargs})
+                return {"listing_id": listing_id, "dry_run": bool(kwargs.get("dry_run"))}
+
+        repo = _Repo()
+        exceptions_df = reports_view.pd.DataFrame(
+            [
+                {
+                    "exception_type": "lot_equal_fallback_review_needed",
+                    "entity_type": "purchase_lot",
+                    "entity_id": 56,
+                    "severity": "P2",
+                    "amount": 341.26,
+                    "details": "Accept equal quantity allocation.",
+                },
+                {
+                    "exception_type": "active_bundle_listing_stock_shortage",
+                    "entity_type": "marketplace_listing",
+                    "entity_id": 206,
+                    "severity": "P1",
+                    "amount": 20,
+                    "details": "Listing stock shortage.",
+                },
+            ]
+        )
+
+        with patch.object(reports_view, "st", fake_st):
+            reports_view._render_accounting_exception_auto_repair_panel(
+                repo,
+                user,
+                exceptions_df,
+                loaded=True,
+            )
+
+        self.assertEqual(len(repo.cost_lots), 1)
+        self.assertEqual(repo.cost_lots[0]["lot_id"], 56)
+        self.assertFalse(repo.cost_lots[0]["dry_run"])
+        self.assertEqual(repo.bundle_listings, [])
+        self.assertTrue(fake_st.rerun_called)
+
+    def test_accounting_exception_finance_repair_bulk_skips_inventory_listing_repairs(self):
+        fake_st = _FakeSt()
+        fake_st.set_button_key_value("reports_accounting_exception_repair_apply_finance_evidence", True)
+        user = SimpleNamespace(username="admin", role="admin")
+
+        class _Repo:
+            def __init__(self):
+                self.finance_entries = []
+                self.bundle_listings = []
+
+            def repair_unmatched_shipping_label_finance_entry(self, finance_entry_id: int, **kwargs):
+                self.finance_entries.append({"finance_entry_id": finance_entry_id, **kwargs})
+                return {"finance_entry_id": finance_entry_id, "dry_run": bool(kwargs.get("dry_run"))}
+
+            def repair_active_bundle_listing_stock_shortage(self, listing_id: int, **kwargs):
+                self.bundle_listings.append({"listing_id": listing_id, **kwargs})
+                return {"listing_id": listing_id, "dry_run": bool(kwargs.get("dry_run"))}
+
+        repo = _Repo()
+        exceptions_df = reports_view.pd.DataFrame(
+            [
+                {
+                    "exception_type": "unmatched_shipping_label_finance_entry",
+                    "entity_type": "order_finance_entry",
+                    "entity_id": 45,
+                    "severity": "P2",
+                    "amount": 8.97,
+                    "details": "Unmatched label finance evidence.",
+                },
+                {
+                    "exception_type": "active_bundle_listing_stock_shortage",
+                    "entity_type": "marketplace_listing",
+                    "entity_id": 206,
+                    "severity": "P1",
+                    "amount": 20,
+                    "details": "Listing stock shortage.",
+                },
+            ]
+        )
+
+        with patch.object(reports_view, "st", fake_st):
+            reports_view._render_accounting_exception_auto_repair_panel(
+                repo,
+                user,
+                exceptions_df,
+                loaded=True,
+            )
+
+        self.assertEqual(len(repo.finance_entries), 1)
+        self.assertEqual(repo.finance_entries[0]["finance_entry_id"], 45)
+        self.assertFalse(repo.finance_entries[0]["dry_run"])
+        self.assertEqual(repo.bundle_listings, [])
+        self.assertTrue(fake_st.rerun_called)
+
+    def test_accounting_exception_suppression_panel_records_no_repair_needed(self):
+        fake_st = _FakeSt()
+        fake_st.set_button_key_value("reports_suppress_accounting_exception_nonpositive_margin_sale_66", True)
+
+        class _Repo:
+            db = None
+
+            def __init__(self):
+                self.suppressed = []
+
+            def accounting_exception_suppression_keys(self):
+                return set()
+
+            def suppress_accounting_exception(self, **kwargs):
+                self.suppressed.append(kwargs)
+
+            def unsuppress_accounting_exception(self, **_kwargs):
+                raise AssertionError("restore should not be called")
+
+        repo = _Repo()
+        user = SimpleNamespace(username="admin", role="admin")
+        exceptions_df = reports_view.pd.DataFrame(
+            [
+                {
+                    "exception_type": "nonpositive_margin",
+                    "entity_type": "sale",
+                    "entity_id": 66,
+                    "severity": "P1",
+                    "amount": -2.5,
+                    "details": "Accepted low-margin sale.",
+                }
+            ]
+        )
+
+        with patch.object(reports_view, "st", fake_st):
+            reports_view._render_accounting_exception_suppression_panel(
+                repo,
+                user,
+                exceptions_df,
+                loaded=True,
+            )
+
+        self.assertEqual(len(repo.suppressed), 1)
+        self.assertEqual(repo.suppressed[0]["exception_type"], "nonpositive_margin")
+        self.assertEqual(repo.suppressed[0]["target_entity_type"], "sale")
+        self.assertEqual(repo.suppressed[0]["target_entity_id"], 66)
+        self.assertEqual(repo.suppressed[0]["actor"], "admin")
+        self.assertTrue(fake_st.rerun_called)
 
 
 if __name__ == "__main__":

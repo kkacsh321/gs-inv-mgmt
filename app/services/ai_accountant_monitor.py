@@ -10,28 +10,43 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.db.models import AuditLog, Product, Sale
+from app.services.ai_accountant_identity import (
+    AI_ACCOUNTANT_LABEL,
+    AI_ACCOUNTANT_NAME,
+    DEFAULT_AI_ACCOUNTANT_MONITOR_INSTRUCTION,
+    DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
+)
 from app.services.llm_runtime import describe_llm_runtime_chain
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
 from app.utils.time import utcnow_naive
 
 
 ACCOUNTING_SEVERITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
-DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE = (
-    "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller watching cost basis, "
-    "lot allocation, COGS, gross/net sales, marketplace fees, shipping label spend, returns, tax evidence, "
-    "close readiness, and sign-off evidence. Cite evidence, label estimates versus actuals, identify concrete "
-    "corrections, and route unsupported tax/legal conclusions to human advisor review."
-)
-DEFAULT_AI_ACCOUNTANT_MONITOR_INSTRUCTION = (
-    "Review the scheduled AI Accountant monitor evidence. Return concise markdown with: close/watch status, "
-    "highest-risk findings, corrections to make, profit/cost-basis notes, and tax/advisor-review notes. "
-    "When profit or COGS basis is questioned, use sale_fifo_cogs_evidence_rows to trace sale COGS back to "
-    "product, lot, assignment, quantity, unit cost, total cost, and source. "
-    "Do not propose direct writes; recommend human-reviewed corrections only."
-)
+
+ACCOUNTING_TASK_PRIORITY = {
+    "missing_cost_basis": 0,
+    "missing_product_link": 1,
+    "dashboard_profit_basis_review": 2,
+    "nonpositive_margin": 3,
+    "listing_lot_inventory_movement_mismatch": 4,
+    "lot_overallocated": 4,
+    "lot_underallocated": 6,
+    "lot_equal_fallback_review_needed": 7,
+    "lot_allocation_pending_check_in": 8,
+    "blank_lot_assignment_without_lot_total": 9,
+    "missing_fee_evidence": 10,
+    "fee_source_fallback": 11,
+    "missing_shipping_label_spend": 12,
+    "unmatched_shipping_label_finance_entry": 13,
+    "dashboard_return_profit_impact_review": 14,
+    "active_bundle_listing_stock_shortage": 15,
+    "active_bundle_component_overcommitted": 16,
+    "ai_accountant_review_followup": 17,
+    "ai_accountant_answer_followup": 18,
+}
 
 AI_ACCOUNTANT_ANSWER_RE = re.compile(
-    r"^\s*(?:ai[-_\s]+)?accountant\s+answer\s+"
+    r"^\s*(?:(?:ai[-_\s]+)?accountant|goldie)\s+answer\s+"
     r"(?P<task_type>[a-z0-9_:-]+)\s+"
     r"(?P<reference>[a-z0-9_:-]+(?:#[0-9]+)?)\s*:\s*"
     r"(?P<answer>.+?)\s*$",
@@ -53,6 +68,21 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _accounting_task_priority(row: dict[str, Any]) -> int:
+    task_type = str(row.get("task_type") or row.get("exception_type") or "").strip().lower()
+    return ACCOUNTING_TASK_PRIORITY.get(task_type, 99)
+
+
+def _accounting_monitor_sort_key(row: dict[str, Any]) -> tuple[int, int, float, str, int]:
+    return (
+        ACCOUNTING_SEVERITY_ORDER.get(str(row.get("severity") or "").strip().upper(), 99),
+        _accounting_task_priority(row),
+        -abs(_safe_float(row.get("amount"))),
+        str(row.get("occurred_at") or ""),
+        _safe_int(row.get("entity_id")),
+    )
+
+
 def _recommended_accounting_action(exception_type: str) -> str:
     key = str(exception_type or "").strip().lower()
     if key in {"missing_cost_basis", "blank_lot_assignment_without_lot_total"}:
@@ -69,6 +99,8 @@ def _recommended_accounting_action(exception_type: str) -> str:
         return "Review refund totals, returned listing/inventory units, restock status, and COGS reversal evidence."
     if key == "missing_product_link":
         return "Link the sale to the correct product so FIFO COGS can be proven."
+    if key == "listing_lot_inventory_movement_mismatch":
+        return "Reconcile the sale inventory movement to the inferred lot quantity, then verify FIFO COGS and stock."
     if key == "active_bundle_listing_stock_shortage":
         return "Reduce/end the active bundle listing quantity or restock the short bundle component inventory."
     if key == "active_bundle_component_overcommitted":
@@ -103,7 +135,7 @@ def _audit_changes(row: Any) -> dict[str, Any]:
 
 
 def parse_ai_accountant_answer_prompt(prompt: str) -> dict[str, Any] | None:
-    """Parse operator replies generated from AI Accountant question prompts."""
+    """Parse operator replies generated from Goldie question prompts."""
     raw = str(prompt or "").strip()
     if not raw:
         return None
@@ -370,13 +402,13 @@ def summarize_ai_accountant_review_outcomes(outcomes: list[dict[str, Any]]) -> d
     outcome = str(latest.get("outcome") or "").strip().lower()
     needs_followup = outcome in {"edited", "rejected"}
     if outcome == "accepted":
-        status = "Latest AI Accountant review was accepted."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review was accepted."
     elif outcome == "edited":
-        status = "Latest AI Accountant review needs edits before close sign-off."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review needs edits before close sign-off."
     elif outcome == "rejected":
-        status = "Latest AI Accountant review was rejected and needs follow-up."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review was rejected and needs follow-up."
     else:
-        status = f"Latest AI Accountant review outcome is `{outcome or 'unknown'}`."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review outcome is `{outcome or 'unknown'}`."
     return {
         "latest_outcome": outcome or "unknown",
         "status": status,
@@ -404,12 +436,12 @@ def build_ai_accountant_review_followup_rows(outcomes: list[dict[str, Any]]) -> 
             "reference": answer_hash[:12] or outcome,
             "amount": None,
             "details": (
-                f"Latest AI Accountant review outcome is `{outcome}`"
+                f"Latest {AI_ACCOUNTANT_NAME} review outcome is `{outcome}`"
                 f"{f' by {actor}' if actor else ''}; follow-up is required before close sign-off."
             ),
             "occurred_at": str(summary.get("recorded_at") or ""),
             "recommended_action": (
-                "Resolve AI Accountant review feedback, rerun or update the review, then record an accepted outcome."
+                f"Resolve {AI_ACCOUNTANT_NAME} review feedback, rerun or update the review, then record an accepted outcome."
             ),
             "source": "ai_accountant_review_outcomes",
         }
@@ -491,6 +523,19 @@ def build_ai_accountant_monitor_rows(
     metrics = dashboard_metrics or {}
     profit_basis = str(metrics.get("sales_30d_profit_basis_status") or "").strip().lower()
     review_count = _safe_int(metrics.get("sales_30d_cogs_review_count"))
+    review_amount = _safe_float(metrics.get("sales_30d_cogs_review_amount"))
+    estimate_amount = _safe_float(metrics.get("sales_30d_cogs_estimate_amount"))
+    verified_amount = _safe_float(metrics.get("sales_30d_cogs_verified_amount"))
+    review_sale_ids = [
+        _safe_int(value)
+        for value in list(metrics.get("sales_30d_cogs_review_sale_ids") or [])
+        if _safe_int(value) > 0
+    ]
+    estimate_sale_ids = [
+        _safe_int(value)
+        for value in list(metrics.get("sales_30d_cogs_estimate_sale_ids") or [])
+        if _safe_int(value) > 0
+    ]
     bundle_sale_count = _safe_int(metrics.get("sales_30d_bundle_sale_count"))
     bundle_inventory_units_sold = _safe_int(metrics.get("sales_30d_bundle_inventory_units_sold"))
     returns_count = _safe_int(metrics.get("returns_30d_count"))
@@ -506,6 +551,16 @@ def build_ai_accountant_monitor_rows(
             if bundle_sale_count > 0
             else ""
         )
+        review_ids_note = (
+            f" Review-needed sale IDs: {', '.join(str(value) for value in review_sale_ids[:12])}."
+            if review_sale_ids
+            else ""
+        )
+        estimate_ids_note = (
+            f" Estimate-basis sale IDs: {', '.join(str(value) for value in estimate_sale_ids[:12])}."
+            if estimate_sale_ids
+            else ""
+        )
         rows.append(
             {
                 "severity": "P1" if profit_basis == "review_needed" else "P2",
@@ -518,9 +573,11 @@ def build_ai_accountant_monitor_rows(
                 "details": (
                     f"Dashboard 30-day profit basis status is `{profit_basis or 'unknown'}`; "
                     f"{review_count} sale(s) need COGS basis review. "
+                    f"COGS evidence split: verified ${verified_amount:,.2f}, "
+                    f"estimated ${estimate_amount:,.2f}, needs review ${review_amount:,.2f}. "
                     f"Profit before returns ${profit_before_returns:,.2f}; "
                     f"estimated profit after returns ${estimated_profit_after_returns:,.2f}."
-                    f"{bundle_note}"
+                    f"{review_ids_note}{estimate_ids_note}{bundle_note}"
                 ),
                 "occurred_at": "",
                 "recommended_action": (
@@ -563,15 +620,7 @@ def build_ai_accountant_monitor_rows(
     deduped: dict[str, dict[str, Any]] = {}
     for row in rows:
         deduped.setdefault(_monitor_key(row), row)
-    return sorted(
-        deduped.values(),
-        key=lambda row: (
-            ACCOUNTING_SEVERITY_ORDER.get(str(row.get("severity") or ""), 99),
-            str(row.get("task_type") or ""),
-            str(row.get("occurred_at") or ""),
-            _safe_int(row.get("entity_id")),
-        ),
-    )[: max(1, int(max_rows or 200))]
+    return sorted(deduped.values(), key=_accounting_monitor_sort_key)[: max(1, int(max_rows or 200))]
 
 
 def build_ai_accountant_message(
@@ -585,26 +634,55 @@ def build_ai_accountant_message(
     p1 = sum(1 for row in rows if str(row.get("severity") or "").upper() == "P1")
     p2 = sum(1 for row in rows if str(row.get("severity") or "").upper() == "P2")
     lines = [
-        f"AI Accountant monitor for {period_label}: {len(rows)} item(s) need review.",
+        f"{AI_ACCOUNTANT_LABEL} monitor for {period_label}: {len(rows)} item(s) need review.",
         f"Severity mix: P0={p0}, P1={p1}, P2={p2}.",
     ]
+    fee_evidence_exposure = sum(
+        _safe_float(row.get("amount"))
+        for row in rows
+        if str(row.get("task_type") or row.get("exception_type") or "").strip()
+        in {"missing_fee_evidence", "fee_source_fallback"}
+    )
+    shipping_evidence_exposure = sum(
+        _safe_float(row.get("amount"))
+        for row in rows
+        if str(row.get("task_type") or row.get("exception_type") or "").strip()
+        in {"missing_shipping_label_spend", "unmatched_shipping_label_finance_entry"}
+    )
+    if fee_evidence_exposure or shipping_evidence_exposure:
+        lines.append(
+            "Fee/shipping evidence exposure: "
+            f"fee rows ${fee_evidence_exposure:,.2f}; "
+            f"shipping-label rows ${shipping_evidence_exposure:,.2f}."
+        )
     for row in rows[: max(1, int(max_items or 6))]:
+        task_type = str(row.get("task_type") or "accounting_review")
+        action = str(row.get("recommended_action") or "").strip()
+        details = str(row.get("details") or "").strip()
+        if task_type in {
+            "dashboard_profit_basis_review",
+            "missing_cost_basis",
+            "nonpositive_margin",
+            "lot_overallocated",
+            "lot_underallocated",
+        } and details:
+            detail_preview = details[:220] + ("..." if len(details) > 220 else "")
+            summary = f"{action} Evidence: {detail_preview}" if action else detail_preview
+        else:
+            summary = action or details
         lines.append(
             "- "
-            f"[{str(row.get('severity') or 'P2')}] {str(row.get('task_type') or 'accounting_review')} "
+            f"[{str(row.get('severity') or 'P2')}] {task_type} "
             f"{str(row.get('entity_type') or '')}#{str(row.get('entity_id') or '')}: "
-            f"{str(row.get('recommended_action') or row.get('details') or '').strip()}"
+            f"{summary.strip()}"
         )
     if len(rows) > max_items:
-        lines.append(f"- Plus {len(rows) - max_items} more item(s) in the AI Accountant workspace.")
+        lines.append(f"- Plus {len(rows) - max_items} more item(s) in the {AI_ACCOUNTANT_NAME} workspace.")
     question_rows = annotate_ai_accountant_question_rows(
         build_ai_accountant_question_rows(rows, max_rows=6),
         answer_rows or [],
     )
-    question_status_counts: dict[str, int] = {}
-    for row in question_rows:
-        status = str(row.get("answer_status") or "unanswered").strip().lower() or "unanswered"
-        question_status_counts[status] = question_status_counts.get(status, 0) + 1
+    question_status_counts = build_ai_accountant_question_status_counts_from_rows(question_rows)
     if question_rows:
         status_order = ["unanswered", "needs_more_info", "obsolete", "answered", "applied"]
         status_parts = [
@@ -626,10 +704,18 @@ def build_ai_accountant_message(
         lines.append("")
         lines.append("Questions to answer in Ask or Slack:")
         for row in unanswered_question_rows:
-            lines.append(f"- {row['question']} Reply with: `{row['reply_prompt']}`")
+            evidence = str(row.get("evidence_preview") or "").strip()
+            amount = row.get("amount")
+            evidence_parts = []
+            if amount is not None:
+                evidence_parts.append(f"amount={_safe_float(amount):,.2f}")
+            if evidence:
+                evidence_parts.append(evidence[:180] + ("..." if len(evidence) > 180 else ""))
+            evidence_text = f" Evidence: {' | '.join(evidence_parts)}." if evidence_parts else ""
+            lines.append(f"- {row['question']}{evidence_text} Reply with: `{row['reply_prompt']}`")
     if answered_question_rows:
         lines.append("")
-        lines.append("Recently answered AI Accountant questions:")
+        lines.append(f"Recently answered {AI_ACCOUNTANT_NAME} questions:")
         for row in answered_question_rows:
             lines.append(
                 f"- `{row.get('task_type')}` `{row.get('reference') or row.get('entity_type')}` "
@@ -637,6 +723,29 @@ def build_ai_accountant_message(
                 f"{str(row.get('latest_answer_preview') or '')[:160]}"
             )
     return "\n".join(lines)
+
+
+def build_ai_accountant_question_status_counts_from_rows(
+    question_rows: list[dict[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in question_rows or []:
+        status = str(row.get("answer_status") or "unanswered").strip().lower() or "unanswered"
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def build_ai_accountant_question_status_counts(
+    rows: list[dict[str, Any]],
+    *,
+    answer_rows: list[dict[str, Any]] | None = None,
+    max_rows: int = 6,
+) -> dict[str, int]:
+    question_rows = annotate_ai_accountant_question_rows(
+        build_ai_accountant_question_rows(rows, max_rows=max_rows),
+        answer_rows or [],
+    )
+    return build_ai_accountant_question_status_counts_from_rows(question_rows)
 
 
 def build_ai_accountant_question_rows(
@@ -651,7 +760,7 @@ def build_ai_accountant_question_rows(
     """
     questions: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for row in rows or []:
+    for row in sorted(list(rows or []), key=_accounting_monitor_sort_key):
         severity = str(row.get("severity") or "P2").strip().upper() or "P2"
         task_type = str(row.get("task_type") or row.get("exception_type") or "accounting_review").strip()
         entity_type = str(row.get("entity_type") or "").strip() or "item"
@@ -665,7 +774,10 @@ def build_ai_accountant_question_rows(
         action = str(row.get("recommended_action") or "").strip()
         if task_type in {"missing_cost_basis", "blank_lot_assignment_without_lot_total"}:
             question = f"What cost-basis evidence should we use for {target}?"
-            answer_format = "lot total, assignment unit/allocated cost, product landed cost, or product_cost source"
+            answer_format = (
+                "sale/product/listing ID, lot total, assignment unit/allocated cost, product landed cost, "
+                "or product_cost source"
+            )
             why_needed = "FIFO COGS cannot be proven until cost basis evidence exists."
         elif task_type in {"missing_product_link"}:
             question = f"Which product should {target} be linked to?"
@@ -699,19 +811,23 @@ def build_ai_accountant_question_rows(
             question = "Are the return refund, restock status, and COGS reversal correct?"
             answer_format = "return IDs/sale IDs, refund amount, restocked yes/no, returned quantity"
             why_needed = "Return profit impact changes estimated profit after returns."
+        elif task_type == "listing_lot_inventory_movement_mismatch":
+            question = f"Should {target} consume the inferred lot quantity or the recorded movement quantity?"
+            answer_format = "sale/listing ID, correct inventory units consumed, and whether to adjust movements or listing metadata"
+            why_needed = "Legacy lot-listing sales can leave stock and FIFO COGS out of sync if only one unit was consumed."
         elif task_type in {"active_bundle_listing_stock_shortage", "active_bundle_component_overcommitted"}:
             question = f"Should we reduce listing quantity or restock inventory for {target}?"
             answer_format = "listing IDs/SKUs, desired active quantity, or restock plan"
             why_needed = "Bundle listings may oversell component inventory and distort COGS planning."
         elif task_type == "ai_accountant_review_followup":
-            question = "What follow-up is needed for the latest AI Accountant review outcome?"
+            question = f"What follow-up is needed for the latest {AI_ACCOUNTANT_NAME} review outcome?"
             answer_format = "accept, edit with corrected note, or reject with reason"
             why_needed = "Close readiness remains blocked until the review outcome is resolved."
         elif task_type == "ai_accountant_answer_followup":
-            question = f"What replacement answer or evidence resolves the open AI Accountant answer follow-up for {target}?"
+            question = f"What replacement answer or evidence resolves the open {AI_ACCOUNTANT_NAME} answer follow-up for {target}?"
             answer_format = "replacement answer, evidence source, normal workflow correction made, or why obsolete"
             why_needed = (
-                "A prior AI Accountant answer was marked needs-more-info or obsolete, "
+                f"A prior {AI_ACCOUNTANT_NAME} answer was marked needs-more-info or obsolete, "
                 "so the accounting issue should remain open until replacement evidence exists."
             )
         else:
@@ -736,6 +852,8 @@ def build_ai_accountant_question_rows(
                 "suggested_answer_format": answer_format,
                 "reply_prompt": base_reply,
                 "source": str(row.get("source") or "ai_accountant_monitor_rows"),
+                "evidence_preview": str(row.get("details") or "").strip()[:260],
+                "amount": row.get("amount"),
             }
         )
         if len(questions) >= max(1, int(max_rows or 12)):
@@ -871,6 +989,11 @@ def build_ai_accountant_review_context(
             "sales_30d_est_cogs": dashboard_metrics.get("sales_30d_est_cogs"),
             "sales_30d_profit_basis_status": dashboard_metrics.get("sales_30d_profit_basis_status"),
             "sales_30d_cogs_review_count": dashboard_metrics.get("sales_30d_cogs_review_count"),
+            "sales_30d_cogs_review_amount": dashboard_metrics.get("sales_30d_cogs_review_amount"),
+            "sales_30d_cogs_estimate_amount": dashboard_metrics.get("sales_30d_cogs_estimate_amount"),
+            "sales_30d_cogs_verified_amount": dashboard_metrics.get("sales_30d_cogs_verified_amount"),
+            "sales_30d_cogs_review_sale_ids": dashboard_metrics.get("sales_30d_cogs_review_sale_ids"),
+            "sales_30d_cogs_estimate_sale_ids": dashboard_metrics.get("sales_30d_cogs_estimate_sale_ids"),
             "sales_30d_cogs_source_counts": dashboard_metrics.get("sales_30d_cogs_source_counts"),
             "sales_30d_bundle_sale_count": dashboard_metrics.get("sales_30d_bundle_sale_count"),
             "sales_30d_bundle_inventory_units_sold": dashboard_metrics.get("sales_30d_bundle_inventory_units_sold"),
@@ -1124,6 +1247,7 @@ def record_ai_accountant_message(
     review_result: dict[str, Any] | None = None,
     min_severity: str = "",
     requested_min_severity: str = "",
+    question_status_counts: dict[str, int] | None = None,
 ) -> Any:
     review_payload = dict(review_result or {})
     review_metadata = review_payload.get("metadata") if isinstance(review_payload.get("metadata"), dict) else {}
@@ -1143,6 +1267,11 @@ def record_ai_accountant_message(
                 "P0": sum(1 for row in rows if str(row.get("severity") or "").upper() == "P0"),
                 "P1": sum(1 for row in rows if str(row.get("severity") or "").upper() == "P1"),
                 "P2": sum(1 for row in rows if str(row.get("severity") or "").upper() == "P2"),
+            },
+            "question_status_counts": {
+                str(key): _safe_int(value)
+                for key, value in sorted((question_status_counts or {}).items())
+                if str(key).strip()
             },
             "sample_items": rows[:10],
             "slack_outbox_id": slack_outbox_id,
@@ -1218,7 +1347,7 @@ def run_ai_accountant_automated_review(
     if not get_runtime_bool(repo, "ai_accountant_monitor_llm_review_enabled", True):
         return {"enabled": False, "text": "", "error": "", "answer_hash_sha256": ""}
 
-    prompt = "AI Accountant scheduled monitor review"
+    prompt = f"{AI_ACCOUNTANT_NAME} scheduled monitor review"
     system_message = get_runtime_str(
         repo,
         "accountant_llm_system_message",
@@ -1441,13 +1570,14 @@ def run_ai_accountant_monitor(
             exception_rows=exception_rows,
             dashboard_metrics=dashboard_metrics,
         )
+    question_status_counts = build_ai_accountant_question_status_counts(message_rows, answer_rows=answer_rows)
     message = build_ai_accountant_message(message_rows, period_label=period_label, answer_rows=answer_rows)
     if review_result.get("text"):
-        message = f"{message}\n\nAI Accountant automated review:\n{_compact_monitor_review(str(review_result.get('text') or ''))}"
+        message = f"{message}\n\n{AI_ACCOUNTANT_NAME} automated review:\n{_compact_monitor_review(str(review_result.get('text') or ''))}"
     elif review_result.get("error"):
         runtime_brief = str(review_result.get("runtime_chain_brief") or "").strip()
         message = (
-            f"{message}\n\nAI Accountant automated review unavailable: "
+            f"{message}\n\n{AI_ACCOUNTANT_NAME} automated review unavailable: "
             f"{str(review_result.get('error') or '').strip()[:300]}"
         )
         if runtime_brief:
@@ -1474,6 +1604,7 @@ def run_ai_accountant_monitor(
             review_result=review_result,
             min_severity=effective_min_severity,
             requested_min_severity=requested_min_severity,
+            question_status_counts=question_status_counts,
         )
         audit_id = int(getattr(audit, "id", 0) or 0) or None
     return {
@@ -1483,6 +1614,7 @@ def run_ai_accountant_monitor(
         "slack_outbox_id": outbox_id,
         "period_label": period_label,
         "message": message,
+        "question_status_counts": question_status_counts,
         "min_severity": effective_min_severity,
         "requested_min_severity": requested_min_severity,
         "review_enabled": bool(review_result.get("enabled")),

@@ -83,6 +83,8 @@ class PageCommonTests(unittest.TestCase):
         self.assertEqual(page_common._normalize_quick_action("go reports"), "reports")
         self.assertEqual(page_common._normalize_quick_action(" SY "), "sync")
         self.assertEqual(page_common._normalize_quick_action("acct"), "ai-accountant")
+        self.assertEqual(page_common._normalize_quick_action("goldie"), "ai-accountant")
+        self.assertEqual(page_common.QUICK_ACTION_PAGE_MAP["ai-accountant"], "pages/28_Goldie.py")
 
     def test_logo_data_url(self):
         with tempfile.TemporaryDirectory() as td:

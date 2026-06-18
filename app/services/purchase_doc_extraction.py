@@ -8,6 +8,18 @@ import boto3
 from app.config import settings
 
 
+class PurchaseDocTextractUnsupportedError(RuntimeError):
+    """Raised when Textract rejects a document format that the app can still store."""
+
+
+SUPPORTED_TEXTRACT_ANALYZE_EXPENSE_CONTENT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+}
+
+
 @dataclass(frozen=True)
 class PurchaseDocExtractResult:
     payload: dict[str, Any]
@@ -109,6 +121,17 @@ def _merge_payloads(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[s
     return merged
 
 
+def _is_unsupported_textract_document_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error") if isinstance(response.get("Error"), dict) else {}
+        code = str(error.get("Code") or "").strip()
+        if code == "UnsupportedDocumentException":
+            return True
+    text = str(exc or "")
+    return "UnsupportedDocumentException" in text or "unsupported document format" in text.lower()
+
+
 def extract_with_textract(file_bytes: bytes, content_type: str) -> PurchaseDocExtractResult:
     if not file_bytes:
         raise ValueError("File bytes are required for Textract extraction.")
@@ -120,7 +143,15 @@ def extract_with_textract(file_bytes: bytes, content_type: str) -> PurchaseDocEx
     )
     client = session.client("textract")
 
-    expense_response = client.analyze_expense(Document={"Bytes": file_bytes})
+    try:
+        expense_response = client.analyze_expense(Document={"Bytes": file_bytes})
+    except Exception as exc:
+        if _is_unsupported_textract_document_error(exc):
+            raise PurchaseDocTextractUnsupportedError(
+                "Textract AnalyzeExpense does not support this document format. "
+                "The document can still be stored; use LLM/PDF text extraction or convert the file before retrying Textract."
+            ) from exc
+        raise
     documents = expense_response.get("ExpenseDocuments") or []
     if not documents:
         raise RuntimeError("Textract returned no ExpenseDocuments.")
@@ -141,6 +172,54 @@ def extract_with_textract(file_bytes: bytes, content_type: str) -> PurchaseDocEx
         summary_text=json.dumps(payload, indent=2),
         raw_provider="aws_textract",
     )
+
+
+def extract_with_textract_best_effort(file_bytes: bytes, content_type: str) -> tuple[dict[str, Any], str, str]:
+    normalized_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_content_type and normalized_content_type not in SUPPORTED_TEXTRACT_ANALYZE_EXPENSE_CONTENT_TYPES:
+        error = (
+            "Textract AnalyzeExpense is skipped for unsupported content type "
+            f"`{normalized_content_type}`. Supported types: application/pdf, image/jpeg, image/png."
+        )
+        summary = f"Textract skipped: {error}"
+        return (
+            {
+                "provider": "aws_textract",
+                "confidence": "low",
+                "extraction_error": error,
+                "notes": summary,
+            },
+            summary,
+            error,
+        )
+    try:
+        result = extract_with_textract(file_bytes=file_bytes, content_type=content_type)
+        return dict(result.payload or {}), str(result.summary_text or "").strip(), ""
+    except PurchaseDocTextractUnsupportedError as exc:
+        error = str(exc)
+        summary = f"Textract skipped: {error}"
+        return (
+            {
+                "provider": "aws_textract",
+                "confidence": "low",
+                "extraction_error": error,
+                "notes": summary,
+            },
+            summary,
+            error,
+        )
+    except Exception as exc:
+        error = f"Textract extraction failed: {exc}"
+        return (
+            {
+                "provider": "aws_textract",
+                "confidence": "low",
+                "extraction_error": error,
+                "notes": error,
+            },
+            error,
+            error,
+        )
 
 
 def merge_llm_and_textract(llm_payload: dict[str, Any], textract_payload: dict[str, Any]) -> dict[str, Any]:

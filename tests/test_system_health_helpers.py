@@ -173,14 +173,14 @@ class SystemHealthHelpersTests(unittest.TestCase):
     def test_service_critical_signals_promotes_error_rows(self):
         signals = system_health._service_critical_signals(
             [
-                {"component": "AI Accountant LLM Route", "status": "error"},
+                {"component": "Goldie LLM Route", "status": "error"},
                 {"component": "Sync Runner", "status": "warn"},
                 {"component": "Database", "status": "ok"},
-                {"component": "AI Accountant LLM Route", "status": "error"},
+                {"component": "Goldie LLM Route", "status": "error"},
             ]
         )
 
-        self.assertEqual(signals, ["service_ai_accountant_llm_route"])
+        self.assertEqual(signals, ["service_goldie_llm_route"])
 
     def test_ai_accountant_latest_review_health_row_completed(self):
         class Result:
@@ -203,7 +203,7 @@ class SystemHealthHelpersTests(unittest.TestCase):
 
         row = system_health._ai_accountant_latest_review_health_row(types.SimpleNamespace(db=DB()))
 
-        self.assertEqual(row["component"], "AI Accountant Review Evidence")
+        self.assertEqual(row["component"], "Goldie Review Evidence")
         self.assertEqual(row["status"], "ok")
         self.assertIn("review_status=completed", row["details"])
         self.assertIn("hash=aaaaaaaaaaaa", row["details"])
@@ -233,6 +233,34 @@ class SystemHealthHelpersTests(unittest.TestCase):
         self.assertEqual(row["status"], "warn")
         self.assertIn("review_status=unavailable", row["details"])
         self.assertIn("localai 500", row["details"])
+
+    def test_ai_accountant_answer_followup_health_row_ok(self):
+        rows = [
+            {"followup_status": "applied"},
+            {"followup_status": "unreviewed"},
+        ]
+        with patch.object(system_health, "list_ai_accountant_answers", return_value=rows):
+            row = system_health._ai_accountant_answer_followup_health_row(types.SimpleNamespace())
+
+        self.assertEqual(row["component"], "Goldie Answer Follow-Ups")
+        self.assertEqual(row["status"], "ok")
+        self.assertIn("answers=2", row["details"])
+        self.assertIn("needs_more_info=0", row["details"])
+        self.assertIn("obsolete=0", row["details"])
+
+    def test_ai_accountant_answer_followup_health_row_warns_for_open_followups(self):
+        rows = [
+            {"followup_status": "needs_more_info"},
+            {"followup_status": "obsolete"},
+            {"followup_status": "applied"},
+        ]
+        with patch.object(system_health, "list_ai_accountant_answers", return_value=rows):
+            row = system_health._ai_accountant_answer_followup_health_row(types.SimpleNamespace())
+
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("needs_more_info=1", row["details"])
+        self.assertIn("obsolete=1", row["details"])
+        self.assertIn("record_replacement_answer_or_mark_resolved", row["details"])
 
     def test_system_health_critical_slack_policy_respects_route(self):
         values = {
@@ -449,7 +477,7 @@ class SystemHealthHelpersTests(unittest.TestCase):
                 now=datetime(2026, 5, 8, 7, 0, 0),
             )
 
-        self.assertEqual(row["component"], "AI Accountant Monitor")
+        self.assertEqual(row["component"], "Goldie Monitor")
         self.assertEqual(row["status"], "warn")
         self.assertIn("due=overdue", row["details"])
         self.assertIn("next_due=2026-05-08T06:00:00", row["details"])
@@ -519,7 +547,7 @@ class SystemHealthHelpersTests(unittest.TestCase):
         with patch.object(system_health, "describe_llm_runtime_chain", return_value=rows):
             row = system_health._ai_accountant_runtime_route_health_row(types.SimpleNamespace())
 
-        self.assertEqual(row["component"], "AI Accountant LLM Route")
+        self.assertEqual(row["component"], "Goldie LLM Route")
         self.assertEqual(row["status"], "ok")
         self.assertIn("workflow=accounting", row["details"])
         self.assertIn("localai/Qwen", row["details"])

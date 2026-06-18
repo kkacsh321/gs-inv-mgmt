@@ -6,9 +6,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.page_common import repo_context, setup_page
-from app.components.views.ai_accountant import render_ai_accountant
+from app.components.views.business_chat_room import render_business_chat_room
 
-setup_page("AI Accountant")
+setup_page("Business Chat Room")
 
 with repo_context() as repo:
-    render_ai_accountant(repo)
+    render_business_chat_room(repo)

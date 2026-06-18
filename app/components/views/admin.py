@@ -45,6 +45,7 @@ from app.db.models import (
     ShippingPreset,
     WorkflowDraft,
     WorkflowEvent,
+    Customer,
 )
 from app.db.seed import seed_dev_data
 from app.repository import InventoryRepository
@@ -81,6 +82,16 @@ from app.services.grading_standards import (
     clear_standards_snapshot_cache,
     fetch_standards_snapshot,
 )
+from app.services.ai_accountant_identity import (
+    AI_ACCOUNTANT_NAME,
+    DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION,
+    DEFAULT_AI_ACCOUNTANT_MONITOR_INSTRUCTION,
+    DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
+)
+from app.services.accounting_cogs import (
+    cogs_evidence_split as build_cogs_evidence_split,
+    format_cogs_evidence_split,
+)
 from app.services.llm_runtime import (
     DEFAULT_COMP_INSTRUCTION,
     DEFAULT_COMP_SYSTEM_MESSAGE,
@@ -88,6 +99,7 @@ from app.services.llm_runtime import (
     fetch_available_models,
     validate_llm_runtime_config,
 )
+from app.services.quickbooks import QuickBooksClearingConfig
 from app.services.sync_jobs import is_sync_job_enabled, sync_job_catalog
 from app.services.runtime_settings import (
     get_runtime_bool,
@@ -157,6 +169,17 @@ def _business_status_format_cogs_source_mix(
     return "; ".join(parts)
 
 
+def _business_status_cogs_evidence_split(
+    source_totals: dict[str, float],
+    source_counts: dict[str, int],
+) -> dict[str, float | int]:
+    return build_cogs_evidence_split(source_totals, source_counts)
+
+
+def _business_status_format_cogs_evidence_split(split: dict[str, float | int]) -> str:
+    return format_cogs_evidence_split(split)
+
+
 def _audit_changes(row: AuditLog) -> dict:
     try:
         payload = json.loads(str(getattr(row, "changes_json", "") or "{}"))
@@ -222,7 +245,13 @@ def _build_business_status_context(repo: InventoryRepository, *, days: int = 1) 
         cogs_source_totals[cost_source] = cogs_source_totals.get(cost_source, 0.0) + sale_cogs
         cogs_source_counts[cost_source] = cogs_source_counts.get(cost_source, 0) + 1
     cogs_source_mix = _business_status_format_cogs_source_mix(cogs_source_totals, cogs_source_counts)
-    cogs_source_mix_line = f"- COGS source mix: {cogs_source_mix}\n" if cogs_source_mix else ""
+    cogs_evidence_split = _business_status_cogs_evidence_split(cogs_source_totals, cogs_source_counts)
+    cogs_evidence_split_text = _business_status_format_cogs_evidence_split(cogs_evidence_split)
+    cogs_source_mix_line = ""
+    if cogs_evidence_split_text:
+        cogs_source_mix_line += f"- COGS evidence split: {cogs_evidence_split_text}\n"
+    if cogs_source_mix:
+        cogs_source_mix_line += f"- COGS source mix: {cogs_source_mix}\n"
     actual_rows = []
     if hasattr(repo, "report_sales_actual_econ_rows"):
         try:
@@ -272,6 +301,8 @@ def _build_business_status_context(repo: InventoryRepository, *, days: int = 1) 
         "cogs_window": f"{cogs_window:,.2f}",
         "cogs_source_mix": cogs_source_mix,
         "cogs_source_mix_line": cogs_source_mix_line,
+        "cogs_evidence_split": cogs_evidence_split,
+        "cogs_evidence_split_text": cogs_evidence_split_text,
         "order_count": int(len(orders)),
         "orders_window_count": int(len(orders_window)),
         "inventory_cost": f"{float(metrics.get('inventory_cost', 0.0)):,.2f}",
@@ -817,7 +848,591 @@ def _ebay_finding_recommended_runtime_settings() -> list[tuple[str, str, str, st
     ]
 
 
+def _normalize_ebay_buyer_usernames(raw: Any) -> list[str]:
+    if isinstance(raw, (list, tuple, set)):
+        text = "\n".join(str(item or "") for item in raw)
+    else:
+        text = str(raw or "")
+    tokens = re.split(r"[\s,;]+", text)
+    rows: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        username = token.strip().strip("\"'").lstrip("@").strip()
+        if not username or "@" in username:
+            continue
+        username = re.sub(r"^https?://(?:www\.)?ebay\.com/usr/", "", username, flags=re.IGNORECASE)
+        username = username.strip("/").strip()
+        if not username or len(username) > 64:
+            continue
+        dedupe_key = username.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        rows.append(username)
+    return rows
+
+
+def _ebay_buyer_blocklist_csv(usernames: list[str]) -> str:
+    return "\n".join(_normalize_ebay_buyer_usernames(usernames))
+
+
+def _ebay_buyer_blocklist_diff(current: list[str], proposed: list[str]) -> dict[str, list[str]]:
+    current_rows = _normalize_ebay_buyer_usernames(current)
+    proposed_rows = _normalize_ebay_buyer_usernames(proposed)
+    current_keys = {row.lower() for row in current_rows}
+    proposed_keys = {row.lower() for row in proposed_rows}
+    return {
+        "added": [row for row in proposed_rows if row.lower() not in current_keys],
+        "removed": [row for row in current_rows if row.lower() not in proposed_keys],
+        "unchanged": [row for row in proposed_rows if row.lower() in current_keys],
+    }
+
+
+def _ebay_buyer_management_urls(environment: str) -> dict[str, str]:
+    host = "https://www.ebay.com"
+    if str(environment or "").strip().lower() != "production":
+        host = "https://www.sandbox.ebay.com"
+    return {
+        "blocked_buyer_list": f"{host}/bmgt/BuyerBlock",
+        "buyer_requirements": f"{host}/bmgt/buyerrequirements",
+        "buyer_management": f"{host}/bmgt",
+    }
+
+
+def _ebay_buyer_block_api_capability_rows(account_preferences_payload: dict | None = None) -> list[dict[str, str]]:
+    payload = account_preferences_payload if isinstance(account_preferences_payload, dict) else {}
+    account_keys = set(payload.keys())
+    account_available = bool(payload)
+    return [
+        {
+            "surface": "Blocked buyer list",
+            "status": "manual_ui_required",
+            "api": "No official REST/Trading endpoint confirmed for the exact eBay Blocked Buyer list.",
+            "meaning": "Use Admin mirror plus eBay Buyer Management page for live add/remove.",
+        },
+        {
+            "surface": "Buyer requirements",
+            "status": "partial_api_surface",
+            "api": "Sell Account user_preferences can expose account-level preferences; individual blocked usernames are separate.",
+            "meaning": "Good for capability checks and future guarded preferences review, not a direct blocklist replacement.",
+        },
+        {
+            "surface": "Unpaid item excluded users",
+            "status": "trading_api_available_distinct",
+            "api": "Trading GetUserPreferences/SetUserPreferences: UnpaidItemAssistancePreferences.ExcludedUser.",
+            "meaning": "This is an unpaid-item automation exclusion list, not a buyer block list.",
+        },
+        {
+            "surface": "Account user preferences smoke test",
+            "status": "available" if account_available else "not_run",
+            "api": "GET /sell/account/v2/user_preferences",
+            "meaning": (
+                f"Returned {len(account_keys)} top-level field(s): {', '.join(sorted(account_keys)[:6])}"
+                if account_available
+                else "Run the smoke test with a seller user token to verify Sell Account API access."
+            ),
+        },
+    ]
+
+
+def _ebay_buyer_blocklist_customer_rows(usernames: list[str], customers: list[Customer]) -> list[dict[str, Any]]:
+    blocked_usernames = _normalize_ebay_buyer_usernames(usernames)
+    customer_by_username: dict[str, Customer] = {}
+    for customer in customers:
+        username = str(getattr(customer, "ebay_username", "") or "").strip()
+        marketplace = str(getattr(customer, "marketplace", "") or "").strip().lower()
+        if not username or marketplace != "ebay":
+            continue
+        key = username.lower()
+        existing = customer_by_username.get(key)
+        if existing is None:
+            customer_by_username[key] = customer
+            continue
+        existing_last = getattr(existing, "last_order_at", None)
+        candidate_last = getattr(customer, "last_order_at", None)
+        if candidate_last and (not existing_last or candidate_last > existing_last):
+            customer_by_username[key] = customer
+
+    rows: list[dict[str, Any]] = []
+    for username in blocked_usernames:
+        customer = customer_by_username.get(username.lower())
+        notes = " ".join(str(getattr(customer, "notes", "") or "").split()) if customer is not None else ""
+        if len(notes) > 120:
+            notes = notes[:117].rstrip() + "..."
+        rows.append(
+            {
+                "username": username,
+                "local_customer": "yes" if customer is not None else "no",
+                "customer_id": int(getattr(customer, "id", 0) or 0) if customer is not None else None,
+                "display_name": str(getattr(customer, "display_name", "") or "") if customer is not None else "",
+                "orders": int(getattr(customer, "order_count", 0) or 0) if customer is not None else 0,
+                "lifetime_spend": float(getattr(customer, "total_spend", 0) or 0) if customer is not None else 0.0,
+                "repeat_buyer": bool(getattr(customer, "is_repeat_buyer", False)) if customer is not None else False,
+                "last_order_at": getattr(customer, "last_order_at", None) if customer is not None else None,
+                "ship_to": (
+                    ", ".join(
+                        part
+                        for part in [
+                            str(getattr(customer, "shipping_city", "") or "").strip(),
+                            str(getattr(customer, "shipping_state", "") or "").strip(),
+                            str(getattr(customer, "shipping_postal_code", "") or "").strip(),
+                        ]
+                        if part
+                    )
+                    if customer is not None
+                    else ""
+                ),
+                "has_internal_notes": bool(notes),
+                "notes_preview": notes,
+            }
+        )
+    return rows
+
+
+def _ebay_buyer_blocklist_candidate_customer_rows(
+    current_usernames: list[str],
+    customers: list[Customer],
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    blocked_keys = {row.lower() for row in _normalize_ebay_buyer_usernames(current_usernames)}
+    candidates: list[dict[str, Any]] = []
+    for customer in customers:
+        marketplace = str(getattr(customer, "marketplace", "") or "").strip().lower()
+        username = str(getattr(customer, "ebay_username", "") or "").strip()
+        if marketplace != "ebay" or not username or username.lower() in blocked_keys:
+            continue
+        notes = " ".join(str(getattr(customer, "notes", "") or "").split())
+        order_count = int(getattr(customer, "order_count", 0) or 0)
+        total_spend = float(getattr(customer, "total_spend", 0) or 0)
+        repeat_buyer = bool(getattr(customer, "is_repeat_buyer", False))
+        reason_parts: list[str] = []
+        if notes:
+            reason_parts.append("internal notes")
+        if repeat_buyer:
+            reason_parts.append("repeat buyer")
+        if order_count:
+            reason_parts.append(f"{order_count} order(s)")
+        if not reason_parts:
+            reason_parts.append("eBay customer")
+        if len(notes) > 120:
+            notes = notes[:117].rstrip() + "..."
+        candidates.append(
+            {
+                "username": username,
+                "customer_id": int(getattr(customer, "id", 0) or 0),
+                "display_name": str(getattr(customer, "display_name", "") or ""),
+                "orders": order_count,
+                "lifetime_spend": total_spend,
+                "repeat_buyer": repeat_buyer,
+                "last_order_at": getattr(customer, "last_order_at", None),
+                "has_internal_notes": bool(notes),
+                "notes_preview": notes,
+                "suggestion_reason": ", ".join(reason_parts),
+            }
+        )
+
+    def _candidate_sort_key(row: dict[str, Any]) -> tuple:
+        last_order_at = row.get("last_order_at")
+        try:
+            last_order_sort = -float(last_order_at.timestamp()) if last_order_at else 0.0
+        except Exception:
+            last_order_sort = 0.0
+        return (
+            not bool(row.get("has_internal_notes")),
+            not bool(row.get("repeat_buyer")),
+            -int(row.get("orders") or 0),
+            -float(row.get("lifetime_spend") or 0),
+            last_order_sort,
+        )
+
+    candidates.sort(key=_candidate_sort_key)
+    return candidates[: max(0, int(limit or 0))]
+
+
+def _render_ebay_buyer_blocklist_admin(repo: InventoryRepository, user: Any) -> None:
+    st.markdown("### eBay Buyer Block Management")
+    st.caption(
+        "Maintain a local mirror of blocked eBay buyer usernames, export/copy it for eBay, "
+        "and open eBay's buyer-management pages to apply the actual marketplace block list."
+    )
+    urls = _ebay_buyer_management_urls(settings.ebay_environment)
+    link_cols = st.columns(3)
+    link_cols[0].link_button("Open Blocked Buyer List", urls["blocked_buyer_list"], use_container_width=True)
+    link_cols[1].link_button("Open Buyer Requirements", urls["buyer_requirements"], use_container_width=True)
+    link_cols[2].link_button("Open Buyer Management", urls["buyer_management"], use_container_width=True)
+    st.info(
+        "This app stores an auditable local mirror. Apply the live eBay block list in eBay Buyer Management, "
+        "then paste or import the resulting username list back here to keep local records aligned."
+    )
+    st.markdown("#### API Capability")
+    st.caption(
+        "eBay exposes some seller-preference APIs, but the individual blocked-buyer list is treated here as "
+        "manual UI until an official endpoint is confirmed."
+    )
+    st.dataframe(pd.DataFrame(_ebay_buyer_block_api_capability_rows()), use_container_width=True, hide_index=True)
+    if st.button("Smoke Test Account User Preferences API", key="admin_ebay_buyer_block_api_smoke_test"):
+        access_token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+        if not access_token:
+            st.error("No eBay user access token is available in runtime settings.")
+        else:
+            try:
+                payload = EbayClient().get_account_user_preferences(
+                    access_token=access_token,
+                    marketplace_id=settings.ebay_marketplace_id or "EBAY_US",
+                )
+                st.success("Sell Account user_preferences API is reachable with the stored seller token.")
+                st.dataframe(
+                    pd.DataFrame(_ebay_buyer_block_api_capability_rows(payload)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.expander("Account User Preferences Response", expanded=False):
+                    st.json(payload)
+                try:
+                    repo.record_audit_event(
+                        entity_type="ebay_buyer_blocklist",
+                        entity_id=None,
+                        action="account_user_preferences_smoke_test",
+                        actor=user.username,
+                        changes={
+                            "status": "success",
+                            "marketplace_id": settings.ebay_marketplace_id or "EBAY_US",
+                            "top_level_keys": sorted(str(key) for key in payload.keys()),
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                st.error(f"Sell Account user_preferences smoke test failed: {exc}")
+                try:
+                    repo.record_audit_event(
+                        entity_type="ebay_buyer_blocklist",
+                        entity_id=None,
+                        action="account_user_preferences_smoke_test",
+                        actor=user.username,
+                        changes={
+                            "status": "error",
+                            "marketplace_id": settings.ebay_marketplace_id or "EBAY_US",
+                            "message": str(exc),
+                        },
+                    )
+                except Exception:
+                    pass
+
+    current_csv = get_runtime_str(repo, "ebay_buyer_blocklist_usernames_csv", "")
+    current_usernames = _normalize_ebay_buyer_usernames(current_csv)
+    notes = get_runtime_str(repo, "ebay_buyer_blocklist_notes", "")
+    all_customers: list[Customer] = []
+    if hasattr(repo, "list_customers"):
+        try:
+            all_customers = list(repo.list_customers())
+        except Exception as exc:
+            st.warning(f"Unable to load customer context for buyer blocklist: {exc}")
+
+    m1, m2 = st.columns(2)
+    m1.metric("Local Blocked Buyers", len(current_usernames))
+    m2.metric("Environment", settings.ebay_environment or "sandbox")
+    if current_usernames:
+        st.dataframe(
+            pd.DataFrame([{"username": username} for username in current_usernames]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        customer_context_rows: list[dict[str, Any]] = []
+        if all_customers:
+            customer_context_rows = _ebay_buyer_blocklist_customer_rows(current_usernames, all_customers)
+        if customer_context_rows:
+            matched_count = sum(1 for row in customer_context_rows if row.get("local_customer") == "yes")
+            note_count = sum(1 for row in customer_context_rows if row.get("has_internal_notes"))
+            st.markdown("#### Customer Context")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Matched Customers", matched_count)
+            c2.metric("Repeat Buyers", sum(1 for row in customer_context_rows if row.get("repeat_buyer")))
+            c3.metric("With Internal Notes", note_count)
+            st.caption(
+                "Use this to spot blocked buyers who already have order history or internal customer notes. "
+                "The app still does not apply live eBay blocks automatically."
+            )
+            st.dataframe(
+                pd.DataFrame(customer_context_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "lifetime_spend": st.column_config.NumberColumn("lifetime_spend", format="$%.2f"),
+                    "last_order_at": st.column_config.DatetimeColumn("last_order_at"),
+                },
+            )
+            st.page_link("pages/29_Customers.py", label="Open Customers")
+    else:
+        st.caption("No local blocked-buyer mirror entries yet.")
+
+    if all_customers:
+        candidate_rows = _ebay_buyer_blocklist_candidate_customer_rows(current_usernames, all_customers)
+        with st.expander("Customer Candidates", expanded=False):
+            st.caption(
+                "These are local eBay customers not already in the blocklist mirror. "
+                "Review evidence before adding anyone; this only updates the local mirror."
+            )
+            if candidate_rows:
+                st.dataframe(
+                    pd.DataFrame(candidate_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "lifetime_spend": st.column_config.NumberColumn("lifetime_spend", format="$%.2f"),
+                        "last_order_at": st.column_config.DatetimeColumn("last_order_at"),
+                    },
+                )
+                candidate_labels = [
+                    (
+                        f"{row['username']} | {row['orders']} order(s) | "
+                        f"${float(row['lifetime_spend'] or 0):.2f} | {row['suggestion_reason']}"
+                    )
+                    for row in candidate_rows
+                ]
+                selected_candidate_label = st.selectbox(
+                    "Select customer username to add to local mirror",
+                    options=candidate_labels,
+                    key="admin_ebay_buyer_blocklist_candidate_select",
+                )
+                selected_candidate = candidate_rows[candidate_labels.index(selected_candidate_label)]
+                candidate_reason = st.text_input(
+                    "Candidate evidence note",
+                    value=f"Added from customer#{selected_candidate.get('customer_id')} evidence: {selected_candidate.get('suggestion_reason')}",
+                    key="admin_ebay_buyer_blocklist_candidate_reason",
+                )
+                if st.button(
+                    "Add Selected Customer To Local Mirror",
+                    key="admin_ebay_buyer_blocklist_add_customer_candidate",
+                ):
+                    if not ensure_permission(user, "update", "Update eBay Buyer Blocklist Mirror"):
+                        st.stop()
+                    merged = _normalize_ebay_buyer_usernames(
+                        current_usernames + [str(selected_candidate.get("username") or "")]
+                    )
+                    diff = _ebay_buyer_blocklist_diff(current_usernames, merged)
+                    try:
+                        repo.upsert_runtime_setting(
+                            environment=settings.app_env,
+                            key="ebay_buyer_blocklist_usernames_csv",
+                            value=_ebay_buyer_blocklist_csv(merged),
+                            value_type="str",
+                            description="Local mirror of eBay blocked buyer usernames for Admin review/export.",
+                            actor=user.username,
+                        )
+                        note_line = (
+                            f"{utcnow_naive().isoformat(timespec='seconds')} {user.username}: "
+                            f"{candidate_reason.strip() or 'Added from local customer candidate.'}"
+                        )
+                        repo.upsert_runtime_setting(
+                            environment=settings.app_env,
+                            key="ebay_buyer_blocklist_notes",
+                            value=(notes + "\n" + note_line).strip(),
+                            value_type="str",
+                            description="Internal notes for the local eBay buyer blocklist mirror.",
+                            actor=user.username,
+                        )
+                        repo.record_audit_event(
+                            entity_type="ebay_buyer_blocklist",
+                            entity_id=None,
+                            action="add_local_mirror_customer_candidate",
+                            actor=user.username,
+                            changes={
+                                "added": diff["added"],
+                                "added_count": len(diff["added"]),
+                                "customer_id": selected_candidate.get("customer_id"),
+                                "reason": candidate_reason.strip(),
+                            },
+                        )
+                        st.success(f"Added {len(diff['added'])} username(s) to local mirror.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to add customer candidate to local buyer blocklist mirror: {exc}")
+            else:
+                st.caption("No unblocked eBay customer candidates found.")
+
+    st.download_button(
+        "Download Local Blocklist CSV",
+        data=(_ebay_buyer_blocklist_csv(current_usernames) + ("\n" if current_usernames else "")).encode("utf-8"),
+        file_name=f"ebay_buyer_blocklist_{settings.app_env}.csv",
+        mime="text/csv",
+        key="admin_ebay_buyer_blocklist_download",
+        disabled=not current_usernames,
+    )
+    st.text_area(
+        "Copy/Paste Local Blocklist",
+        value=_ebay_buyer_blocklist_csv(current_usernames),
+        height=140,
+        key="admin_ebay_buyer_blocklist_copy_text",
+        help="Paste this into eBay Buyer Management if you need to reconcile manually.",
+    )
+
+    with st.form("admin_ebay_buyer_blocklist_add_form"):
+        add_raw = st.text_area(
+            "Add buyer usernames",
+            height=110,
+            placeholder="buyer_one\nbuyer-two\nbuyer.three",
+            help="Accepts newline, comma, semicolon, or whitespace-separated eBay usernames.",
+        )
+        add_reason = st.text_input(
+            "Reason / evidence note",
+            placeholder="Return abuse, unpaid order, abusive messages, etc.",
+        )
+        add_submit = st.form_submit_button("Add To Local Mirror")
+    if add_submit:
+        if not ensure_permission(user, "update", "Update eBay Buyer Blocklist Mirror"):
+            st.stop()
+        add_usernames = _normalize_ebay_buyer_usernames(add_raw)
+        if not add_usernames:
+            st.warning("Enter at least one valid eBay username to add.")
+        else:
+            merged = _normalize_ebay_buyer_usernames(current_usernames + add_usernames)
+            diff = _ebay_buyer_blocklist_diff(current_usernames, merged)
+            try:
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ebay_buyer_blocklist_usernames_csv",
+                    value=_ebay_buyer_blocklist_csv(merged),
+                    value_type="str",
+                    description="Local mirror of eBay blocked buyer usernames for Admin review/export.",
+                    actor=user.username,
+                )
+                if add_reason.strip():
+                    note_line = f"{utcnow_naive().isoformat(timespec='seconds')} {user.username}: {add_reason.strip()}"
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key="ebay_buyer_blocklist_notes",
+                        value=(notes + "\n" + note_line).strip(),
+                        value_type="str",
+                        description="Internal notes for the local eBay buyer blocklist mirror.",
+                        actor=user.username,
+                    )
+                repo.record_audit_event(
+                    entity_type="ebay_buyer_blocklist",
+                    entity_id=None,
+                    action="add_local_mirror_usernames",
+                    actor=user.username,
+                    changes={
+                        "added": diff["added"],
+                        "added_count": len(diff["added"]),
+                        "reason": add_reason.strip(),
+                    },
+                )
+                st.success(f"Added {len(diff['added'])} username(s) to local mirror.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to update local buyer blocklist mirror: {exc}")
+
+    if current_usernames:
+        with st.form("admin_ebay_buyer_blocklist_remove_form"):
+            remove_usernames = st.multiselect(
+                "Remove usernames from local mirror",
+                options=current_usernames,
+            )
+            remove_reason = st.text_input("Removal note", placeholder="Unblocked, corrected typo, etc.")
+            remove_submit = st.form_submit_button("Remove From Local Mirror")
+        if remove_submit:
+            if not ensure_permission(user, "update", "Update eBay Buyer Blocklist Mirror"):
+                st.stop()
+            remove_keys = {row.lower() for row in remove_usernames}
+            updated = [row for row in current_usernames if row.lower() not in remove_keys]
+            diff = _ebay_buyer_blocklist_diff(current_usernames, updated)
+            try:
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ebay_buyer_blocklist_usernames_csv",
+                    value=_ebay_buyer_blocklist_csv(updated),
+                    value_type="str",
+                    description="Local mirror of eBay blocked buyer usernames for Admin review/export.",
+                    actor=user.username,
+                )
+                if remove_reason.strip():
+                    note_line = f"{utcnow_naive().isoformat(timespec='seconds')} {user.username}: {remove_reason.strip()}"
+                    repo.upsert_runtime_setting(
+                        environment=settings.app_env,
+                        key="ebay_buyer_blocklist_notes",
+                        value=(notes + "\n" + note_line).strip(),
+                        value_type="str",
+                        description="Internal notes for the local eBay buyer blocklist mirror.",
+                        actor=user.username,
+                    )
+                repo.record_audit_event(
+                    entity_type="ebay_buyer_blocklist",
+                    entity_id=None,
+                    action="remove_local_mirror_usernames",
+                    actor=user.username,
+                    changes={
+                        "removed": diff["removed"],
+                        "removed_count": len(diff["removed"]),
+                        "reason": remove_reason.strip(),
+                    },
+                )
+                st.success(f"Removed {len(diff['removed'])} username(s) from local mirror.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to update local buyer blocklist mirror: {exc}")
+
+    with st.expander("Replace Local Mirror From eBay", expanded=False):
+        st.caption(
+            "Use this after reviewing the live eBay blocked buyer page. Paste the full current list from eBay "
+            "to make the local mirror match the marketplace-side list."
+        )
+        with st.form("admin_ebay_buyer_blocklist_replace_form"):
+            replace_raw = st.text_area("Full replacement username list", height=160)
+            replace_note = st.text_input("Replacement note", placeholder="Synced from eBay BuyerBlock page.")
+            replace_submit = st.form_submit_button("Replace Local Mirror")
+        if replace_submit:
+            if not ensure_permission(user, "update", "Replace eBay Buyer Blocklist Mirror"):
+                st.stop()
+            replacement = _normalize_ebay_buyer_usernames(replace_raw)
+            diff = _ebay_buyer_blocklist_diff(current_usernames, replacement)
+            try:
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ebay_buyer_blocklist_usernames_csv",
+                    value=_ebay_buyer_blocklist_csv(replacement),
+                    value_type="str",
+                    description="Local mirror of eBay blocked buyer usernames for Admin review/export.",
+                    actor=user.username,
+                )
+                note_line = (
+                    f"{utcnow_naive().isoformat(timespec='seconds')} {user.username}: "
+                    f"{replace_note.strip() or 'Replaced local mirror from pasted eBay list.'}"
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="ebay_buyer_blocklist_notes",
+                    value=(notes + "\n" + note_line).strip(),
+                    value_type="str",
+                    description="Internal notes for the local eBay buyer blocklist mirror.",
+                    actor=user.username,
+                )
+                repo.record_audit_event(
+                    entity_type="ebay_buyer_blocklist",
+                    entity_id=None,
+                    action="replace_local_mirror",
+                    actor=user.username,
+                    changes={
+                        "added": diff["added"],
+                        "removed": diff["removed"],
+                        "added_count": len(diff["added"]),
+                        "removed_count": len(diff["removed"]),
+                        "replacement_count": len(replacement),
+                        "note": replace_note.strip(),
+                    },
+                )
+                st.success(f"Replaced local mirror with {len(replacement)} username(s).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to replace local buyer blocklist mirror: {exc}")
+
+    with st.expander("Internal Blocklist Notes", expanded=False):
+        st.text_area("Notes", value=notes, height=180, disabled=True)
+
+
 def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
+    quickbooks_defaults = QuickBooksClearingConfig()
     return [
         {
             "key": "app_build_version",
@@ -878,6 +1493,42 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "false",
             "value_type": "bool",
             "description": "Require eBay Workspace runbook completion before bulk eBay Ops actions are enabled.",
+        },
+        {
+            "key": "ebay_buyer_blocklist_usernames_csv",
+            "value": "",
+            "value_type": "str",
+            "description": "Local mirror of eBay blocked buyer usernames for Admin review/export.",
+        },
+        {
+            "key": "ebay_buyer_blocklist_notes",
+            "value": "",
+            "value_type": "str",
+            "description": "Internal notes for the local eBay buyer blocklist mirror.",
+        },
+        {
+            "key": "quarterly_estimated_tax_federal_income_rate_percent",
+            "value": "22.0",
+            "value_type": "float",
+            "description": "Default federal income-tax reserve percentage for quarterly estimated-tax planning.",
+        },
+        {
+            "key": "quarterly_estimated_tax_colorado_income_rate_percent",
+            "value": "4.40",
+            "value_type": "float",
+            "description": "Default Colorado income-tax reserve percentage for quarterly estimated-tax planning.",
+        },
+        {
+            "key": "quarterly_estimated_tax_self_employment_rate_percent",
+            "value": "15.30",
+            "value_type": "float",
+            "description": "Default self-employment tax reserve percentage for quarterly estimated-tax planning.",
+        },
+        {
+            "key": "quarterly_estimated_tax_se_net_earnings_multiplier_percent",
+            "value": "92.35",
+            "value_type": "float",
+            "description": "Default Schedule SE net-earnings multiplier percentage for quarterly estimated-tax planning.",
         },
         {
             "key": "ebay_marketplace_id",
@@ -962,6 +1613,36 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "value": "0.0",
             "value_type": "float",
             "description": "Default auction Buy It Now price for eBay listing workflows.",
+        },
+        {
+            "key": "ebay_fee_estimate_final_value_rate_percent",
+            "value": "13.25",
+            "value_type": "float",
+            "description": "Default eBay final value fee percentage for pre-listing estimates.",
+        },
+        {
+            "key": "ebay_fee_estimate_final_value_fixed_per_order_usd",
+            "value": "0.30",
+            "value_type": "float",
+            "description": "Default eBay fixed per-order fee for pre-listing estimates.",
+        },
+        {
+            "key": "ebay_fee_estimate_payment_rate_percent",
+            "value": "0.0",
+            "value_type": "float",
+            "description": "Optional additional eBay percentage surcharge for pre-listing estimates; default 0.",
+        },
+        {
+            "key": "ebay_fee_estimate_payment_fixed_per_order_usd",
+            "value": "0.0",
+            "value_type": "float",
+            "description": "Optional additional eBay fixed surcharge for pre-listing estimates; default 0.",
+        },
+        {
+            "key": "ebay_fee_estimate_promoted_rate_percent",
+            "value": "0.0",
+            "value_type": "float",
+            "description": "Default promoted listing percentage for pre-listing estimates.",
         },
         {
             "key": "ebay_workspace_store_profiles_json",
@@ -1104,10 +1785,110 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "description": "Minimum minutes between scheduled eBay connection health checks.",
         },
         {
+            "key": "sync_job_ebay_store_categories_sync_enabled",
+            "value": "true"
+            if getattr(settings, "sync_job_ebay_store_categories_sync_enabled", True)
+            else "false",
+            "value_type": "bool",
+            "description": "Enable/disable scheduled eBay store category hierarchy sync.",
+        },
+        {
+            "key": "sync_job_ebay_store_categories_sync_interval_hours",
+            "value": str(int(getattr(settings, "sync_job_ebay_store_categories_sync_interval_hours", 24))),
+            "value_type": "int",
+            "description": "Minimum hours between scheduled eBay store category hierarchy syncs.",
+        },
+        {
+            "key": "sync_job_ebay_store_categories_sync_deactivate_missing",
+            "value": "true"
+            if getattr(settings, "sync_job_ebay_store_categories_sync_deactivate_missing", False)
+            else "false",
+            "value_type": "bool",
+            "description": "Deactivate eBay-imported local store categories missing from the latest GetStore response.",
+        },
+        {
             "key": "sync_job_quickbooks_export_enabled",
             "value": "true" if settings.sync_job_quickbooks_export_enabled else "false",
             "value_type": "bool",
-            "description": "Enable/disable QuickBooks export job scaffold.",
+            "description": "Enable/disable QuickBooks dry-run export evidence job.",
+        },
+        {
+            "key": "sync_job_quickbooks_export_lookback_days",
+            "value": "30",
+            "value_type": "int",
+            "description": "Default lookback window for QuickBooks dry-run export payload evidence.",
+        },
+        {
+            "key": "quickbooks_clearing_account_ref",
+            "value": quickbooks_defaults.clearing_account_ref,
+            "value_type": "str",
+            "description": "QBO asset account used as the app clearing account for marketplace sales and deductions.",
+        },
+        {
+            "key": "quickbooks_sales_income_account_ref",
+            "value": quickbooks_defaults.sales_income_account_ref,
+            "value_type": "str",
+            "description": "QBO income account ref/name for marketplace gross item sales in manual journal fallback.",
+        },
+        {
+            "key": "quickbooks_shipping_income_account_ref",
+            "value": quickbooks_defaults.shipping_income_account_ref,
+            "value_type": "str",
+            "description": "QBO income account ref/name for buyer-paid shipping income in manual journal fallback.",
+        },
+        {
+            "key": "quickbooks_ebay_customer_ref",
+            "value": quickbooks_defaults.ebay_customer_ref,
+            "value_type": "str",
+            "description": "Generic QBO customer ref/name used for eBay SalesReceipt payloads.",
+        },
+        {
+            "key": "quickbooks_ebay_vendor_ref",
+            "value": quickbooks_defaults.ebay_vendor_ref,
+            "value_type": "str",
+            "description": "Generic QBO vendor ref/name used for eBay fee Purchase payloads.",
+        },
+        {
+            "key": "quickbooks_ebay_payment_method_ref",
+            "value": quickbooks_defaults.ebay_payment_method_ref,
+            "value_type": "str",
+            "description": "QBO payment method ref/name used for eBay SalesReceipt payloads.",
+        },
+        {
+            "key": "quickbooks_ebay_fee_expense_account_ref",
+            "value": quickbooks_defaults.ebay_fee_expense_account_ref,
+            "value_type": "str",
+            "description": "QBO expense account ref/name for eBay order-level fees.",
+        },
+        {
+            "key": "quickbooks_ebay_shipping_expense_account_ref",
+            "value": quickbooks_defaults.ebay_shipping_expense_account_ref,
+            "value_type": "str",
+            "description": "QBO expense account ref/name for non-order eBay shipping-label deductions.",
+        },
+        {
+            "key": "quickbooks_ebay_subscription_expense_account_ref",
+            "value": quickbooks_defaults.ebay_subscription_expense_account_ref,
+            "value_type": "str",
+            "description": "QBO expense account ref/name for eBay store subscription deductions.",
+        },
+        {
+            "key": "quickbooks_ebay_adjustment_expense_account_ref",
+            "value": quickbooks_defaults.ebay_adjustment_expense_account_ref,
+            "value_type": "str",
+            "description": "QBO expense account ref/name for other non-order marketplace deductions.",
+        },
+        {
+            "key": "quickbooks_tax_code_ref",
+            "value": quickbooks_defaults.tax_code_ref,
+            "value_type": "str",
+            "description": "QBO tax code ref/name for eBay marketplace-facilitator orders.",
+        },
+        {
+            "key": "quickbooks_doc_number_prefix",
+            "value": quickbooks_defaults.doc_number_prefix,
+            "value_type": "str",
+            "description": "QBO DocNumber prefix used for generated SalesReceipt and Purchase payloads.",
         },
         {
             "key": "sync_job_shopify_orders_pull_enabled",
@@ -1560,7 +2341,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "key": "ai_workflow_profile_accounting",
             "value": "",
             "value_type": "str",
-            "description": "Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
+            "description": f"Preferred AI runtime profile id for accounting/{AI_ACCOUNTANT_NAME} workflow calls (blank uses default chain order).",
         },
         {
             "key": "ai_quality_title_min_words",
@@ -1962,132 +2743,121 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "key": "ai_accountant_monitor_enabled",
             "value": "true",
             "value_type": "bool",
-            "description": "Enable sync-runner scheduled AI Accountant monitor pass.",
+            "description": f"Enable sync-runner scheduled {AI_ACCOUNTANT_NAME} monitor pass.",
         },
         {
             "key": "ai_accountant_monitor_timezone",
             "value": "America/Denver",
             "value_type": "str",
-            "description": "IANA timezone used by the scheduled AI Accountant monitor.",
+            "description": f"IANA timezone used by the scheduled {AI_ACCOUNTANT_NAME} monitor.",
         },
         {
             "key": "ai_accountant_monitor_schedule_mode",
             "value": "interval",
             "value_type": "str",
-            "description": "AI Accountant monitor schedule mode: `interval` for several times per day, or `daily` for one local HH:MM run.",
+            "description": f"{AI_ACCOUNTANT_NAME} monitor schedule mode: `interval` for several times per day, or `daily` for one local HH:MM run.",
         },
         {
             "key": "ai_accountant_monitor_interval_hours",
             "value": "6",
             "value_type": "int",
-            "description": "When schedule mode is `interval`, run the AI Accountant monitor every N hours.",
+            "description": f"When schedule mode is `interval`, run the {AI_ACCOUNTANT_NAME} monitor every N hours.",
         },
         {
             "key": "ai_accountant_monitor_local_time",
             "value": "08:30",
             "value_type": "str",
-            "description": "Local HH:MM trigger for the scheduled AI Accountant monitor.",
+            "description": f"Local HH:MM trigger for the scheduled {AI_ACCOUNTANT_NAME} monitor.",
         },
         {
             "key": "ai_accountant_monitor_lookback_days",
             "value": "30",
             "value_type": "int",
-            "description": "Lookback window in days for scheduled AI Accountant monitor checks.",
+            "description": f"Lookback window in days for scheduled {AI_ACCOUNTANT_NAME} monitor checks.",
         },
         {
             "key": "ai_accountant_monitor_min_severity",
             "value": "P1",
             "value_type": "str",
-            "description": "Minimum severity to record/alert from scheduled AI Accountant monitor (`P0`, `P1`, or `P2`).",
+            "description": f"Minimum severity to record/alert from scheduled {AI_ACCOUNTANT_NAME} monitor (`P0`, `P1`, or `P2`).",
         },
         {
             "key": "ai_accountant_monitor_slack_enabled",
             "value": "true",
             "value_type": "bool",
-            "description": "Queue Slack notification-outbox messages for scheduled AI Accountant monitor findings.",
+            "description": f"Queue Slack notification-outbox messages for scheduled {AI_ACCOUNTANT_NAME} monitor findings.",
         },
         {
             "key": "ai_accountant_monitor_channel",
             "value": "",
             "value_type": "str",
-            "description": "Optional Slack channel override for scheduled AI Accountant monitor alerts.",
+            "description": f"Optional Slack channel override for scheduled {AI_ACCOUNTANT_NAME} monitor alerts.",
         },
         {
             "key": "ai_accountant_monitor_record_empty",
             "value": "false",
             "value_type": "bool",
-            "description": "Record an in-app AI Accountant monitor message even when no actionable findings exist.",
+            "description": f"Record an in-app {AI_ACCOUNTANT_NAME} monitor message even when no actionable findings exist.",
         },
         {
             "key": "ai_accountant_monitor_llm_review_enabled",
             "value": "true",
             "value_type": "bool",
-            "description": "Run and audit a read-only AI Accountant LLM review during scheduled monitor passes.",
+            "description": f"Run and audit a read-only {AI_ACCOUNTANT_NAME} LLM review during scheduled monitor passes.",
         },
         {
             "key": "ai_accountant_monitor_review_instruction",
-            "value": (
-                "Review the scheduled AI Accountant monitor evidence. Return concise markdown with close/watch status, "
-                "highest-risk findings, corrections to make, profit/cost-basis notes, and tax/advisor-review notes."
-            ),
+            "value": DEFAULT_AI_ACCOUNTANT_MONITOR_INSTRUCTION,
             "value_type": "str",
-            "description": "Instruction prompt for automated scheduled AI Accountant monitor reviews.",
+            "description": f"Instruction prompt for automated scheduled {AI_ACCOUNTANT_NAME} monitor reviews.",
         },
         {
             "key": "ai_accountant_monitor_review_max_rows",
             "value": "25",
             "value_type": "int",
-            "description": "Maximum monitor rows sent to scheduled AI Accountant LLM reviews.",
+            "description": f"Maximum monitor rows sent to scheduled {AI_ACCOUNTANT_NAME} LLM reviews.",
         },
         {
             "key": "ai_accountant_monitor_review_max_exception_rows",
             "value": "25",
             "value_type": "int",
-            "description": "Maximum accounting exception rows sent to scheduled AI Accountant LLM reviews.",
+            "description": f"Maximum accounting exception rows sent to scheduled {AI_ACCOUNTANT_NAME} LLM reviews.",
         },
         {
             "key": "ai_accountant_chat_ai_enabled",
             "value": "true",
             "value_type": "bool",
-            "description": "Enable the AI Accountant identity/system prompt for accounting/tax chat questions even when generic chat refinement is off.",
+            "description": f"Enable the {AI_ACCOUNTANT_NAME} identity/system prompt for accounting/tax chat questions even when generic chat refinement is off.",
         },
         {
             "key": "ai_accountant_web_research_enabled",
             "value": "true",
             "value_type": "bool",
-            "description": "Allow AI Accountant chat/Slack answers to fetch external web-research context for tax/accounting questions.",
+            "description": f"Allow {AI_ACCOUNTANT_NAME} chat/Slack answers to fetch external web-research context for tax/accounting questions.",
         },
         {
             "key": "ai_accountant_web_research_limit",
             "value": "5",
             "value_type": "int",
-            "description": "Maximum external web-search rows attached to AI Accountant research context.",
+            "description": f"Maximum external web-search rows attached to {AI_ACCOUNTANT_NAME} research context.",
         },
         {
             "key": "ai_accountant_web_research_timeout_seconds",
             "value": "10",
             "value_type": "int",
-            "description": "HTTP timeout for optional AI Accountant external web research.",
+            "description": f"HTTP timeout for optional {AI_ACCOUNTANT_NAME} external web research.",
         },
         {
             "key": "accountant_llm_system_message",
-            "value": (
-                "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller watching cost basis, "
-                "lot allocation, COGS, gross/net sales, marketplace fees, shipping label spend, returns, tax evidence, "
-                "close readiness, and sign-off evidence. Cite evidence, label estimates versus actuals, identify concrete "
-                "corrections, and route unsupported tax/legal conclusions to human advisor review."
-            ),
+            "value": DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
             "value_type": "str",
-            "description": "Primary identity/system message for AI Accountant reviews, chat, and Slack answers.",
+            "description": f"Primary identity/system message for {AI_ACCOUNTANT_NAME} reviews, chat, and Slack answers.",
         },
         {
             "key": "ai_accountant_chat_instruction",
-            "value": (
-                "Answer as the AI Accountant. Use app evidence as source of truth, use web research only as external context, "
-                "and return concise markdown with direct answer, evidence checked, risks/corrections, and advisor-review notes."
-            ),
+            "value": DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION,
             "value_type": "str",
-            "description": "Instruction prompt for interactive AI Accountant chat and Slack responses.",
+            "description": f"Instruction prompt for interactive {AI_ACCOUNTANT_NAME} chat and Slack responses.",
         },
         {
             "key": "slack_notify_backup_success",
@@ -2225,7 +2995,7 @@ def _runtime_setting_seed_defaults() -> list[dict[str, str]]:
             "key": "notification_route_ai_accountant_monitor",
             "value": "slack",
             "value_type": "str",
-            "description": "Notification route for scheduled AI Accountant monitor alerts (`slack`, `email`, `both`, `disabled`).",
+            "description": f"Notification route for scheduled {AI_ACCOUNTANT_NAME} monitor alerts (`slack`, `email`, `both`, `disabled`).",
         },
         {
             "key": "notification_email_enabled",
@@ -6304,6 +7074,132 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
         st.caption("Recent Evidence Capture Events")
         st.dataframe(pd.DataFrame(capture_rows), use_container_width=True, hide_index=True)
 
+    st.markdown("#### eBay Fee Estimate Defaults")
+    st.caption(
+        "These defaults feed the Tools eBay Fee Calculator plus Listing Wizard/Listings pre-publish estimates. "
+        "Actual imported eBay finance entries remain the accounting source of truth after a sale."
+    )
+    current_fee_defaults = {
+        "ebay_fee_estimate_final_value_rate_percent": get_runtime_float(
+            repo, "ebay_fee_estimate_final_value_rate_percent", 13.25
+        ),
+        "ebay_fee_estimate_final_value_fixed_per_order_usd": get_runtime_float(
+            repo, "ebay_fee_estimate_final_value_fixed_per_order_usd", 0.30
+        ),
+        "ebay_fee_estimate_payment_rate_percent": get_runtime_float(
+            repo, "ebay_fee_estimate_payment_rate_percent", 0.0
+        ),
+        "ebay_fee_estimate_payment_fixed_per_order_usd": get_runtime_float(
+            repo, "ebay_fee_estimate_payment_fixed_per_order_usd", 0.0
+        ),
+        "ebay_fee_estimate_promoted_rate_percent": get_runtime_float(
+            repo, "ebay_fee_estimate_promoted_rate_percent", 0.0
+        ),
+    }
+    with st.form("admin_ebay_fee_estimate_defaults_form"):
+        ed1, ed2, ed3 = st.columns(3)
+        with ed1:
+            fee_default_fvf = st.number_input(
+                "Default Final Value Fee %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(current_fee_defaults["ebay_fee_estimate_final_value_rate_percent"]),
+                step=0.05,
+                format="%.4f",
+                key="admin_ebay_fee_default_fvf",
+            )
+            fee_default_fixed = st.number_input(
+                "Default Per-Order Fee",
+                min_value=0.0,
+                value=float(current_fee_defaults["ebay_fee_estimate_final_value_fixed_per_order_usd"]),
+                step=0.05,
+                format="%.4f",
+                key="admin_ebay_fee_default_fixed",
+            )
+        with ed2:
+            fee_default_extra_pct = st.number_input(
+                "Additional Surcharge %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(current_fee_defaults["ebay_fee_estimate_payment_rate_percent"]),
+                step=0.05,
+                format="%.4f",
+                key="admin_ebay_fee_default_extra_pct",
+                help="Leave at 0 unless you intentionally model a separate international/payment/performance surcharge.",
+            )
+            fee_default_extra_fixed = st.number_input(
+                "Additional Fixed Surcharge",
+                min_value=0.0,
+                value=float(current_fee_defaults["ebay_fee_estimate_payment_fixed_per_order_usd"]),
+                step=0.05,
+                format="%.4f",
+                key="admin_ebay_fee_default_extra_fixed",
+            )
+        with ed3:
+            fee_default_promoted = st.number_input(
+                "Default Promoted Listing %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(current_fee_defaults["ebay_fee_estimate_promoted_rate_percent"]),
+                step=0.25,
+                format="%.4f",
+                key="admin_ebay_fee_default_promoted",
+            )
+            fee_defaults_active = st.checkbox(
+                "Active",
+                value=True,
+                key="admin_ebay_fee_defaults_active",
+            )
+        save_fee_defaults = st.form_submit_button("Save eBay Fee Defaults")
+    if save_fee_defaults:
+        try:
+            defaults_to_save = {
+                "ebay_fee_estimate_final_value_rate_percent": (
+                    fee_default_fvf,
+                    "Default eBay final value fee percentage for pre-listing estimates.",
+                ),
+                "ebay_fee_estimate_final_value_fixed_per_order_usd": (
+                    fee_default_fixed,
+                    "Default eBay fixed per-order fee for pre-listing estimates.",
+                ),
+                "ebay_fee_estimate_payment_rate_percent": (
+                    fee_default_extra_pct,
+                    "Optional additional eBay percentage surcharge for pre-listing estimates; default 0.",
+                ),
+                "ebay_fee_estimate_payment_fixed_per_order_usd": (
+                    fee_default_extra_fixed,
+                    "Optional additional eBay fixed surcharge for pre-listing estimates; default 0.",
+                ),
+                "ebay_fee_estimate_promoted_rate_percent": (
+                    fee_default_promoted,
+                    "Default promoted listing percentage for pre-listing estimates.",
+                ),
+            }
+            for key, (value, description) in defaults_to_save.items():
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key=key,
+                    value=f"{float(value or 0.0):.4f}",
+                    value_type="float",
+                    description=description,
+                    is_active=bool(fee_defaults_active),
+                    actor=user.username,
+                )
+            st.success("eBay fee estimate defaults saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to save eBay fee estimate defaults: {exc}")
+    fee_defaults_df = pd.DataFrame(
+        [
+            {
+                "setting": key,
+                "value": value,
+            }
+            for key, value in current_fee_defaults.items()
+        ]
+    )
+    st.dataframe(fee_defaults_df, use_container_width=True, hide_index=True)
+
     st.markdown("#### eBay Fee Calibration Sign-Off Tracker")
     st.caption(
         "Capture finance calibration acceptance for eBay fee assumptions (owner/date/evidence) per environment."
@@ -6353,8 +7249,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                             "sample_order_count": 0,
                             "assumption_snapshot": (
                                 f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
-                                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
-                                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+                                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_rate_percent', 0.0):.4f}, "
+                                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_final_value_fixed_per_order_usd', 0.30):.4f}"
                             ),
                             "evidence_link": "",
                             "notes": "Auto-seeded missing fee calibration sign-off row from Admin tracker.",
@@ -6393,8 +7289,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
                         "sample_order_count": 0,
                         "assumption_snapshot": (
                             f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
-                            f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
-                            f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+                            f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_rate_percent', 0.0):.4f}, "
+                            f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_final_value_fixed_per_order_usd', 0.30):.4f}"
                         ),
                         "evidence_link": "",
                         "notes": "Quick approved from fee calibration tracker.",
@@ -6449,8 +7345,8 @@ def _render_governance_exports_hub(repo: InventoryRepository, user) -> None:
             "Assumption Snapshot",
             value=(
                 f"final_value_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_final_value_rate_percent', 13.25):.4f}, "
-                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_processing_rate_percent', 2.9):.4f}, "
-                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_fixed_fee_per_order_usd', 0.30):.4f}"
+                f"payment_rate_percent={get_runtime_float(repo, 'ebay_fee_estimate_payment_rate_percent', 0.0):.4f}, "
+                f"per_order_fixed_usd={get_runtime_float(repo, 'ebay_fee_estimate_final_value_fixed_per_order_usd', 0.30):.4f}"
             ),
             key="admin_ebay_fee_calibration_signoff_assumption_snapshot",
         )
@@ -8049,6 +8945,7 @@ def render_admin(repo: InventoryRepository) -> None:
         tab_maintenance,
         tab_backups,
         tab_ebay_verify,
+        tab_ebay_buyer_blocks,
         tab_ai_runtime,
         tab_env_config,
         tab_runtime_settings,
@@ -8066,6 +8963,7 @@ def render_admin(repo: InventoryRepository) -> None:
             "Maintenance",
             "Backups",
             "eBay Verify",
+            "eBay Buyer Blocks",
             "AI Runtime",
             "Env Config",
             "Runtime Settings",
@@ -9488,6 +10386,9 @@ def render_admin(repo: InventoryRepository) -> None:
                         except Exception:
                             pass
 
+    with tab_ebay_buyer_blocks:
+        _render_ebay_buyer_blocklist_admin(repo, user)
+
     with tab_ai_runtime:
         st.markdown("### AI Provider Runtime")
         st.caption(
@@ -10615,7 +11516,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     key="ai_workflow_profile_accounting",
                     value=label_to_value.get(str(accounting_label), ""),
                     value_type="str",
-                    description="Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
+                    description=f"Preferred AI runtime profile id for accounting/{AI_ACCOUNTANT_NAME} workflow calls (blank uses default chain order).",
                     is_active=True,
                     actor=user.username,
                 )
@@ -10645,7 +11546,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     ),
                     (
                         "ai_workflow_profile_accounting",
-                        "Preferred AI runtime profile id for accounting/AI Accountant workflow calls (blank uses default chain order).",
+                        f"Preferred AI runtime profile id for accounting/{AI_ACCOUNTANT_NAME} workflow calls (blank uses default chain order).",
                     ),
                 ]:
                     repo.upsert_runtime_setting(
@@ -13194,6 +14095,12 @@ def render_admin(repo: InventoryRepository) -> None:
         def _rb(key: str, default: bool = False) -> bool:
             return _rv(key, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
 
+        st.markdown("#### QuickBooks Online")
+        st.caption(
+            "QuickBooks settings, dry-run export controls, and manual journal fallback guidance now live on "
+            "the dedicated QuickBooks page. Runtime Settings below still shows the raw DB-backed keys when needed."
+        )
+
         st.markdown("#### Integrations Performance Controls")
         ic1, ic2, ic3, ic4 = st.columns(4)
         with ic1:
@@ -15466,7 +16373,7 @@ def render_admin(repo: InventoryRepository) -> None:
                     index=_route_index(_rv("notification_route_business_reports", "slack")),
                 )
                 route_ai_accountant_monitor = st.selectbox(
-                    "Route: AI Accountant Monitor",
+                    f"Route: {AI_ACCOUNTANT_NAME} Monitor",
                     options=route_options,
                     index=_route_index(_rv("notification_route_ai_accountant_monitor", "slack")),
                 )
@@ -15488,7 +16395,12 @@ def render_admin(repo: InventoryRepository) -> None:
                     ("notification_route_backup_events", route_backup_events, "str", "Notification route for backup events."),
                     ("notification_route_system_health_critical", route_system_health_critical, "str", "Notification route for system-health critical events."),
                     ("notification_route_business_reports", route_business_reports, "str", "Notification route for manual business reports."),
-                    ("notification_route_ai_accountant_monitor", route_ai_accountant_monitor, "str", "Notification route for scheduled AI Accountant monitor alerts."),
+                    (
+                        "notification_route_ai_accountant_monitor",
+                        route_ai_accountant_monitor,
+                        "str",
+                        f"Notification route for scheduled {AI_ACCOUNTANT_NAME} monitor alerts.",
+                    ),
                     ("notification_email_enabled", "true" if notification_email_enabled else "false", "bool", "Enable notification email pipeline."),
                     ("notification_email_recipients_csv", notification_email_recipients_csv.strip(), "str", "Default notification email recipients (CSV)."),
                 ]
@@ -16870,6 +17782,7 @@ def render_admin(repo: InventoryRepository) -> None:
             "ebay_orders_pull_import": "SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_ENABLED",
             "ebay_shipping_tracking_push": "SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED",
             "ebay_connection_health_check": "SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_ENABLED",
+            "ebay_store_categories_sync": "SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_ENABLED",
             "quickbooks_export": "SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED",
             "shopify_orders_pull": "SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED",
         }
@@ -16920,9 +17833,39 @@ def render_admin(repo: InventoryRepository) -> None:
                 ),
                 step=5,
             )
-            desired_quickbooks_export = st.checkbox(
-                "Enable QuickBooks export (future job)",
-                value=bool(is_sync_job_enabled("quickbooks_export", repo=repo)),
+            desired_store_categories_sync = st.checkbox(
+                "Enable eBay store category sync",
+                value=bool(is_sync_job_enabled("ebay_store_categories_sync", repo=repo)),
+                help="Pulls your eBay Store category hierarchy into local listing selectors.",
+            )
+            desired_store_categories_sync_interval_hours = st.number_input(
+                "eBay store category sync interval (hours)",
+                min_value=1,
+                max_value=24 * 30,
+                value=max(
+                    1,
+                    min(
+                        24 * 30,
+                        get_runtime_int(
+                            repo,
+                            "sync_job_ebay_store_categories_sync_interval_hours",
+                            int(getattr(settings, "sync_job_ebay_store_categories_sync_interval_hours", 24)),
+                        ),
+                    ),
+                ),
+                step=1,
+            )
+            desired_store_categories_deactivate_missing = st.checkbox(
+                "Deactivate stale eBay-synced store categories",
+                value=get_runtime_bool(
+                    repo,
+                    "sync_job_ebay_store_categories_sync_deactivate_missing",
+                    bool(getattr(settings, "sync_job_ebay_store_categories_sync_deactivate_missing", False)),
+                ),
+                help=(
+                    "When enabled, scheduled sync deactivates local categories previously imported from eBay "
+                    "if GetStore no longer returns them. Manual categories are not touched."
+                ),
             )
             desired_shopify_pull = st.checkbox(
                 "Enable Shopify orders pull (future job)",
@@ -16998,10 +17941,28 @@ def render_admin(repo: InventoryRepository) -> None:
                 )
                 repo.upsert_runtime_setting(
                     environment=settings.app_env,
-                    key="sync_job_quickbooks_export_enabled",
-                    value="true" if desired_quickbooks_export else "false",
+                    key="sync_job_ebay_store_categories_sync_enabled",
+                    value="true" if desired_store_categories_sync else "false",
                     value_type="bool",
-                    description="Enable/disable QuickBooks export job scaffold.",
+                    description="Enable/disable scheduled eBay store category hierarchy sync.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="sync_job_ebay_store_categories_sync_interval_hours",
+                    value=str(int(desired_store_categories_sync_interval_hours)),
+                    value_type="int",
+                    description="Minimum hours between scheduled eBay store category hierarchy syncs.",
+                    is_active=True,
+                    actor=user.username,
+                )
+                repo.upsert_runtime_setting(
+                    environment=settings.app_env,
+                    key="sync_job_ebay_store_categories_sync_deactivate_missing",
+                    value="true" if desired_store_categories_deactivate_missing else "false",
+                    value_type="bool",
+                    description="Deactivate eBay-imported local store categories missing from the latest GetStore response.",
                     is_active=True,
                     actor=user.username,
                 )
@@ -17061,7 +18022,10 @@ def render_admin(repo: InventoryRepository) -> None:
                 f"SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED={'true' if desired_tracking_push else 'false'}\n"
                 f"SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_ENABLED={'true' if desired_connection_health_check else 'false'}\n"
                 f"SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_INTERVAL_MINUTES={int(desired_connection_health_check_interval_minutes)}\n"
-                f"SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED={'true' if desired_quickbooks_export else 'false'}\n"
+                f"SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_ENABLED={'true' if desired_store_categories_sync else 'false'}\n"
+                f"SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_INTERVAL_HOURS={int(desired_store_categories_sync_interval_hours)}\n"
+                f"SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_DEACTIVATE_MISSING={'true' if desired_store_categories_deactivate_missing else 'false'}\n"
+                "# QuickBooks dry-run controls are managed on the QuickBooks page.\n"
                 f"SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED={'true' if desired_shopify_pull else 'false'}\n"
                 "# Governance snapshot scheduler is runtime-only (DB-backed):\n"
                 f"# governance_snapshot_runner_enabled={'true' if desired_governance_snapshot_runner else 'false'}\n"

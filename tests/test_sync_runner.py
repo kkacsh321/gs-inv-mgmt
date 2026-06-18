@@ -243,6 +243,8 @@ class SyncRunnerTests(unittest.TestCase):
         with patch("app.services.sync_runner._run_ebay_token_auto_refresh") as ebay_token_refresh_job, patch(
             "app.services.sync_runner._run_ebay_connection_health_check"
         ) as ebay_health_job, patch(
+            "app.services.sync_runner._run_ebay_store_categories_sync"
+        ) as ebay_store_categories_job, patch(
             "app.services.sync_runner._run_ebay_orders_pull_import"
         ) as ebay_job, patch(
             "app.services.sync_runner._run_governance_snapshot_schedule"
@@ -261,6 +263,7 @@ class SyncRunnerTests(unittest.TestCase):
                 sync_runner.run_once()
         ebay_token_refresh_job.assert_called_once()
         ebay_health_job.assert_called_once()
+        ebay_store_categories_job.assert_called_once()
         ebay_job.assert_called_once()
         gov_job.assert_called_once()
         backup_job.assert_called_once()
@@ -608,6 +611,77 @@ class SyncRunnerTests(unittest.TestCase):
             sync_runner._run_ebay_connection_health_check()
         self.assertTrue(any("failed" in str(c.args[0]).lower() for c in log.call_args_list))
 
+    def test_run_ebay_store_categories_sync_disabled_not_due_and_success(self) -> None:
+        db = _FakeSession()
+        now = datetime(2026, 6, 15, 12, 0, 0)
+
+        class RepoWithRuns(_FakeRepo):
+            def __init__(self, rows):
+                super().__init__(_FakeDB())
+                self._rows = rows
+
+            def list_sync_runs(self, provider="ebay", limit=500):
+                return list(self._rows)
+
+        disabled_repo = RepoWithRuns([])
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=disabled_repo
+        ), patch("app.services.sync_runner.is_sync_job_enabled", return_value=False), patch(
+            "app.services.sync_runner._log"
+        ) as log:
+            sync_runner._run_ebay_store_categories_sync()
+        self.assertTrue(any("disabled" in str(c.args[0]).lower() for c in log.call_args_list))
+
+        not_due_repo = RepoWithRuns(
+            [
+                SimpleNamespace(
+                    started_at=now - timedelta(hours=1),
+                    completed_at=now - timedelta(hours=1),
+                    job_name="ebay_store_categories_sync",
+                )
+            ]
+        )
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=not_due_repo
+        ), patch("app.services.sync_runner.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_runner.get_runtime_int", return_value=24
+        ), patch("app.services.sync_runner.utcnow_naive", return_value=now), patch(
+            "app.services.sync_runner._log"
+        ) as log:
+            sync_runner._run_ebay_store_categories_sync()
+        self.assertTrue(any("not due" in str(c.args[0]).lower() for c in log.call_args_list))
+
+        success_repo = RepoWithRuns([])
+        settings = SimpleNamespace(
+            ebay_user_access_token="tok",
+            ebay_marketplace_id="EBAY_US",
+            sync_runner_actor="runner",
+            sync_job_ebay_store_categories_sync_interval_hours=24,
+            sync_job_ebay_store_categories_sync_deactivate_missing=False,
+        )
+        with patch("app.services.sync_runner.SessionLocal", return_value=db), patch(
+            "app.services.sync_runner.InventoryRepository", return_value=success_repo
+        ), patch("app.services.sync_runner.settings", settings), patch(
+            "app.services.sync_runner.is_sync_job_enabled", return_value=True
+        ), patch("app.services.sync_runner.get_runtime_int", return_value=24), patch(
+            "app.services.sync_runner.get_runtime_str", return_value="tok"
+        ), patch("app.services.sync_runner.get_runtime_bool", return_value=False), patch(
+            "app.services.sync_runner.execute_sync_job",
+            return_value={
+                "run_id": 7,
+                "status": "success",
+                "processed": 2,
+                "updated": 2,
+                "missing": 0,
+                "deactivated": 0,
+                "failed": 0,
+            },
+        ) as exec_job:
+            sync_runner._run_ebay_store_categories_sync()
+        exec_job.assert_called_once()
+        self.assertEqual(exec_job.call_args.kwargs["job_name"], "ebay_store_categories_sync")
+        self.assertFalse(exec_job.call_args.kwargs["deactivate_missing"])
+
     def test_run_governance_snapshot_disabled(self) -> None:
         db = _FakeSession()
         repo = _FakeRepo(_FakeDB())
@@ -786,7 +860,7 @@ class SyncRunnerTests(unittest.TestCase):
             "app.services.sync_runner._log"
         ) as log:
             sync_runner._run_ai_accountant_monitor_schedule()
-        self.assertTrue(any("AI Accountant monitor disabled" in str(call.args[0]) for call in log.call_args_list))
+        self.assertTrue(any("Goldie (AI Accountant) monitor disabled" in str(call.args[0]) for call in log.call_args_list))
 
     def test_run_ai_accountant_monitor_schedule_success(self) -> None:
         db = _FakeSession()
@@ -1054,6 +1128,18 @@ class SyncRunnerTests(unittest.TestCase):
         self.assertEqual(context["net_after_returns_24h"], "58.25")
         self.assertEqual(context["estimated_profit_24h"], "58.25")
         self.assertIn("lot_expected_quantity_fallback", context["cogs_source_mix"])
+        self.assertEqual(
+            context["cogs_evidence_split"],
+            {
+                "verified_amount": 0.0,
+                "estimated_amount": 12.5,
+                "review_needed_amount": 0.0,
+                "verified_sale_rows": 0,
+                "estimated_sale_rows": 1,
+                "review_needed_sale_rows": 0,
+            },
+        )
+        self.assertIn("COGS evidence split 24h", context["cogs_source_mix_line"])
         event = next(e for e in repo.integration_events if e.get("action") == "daily_report")
         self.assertAlmostEqual(event["details"]["net_24h"], 93.25)
         self.assertAlmostEqual(event["details"]["cogs_24h"], 12.5)
@@ -1067,6 +1153,7 @@ class SyncRunnerTests(unittest.TestCase):
             event["details"]["cogs_source_totals"],
             {"lot_expected_quantity_fallback": 12.5},
         )
+        self.assertEqual(event["details"]["cogs_evidence_split"], context["cogs_evidence_split"])
 
     def test_run_daily_slack_report_logs_fee_coverage_alert(self) -> None:
         db = _FakeSession()

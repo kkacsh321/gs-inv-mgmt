@@ -689,6 +689,85 @@ class SmallViewsTests(unittest.TestCase):
         self.assertAlmostEqual(actual["actual_net_before_cogs"], 96.25)
         self.assertEqual(actual["actual_net_source"], "order_actuals_rollup")
 
+    def test_order_customer_context_summarizes_repeat_buyer_and_notes(self) -> None:
+        customer = SimpleNamespace(
+            id=9,
+            ebay_username="buyer42",
+            display_name="Buyer Name",
+            primary_email="buyer@example.com",
+            shipping_postal_code="80401",
+            is_repeat_buyer=True,
+            order_count=4,
+            total_spend=125.5,
+            notes="Prefers combined shipping. " * 20,
+        )
+        order = SimpleNamespace(customer_id=9)
+
+        context = orders._order_customer_context(order, {9: customer})
+
+        self.assertEqual(context["customer_id"], 9)
+        self.assertTrue(context["repeat_buyer"])
+        self.assertEqual(context["order_count"], 4)
+        self.assertAlmostEqual(context["total_spend"], 125.5)
+        self.assertIn("buyer42", context["identity_summary"])
+        self.assertTrue(context["has_internal_notes"])
+        self.assertLessEqual(len(context["notes_preview"]), 220)
+
+    def test_order_customer_context_handles_unlinked_order(self) -> None:
+        context = orders._order_customer_context(SimpleNamespace(customer_id=None), {})
+
+        self.assertIsNone(context["customer_id"])
+        self.assertFalse(context["repeat_buyer"])
+        self.assertEqual(context["identity_summary"], "")
+        self.assertFalse(context["has_internal_notes"])
+
+    def test_filter_order_rows_supports_customer_filters(self) -> None:
+        rows = [
+            {
+                "external_order_id": "ORDER-1",
+                "marketplace": "ebay",
+                "status": "paid",
+                "buyer_username": "repeatbuyer",
+                "repeat_buyer": True,
+                "customer_has_internal_notes": True,
+                "customer_notes_preview": "Prefers combined shipping",
+            },
+            {
+                "external_order_id": "ORDER-2",
+                "marketplace": "ebay",
+                "status": "paid",
+                "buyer_username": "newbuyer",
+                "repeat_buyer": False,
+                "customer_has_internal_notes": False,
+                "customer_notes_preview": "",
+            },
+        ]
+
+        self.assertEqual(
+            orders._filter_order_rows(rows, buyer_type="Repeat buyers", customer_notes="Has notes"),
+            [rows[0]],
+        )
+        self.assertEqual(
+            orders._filter_order_rows(rows, query="combined", buyer_type="First observed"),
+            [],
+        )
+        self.assertEqual(
+            orders._filter_order_rows(rows, buyer_type="First observed", customer_notes="No notes"),
+            [rows[1]],
+        )
+
+    def test_update_linked_customer_notes_uses_repository_customer_update(self) -> None:
+        calls = []
+        repo = SimpleNamespace(
+            update_customer=lambda customer_id, updates, actor: calls.append((customer_id, updates, actor))
+            or SimpleNamespace(id=customer_id, notes=updates["notes"])
+        )
+
+        updated = orders._update_linked_customer_notes(repo, 42, "Prefers combined shipping.", actor="admin")
+
+        self.assertEqual(updated.notes, "Prefers combined shipping.")
+        self.assertEqual(calls, [(42, {"notes": "Prefers combined shipping."}, "admin")])
+
     def test_order_map_builds_state_destination_rows(self) -> None:
         rows = order_map._build_order_destination_rows(
             [
@@ -977,6 +1056,26 @@ class SmallViewsTests(unittest.TestCase):
             sync.render_sync(repo)
         self.assertGreaterEqual(len(fake_st.dataframes), 1)
 
+    def test_store_category_sync_event_summary_rows_parse_payload(self) -> None:
+        event = SimpleNamespace(
+            id=1,
+            entity_type="ebay_store_categories",
+            entity_id="EBAY_US",
+            status="warn",
+            message="done",
+            created_at=datetime(2026, 6, 16, 9, 0, 0),
+            payload_json=(
+                '{"ack":"Success","marketplace_id":"EBAY_US","site_id":"0",'
+                '"imported_count":5,"missing_count":1,"deactivated_count":0,'
+                '"deactivate_missing":false}'
+            ),
+        )
+        rows = sync._store_category_sync_event_summary_rows([event])
+        self.assertEqual(rows[0]["marketplace_id"], "EBAY_US")
+        self.assertEqual(rows[0]["imported_count"], 5)
+        self.assertEqual(rows[0]["missing_count"], 1)
+        self.assertFalse(rows[0]["deactivate_missing"])
+
     def test_render_sync_with_run_detail_and_exception_queue(self) -> None:
         fake_st = _FakeSt()
         now = datetime(2026, 4, 2, 10, 0, 0)
@@ -1064,6 +1163,95 @@ class SmallViewsTests(unittest.TestCase):
         ):
             sync.render_sync(repo)
         self.assertGreaterEqual(len(fake_st.dataframes), 5)
+
+    def test_render_sync_store_category_run_detail_shows_summary(self) -> None:
+        fake_st = _FakeSt()
+        now = datetime(2026, 6, 16, 9, 0, 0)
+        run_row = SimpleNamespace(
+            id=15,
+            retry_of_run_id=None,
+            retry_count=0,
+            provider="ebay",
+            job_name="ebay_store_categories_sync",
+            direction="pull",
+            status="partial",
+            started_at=now,
+            completed_at=now,
+            records_processed=5,
+            records_created=0,
+            records_updated=5,
+            records_failed=0,
+            line_items_with_listing_link=0,
+            line_items_unmapped_sku=0,
+            auto_listings_created=0,
+            notes="store category sync",
+        )
+        event_row = SimpleNamespace(
+            id=41,
+            entity_type="ebay_store_categories",
+            entity_id="EBAY_US",
+            action="sync",
+            status="warn",
+            message="Synced 5 categories; missing=1",
+            created_at=now,
+            payload_json=(
+                '{"ack":"Success","marketplace_id":"EBAY_US","site_id":"0",'
+                '"imported_count":5,"missing_count":1,"deactivated_count":0,'
+                '"deactivate_missing":false}'
+            ),
+        )
+
+        class Repo:
+            def list_sync_runs(self, limit=250, provider=None):
+                return [run_row]
+
+            def list_sync_errors(self, run_id=None, unresolved_only=False, limit=500):
+                return []
+
+            def list_sync_events(self, run_id=None, limit=500):
+                return [event_row]
+
+            def list_sync_error_queue(self, provider=None, unresolved_only=True, limit=300):
+                return []
+
+        repo = Repo()
+        with patch.object(sync, "st", fake_st), patch.object(
+            sync, "current_user", return_value=SimpleNamespace(username="admin", role="admin")
+        ), patch.object(
+            sync, "render_help_panel"
+        ), patch.object(
+            sync, "is_sync_job_enabled", return_value=True
+        ), patch.object(
+            sync, "sync_job_catalog",
+            return_value=[
+                {
+                    "job_name": "ebay_store_categories_sync",
+                    "provider": "ebay",
+                    "enabled": True,
+                    "retry_policy": {},
+                    "dispatch_meta": {"supports_execute_now": True},
+                }
+            ],
+        ), patch.object(
+            sync, "render_workspace_loading_state"
+        ), patch.object(
+            sync, "render_workspace_empty_state"
+        ), patch.object(
+            sync, "render_workspace_error_state"
+        ), patch.object(
+            sync, "render_workspace_task_completion"
+        ), patch.object(
+            sync, "render_workspace_feedback"
+        ):
+            sync.render_sync(repo)
+        self.assertTrue(
+            any(
+                hasattr(df, "columns")
+                and "imported_count" in df.columns
+                and int(df.iloc[0]["imported_count"]) == 5
+                for df in fake_st.dataframes
+            )
+        )
 
     def test_render_sync_execute_now_disabled_job_shows_error(self) -> None:
         fake_st = _FakeSt(button_values=[True])

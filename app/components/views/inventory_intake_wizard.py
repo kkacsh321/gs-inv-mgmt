@@ -22,8 +22,16 @@ from app.config import settings
 from app.repository import InventoryRepository
 from app.services.ai_orchestration import execute_comp_summary, execute_multimodal_task
 from app.services.ai_quality import is_weak_intake_text, is_weak_listing_title, load_ai_quality_policy
+from app.services.business_chat_room import (
+    build_business_room_answer_command_suggestions,
+    build_business_room_attachment_evidence_rows,
+    build_business_room_handoff_review_card,
+    build_business_room_operator_answer_rows,
+    list_business_room_workflow_handoffs,
+    mark_business_room_workflow_handoff_reviewed,
+)
 from app.services.ebay import EbayClient
-from app.services.purchase_doc_extraction import extract_with_textract, merge_llm_and_textract
+from app.services.purchase_doc_extraction import extract_with_textract_best_effort, merge_llm_and_textract
 from app.services.ai_text import (
     coin_grader_structured_to_text,
     normalize_ai_text,
@@ -279,6 +287,26 @@ def _extract_decimal_candidate(value: object) -> float | None:
         return None
 
 
+def _derive_lot_item_subtotal(payload: dict, total: float | None) -> float | None:
+    subtotal = _extract_decimal_candidate(payload.get("subtotal"))
+    if subtotal is not None:
+        return subtotal
+    if total is None:
+        return None
+    components = sum(
+        value or 0.0
+        for value in (
+            _extract_decimal_candidate(payload.get("tax")),
+            _extract_decimal_candidate(payload.get("shipping")),
+            _extract_decimal_candidate(payload.get("handling")),
+        )
+    )
+    if components <= 0:
+        return total
+    derived = round(float(total) - float(components), 2)
+    return derived if derived >= 0 else total
+
+
 def _extract_invoice_date_candidate(value: object):
     text = str(value or "").strip()
     if not text:
@@ -297,6 +325,7 @@ def _build_purchase_lot_updates_from_payload(payload: dict) -> tuple[dict[str, o
     ai_vendor = str(payload.get("vendor_name") or "").strip()
     ai_invoice_date = _extract_invoice_date_candidate(payload.get("invoice_date"))
     ai_total = _extract_decimal_candidate(payload.get("total"))
+    ai_subtotal = _derive_lot_item_subtotal(payload, ai_total)
     ai_tax = _extract_decimal_candidate(payload.get("tax"))
     ai_shipping = _extract_decimal_candidate(payload.get("shipping"))
     ai_handling = _extract_decimal_candidate(payload.get("handling"))
@@ -305,8 +334,8 @@ def _build_purchase_lot_updates_from_payload(payload: dict) -> tuple[dict[str, o
         apply_updates["vendor"] = ai_vendor
     if ai_invoice_date is not None:
         apply_updates["purchase_date"] = datetime.combine(ai_invoice_date, datetime.min.time())
-    if ai_total is not None:
-        apply_updates["total_cost"] = to_decimal_or_none(ai_total)
+    if ai_subtotal is not None:
+        apply_updates["total_cost"] = to_decimal_or_none(ai_subtotal)
     if ai_tax is not None:
         apply_updates["total_tax_paid"] = to_decimal_or_none(ai_tax)
     if ai_shipping is not None:
@@ -316,6 +345,7 @@ def _build_purchase_lot_updates_from_payload(payload: dict) -> tuple[dict[str, o
     candidates = {
         "vendor": ai_vendor,
         "invoice_date": ai_invoice_date.isoformat() if ai_invoice_date else "n/a",
+        "subtotal": ai_subtotal if ai_subtotal is not None else "n/a",
         "total": ai_total if ai_total is not None else "n/a",
         "tax": ai_tax if ai_tax is not None else "n/a",
         "shipping": ai_shipping if ai_shipping is not None else "n/a",
@@ -500,6 +530,224 @@ def _inventory_intake_draft_signature(payload: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _render_inventory_intake_business_room_handoffs(repo: InventoryRepository, *, username: str) -> None:
+    handoffs = list_business_room_workflow_handoffs(
+        repo,
+        environment=settings.app_env,
+        workflow_key=INVENTORY_INTAKE_WORKFLOW_KEY,
+        username=username,
+        limit=20,
+    )
+    loaded = st.session_state.get("inventory_intake_business_room_handoff_context")
+    if isinstance(loaded, dict) and str(loaded.get("prompt") or "").strip():
+        st.info(
+            "Loaded Business Chat Room handoff context: "
+            + str(loaded.get("prompt") or "").strip()[:180]
+        )
+    if not handoffs:
+        st.caption("No Business Chat Room inventory handoffs are waiting for this user.")
+        return
+
+    with st.expander(f"Business Chat Room Handoffs ({len(handoffs)})", expanded=False):
+        st.caption(
+            "Approved room requests routed to Inventory Intake Wizard appear here. Loading one adds its prompt to the intake AI seed; it does not create inventory by itself."
+        )
+        table_rows = [
+            {
+                "draft_id": row["id"],
+                "queue_job_id": row["queue_job_id"],
+                "route": row["route_label"] or row["route"],
+                "requester": row["requester"],
+                "attachments": row["attachment_count"],
+                "prompt": row["prompt"][:160],
+                "updated_at": row["updated_at"],
+            }
+            for row in handoffs
+        ]
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        options = {
+            f"#{row['id']} | job {row['queue_job_id']} | {(row['prompt'] or 'No prompt')[:80]}": row
+            for row in handoffs
+        }
+        selected_label = st.selectbox(
+            "Select handoff",
+            options=list(options.keys()),
+            key="inventory_intake_business_room_handoff_select",
+        )
+        selected = options[selected_label]
+        review_card = build_business_room_handoff_review_card(
+            selected,
+            workflow_key=INVENTORY_INTAKE_WORKFLOW_KEY,
+        )
+        if review_card.get("fields"):
+            st.dataframe(
+                [
+                    {
+                        "field": row.get("key"),
+                        "value": row.get("value"),
+                        "confidence": row.get("confidence"),
+                        "source": row.get("source"),
+                    }
+                    for row in review_card.get("fields", [])
+                    if isinstance(row, dict)
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        for warning in review_card.get("warnings", [])[:3]:
+            st.caption(f"Review note: {warning}")
+        cost_guardrail = (
+            review_card.get("cost_basis_guardrail")
+            if isinstance(review_card.get("cost_basis_guardrail"), dict)
+            else {}
+        )
+        if cost_guardrail.get("review_note"):
+            st.caption(
+                "Cost basis: "
+                f"`{cost_guardrail.get('basis_type') or 'unknown'}` - "
+                + str(cost_guardrail.get("review_note") or "")
+            )
+        missing_questions = [
+            row
+            for row in review_card.get("missing_questions", [])
+            if isinstance(row, dict) and str(row.get("question") or row.get("field") or "").strip()
+        ]
+        if missing_questions:
+            st.caption(
+                "Missing confirmations: "
+                + "; ".join(str(row.get("question") or row.get("field") or "") for row in missing_questions[:5])
+            )
+        answer_suggestions = build_business_room_answer_command_suggestions(
+            selected,
+            review_card=review_card,
+            max_suggestions=8,
+        )
+        if answer_suggestions:
+            st.caption("Reply in Business Chat Room or Slack with one of:")
+            st.code("\n".join(answer_suggestions), language="text")
+        selected_payload = selected.get("payload") if isinstance(selected.get("payload"), dict) else {}
+        operator_answers = build_business_room_operator_answer_rows(selected_payload)
+        if operator_answers:
+            st.dataframe(
+                operator_answers[:10],
+                use_container_width=True,
+                hide_index=True,
+            )
+        apply_plan = selected_payload.get("apply_plan") if isinstance(selected_payload.get("apply_plan"), dict) else {}
+        if apply_plan:
+            st.caption(
+                "Apply plan: "
+                f"`{apply_plan.get('status') or 'unknown'}`"
+                + (f" ({apply_plan.get('reason')})" if apply_plan.get("reason") else "")
+            )
+        proposed_actions = [
+            row
+            for row in review_card.get("proposed_actions", [])
+            if isinstance(row, dict) and str(row.get("action") or "").strip()
+        ]
+        if proposed_actions:
+            st.caption("Proposed actions: " + ", ".join(str(row.get("action") or "") for row in proposed_actions[:5]))
+        st.text_area(
+            "Handoff Prompt",
+            value=str(selected.get("prompt") or ""),
+            height=120,
+            disabled=True,
+            key="inventory_intake_business_room_handoff_prompt_preview",
+        )
+        next_step = str(selected.get("next_step") or "").strip()
+        if next_step:
+            st.caption(f"Recommended next step: {next_step}")
+        attachment_rows = build_business_room_attachment_evidence_rows(selected_payload)
+        if attachment_rows:
+            st.caption("Attachment evidence")
+            st.dataframe(attachment_rows, use_container_width=True, hide_index=True)
+        elif int(selected.get("attachment_count") or 0) > 0:
+            st.caption(f"Attachment evidence included: {int(selected.get('attachment_count') or 0)} file(s).")
+        if st.button("Load Handoff Context", key="inventory_intake_load_business_room_handoff_btn"):
+            payload = dict(selected.get("payload") or {})
+            prompt = str(payload.get("prompt") or selected.get("prompt") or "").strip()
+            st.session_state["inventory_intake_business_room_handoff_context"] = payload
+            st.session_state["inventory_intake_business_room_review_card"] = review_card
+            field_values = dict(review_card.get("field_values") or {})
+            title = str(field_values.get("title") or "").strip()
+            if title:
+                st.session_state["inv_intake_default_title"] = title
+                if not str(st.session_state.get("inv_intake_form_title") or "").strip():
+                    st.session_state["inv_intake_form_title"] = title
+            category = str(field_values.get("category") or "").strip()
+            if category in {"bullion", "collectibles", "antiques", "coins", "normal_goods", "other"}:
+                st.session_state["inv_intake_default_category"] = category
+                st.session_state["inv_intake_form_category"] = category
+            description = str(field_values.get("description") or field_values.get("notes") or "").strip()
+            if description:
+                st.session_state["inv_intake_default_description"] = description
+                if not str(st.session_state.get("inv_intake_form_description") or "").strip():
+                    st.session_state["inv_intake_form_description"] = description
+            quantity = field_values.get("quantity")
+            if quantity not in (None, ""):
+                try:
+                    st.session_state["inv_intake_form_quantity"] = max(0, int(quantity))
+                except Exception:
+                    pass
+            acquisition_cost = field_values.get("acquisition_cost")
+            if acquisition_cost not in (None, ""):
+                try:
+                    st.session_state["inv_intake_form_acquisition_cost"] = float(acquisition_cost)
+                except Exception:
+                    pass
+            metal_type = str(field_values.get("metal_type") or field_values.get("material") or "").strip()
+            if metal_type:
+                st.session_state["inv_intake_default_metal_type"] = metal_type
+                st.session_state["inv_intake_form_metal_type"] = metal_type
+            if prompt:
+                existing_seed = str(st.session_state.get("inv_intake_ai_seed_prompt") or "").strip()
+                handoff_block = (
+                    "\n\nBusiness Chat Room handoff context:\n"
+                    + prompt
+                    + "\nUse this as operator intent and evidence context for inventory intake."
+                )
+                if "Business Chat Room handoff context:" not in existing_seed:
+                    st.session_state["inv_intake_ai_seed_prompt"] = (existing_seed + handoff_block).strip()
+            repo.append_workflow_event(
+                environment=settings.app_env,
+                workflow_key=INVENTORY_INTAKE_WORKFLOW_KEY,
+                username=username,
+                scope_key=str(selected.get("scope_key") or INVENTORY_INTAKE_WORKFLOW_SCOPE),
+                action="load_business_room_handoff",
+                status="ok",
+                message="Operator loaded Business Chat Room handoff context into Inventory Intake Wizard session.",
+                payload={
+                    "handoff_draft_id": int(selected.get("id") or 0),
+                    "queue_job_id": int(selected.get("queue_job_id") or 0),
+                    "source_message_id": int(selected.get("source_message_id") or 0),
+                    "prompt_loaded": bool(prompt),
+                    "field_count": len(review_card.get("fields") or []),
+                    "draft_signature": str(review_card.get("signature") or ""),
+                    "route": str(selected.get("route") or ""),
+                },
+                draft_id=int(selected.get("id") or 0),
+                actor=username,
+            )
+            st.success("Loaded handoff context into this Inventory Intake Wizard session.")
+            st.rerun()
+        if st.button("Mark Handoff Reviewed", key="inventory_intake_reviewed_business_room_handoff_btn"):
+            scope_key = str(selected.get("scope_key") or "").strip()
+            if not scope_key:
+                st.warning("Selected handoff is missing a scope key.")
+            else:
+                mark_business_room_workflow_handoff_reviewed(
+                    repo,
+                    environment=settings.app_env,
+                    workflow_key=INVENTORY_INTAKE_WORKFLOW_KEY,
+                    username=username,
+                    actor=username,
+                    source="inventory_intake_wizard",
+                    handoff=selected,
+                )
+                st.success("Marked Business Chat Room handoff reviewed.")
+                st.rerun()
+
+
 def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStorageService) -> None:
     user = current_user()
     quality_policy = load_ai_quality_policy(repo)
@@ -619,6 +867,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
             _inventory_intake_clear_draft_session_state()
             st.session_state["inventory_intake_draft_flash"] = "Cleared draft."
             st.rerun()
+    _render_inventory_intake_business_room_handoffs(repo, username=user.username)
     render_workspace_feedback(
         repo=repo,
         actor=user.username,
@@ -1321,7 +1570,13 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                 new_lot_code = st.text_input("New Lot Code", key="inv_intake_form_new_lot_code")
             with l2:
                 new_lot_vendor = st.text_input("New Lot Vendor", key="inv_intake_form_new_lot_vendor")
-            new_lot_total_cost = st.number_input("New Lot Total Cost", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_cost")
+            new_lot_total_cost = st.number_input(
+                "New Lot Item Subtotal (before tax/shipping/fees)",
+                min_value=0.0,
+                step=0.01,
+                key="inv_intake_form_new_lot_total_cost",
+                help="Enter the item subtotal only. Do not enter the order total here when tax/shipping/fees are entered below.",
+            )
             new_lot_total_tax_paid = st.number_input("New Lot Total Tax Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_tax_paid")
             new_lot_total_shipping_paid = st.number_input("New Lot Total Shipping Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_shipping_paid")
             new_lot_total_handling_paid = st.number_input("New Lot Total Handling Paid", min_value=0.0, step=0.01, key="inv_intake_form_new_lot_total_handling_paid")
@@ -1639,6 +1894,7 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                     ai_summary = ""
                     llm_summary = ""
                     textract_summary = ""
+                    textract_error = ""
                     if purchase_doc_run_ai_extract:
                         if purchase_doc_extraction_mode in {"llm", "both"}:
                             default_sys = get_runtime_str(
@@ -1691,15 +1947,13 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                             llm_summary = str(ai_result.text or "").strip()
                             ai_payload = _try_extract_json_object(llm_summary)
                         if purchase_doc_extraction_mode in {"textract", "both"}:
-                            textract_result = extract_with_textract(
+                            textract_payload, textract_summary, textract_error = extract_with_textract_best_effort(
                                 file_bytes=file_bytes,
                                 content_type=content_type,
                             )
-                            textract_summary = str(textract_result.summary_text or "").strip()
-                            textract_payload = dict(textract_result.payload or {})
                             if purchase_doc_extraction_mode == "textract":
                                 ai_payload = textract_payload
-                            else:
+                            elif not textract_error:
                                 ai_payload = merge_llm_and_textract(ai_payload, textract_payload)
                         if purchase_doc_extraction_mode == "llm":
                             ai_summary = llm_summary
@@ -1749,7 +2003,13 @@ def render_inventory_intake_wizard(repo: InventoryRepository, storage: MediaStor
                         else "disabled",
                         "ai_payload": ai_payload if isinstance(ai_payload, dict) else {},
                         "ai_summary": str(ai_summary or "").strip(),
+                        "textract_error": textract_error,
                     }
+                    if textract_error:
+                        st.warning(
+                            "Purchase document was stored, but Textract extraction was skipped/failed: "
+                            f"{textract_error}"
+                        )
                     auto_apply_enabled = bool(
                         get_runtime_bool(repo, "purchase_doc_auto_apply_linked_lot_fields", False)
                     )

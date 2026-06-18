@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import re
 from typing import Any
 
 import requests
@@ -44,10 +45,13 @@ def send_slack_message(
     target_channel = (channel or cfg.default_channel).strip()
     if not target_channel:
         raise ValueError("Slack channel is required (or set `slack_default_channel`).")
+    resolved_text = (text or "").strip()
+    if has_unresolved_slack_template_placeholders(resolved_text):
+        raise ValueError("Slack message contains unresolved template placeholders; refusing to send.")
 
     body = {
         "channel": target_channel,
-        "text": (text or "").strip()[:4000],
+        "text": resolved_text[:4000],
         "mrkdwn": True,
     }
     thread_ts_value = str(thread_ts or "").strip()
@@ -107,6 +111,15 @@ class _SafeFormatDict(dict):
         return "{" + str(key) + "}"
 
 
+def has_unresolved_slack_template_placeholders(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\{(?:job_name|status|run_id|processed|failed|actor|env)\}",
+            str(text or ""),
+        )
+    )
+
+
 def build_slack_alert_text(
     repo: Any,
     *,
@@ -119,7 +132,10 @@ def build_slack_alert_text(
     values = {k: str(v) for k, v in (context or {}).items()}
     values.setdefault("env", str(settings.app_env or "local"))
     try:
-        return template.format_map(_SafeFormatDict(values))
+        rendered = template.format_map(_SafeFormatDict(values))
+        if "{{" in template or "}}" in template:
+            rendered = rendered.format_map(_SafeFormatDict(values))
+        return rendered
     except Exception:
         return template
 

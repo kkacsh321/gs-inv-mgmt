@@ -108,6 +108,103 @@ def _order_actual_context(order, actuals: dict | None = None) -> dict[str, objec
     }
 
 
+def _customer_notes_preview(customer, *, max_chars: int = 220) -> str:
+    notes = str(getattr(customer, "notes", "") or "").strip()
+    if not notes:
+        return ""
+    limit = max(20, int(max_chars or 220))
+    if len(notes) <= limit:
+        return notes
+    return notes[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _customer_identity_summary(customer) -> str:
+    if customer is None:
+        return ""
+    parts = [
+        str(getattr(customer, "ebay_username", "") or "").strip(),
+        str(getattr(customer, "display_name", "") or "").strip(),
+        str(getattr(customer, "primary_email", "") or "").strip(),
+        str(getattr(customer, "shipping_postal_code", "") or "").strip(),
+    ]
+    return " | ".join(part for part in parts if part)
+
+
+def _customer_order_context(customer) -> dict[str, object]:
+    if customer is None:
+        return {
+            "customer_id": None,
+            "repeat_buyer": False,
+            "order_count": 0,
+            "total_spend": 0.0,
+            "identity_summary": "",
+            "has_internal_notes": False,
+            "notes_preview": "",
+        }
+    notes_preview = _customer_notes_preview(customer)
+    return {
+        "customer_id": int(getattr(customer, "id", 0) or 0),
+        "repeat_buyer": bool(getattr(customer, "is_repeat_buyer", False)),
+        "order_count": int(getattr(customer, "order_count", 0) or 0),
+        "total_spend": float(getattr(customer, "total_spend", 0) or 0),
+        "identity_summary": _customer_identity_summary(customer),
+        "has_internal_notes": bool(notes_preview),
+        "notes_preview": notes_preview,
+    }
+
+
+def _order_customer_context(order, customer_by_id: dict[int, object]) -> dict[str, object]:
+    return _customer_order_context(customer_by_id.get(int(getattr(order, "customer_id", 0) or 0)))
+
+
+def _filter_order_rows(
+    rows: list[dict],
+    *,
+    query: str = "",
+    marketplaces: list[str] | None = None,
+    statuses: list[str] | None = None,
+    buyer_type: str = "All",
+    customer_notes: str = "All",
+) -> list[dict]:
+    q = str(query or "").strip().lower()
+    marketplace_set = {str(v).strip().lower() for v in (marketplaces or []) if str(v).strip()}
+    status_set = {str(v).strip().lower() for v in (statuses or []) if str(v).strip()}
+    buyer_type = str(buyer_type or "All")
+    customer_notes = str(customer_notes or "All")
+    filtered: list[dict] = []
+    for row in rows:
+        haystack = " ".join(
+            str(row.get(field) or "")
+            for field in (
+                "external_order_id",
+                "buyer_username",
+                "buyer_name",
+                "buyer_email",
+                "customer_notes_preview",
+            )
+        ).lower()
+        if q and q not in haystack:
+            continue
+        if marketplace_set and str(row.get("marketplace") or "").strip().lower() not in marketplace_set:
+            continue
+        if status_set and str(row.get("status") or "").strip().lower() not in status_set:
+            continue
+        if buyer_type == "Repeat buyers" and not bool(row.get("repeat_buyer")):
+            continue
+        if buyer_type == "First observed" and bool(row.get("repeat_buyer")):
+            continue
+        if customer_notes == "Has notes" and not bool(row.get("customer_has_internal_notes")):
+            continue
+        if customer_notes == "No notes" and bool(row.get("customer_has_internal_notes")):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _update_linked_customer_notes(repo: InventoryRepository, customer_id: int, notes: str, *, actor: str):
+    return repo.update_customer(int(customer_id), {"notes": str(notes or "")}, actor=actor)
+
+
 def render_orders(repo: InventoryRepository) -> None:
     user = current_user()
     st.subheader("Orders")
@@ -143,6 +240,18 @@ def render_orders(repo: InventoryRepository) -> None:
             order_fees = st.number_input("Order-Level Fees", min_value=0.0, value=0.0, step=1.0)
         with c2:
             order_shipping = st.number_input("Order-Level Shipping Cost", min_value=0.0, value=0.0, step=1.0)
+        st.markdown("**Customer / Ship-To**")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            buyer_username = st.text_input("Buyer Username")
+            buyer_name = st.text_input("Buyer / Ship-To Name")
+        with b2:
+            buyer_email = st.text_input("Buyer Email")
+            ship_to_city = st.text_input("Ship-To City")
+        with b3:
+            ship_to_state = st.text_input("Ship-To State")
+            ship_to_postal_code = st.text_input("Ship-To Postal Code")
+            ship_to_country = st.text_input("Ship-To Country", value="US")
         notes = st.text_area("Order Notes")
         actor = st.text_input(
             "Actor (for audit log)",
@@ -214,6 +323,13 @@ def render_orders(repo: InventoryRepository) -> None:
                     external_order_id=external_order_id.strip(),
                     order_status=order_status,
                     sold_at=datetime.combine(sold_date, datetime.min.time()),
+                    buyer_username=buyer_username,
+                    buyer_name=buyer_name,
+                    buyer_email=buyer_email,
+                    ship_to_city=ship_to_city,
+                    ship_to_state=ship_to_state,
+                    ship_to_postal_code=ship_to_postal_code,
+                    ship_to_country=ship_to_country,
                     fees=to_decimal(order_fees),
                     shipping_cost=to_decimal(order_shipping),
                     notes=notes.strip(),
@@ -247,6 +363,22 @@ def render_orders(repo: InventoryRepository) -> None:
             except ValueError as exc:
                 st.error(str(exc))
 
+    customers = repo.list_customers() if hasattr(repo, "list_customers") else []
+    customer_by_id = {int(c.id): c for c in customers}
+    if st.button("Backfill Customers From Existing Orders", key="orders_backfill_customers_btn"):
+        if not ensure_permission(user, "update", "Backfill Customers"):
+            st.stop()
+        try:
+            result = repo.backfill_customers_from_orders(actor=user.username)
+            st.success(
+                "Customer backfill complete: "
+                f"{int(result.get('created_customers') or 0)} customer(s) created, "
+                f"{int(result.get('linked_orders') or 0)} order(s) linked."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Customer backfill failed: {exc}")
+
     orders = repo.list_orders()
     if not orders:
         st.info("No orders yet.")
@@ -260,6 +392,19 @@ def render_orders(repo: InventoryRepository) -> None:
             "external_order_id": o.external_order_id,
             "status": o.order_status,
             "sold_at": iso_or_none(o.sold_at),
+            "customer_id": int(getattr(o, "customer_id", 0) or 0),
+            "buyer_username": str(getattr(o, "buyer_username", "") or ""),
+            "buyer_name": str(getattr(o, "buyer_name", "") or ""),
+            "buyer_email": str(getattr(o, "buyer_email", "") or ""),
+            "repeat_buyer": customer_context["repeat_buyer"],
+            "customer_order_count": customer_context["order_count"],
+            "customer_total_spend": customer_context["total_spend"],
+            "customer_has_internal_notes": customer_context["has_internal_notes"],
+            "customer_notes_preview": customer_context["notes_preview"],
+            "ship_to_city": str(getattr(o, "ship_to_city", "") or ""),
+            "ship_to_state": str(getattr(o, "ship_to_state", "") or ""),
+            "ship_to_postal_code": str(getattr(o, "ship_to_postal_code", "") or ""),
+            "ship_to_country": str(getattr(o, "ship_to_country", "") or ""),
             "subtotal_amount": float(o.subtotal_amount),
             "fees": float(o.fees),
             "actual_fee": _order_actual_context(o, actuals_by_order_id.get(int(o.id), {}))["actual_fee"],
@@ -293,6 +438,7 @@ def render_orders(repo: InventoryRepository) -> None:
             "item_count": len(o.items),
         }
         for o in orders
+        for customer_context in [_order_customer_context(o, customer_by_id)]
     ]
     st.markdown("### Order Filters")
     order_marketplace_options = sorted(
@@ -311,9 +457,9 @@ def render_orders(repo: InventoryRepository) -> None:
         st.session_state["orders_filter_marketplaces"] = normalized_marketplace_filters
     if list(st.session_state.get("orders_filter_status") or []) != normalized_status_filters:
         st.session_state["orders_filter_status"] = normalized_status_filters
-    f1, f2, f3 = st.columns(3)
+    f1, f2, f3, f4, f5 = st.columns([2, 1, 1, 1, 1])
     with f1:
-        order_filter_query = st.text_input("Search External Order ID", key="orders_filter_query")
+        order_filter_query = st.text_input("Search Order / Buyer", key="orders_filter_query")
     with f2:
         order_filter_marketplaces = st.multiselect(
             "Marketplace",
@@ -326,6 +472,18 @@ def render_orders(repo: InventoryRepository) -> None:
             options=order_status_options,
             key="orders_filter_status",
         )
+    with f4:
+        order_filter_buyer_type = st.selectbox(
+            "Buyer Type",
+            options=["All", "Repeat buyers", "First observed"],
+            key="orders_filter_buyer_type",
+        )
+    with f5:
+        order_filter_customer_notes = st.selectbox(
+            "Customer Notes",
+            options=["All", "Has notes", "No notes"],
+            key="orders_filter_customer_notes",
+        )
     effective_filter = render_saved_filter_bar(
         repo=repo,
         scope="orders",
@@ -334,22 +492,25 @@ def render_orders(repo: InventoryRepository) -> None:
             "query": order_filter_query,
             "marketplaces": order_filter_marketplaces,
             "statuses": order_filter_status,
+            "buyer_type": order_filter_buyer_type,
+            "customer_notes": order_filter_customer_notes,
         },
     )
     q = str(effective_filter.get("query") or "").strip().lower()
-    marketplaces = {
-        str(v).strip().lower() for v in (effective_filter.get("marketplaces") or []) if str(v).strip()
-    }
-    statuses = {str(v).strip().lower() for v in (effective_filter.get("statuses") or []) if str(v).strip()}
-    filtered_rows = []
-    for row in order_rows:
-        if q and q not in str(row.get("external_order_id") or "").lower():
-            continue
-        if marketplaces and str(row.get("marketplace") or "").strip().lower() not in marketplaces:
-            continue
-        if statuses and str(row.get("status") or "").strip().lower() not in statuses:
-            continue
-        filtered_rows.append(row)
+    marketplaces = [
+        str(v).strip() for v in (effective_filter.get("marketplaces") or []) if str(v).strip()
+    ]
+    statuses = [str(v).strip() for v in (effective_filter.get("statuses") or []) if str(v).strip()]
+    buyer_type_filter = str(effective_filter.get("buyer_type") or "All")
+    customer_notes_filter = str(effective_filter.get("customer_notes") or "All")
+    filtered_rows = _filter_order_rows(
+        order_rows,
+        query=q,
+        marketplaces=marketplaces,
+        statuses=statuses,
+        buyer_type=buyer_type_filter,
+        customer_notes=customer_notes_filter,
+    )
 
     filtered_df = pd.DataFrame(filtered_rows)
     st.markdown("### Orders Table + Side Panel")
@@ -361,8 +522,10 @@ def render_orders(repo: InventoryRepository) -> None:
             export_basename="orders_filtered",
             active_filters={
                 "query": q,
-                "marketplaces": sorted(marketplaces),
-                "statuses": sorted(statuses),
+                "marketplaces": sorted({str(v).strip().lower() for v in marketplaces if str(v).strip()}),
+                "statuses": sorted({str(v).strip().lower() for v in statuses if str(v).strip()}),
+                "buyer_type": buyer_type_filter,
+                "customer_notes": customer_notes_filter,
             },
         )
         st.dataframe(filtered_df, use_container_width=True)
@@ -391,6 +554,51 @@ def render_orders(repo: InventoryRepository) -> None:
             )
             selected_order = orders_by_id[select_options[selected_label]]
             selected_actuals = actuals_by_order_id.get(int(selected_order.id), {})
+            selected_customer = customer_by_id.get(int(getattr(selected_order, "customer_id", 0) or 0))
+            selected_customer_context = _customer_order_context(selected_customer)
+            if selected_customer is not None:
+                st.markdown("##### Customer")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric(
+                        "Repeat Buyer",
+                        "Yes" if bool(getattr(selected_customer, "is_repeat_buyer", False)) else "No",
+                    )
+                with c2:
+                    st.metric("Orders", int(getattr(selected_customer, "order_count", 0) or 0))
+                st.caption(
+                    str(selected_customer_context.get("identity_summary") or "")
+                )
+                st.caption(
+                    f"Lifetime spend: ${float(selected_customer_context.get('total_spend') or 0):,.2f}"
+                )
+                if bool(selected_customer_context.get("has_internal_notes")):
+                    with st.expander("Internal Customer Notes", expanded=False):
+                        st.write(str(selected_customer_context.get("notes_preview") or ""))
+                with st.expander("Edit Internal Customer Notes", expanded=False):
+                    with st.form(f"orders_customer_notes_form_{int(selected_customer.id)}"):
+                        customer_notes = st.text_area(
+                            "Internal Customer Notes",
+                            value=str(getattr(selected_customer, "notes", "") or ""),
+                            height=120,
+                            help="Internal-only notes saved on the linked customer record.",
+                        )
+                        if st.form_submit_button("Save Customer Notes"):
+                            if not ensure_permission(user, "update", "Update Customer Notes"):
+                                st.stop()
+                            try:
+                                _update_linked_customer_notes(
+                                    repo,
+                                    int(selected_customer.id),
+                                    customer_notes,
+                                    actor=user.username,
+                                )
+                                st.success("Customer notes saved.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Customer notes save failed: {exc}")
+            elif str(getattr(selected_order, "buyer_username", "") or getattr(selected_order, "buyer_email", "") or "").strip():
+                st.caption("Customer details exist on this order but have not been linked. Run customer backfill.")
             st.markdown("##### Sales/Orders Copilot")
             st.caption("AI triage for order mismatches, fulfillment risk, and refund/return guidance.")
             if st.button("Analyze Selected Order", key=f"orders_copilot_analyze_{selected_order.id}"):
@@ -420,6 +628,7 @@ def render_orders(repo: InventoryRepository) -> None:
                             selected_actual_context.get("actual_net_before_cogs") or 0
                         ),
                         "actual_net_source": str(selected_actual_context.get("actual_net_source") or ""),
+                        "customer": selected_customer_context,
                         "total_amount": float(selected_order.total_amount or 0),
                         "notes": str(selected_order.notes or ""),
                         "item_count": len(order_items),

@@ -14,6 +14,18 @@ import requests
 
 from app.config import settings
 from app.db.models import IntegrationQueueJob, Product, Sale
+from app.services.ai_accountant_identity import (
+    AI_ACCOUNTANT_NAME,
+    DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION,
+    DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
+)
+from app.services.business_agents import MURDOCK_CHAT_INSTRUCTION, MURDOCK_SYSTEM_MESSAGE
+from app.services.business_chat_room import (
+    DEFAULT_BUSINESS_ROOM_KEY,
+    apply_business_room_agent_answer_to_latest_handoff,
+    record_business_room_message,
+    save_business_room_action_workflow_draft,
+)
 from app.services.google_workspace import (
     create_calendar_event,
     resolve_google_workspace_config,
@@ -26,9 +38,11 @@ from app.services.shipping_labels import purchase_shipping_label
 from app.services.slack_notify import (
     build_slack_alert_text,
     dispatch_slack_alert,
+    has_unresolved_slack_template_placeholders,
     resolve_slack_notify_config,
     send_slack_message,
 )
+from app.services.workflow_contracts import build_ai_agent_draft_payload, build_ai_agent_apply_plan
 from app.utils.time import utcnow_naive
 
 
@@ -189,6 +203,11 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         ).strip()
         request_actor = (
             str(request_context.get("app_username") or request_context.get("slack_username") or actor).strip() or actor
+        )
+        ai_agent_answer = (
+            command_payload.get("ai_agent_answer")
+            if isinstance(command_payload.get("ai_agent_answer"), dict)
+            else {}
         )
 
         def _extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -909,7 +928,14 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                 )
             return out
 
-        def _persist_slack_summary(*, summary: str, error: str = "", links: list[str] | None = None) -> None:
+        def _persist_slack_summary(
+            *,
+            summary: str,
+            error: str = "",
+            links: list[str] | None = None,
+            draft_contract: dict[str, Any] | None = None,
+            ai_agent_answer: dict[str, Any] | None = None,
+        ) -> None:
             if getattr(job, "id", None) is None:
                 return
             response_payload = {
@@ -919,6 +945,11 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                 "links": list(links or []),
                 "generated_at": utcnow_naive().isoformat(timespec="seconds"),
             }
+            if draft_contract:
+                response_payload["draft_contract"] = dict(draft_contract)
+                response_payload["apply_plan"] = build_ai_agent_apply_plan(draft_contract)
+            if ai_agent_answer:
+                response_payload["ai_agent_answer"] = dict(ai_agent_answer)
             try:
                 next_payload = dict(payload)
                 next_payload["ai_response"] = response_payload
@@ -945,6 +976,53 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                     )
                 except Exception:
                     pass
+
+        def _mirror_slack_ops_to_business_room(
+            *,
+            agent_key: str,
+            summary: str,
+            draft_contract: dict[str, Any] | None = None,
+            ai_agent_answer: dict[str, Any] | None = None,
+            error: str = "",
+        ) -> None:
+            if not get_runtime_bool(repo, "business_chat_room_slack_mirror_enabled", True):
+                return
+            lines: list[str] = []
+            command_text = str(query_text or "").strip()
+            if command_text:
+                lines.append(f"Slack request: {command_text}")
+            if summary:
+                lines.append(str(summary).strip())
+            if error:
+                lines.append(f"Error: {str(error).strip()[:300]}")
+            message = "\n\n".join(line for line in lines if line).strip()
+            if not message:
+                return
+            try:
+                record_business_room_message(
+                    repo,
+                    room_key=DEFAULT_BUSINESS_ROOM_KEY,
+                    sender_type="agent",
+                    sender_key=agent_key,
+                    message=message,
+                    thread_key=target_thread_ts or str(getattr(job, "id", "") or ""),
+                    directed_to=[request_actor] if request_actor else [],
+                    source="slack_ops",
+                    metadata={
+                        "queue_job_id": int(getattr(job, "id", 0) or 0),
+                        "intent": intent,
+                        "channel_id": target_channel,
+                        "thread_ts": target_thread_ts,
+                        "draft_signature": str((draft_contract or {}).get("signature") or ""),
+                        "has_draft_contract": bool(draft_contract),
+                        "draft_contract": dict(draft_contract or {}) if draft_contract else {},
+                        "apply_plan": build_ai_agent_apply_plan(draft_contract) if draft_contract else {},
+                        "ai_agent_answer": dict(ai_agent_answer or {}) if ai_agent_answer else {},
+                    },
+                    actor=agent_key,
+                )
+            except Exception:
+                pass
 
         def _status_summary() -> str:
             slack_rows = repo.list_integration_queue_jobs(
@@ -976,7 +1054,8 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         def _operations_help() -> str:
             return (
                 "*Slack Ops operations commands*\n"
-                "- `accountant <question>` for read-only AI Accountant answers (aliases: `accounting`, `tax`, `ai-accountant`)\n"
+                f"- `{AI_ACCOUNTANT_NAME.lower()} <question>` or `accountant <question>` for read-only "
+                f"{AI_ACCOUNTANT_NAME} answers (aliases: `accounting`, `tax`, `ai-accountant`)\n"
                 "- `comp <query>` for pricing/comparable research\n"
                 "- `status` for queue + business status\n"
                 "- `operations run_due <integration> [limit]` where integration in `slack_ops|google|shipping|slack`\n"
@@ -1111,7 +1190,51 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
             _persist_slack_summary(summary=summary)
             return False, f"Unsupported operations command `{op}`."
 
-        if not file_rows and intent not in {"comp", "intake", "accountant"}:
+        if ai_agent_answer:
+            answer_agent = str(ai_agent_answer.get("agent") or "").strip().lower()
+            answer_field = str(ai_agent_answer.get("field") or "").strip()
+            answer_value = str(ai_agent_answer.get("answer") or "").strip()
+            agent_key = (
+                "murdock_listing_agent"
+                if answer_agent == "murdock" or intent == "listing"
+                else "kurt_intake_agent"
+                if answer_agent == "kurt" or intent == "intake"
+                else "business_monitor_agent"
+            )
+            answer_apply_result = apply_business_room_agent_answer_to_latest_handoff(
+                repo,
+                environment=str(payload.get("environment") or settings.app_env or "local").strip().lower(),
+                username=request_actor,
+                answer_evidence={
+                    **dict(ai_agent_answer),
+                    "agent_key": agent_key,
+                    "actor": request_actor,
+                    "source": "slack_ops",
+                },
+                actor=actor,
+            )
+            handoff_update_line = (
+                f"- Updated handoff: `{answer_apply_result.get('workflow_key')}` `{answer_apply_result.get('scope_key')}`\n"
+                if answer_apply_result.get("applied")
+                else f"- Handoff update: `{answer_apply_result.get('reason') or 'not_applied'}`\n"
+            )
+            summary = (
+                f"*Captured agent answer*\n"
+                f"- Agent: `{answer_agent or intent or 'agent'}`\n"
+                f"- Field: `{answer_field or 'unknown'}`\n"
+                f"- Answer: `{answer_value[:240] or '(blank)'}`\n"
+                f"{handoff_update_line}"
+                "- No product/listing write was executed. The answer is available as draft evidence for the app workflow."
+            )
+            _persist_slack_summary(summary=summary, ai_agent_answer=ai_agent_answer)
+            _mirror_slack_ops_to_business_room(
+                agent_key=agent_key,
+                summary=summary,
+                ai_agent_answer={**dict(ai_agent_answer), "apply_result": answer_apply_result},
+            )
+            return True, "Slack agent answer captured; no direct write executed."
+
+        if not file_rows and intent not in {"comp", "intake", "listing", "accountant", "customer"}:
             return True, "Slack ops command ingested (no file attachments)."
 
         storage = None
@@ -1128,6 +1251,15 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         listing_id = _coerce_int(command_payload.get("raw_payload", {}).get("listing_id"))
         lot_id = _coerce_int(command_payload.get("raw_payload", {}).get("lot_id"))
         source_id = _coerce_int(command_payload.get("raw_payload", {}).get("source_id"))
+        command_overrides = _parse_override_pairs(normalized_args)
+        if product_id is None:
+            product_id = _coerce_int(command_overrides.get("product_id") or command_overrides.get("product"))
+        if listing_id is None:
+            listing_id = _coerce_int(command_overrides.get("listing_id") or command_overrides.get("listing"))
+        if lot_id is None:
+            lot_id = _coerce_int(command_overrides.get("lot_id") or command_overrides.get("lot"))
+        if source_id is None:
+            source_id = _coerce_int(command_overrides.get("source_id") or command_overrides.get("source"))
         document_kind = (
             str(command_payload.get("raw_payload", {}).get("document_kind") or "incoming_invoice").strip().lower()
             or "incoming_invoice"
@@ -1207,6 +1339,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
 
         ai_error = ""
         ai_summary = ""
+        ai_draft_contract: dict[str, Any] | None = None
         comp_ebay_rows: list[dict[str, Any]] = []
         comp_web_rows: list[dict[str, Any]] = []
         comp_query_used = ""
@@ -1225,7 +1358,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
         min_qualified_rows: int = 2
         trusted_web_domains = _trusted_comp_web_domains()
         filtered_web_rows_count = 0
-        if intent in {"comp", "intake", "accountant"} and get_runtime_bool(repo, "slack_ops_ai_assist_enabled", True):
+        if intent in {"comp", "intake", "listing", "accountant", "customer"} and get_runtime_bool(repo, "slack_ops_ai_assist_enabled", True):
             try:
                 from app.services.ai_orchestration import execute_comp_summary, execute_multimodal_task
 
@@ -1409,7 +1542,7 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                             accountant_web_error = str(exc)
                     ai_result = execute_comp_summary(
                         repo,
-                        query=query_text or "Slack AI Accountant request",
+                        query=query_text or f"Slack {AI_ACCOUNTANT_NAME} request",
                         ebay_rows=[],
                         web_rows=accountant_web_rows,
                         spot_context={
@@ -1426,21 +1559,158 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                         system_message=get_runtime_str(
                             repo,
                             "accountant_llm_system_message",
-                            (
-                                "You are GoldenStackers' AI Accountant, a vigilant read-only accounting controller. "
-                                "Cite evidence, label estimates versus actuals, and route unsupported tax/legal "
-                                "conclusions to human advisor review."
-                            ),
+                            DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
                         ),
                         instruction=get_runtime_str(
                             repo,
                             "ai_accountant_chat_instruction",
-                            (
-                                "Answer the Slack operator in concise markdown with direct answer, evidence checked, "
-                                "risks/corrections, and advisor-review notes. Do not propose direct writes."
-                            ),
+                            DEFAULT_AI_ACCOUNTANT_CHAT_INSTRUCTION,
                         ),
                         workflow="accounting",
+                    )
+                elif intent == "customer":
+                    from app.services.chat_context_builders import build_customers_snapshot
+
+                    customers_answer, customers_citations = build_customers_snapshot(
+                        repo,
+                        max_scan_rows=max(50, min(5000, get_runtime_int(repo, "chat_max_scan_rows", 1000))),
+                    )
+                    ai_result = execute_comp_summary(
+                        repo,
+                        query=query_text or "Slack customer intelligence request",
+                        ebay_rows=[],
+                        web_rows=[],
+                        spot_context={
+                            "source": "slack_ops",
+                            "intent": "customer",
+                            "customer_snapshot": customers_answer,
+                            "citations": customers_citations,
+                            "guardrails": {
+                                "read_only": True,
+                                "privacy": "Use internal customer notes only for operator support; do not expose them to buyers.",
+                            },
+                        },
+                        system_message=get_runtime_str(
+                            repo,
+                            "slack_ops_customer_system_message",
+                            "You are a concise customer-support analyst for GoldenStackers operators.",
+                        ),
+                        instruction=get_runtime_str(
+                            repo,
+                            "slack_ops_customer_instruction",
+                            (
+                                "Answer from the provided customer snapshot. Summarize repeat-buyer status, "
+                                "customer-note presence, dormant buyers, and follow-up priorities. Keep it read-only "
+                                "and avoid exposing full internal notes unless the operator explicitly asks."
+                            ),
+                        ),
+                        workflow="chat",
+                    )
+                elif intent == "listing":
+                    product_context: dict[str, Any] = {}
+                    if product_id is not None:
+                        product = repo.db.get(Product, int(product_id))
+                        if product is not None:
+                            product_context = {
+                                "product_id": int(getattr(product, "id", 0) or 0),
+                                "sku": str(getattr(product, "sku", "") or ""),
+                                "title": str(getattr(product, "title", "") or ""),
+                                "category": str(getattr(product, "category", "") or ""),
+                                "inventory_class": str(getattr(product, "inventory_class", "") or ""),
+                                "quantity_on_hand": int(getattr(product, "current_quantity", 0) or 0),
+                                "metal_type": str(getattr(product, "metal_type", "") or ""),
+                                "weight_oz": str(getattr(product, "weight_oz", "") or ""),
+                            }
+                    ai_result = execute_comp_summary(
+                        repo,
+                        query=query_text or "Slack Murdock listing draft request",
+                        ebay_rows=[],
+                        web_rows=[],
+                        spot_context={
+                            "source": "slack_ops",
+                            "intent": "listing",
+                            "product_context": product_context,
+                            "operator_request": query_text,
+                            "guardrails": {
+                                "approval_required": True,
+                                "write_boundary": "Murdock may prepare listing drafts, but app writes/publish actions require approval.",
+                            },
+                        },
+                        system_message=get_runtime_str(
+                            repo,
+                            "slack_ops_listing_system_message",
+                            MURDOCK_SYSTEM_MESSAGE,
+                        ),
+                        instruction=get_runtime_str(
+                            repo,
+                            "slack_ops_listing_instruction",
+                            MURDOCK_CHAT_INSTRUCTION,
+                        ),
+                        workflow="listing",
+                    )
+                    ai_draft_contract = build_ai_agent_draft_payload(
+                        agent_key="murdock_listing_agent",
+                        draft_type="listing",
+                        operator_request=query_text,
+                        fields=[
+                            {
+                                "key": "product_id",
+                                "label": "Product ID",
+                                "value": product_context.get("product_id") if product_context else product_id,
+                                "confidence": 1.0 if product_context else 0.0,
+                                "source": "slack_command",
+                                "missing_reason": "product_id is needed to attach draft listing suggestions",
+                            },
+                            {
+                                "key": "listing_id",
+                                "label": "Listing ID",
+                                "value": listing_id,
+                                "confidence": 1.0 if listing_id else 0.0,
+                                "source": "slack_command",
+                            },
+                            {
+                                "key": "title",
+                                "label": "eBay Title",
+                                "value": product_context.get("title") if product_context else "",
+                                "confidence": 0.75 if product_context.get("title") else 0.0,
+                                "source": "product_context",
+                            },
+                            {
+                                "key": "description_html",
+                                "label": "eBay Description HTML",
+                                "value": str(ai_result.text or "").strip(),
+                                "confidence": 0.65 if str(ai_result.text or "").strip() else 0.0,
+                                "source": "murdock_ai_summary",
+                                "warnings": [
+                                    "Review generated copy for unsupported grade, scarcity, metal, weight, or handmade claims before applying."
+                                ],
+                            },
+                        ],
+                        context={
+                            "source": "slack_ops",
+                            "channel_id": target_channel,
+                            "thread_ts": target_thread_ts,
+                            "product_context": product_context,
+                        },
+                        warnings=[
+                            "Murdock listing drafts are suggestions until reviewed and applied through the listing workflow."
+                        ],
+                        proposed_actions=[
+                            {
+                                "action": "update_listing_draft",
+                                "requires_approval": True,
+                                "target_product_id": product_context.get("product_id") if product_context else product_id,
+                                "target_listing_id": listing_id,
+                            }
+                        ],
+                        source_refs=[
+                            {
+                                "kind": "slack_thread",
+                                "channel_id": target_channel,
+                                "thread_ts": target_thread_ts,
+                            }
+                        ],
+                        approval_required=True,
                     )
                 else:
                     ai_result = execute_multimodal_task(
@@ -1747,56 +2017,352 @@ def execute_integration_queue_job(repo: Any, job: Any, *, actor: str) -> tuple[b
                 created_product_id = int(getattr(created_product, "id", 0) or 0)
                 if created_product_id > 0:
                     product_id = created_product_id
-                    links.append(f"Product #{created_product_id}")
-                    if created_media_ids:
-                        try:
-                            repo.bulk_update_media_assets(
-                                created_media_ids,
-                                {"product_id": created_product_id},
-                                actor=request_actor,
-                            )
-                        except Exception:
-                            pass
-                    missing_fields: list[str] = []
-                    if float(acquisition_cost or 0) <= 0:
-                        missing_fields.append("acquisition_cost")
-                    if not metal_type:
-                        missing_fields.append("metal_type")
-                    if weight_oz in (None, Decimal("0")):
-                        missing_fields.append("weight_oz")
-                    ai_summary = (
-                        f"*Created intake product draft* `#{created_product_id}`\n"
-                        f"- SKU: `{str(getattr(created_product, 'sku', '') or '')}`\n"
-                        f"- Title: `{title}`\n"
-                        f"- Category: `{category}`\n"
-                        f"- Qty: `{quantity}`\n"
-                        f"- Cost: `${float(acquisition_cost or 0):,.2f}`\n"
-                        f"- Media linked: `{len(created_media_ids)}`"
-                    )
-                    if missing_fields:
-                        ai_summary += (
-                            "\n- Missing confirmations: `"
-                            + ", ".join(missing_fields)
-                            + "` (update from Products page or next Slack ops command)."
+                links.append(f"Product #{created_product_id}")
+                if created_media_ids:
+                    try:
+                        repo.bulk_update_media_assets(
+                            created_media_ids,
+                            {"product_id": created_product_id},
+                            actor=request_actor,
                         )
+                    except Exception:
+                        pass
+                missing_fields: list[str] = []
+                if float(acquisition_cost or 0) <= 0:
+                    missing_fields.append("acquisition_cost")
+                if not metal_type:
+                    missing_fields.append("metal_type")
+                if weight_oz in (None, Decimal("0")):
+                    missing_fields.append("weight_oz")
+                ai_summary = (
+                    f"*Created intake product draft* `#{created_product_id}`\n"
+                    f"- SKU: `{str(getattr(created_product, 'sku', '') or '')}`\n"
+                    f"- Title: `{title}`\n"
+                    f"- Category: `{category}`\n"
+                    f"- Qty: `{quantity}`\n"
+                    f"- Cost: `${float(acquisition_cost or 0):,.2f}`\n"
+                    f"- Media linked: `{len(created_media_ids)}`"
+                )
+                if missing_fields:
+                    ai_summary += (
+                        "\n- Missing confirmations: `"
+                        + ", ".join(missing_fields)
+                        + "` (update from Products page or next Slack ops command)."
+                    )
+                ai_draft_contract = build_ai_agent_draft_payload(
+                    agent_key="kurt_intake_agent",
+                    draft_type="intake",
+                    operator_request=query_text,
+                    fields=[
+                        {
+                            "key": "product_id",
+                            "label": "Product ID",
+                            "value": product_id,
+                            "confidence": 1.0 if product_id else 0.0,
+                            "source": "created_product",
+                        },
+                        {
+                            "key": "title",
+                            "label": "Title",
+                            "value": title,
+                            "confidence": 0.7 if title else 0.0,
+                            "source": "operator_or_ai",
+                        },
+                        {
+                            "key": "category",
+                            "label": "Category",
+                            "value": category,
+                            "confidence": 0.75 if category != "other" else 0.45,
+                            "source": "operator_or_ai",
+                        },
+                        {
+                            "key": "quantity",
+                            "label": "Quantity",
+                            "value": quantity,
+                            "confidence": 0.9,
+                            "source": "operator_or_ai",
+                        },
+                        {
+                            "key": "acquisition_cost",
+                            "label": "Acquisition Cost",
+                            "value": str(acquisition_cost or ""),
+                            "confidence": 0.9 if acquisition_cost and acquisition_cost > 0 else 0.0,
+                            "source": "operator_or_ai",
+                            "missing_reason": "cost basis is required before accounting close",
+                        },
+                        {
+                            "key": "metal_type",
+                            "label": "Metal/Material",
+                            "value": metal_type,
+                            "confidence": 0.8 if metal_type else 0.0,
+                            "source": "operator_or_ai",
+                        },
+                        {
+                            "key": "weight_oz",
+                            "label": "Weight Oz",
+                            "value": str(weight_oz or ""),
+                            "confidence": 0.8 if weight_oz else 0.0,
+                            "source": "operator_or_ai",
+                        },
+                    ],
+                    context={
+                        "source": "slack_ops",
+                        "channel_id": target_channel,
+                        "thread_ts": target_thread_ts,
+                        "created_media_ids": created_media_ids,
+                        "missing_fields": missing_fields,
+                    },
+                    warnings=[
+                        "Confirm whether cost is product unit cost, whole-lot landed cost, or assignment-level cost."
+                    ],
+                    proposed_actions=[
+                        {
+                            "action": "review_intake_product",
+                            "requires_approval": True,
+                            "target_product_id": product_id,
+                        }
+                    ],
+                    source_refs=[
+                        {
+                            "kind": "slack_thread",
+                            "channel_id": target_channel,
+                            "thread_ts": target_thread_ts,
+                        }
+                    ],
+                    approval_required=True,
+                )
             except Exception as intake_exc:
                 if not ai_error:
                     ai_error = str(intake_exc)[:500]
 
-        _persist_slack_summary(summary=ai_summary, error=ai_error, links=links)
+        _persist_slack_summary(summary=ai_summary, error=ai_error, links=links, draft_contract=ai_draft_contract)
+        if intent in {"intake", "listing"}:
+            _mirror_slack_ops_to_business_room(
+                agent_key="kurt_intake_agent" if intent == "intake" else "murdock_listing_agent",
+                summary=ai_summary,
+                draft_contract=ai_draft_contract,
+                error=ai_error,
+            )
         msg = f"Slack attachments ingested. media={ingested_media} documents={ingested_documents}"
         if intent == "intake" and product_id is not None:
             msg += f" | Created product draft #{int(product_id)}."
         if ai_summary:
             msg += " | AI summary generated."
-        elif intent in {"comp", "intake", "accountant"} and ai_error:
+        elif intent in {"comp", "intake", "listing", "accountant", "customer"} and ai_error:
             msg += f" | AI assist unavailable: {ai_error[:180]}"
         return (True, msg)
 
     if integration != "google":
+        if integration == "business_chat_room":
+            if action != "write_action_request":
+                return False, f"Unsupported business_chat_room action `{action}`."
+            requester = payload.get("requester") if isinstance(payload.get("requester"), dict) else {}
+            requester_name = str(requester.get("username") or payload.get("requested_by") or actor or "operator").strip()
+            source_message_id = _coerce_int(payload.get("source_message_id")) or 0
+            prompt_preview = str(payload.get("prompt") or "").strip()[:300]
+            action_route = payload.get("action_route") if isinstance(payload.get("action_route"), dict) else {}
+            route_label = str(action_route.get("label") or "General Business Action").strip()
+            route_workflow = str(action_route.get("recommended_workflow") or "business_chat_room").strip()
+            route_next_step = str(action_route.get("next_step") or "Clarify the target workflow before applying changes.").strip()
+            draft_result: dict[str, Any] = {}
+            try:
+                draft_result = save_business_room_action_workflow_draft(
+                    repo,
+                    environment=str(payload.get("environment") or settings.app_env or "local").strip().lower(),
+                    queue_job_id=int(getattr(job, "id", 0) or 0),
+                    payload=payload,
+                    actor=actor,
+                )
+            except Exception as draft_exc:
+                draft_result = {"error": str(draft_exc)[:500]}
+            try:
+                draft_line = ""
+                if draft_result.get("draft_id"):
+                    draft_line = (
+                        f" Draft handoff `#{draft_result.get('draft_id')}` saved for "
+                        f"`{draft_result.get('workflow_key')}`."
+                    )
+                elif draft_result.get("error"):
+                    draft_line = f" Draft handoff could not be saved: `{str(draft_result.get('error'))[:220]}`."
+                record_business_room_message(
+                    repo,
+                    room_key=str(payload.get("room_key") or DEFAULT_BUSINESS_ROOM_KEY),
+                    sender_type="system",
+                    sender_key="business_chat_room",
+                    sender_label="Business Chat Room",
+                    message=(
+                        "Approved room action request reached the integration queue. "
+                        "No direct write was executed because this request needs a workflow-specific executor. "
+                        f"Route: `{route_label}` via `{route_workflow}`. Next: {route_next_step} "
+                        f"{draft_line} "
+                        f"Request: {prompt_preview or '(no prompt)'}"
+                    ),
+                    thread_key=str(source_message_id or ""),
+                    directed_to=[requester_name] if requester_name else [],
+                    source="integration_queue",
+                    metadata={
+                        "queue_job_id": int(getattr(job, "id", 0) or 0),
+                        "source_message_id": source_message_id,
+                        "approval": payload.get("approval") if isinstance(payload.get("approval"), dict) else {},
+                        "action_route": action_route,
+                        "workflow_draft": draft_result,
+                        "directed_to": payload.get("directed_to") if isinstance(payload.get("directed_to"), list) else [],
+                        "requires_workflow_executor": True,
+                    },
+                    actor="business_chat_room",
+                )
+            except Exception:
+                pass
+            return True, "Business Chat Room action request acknowledged; awaiting workflow-specific executor."
+        if integration == "accounting":
+            if action not in {
+                "repair_sale_lot_listing_movements",
+                "repair_accounting_exception",
+                "suppress_accounting_exception",
+                "unsuppress_accounting_exception",
+            }:
+                return False, f"Unsupported accounting action `{action}`."
+            approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else {}
+            approval_required = bool(approval.get("required", True))
+            approval_status = str(approval.get("status") or "").strip().lower()
+            if approval_required and approval_status != "approved":
+                return False, "Accounting action requires approved human approval payload."
+            dry_run = str(payload.get("dry_run") or "").strip().lower() in {"1", "true", "yes", "y"}
+            if action in {"suppress_accounting_exception", "unsuppress_accounting_exception"}:
+                exception_type = str(payload.get("exception_type") or "").strip()
+                target_entity_type = str(
+                    payload.get("target_entity_type")
+                    or payload.get("entity_type")
+                    or ""
+                ).strip()
+                target_entity_id = _coerce_int(payload.get("target_entity_id") or payload.get("entity_id"))
+                if not exception_type:
+                    return False, "Missing/invalid `exception_type` payload."
+                if not target_entity_type:
+                    return False, "Missing/invalid `target_entity_type` payload."
+                if target_entity_id is None:
+                    return False, "Missing/invalid `target_entity_id` payload."
+                if dry_run:
+                    return (
+                        True,
+                        f"Accounting exception suppression dry-run for {exception_type} "
+                        f"{target_entity_type} #{int(target_entity_id)}.",
+                    )
+                reason = str(payload.get("reason") or "").strip()
+                if action == "suppress_accounting_exception":
+                    repo.suppress_accounting_exception(
+                        exception_type=exception_type,
+                        target_entity_type=target_entity_type,
+                        target_entity_id=int(target_entity_id),
+                        actor=actor,
+                        reason=reason,
+                        details=str(payload.get("details") or "").strip(),
+                    )
+                    return (
+                        True,
+                        f"Accounting exception suppression applied for {exception_type} "
+                        f"{target_entity_type} #{int(target_entity_id)}.",
+                    )
+                repo.unsuppress_accounting_exception(
+                    exception_type=exception_type,
+                    target_entity_type=target_entity_type,
+                    target_entity_id=int(target_entity_id),
+                    actor=actor,
+                    reason=reason,
+                )
+                return (
+                    True,
+                    f"Accounting exception suppression restored for {exception_type} "
+                    f"{target_entity_type} #{int(target_entity_id)}.",
+                )
+            if action == "repair_accounting_exception":
+                exception_type = str(payload.get("exception_type") or "").strip()
+                entity_id = _coerce_int(payload.get("entity_id"))
+                if entity_id is None:
+                    return False, "Missing/invalid `entity_id` payload."
+                if exception_type == "lot_total_cost_includes_landed_components":
+                    result = repo.repair_purchase_lot_embedded_landed_components(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type in {"lot_underallocated", "lot_overallocated"}:
+                    result = repo.repair_purchase_lot_assignment_allocations(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type == "lot_equal_fallback_review_needed":
+                    result = repo.repair_purchase_lot_equal_quantity_allocation_weights(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type == "active_bundle_listing_stock_shortage":
+                    result = repo.repair_active_bundle_listing_stock_shortage(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type == "active_bundle_component_overcommitted":
+                    result = repo.repair_active_bundle_component_overcommit(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type == "listing_lot_inventory_movement_mismatch":
+                    result = repo.repair_sale_lot_listing_inventory_movements(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                elif exception_type == "unmatched_shipping_label_finance_entry":
+                    result = repo.repair_unmatched_shipping_label_finance_entry(
+                        int(entity_id),
+                        actor=actor,
+                        dry_run=dry_run,
+                    )
+                else:
+                    return False, f"Unsupported accounting exception repair `{exception_type}`."
+                action_label = "dry-run" if dry_run else "applied"
+                return (
+                    True,
+                    f"Accounting exception repair {action_label} for {exception_type} #{int(entity_id)}.",
+                )
+
+            sale_id = _coerce_int(payload.get("sale_id"))
+            if sale_id is None:
+                return False, "Missing/invalid `sale_id` payload."
+            allow_negative_inventory = str(payload.get("allow_negative_inventory") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+            }
+            preserve_current_inventory = str(payload.get("preserve_current_inventory") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+            }
+            result = repo.repair_sale_lot_listing_inventory_movements(
+                int(sale_id),
+                actor=actor,
+                allow_negative_inventory=allow_negative_inventory,
+                preserve_current_inventory=preserve_current_inventory,
+                dry_run=dry_run,
+            )
+            action_label = "dry-run" if dry_run else "applied"
+            return (
+                True,
+                f"Accounting lot-listing movement repair {action_label} for sale #{int(sale_id)}: "
+                f"{int(result.get('total_repair_units') or 0)} inventory unit(s).",
+            )
         if integration == "slack":
             if action != "post_message":
                 return False, f"Unsupported slack action `{action}`."
+            if has_unresolved_slack_template_placeholders(str(payload.get("text") or "")):
+                return True, "Dropped stale Slack payload with unresolved template placeholders."
             send_slack_message(
                 repo,
                 text=str(payload.get("text") or ""),

@@ -68,6 +68,7 @@ class ListingWorkflowDraftParityTests(unittest.TestCase):
         self.assertIn("listing_wizard_offer_auto_accept", keyset)
         self.assertIn("listing_wizard_offer_minimum", keyset)
         self.assertIn("listing_wizard_volume_pricing_json", keyset)
+        self.assertIn("listing_wizard_store_category_names", keyset)
         self.assertIn("listing_wizard_package_weight_oz", keyset)
         self.assertIn("listing_wizard_shipping_cost", keyset)
         self.assertIn("listing_wizard_direct_post_mode", keyset)
@@ -82,6 +83,7 @@ class ListingWorkflowDraftParityTests(unittest.TestCase):
         self.assertIn("ebay_pub_best_offer_auto_accept", keyset)
         self.assertIn("ebay_pub_best_offer_minimum", keyset)
         self.assertIn("ebay_pub_volume_pricing_json", keyset)
+        self.assertIn("ebay_pub_store_category_names", keyset)
         self.assertIn("ebay_pub_package_weight_oz", keyset)
         self.assertIn("ebay_pub_shipping_cost", keyset)
         self.assertIn("ebay_pub_post_mode", keyset)
@@ -91,6 +93,7 @@ class ListingWorkflowDraftParityTests(unittest.TestCase):
         listings_keys = set(listings.LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS)
         parity_pairs = [
             ("listing_wizard_category_id", "ebay_pub_category_id"),
+            ("listing_wizard_store_category_names", "ebay_pub_store_category_names"),
             ("listing_wizard_aspects_json", "ebay_pub_aspects_json"),
             ("listing_wizard_price", "ebay_pub_fixed_price"),
             ("listing_wizard_quantity", "ebay_pub_qty"),
@@ -109,6 +112,7 @@ class ListingWorkflowDraftParityTests(unittest.TestCase):
     def test_contract_roundtrip_preserves_parity_paths(self):
         wizard_state = {
             "listing_wizard_category_id": "16679",
+            "listing_wizard_store_category_names": ["/Coins/Bullion"],
             "listing_wizard_aspects_json": '{"Certification":["Uncertified"]}',
             "listing_wizard_price": 49.99,
             "listing_wizard_quantity": 3,
@@ -122,6 +126,7 @@ class ListingWorkflowDraftParityTests(unittest.TestCase):
         }
         listings_state = {
             "ebay_pub_category_id": "16679",
+            "ebay_pub_store_category_names": ["/Coins/Bullion"],
             "ebay_pub_aspects_json": '{"Certification":["Uncertified"]}',
             "ebay_pub_fixed_price": 49.99,
             "ebay_pub_qty": 3,

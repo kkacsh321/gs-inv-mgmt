@@ -59,6 +59,30 @@ class _Repo:
             SimpleNamespace(order_status="completed"),
             SimpleNamespace(order_status="cancelled"),
         ]
+        self._customers = [
+            SimpleNamespace(
+                id=1,
+                ebay_username="repeatbuyer",
+                display_name="Repeat Buyer",
+                primary_email="repeat@example.com",
+                order_count=3,
+                total_spend=125.50,
+                is_repeat_buyer=True,
+                notes="Prefers combined shipping.",
+                last_order_at=now - timedelta(days=10),
+            ),
+            SimpleNamespace(
+                id=2,
+                ebay_username="oldbuyer",
+                display_name="Old Buyer",
+                primary_email="old@example.com",
+                order_count=1,
+                total_spend=25.00,
+                is_repeat_buyer=False,
+                notes="",
+                last_order_at=now - timedelta(days=100),
+            ),
+        ]
         self._sync_runs = [
             SimpleNamespace(id=1, provider="ebay", job_name="job1", status="failed", completed_at=now),
             SimpleNamespace(id=2, provider="ebay", job_name="job2", status="queued", completed_at=None),
@@ -88,6 +112,9 @@ class _Repo:
 
     def list_orders(self):
         return list(self._orders)
+
+    def list_customers(self):
+        return list(self._customers)
 
     def list_sync_runs(self, limit=100):
         return list(self._sync_runs)[:limit]
@@ -200,6 +227,17 @@ class ChatContextBuildersTests(unittest.TestCase):
         self.assertIn("`1`", text)
         self.assertEqual(citations[0]["table"], "orders")
 
+    def test_customers_snapshot(self):
+        with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
+            text, citations = ccb.build_customers_snapshot(_Repo(), max_scan_rows=100)
+
+        self.assertIn("Customer snapshot: `2` customers", text)
+        self.assertIn("Repeat buyers: `1`", text)
+        self.assertIn("Customers with internal notes: `1`", text)
+        self.assertIn("Dormant 90d+ customers: `1`", text)
+        self.assertIn("repeatbuyer", text)
+        self.assertEqual(citations[0]["table"], "customers")
+
     def test_reports_snapshot(self):
         with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
             text, citations = ccb.build_reports_snapshot(_Repo(), max_scan_rows=100)
@@ -278,48 +316,194 @@ class ChatContextBuildersTests(unittest.TestCase):
         class AccountingRepo(_Repo):
             def report_accounting_exception_rows(self, *, start_dt, end_dt):
                 return [
-                    {"exception_type": "missing_cost_basis", "severity": "P1"},
-                    {"exception_type": "lot_equal_fallback_review_needed", "severity": "P2"},
+                    {
+                        "exception_type": "missing_cost_basis",
+                        "severity": "P1",
+                        "entity_type": "sale",
+                        "entity_id": 25,
+                        "amount": 42.5,
+                        "details": "Sale has no product, lot, or assignment cost basis.",
+                    },
+                    {
+                        "exception_type": "missing_fee_evidence",
+                        "severity": "P1",
+                        "entity_type": "sale",
+                        "entity_id": 26,
+                        "amount": 6.5,
+                        "details": "Sale uses sale-field fee fallback.",
+                    },
+                    {
+                        "exception_type": "missing_shipping_label_spend",
+                        "severity": "P1",
+                        "entity_type": "sale",
+                        "entity_id": 27,
+                        "amount": 5.0,
+                        "details": "Buyer paid shipping but label spend is missing.",
+                    },
+                    {
+                        "exception_type": "listing_lot_inventory_movement_mismatch",
+                        "severity": "P1",
+                        "entity_type": "sale",
+                        "entity_id": 56,
+                        "amount": 19,
+                        "reference": "ORDER-LOT-20",
+                        "details": "Listing appears to represent 20 inventory units but consumed 1.",
+                    },
+                    {
+                        "exception_type": "lot_equal_fallback_review_needed",
+                        "severity": "P2",
+                        "entity_type": "purchase_lot",
+                        "entity_id": 39,
+                    },
                 ]
 
             def report_lot_assignment_rows(self, *, start_dt=None, end_dt=None):
                 return [
-                    {"cost_source": "lot_allocation_weight"},
-                    {"cost_source": "lot_equal_quantity_fallback"},
-                    {"cost_source": "missing_cost_basis"},
+                    {
+                        "lot_id": 39,
+                        "lot_code": "LOT-39",
+                        "lot_landed_total": 100.0,
+                        "lot_expected_total_quantity": 10,
+                        "sku": "SKU-1",
+                        "quantity_acquired": 4,
+                        "unit_cost": 12.5,
+                        "resolved_landed_total_cost": 50.0,
+                        "cost_source": "assignment_unit_landed_cost",
+                    },
+                    {
+                        "lot_id": 39,
+                        "lot_code": "LOT-39",
+                        "lot_landed_total": 100.0,
+                        "lot_expected_total_quantity": 10,
+                        "sku": "SKU-2",
+                        "quantity_acquired": 3,
+                        "allocated_cost": 30.0,
+                        "resolved_landed_total_cost": 30.0,
+                        "cost_source": "assignment_allocated_landed_cost",
+                    },
+                    {
+                        "lot_id": 40,
+                        "lot_code": "LOT-40",
+                        "lot_landed_total": 90.0,
+                        "sku": "SKU-3",
+                        "quantity_acquired": 3,
+                        "resolved_landed_total_cost": 90.0,
+                        "cost_source": "lot_equal_quantity_fallback",
+                    },
+                ]
+
+            def dashboard_profit_basis_rows(self, *, now, limit=50):
+                return [
+                    {
+                        "sale_id": 15,
+                        "sku": "SKU-NEG",
+                        "net_before_cogs": 78.79,
+                        "fifo_cogs": 87.71,
+                        "profit_before_returns": -8.92,
+                        "fifo_cost_source": "product_default_landed_cost",
+                        "basis_review_required": False,
+                        "basis_review_severity": "ok",
+                        "basis_review_reason": "",
+                        "fifo_cogs_evidence_rows": 1,
+                    },
+                    {
+                        "sale_id": 21,
+                        "sku": "SKU-REVIEW",
+                        "net_before_cogs": 12.0,
+                        "fifo_cogs": 19.42,
+                        "profit_before_returns": -7.42,
+                        "fifo_cost_source": "lot_equal_quantity_fallback",
+                        "basis_review_required": True,
+                        "basis_review_severity": "review",
+                        "basis_review_reason": "Lot COGS used equal-quantity fallback.",
+                        "fifo_cogs_evidence_rows": 1,
+                    },
                 ]
 
         with patch.object(ccb, "utcnow_naive", lambda: datetime(2026, 3, 30, 12, 0, 0)):
             text, citations = ccb.build_accounting_snapshot(AccountingRepo(), max_scan_rows=100)
 
-        self.assertIn("AI Accountant snapshot", text)
+        self.assertIn("Goldie snapshot", text)
         self.assertIn("Profit before returns", text)
         self.assertIn("Estimated profit after returns", text)
         self.assertIn("missing_cost_basis", text)
-        self.assertIn("AI Accountant questions to answer", text)
+        self.assertIn("Priority accounting exception evidence", text)
+        self.assertIn("sale#25", text)
+        self.assertIn("Lot-listing movement mismatches: `1` sale(s), `19` inventory unit(s)", text)
+        self.assertIn("Fee/shipping evidence exposure: fee rows `$6.50`; shipping-label rows `$5.00`.", text)
+        self.assertIn("Sale has no product, lot, or assignment cost basis.", text)
+        self.assertIn("Goldie questions to answer", text)
         self.assertIn("What cost-basis evidence should we use", text)
-        self.assertIn("Recent AI Accountant operator answers recorded: `0`", text)
-        self.assertIn("Recent AI Accountant answer follow-ups recorded: `0`", text)
+        self.assertIn("Should sale#56 consume the inferred lot quantity or the recorded movement quantity?", text)
+        self.assertIn("Which marketplace fee evidence should be linked to sale#26? Amount `$6.50`.", text)
+        self.assertIn("Which shipping label/finance entry belongs to sale#27? Amount `$5.00`.", text)
+        self.assertIn("Profit Basis Audit evidence", text)
+        self.assertIn("sale#15 `SKU-NEG`", text)
+        self.assertIn("sale#21 `SKU-REVIEW`", text)
+        self.assertIn("Recent Goldie operator answers recorded: `0`", text)
+        self.assertIn("Recent Goldie answer follow-ups recorded: `0`", text)
         self.assertIn("fallback/missing-basis rows", text)
-        self.assertEqual(citations[-5]["table"], "accounting_exception_queue")
-        self.assertEqual(citations[-4]["table"], "ai_accountant_monitor_questions")
-        self.assertEqual(citations[-3]["table"], "ai_accountant_answers")
-        self.assertEqual(citations[-2]["table"], "ai_accountant_answer_followups")
+        self.assertIn("Lot allocation evidence for Goldie", text)
+        self.assertIn("purchase_lot#39 `LOT-39`", text)
+        self.assertIn("explicit assignments `$80.00`", text)
+        self.assertIn("assigned qty `7` / expected `10`", text)
+        self.assertIn("underallocated unresolved mismatch", text)
+        self.assertIn("Do not assume which side is correct", text)
+        self.assertEqual(citations[-6]["table"], "accounting_exception_queue")
+        self.assertEqual(citations[-5]["table"], "ai_accountant_monitor_questions")
+        self.assertEqual(citations[-4]["table"], "ai_accountant_answers")
+        self.assertEqual(citations[-3]["table"], "ai_accountant_answer_followups")
+        self.assertEqual(citations[-2]["table"], "dashboard_profit_basis_rows")
         self.assertEqual(citations[-1]["table"], "product_lot_assignments")
 
     def test_accounting_snapshots_prefer_repository_fifo_cost_maps(self):
         class RepoWithCostMaps(_Repo):
             def __init__(self):
                 super().__init__()
+                now = datetime(2026, 3, 30, 12, 0, 0)
+                self._sales.extend(
+                    [
+                        SimpleNamespace(
+                            sold_at=now - timedelta(days=2),
+                            sold_price=20.0,
+                            fees=1.0,
+                            shipping_cost=0.0,
+                            product_id=1,
+                            quantity_sold=1,
+                            tracking_status="label_created",
+                            tracking_number="TRK3",
+                            shipping_exception_code="",
+                        ),
+                        SimpleNamespace(
+                            sold_at=now - timedelta(days=3),
+                            sold_price=15.0,
+                            fees=1.0,
+                            shipping_cost=0.0,
+                            product_id=1,
+                            quantity_sold=1,
+                            tracking_status="label_created",
+                            tracking_number="TRK4",
+                            shipping_exception_code="",
+                        ),
+                    ]
+                )
                 for idx, sale in enumerate(self._sales, start=10):
                     sale.id = idx
 
             def report_sale_unit_cost_maps(self, *, end_dt, default_unit_cost_by_product):
                 return {
-                    "fifo_unit_cost_by_sale": {10: 11.0, 12: 31.0},
+                    "fifo_unit_cost_by_sale": {10: 11.0, 12: 31.0, 13: 9.0, 14: 7.0},
                     "fifo_unit_cost_source_by_sale": {
                         10: "lot_expected_quantity_fallback",
-                        12: "lot_allocation_weight",
+                        12: "mixed_verified_fifo_cost",
+                        13: "mixed_estimate_fifo_cost",
+                        14: "mixed_fifo_cost",
+                    },
+                    "fifo_total_cost_by_sale": {
+                        10: 22.0,
+                        12: 31.0,
+                        13: 9.0,
+                        14: 7.0,
                     },
                     "fifo_remaining_unit_cost_by_product": {1: 12.0, 3: 35.0},
                     "lot_weighted_unit_cost_by_product": {1: 10.0, 3: 30.0},
@@ -331,16 +515,31 @@ class ChatContextBuildersTests(unittest.TestCase):
             reports_text, reports_citations = ccb.build_reports_snapshot(repo, max_scan_rows=100)
 
         self.assertIn("Estimated inventory cost basis: `$165.00`", inventory_text)
-        self.assertIn("Estimated COGS: `$53.00`", reports_text)
-        self.assertIn("Estimated margin before returns: `$118.00`", reports_text)
+        self.assertIn("Estimated COGS: `$69.00`", reports_text)
+        self.assertIn("Estimated margin before returns: `$135.00`", reports_text)
+        self.assertIn("Sold COGS evidence split:", reports_text)
+        self.assertIn("verified `$31.00` / estimated `$31.00` / review-needed `$7.00`", reports_text)
         self.assertIn("Sold COGS source mix:", reports_text)
-        self.assertIn("`lot_allocation_weight`: `$31.00`", reports_text)
+        self.assertIn("`mixed_verified_fifo_cost`: `$31.00`", reports_text)
+        self.assertIn("`mixed_estimate_fifo_cost`: `$9.00`", reports_text)
+        self.assertIn("`mixed_fifo_cost`: `$7.00`", reports_text)
         self.assertIn("`lot_expected_quantity_fallback`: `$22.00`", reports_text)
         self.assertIn("FIFO remaining lot cost", inventory_citations[0]["cost_basis"])
         self.assertIn("time-aware FIFO sale COGS", reports_citations[0]["cost_basis"])
         self.assertEqual(
             reports_citations[0]["cogs_source_mix"]["lot_expected_quantity_fallback"]["sale_rows"],
             1,
+        )
+        self.assertEqual(
+            reports_citations[0]["cogs_evidence_split"],
+            {
+                "verified_amount": 31.0,
+                "estimated_amount": 31.0,
+                "review_needed_amount": 7.0,
+                "verified_sale_rows": 1,
+                "estimated_sale_rows": 2,
+                "review_needed_sale_rows": 1,
+            },
         )
 
     def test_inventory_snapshot_rolls_back_failed_cost_map_lookup(self):
@@ -372,6 +571,7 @@ class ChatContextBuildersTests(unittest.TestCase):
 
         help_text, help_citations = ccb.build_fallback_help()
         self.assertIn("inventory snapshot", help_text)
+        self.assertIn("repeat buyer customers with notes", help_text)
         self.assertEqual(help_citations, [])
 
 

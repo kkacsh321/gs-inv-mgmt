@@ -59,6 +59,46 @@ EBAY_DEFAULT_INVENTORY_CONDITIONS = [
     "FOR_PARTS_OR_NOT_WORKING",
 ]
 EBAY_MAX_CONDITION_DESCRIPTION_CHARS = 1000
+EBAY_MAX_INVENTORY_DESCRIPTION_CHARS = 4000
+EBAY_INVENTORY_SKU_MAX_CHARS = 50
+
+
+def build_ebay_inventory_item_sku(
+    product_sku: str,
+    *,
+    listing_id: int | None = None,
+    suffix: str = "",
+) -> str:
+    """Build a stable eBay Inventory API SKU for a local listing row.
+
+    eBay treats Inventory API SKU as the inventory item identity. A single
+    product can have multiple local marketplace listings, so direct publishes
+    need a listing-specific SKU to avoid revising another live offer for the
+    same product.
+    """
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", str(product_sku or "").strip()).strip("-._")
+    if not base:
+        base = "GS-LISTING"
+
+    suffix_parts: list[str] = []
+    if listing_id is not None:
+        try:
+            clean_listing_id = int(listing_id)
+        except (TypeError, ValueError):
+            clean_listing_id = 0
+        if clean_listing_id > 0:
+            suffix_parts.append(f"L{clean_listing_id}")
+    clean_suffix = re.sub(r"[^A-Za-z0-9._-]+", "-", str(suffix or "").strip()).strip("-._")
+    if clean_suffix:
+        suffix_parts.append(clean_suffix)
+
+    if not suffix_parts:
+        return base[:EBAY_INVENTORY_SKU_MAX_CHARS].strip("-._") or "GS-LISTING"
+
+    suffix_text = "-" + "-".join(suffix_parts)
+    max_base_len = max(1, EBAY_INVENTORY_SKU_MAX_CHARS - len(suffix_text))
+    trimmed_base = base[:max_base_len].strip("-._") or "GS"
+    return f"{trimmed_base}{suffix_text}"[:EBAY_INVENTORY_SKU_MAX_CHARS]
 
 
 def ebay_condition_label(condition: str) -> str:
@@ -75,6 +115,21 @@ def validate_inventory_item_condition_description(payload: dict) -> None:
             "eBay condition description must be "
             f"{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters or fewer "
             f"(currently {len(condition_description)})."
+        )
+
+
+def validate_inventory_item_product_description(payload: dict) -> None:
+    if not isinstance(payload, dict):
+        return
+    product = payload.get("product") if isinstance(payload.get("product"), dict) else {}
+    description = str(product.get("description") or "")
+    if not description:
+        raise ValueError("eBay inventory product description must be between 1 and 4000 characters.")
+    if len(description) > EBAY_MAX_INVENTORY_DESCRIPTION_CHARS:
+        raise ValueError(
+            "eBay inventory product description must be "
+            f"{EBAY_MAX_INVENTORY_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {len(description)})."
         )
 
 
@@ -138,6 +193,8 @@ class EbayClient:
     a sample sell-account call. As requirements stabilize, extend into inventory,
     order ingestion, listing updates, and webhook handling.
     """
+
+    MARKETPLACE_INSIGHTS_SCOPE = "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights"
 
     SCOPES = [
         "https://api.ebay.com/oauth/api_scope",
@@ -263,7 +320,7 @@ class EbayClient:
             "scope": " ".join(scope_values),
         }
         response = requests.post(token_endpoint, headers=headers, data=payload, timeout=30)
-        response.raise_for_status()
+        self._raise_for_status_with_body(response)
         return response.json()
 
     def refresh_user_token(self, refresh_token: str, scopes: list[str] | None = None) -> dict:
@@ -281,7 +338,7 @@ class EbayClient:
         if scope_values:
             payload["scope"] = " ".join(scope_values)
         response = requests.post(token_endpoint, headers=headers, data=payload, timeout=30)
-        response.raise_for_status()
+        self._raise_for_status_with_body(response)
         return response.json()
 
     def decode_access_token_claims(self, access_token: str) -> dict:
@@ -308,6 +365,17 @@ class EbayClient:
         response = requests.get(endpoint, headers=headers, timeout=30)
         self._raise_for_status_with_body(response)
         return response.json()
+
+    def get_account_user_preferences(self, *, access_token: str, marketplace_id: str = "EBAY_US") -> dict:
+        endpoint = f"{self.api_host}/sell/account/v2/user_preferences"
+        headers = {
+            "Authorization": f"Bearer {access_token.strip()}",
+            "X-EBAY-C-MARKETPLACE-ID": str(marketplace_id or "EBAY_US").strip().upper(),
+        }
+        response = requests.get(endpoint, headers=headers, timeout=30)
+        self._raise_for_status_with_body(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"response": payload}
 
     def get_default_category_tree_id(self, *, access_token: str, marketplace_id: str = "EBAY_US") -> str:
         endpoint = f"{self.api_host}/commerce/taxonomy/v1/get_default_category_tree_id"
@@ -576,6 +644,7 @@ class EbayClient:
         content_language: str = "en-US",
     ) -> None:
         validate_inventory_item_condition_description(payload)
+        validate_inventory_item_product_description(payload)
         endpoint = f"{self.api_host}/sell/inventory/v1/inventory_item/{sku}"
         headers = self._rest_headers(access_token, content_language=content_language)
         response = requests.put(endpoint, headers=headers, json=payload, timeout=45)
@@ -1214,6 +1283,91 @@ class EbayClient:
             "errors": errors,
         }
 
+    def get_store_categories(
+        self,
+        *,
+        access_token: str,
+        marketplace_id: str = "EBAY_US",
+        level_limit: int = 3,
+        compatibility_level: str = "1193",
+    ) -> dict:
+        site_id = self.trading_site_id_for_marketplace(marketplace_id)
+        endpoint = f"{self.api_host}/ws/api.dll"
+        resolved_level_limit = max(1, min(int(level_limit or 3), 3))
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "X-EBAY-API-IAF-TOKEN": str(access_token or "").strip(),
+            "X-EBAY-API-CALL-NAME": "GetStore",
+            "X-EBAY-API-SITEID": site_id,
+            "X-EBAY-API-COMPATIBILITY-LEVEL": str(compatibility_level or "1193").strip() or "1193",
+        }
+        payload = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<GetStoreRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+            "<ErrorLanguage>en_US</ErrorLanguage>"
+            "<WarningLevel>High</WarningLevel>"
+            "<CategoryStructureOnly>true</CategoryStructureOnly>"
+            f"<LevelLimit>{resolved_level_limit}</LevelLimit>"
+            "</GetStoreRequest>"
+        )
+        response = requests.post(endpoint, headers=headers, data=payload.encode("utf-8"), timeout=45)
+        self._raise_for_status_with_body(response)
+        raw_xml = response.text or ""
+        root = ET.fromstring(raw_xml.encode("utf-8"))
+        ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+        ack = (root.findtext("e:Ack", default="", namespaces=ns) or "").strip()
+        errors = [
+            {
+                "code": (err.findtext("e:ErrorCode", default="", namespaces=ns) or "").strip(),
+                "short": (err.findtext("e:ShortMessage", default="", namespaces=ns) or "").strip(),
+                "long": (err.findtext("e:LongMessage", default="", namespaces=ns) or "").strip(),
+                "severity": (err.findtext("e:SeverityCode", default="", namespaces=ns) or "").strip(),
+            }
+            for err in root.findall("e:Errors", ns)
+        ]
+        if ack.upper() == "FAILURE":
+            summary = "; ".join(
+                f"{err.get('code')}: {err.get('short') or err.get('long')}" for err in errors if err
+            )
+            raise RuntimeError(f"Trading GetStore failed: {summary or raw_xml[:500]}")
+
+        def _parse_category(node: ET.Element, parent_parts: list[str], level: int) -> list[dict]:
+            name = (node.findtext("e:Name", default="", namespaces=ns) or "").strip()
+            category_id = (node.findtext("e:CategoryID", default="", namespaces=ns) or "").strip()
+            order_raw = (node.findtext("e:Order", default="", namespaces=ns) or "").strip()
+            try:
+                sort_order = int(order_raw or 0)
+            except ValueError:
+                sort_order = 0
+            current_parts = [*parent_parts, name] if name else list(parent_parts)
+            path = "/" + "/".join(current_parts) if current_parts else ""
+            rows: list[dict] = []
+            if path:
+                rows.append(
+                    {
+                        "category_name": name,
+                        "category_path": path,
+                        "parent_path": "/" + "/".join(parent_parts) if parent_parts else "",
+                        "external_category_id": category_id,
+                        "sort_order": sort_order,
+                        "level": level,
+                    }
+                )
+            for child in node.findall("e:ChildCategory", ns):
+                rows.extend(_parse_category(child, current_parts, level + 1))
+            return rows
+
+        category_rows: list[dict] = []
+        for node in root.findall(".//e:CustomCategories/e:CustomCategory", ns):
+            category_rows.extend(_parse_category(node, [], 1))
+        return {
+            "ack": ack,
+            "marketplace_id": str(marketplace_id or "").strip() or "EBAY_US",
+            "site_id": site_id,
+            "categories": category_rows,
+            "errors": errors,
+        }
+
     def _finding_global_id(self) -> str:
         raw = (settings.ebay_marketplace_id or "EBAY_US").strip().upper()
         if raw == "EBAY_US":
@@ -1536,6 +1690,128 @@ class EbayClient:
         return rows
 
     @staticmethod
+    def _marketplace_insights_money_value(value: object) -> float:
+        if isinstance(value, dict):
+            raw = value.get("value")
+        else:
+            raw = value
+        try:
+            return float(str(raw or "0").replace(",", "").replace("$", "").strip() or 0.0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _marketplace_insights_money_currency(value: object, default: str = "USD") -> str:
+        if isinstance(value, dict):
+            currency = str(value.get("currency") or value.get("currencyId") or "").strip()
+            if currency:
+                return currency
+        return default
+
+    def search_marketplace_insights_item_sales(
+        self,
+        *,
+        access_token: str,
+        query: str,
+        marketplace_id: str = "EBAY_US",
+        category_id: str = "",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        normalized_query = " ".join(str(query or "").split()).strip()
+        if not normalized_query:
+            return {}
+        endpoint = f"{self.api_host}/buy/marketplace_insights/v1_beta/item_sales/search"
+        params: dict[str, object] = {
+            "q": normalized_query,
+            "limit": max(1, min(int(limit or 25), 200)),
+            "offset": max(0, int(offset or 0)),
+        }
+        if str(category_id or "").strip():
+            params["category_ids"] = str(category_id or "").strip()
+        headers = self._rest_headers(access_token)
+        headers["X-EBAY-C-MARKETPLACE-ID"] = str(marketplace_id or "EBAY_US").strip() or "EBAY_US"
+        response = requests.get(endpoint, headers=headers, params=params, timeout=45)
+        self._raise_for_status_with_body(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
+    def search_marketplace_insights_sold_comps(
+        self,
+        *,
+        access_token: str,
+        query: str,
+        marketplace_id: str = "EBAY_US",
+        category_id: str = "",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> list[dict]:
+        payload = self.search_marketplace_insights_item_sales(
+            access_token=access_token,
+            query=query,
+            marketplace_id=marketplace_id,
+            category_id=category_id,
+            limit=limit,
+            offset=offset,
+        )
+        items = payload.get("itemSales") or payload.get("itemSummaries") or payload.get("items") or []
+        if not isinstance(items, list):
+            return []
+        rows: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            price_obj = item.get("price") or item.get("soldPrice") or item.get("currentBidPrice") or {}
+            sold_price = self._marketplace_insights_money_value(price_obj)
+            shipping_cost = 0.0
+            shipping_options = item.get("shippingOptions") or []
+            if isinstance(shipping_options, list) and shipping_options:
+                first_shipping = shipping_options[0] if isinstance(shipping_options[0], dict) else {}
+                shipping_cost = self._marketplace_insights_money_value(first_shipping.get("shippingCost"))
+            if shipping_cost <= 0:
+                shipping_cost = self._marketplace_insights_money_value(
+                    item.get("shippingCost") or item.get("shippingPrice")
+                )
+            total_price = sold_price + shipping_cost
+            if total_price <= 0:
+                continue
+            condition = ""
+            condition_obj = item.get("condition") or item.get("conditionId") or ""
+            if isinstance(condition_obj, dict):
+                condition = str(
+                    condition_obj.get("conditionDisplayName")
+                    or condition_obj.get("localizedAspectValue")
+                    or condition_obj.get("name")
+                    or ""
+                ).strip()
+            else:
+                condition = str(condition_obj or "").strip()
+            rows.append(
+                {
+                    "item_id": str(item.get("itemId") or item.get("legacyItemId") or "").strip(),
+                    "title": str(item.get("title") or "").strip(),
+                    "sold_price": sold_price,
+                    "shipping_cost": shipping_cost,
+                    "total_price": total_price,
+                    "currency": self._marketplace_insights_money_currency(price_obj),
+                    "condition": condition,
+                    "end_time": str(
+                        item.get("itemEndDate")
+                        or item.get("lastSoldDate")
+                        or item.get("itemCreationDate")
+                        or item.get("dateSold")
+                        or ""
+                    ).strip(),
+                    "view_url": str(item.get("itemWebUrl") or item.get("itemHref") or "").strip(),
+                    "gallery_url": str(item.get("image", {}).get("imageUrl") if isinstance(item.get("image"), dict) else "").strip(),
+                    "source": "ebay_marketplace_insights",
+                    "evidence": "sold_market",
+                    "marketplace_id": str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+                }
+            )
+        return rows
+
+    @staticmethod
     def _extract_price_hints_simple(raw_text: str) -> list[float]:
         text = unescape(str(raw_text or "")).replace("\xa0", " ").strip()
         if not text:
@@ -1563,6 +1839,7 @@ class EbayClient:
         query = " ".join(str(keywords or "").split()).strip()
         if not query:
             return []
+        self.__class__._sold_html_last_error = {}
         endpoint = (
             "https://www.ebay.com/sch/i.html"
             f"?_nkw={quote_plus(query)}&LH_Sold=1&LH_Complete=1&rt=nc"
@@ -1575,11 +1852,18 @@ class EbayClient:
             )
             response.raise_for_status()
             html_text = str(response.text or "")
-        except Exception:
+        except Exception as exc:
+            response_obj = getattr(exc, "response", None)
+            self.__class__._sold_html_last_error = {
+                "type": type(exc).__name__,
+                "status_code": int(getattr(response_obj, "status_code", 0) or 0),
+                "keywords": query[:140],
+                "response_excerpt": str(getattr(response_obj, "text", "") or "")[:300],
+            }
             return []
         row_limit = max(1, min(int(limit), 100))
         item_blocks = re.findall(
-            r'<li[^>]*class="[^"]*\bs-item\b[^"]*"[^>]*>(.*?)</li>',
+            r'<li[^>]*class=["\'][^"\']*\bs-item\b[^"\']*["\'][^>]*>(.*?)</li>',
             html_text,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -1588,7 +1872,7 @@ class EbayClient:
             if len(rows) >= row_limit:
                 break
             title_match = re.search(
-                r'<[^>]*class="[^"]*\bs-item__title\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                r'<[^>]*class=["\'][^"\']*\bs-item__title\b[^"\']*["\'][^>]*>(.*?)</[^>]+>',
                 block,
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -1596,18 +1880,18 @@ class EbayClient:
             if not title or title.lower().startswith("shop on ebay"):
                 continue
             href_match = re.search(
-                r'<a[^>]*class="[^"]*\bs-item__link\b[^"]*"[^>]*href="([^"]+)"',
+                r'<a[^>]*class=["\'][^"\']*\bs-item__link\b[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
                 block,
                 flags=re.IGNORECASE | re.DOTALL,
             )
             view_url = unescape(str(href_match.group(1) if href_match else "")).strip()
             price_match = re.search(
-                r'<[^>]*class="[^"]*\bs-item__price\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                r'<[^>]*class=["\'][^"\']*\bs-item__price\b[^"\']*["\'][^>]*>(.*?)</[^>]+>',
                 block,
                 flags=re.IGNORECASE | re.DOTALL,
             )
             shipping_match = re.search(
-                r'<[^>]*class="[^"]*\bs-item__shipping\b[^"]*"[^>]*>(.*?)</[^>]+>',
+                r'<[^>]*class=["\'][^"\']*\bs-item__shipping\b[^"\']*["\'][^>]*>(.*?)</[^>]+>',
                 block,
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -1640,7 +1924,19 @@ class EbayClient:
                     "source": "ebay_sold_html",
                 }
             )
+        if not rows:
+            self.__class__._sold_html_last_error = {
+                "type": "no_parsed_rows",
+                "status_code": int(getattr(response, "status_code", 0) or 0),
+                "keywords": query[:140],
+                "html_bytes": len(html_text),
+                "item_blocks": len(item_blocks),
+            }
         return rows
+
+    @classmethod
+    def sold_html_last_error(cls) -> dict:
+        return dict(getattr(cls, "_sold_html_last_error", {}) or {})
 
     def find_completed_items_with_fallback(
         self,
@@ -1672,4 +1968,5 @@ class EbayClient:
     _finding_rate_limited_until: datetime | None = None
     _finding_last_probe_at: datetime | None = None
     _finding_last_error: dict = {}
+    _sold_html_last_error: dict = {}
     _CONTENT_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2}(?:-[A-Za-z]{2})?$")

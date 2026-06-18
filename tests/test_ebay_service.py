@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 import requests
 
-from app.services.ebay import EbayClient, normalize_ebay_condition_policy_rows
+from app.services.ebay import (
+    EBAY_INVENTORY_SKU_MAX_CHARS,
+    EbayClient,
+    build_ebay_inventory_item_sku,
+    normalize_ebay_condition_policy_rows,
+)
 
 
 class _FakeResponse:
@@ -51,6 +56,25 @@ class EbayClientTests(unittest.TestCase):
         }
         base.update(overrides)
         return SimpleNamespace(**base)
+
+    def test_build_inventory_item_sku_is_listing_specific(self) -> None:
+        sku_a = build_ebay_inventory_item_sku("GS-CO-CO-26120-604B", listing_id=140)
+        sku_b = build_ebay_inventory_item_sku("GS-CO-CO-26120-604B", listing_id=177)
+
+        self.assertEqual(sku_a, "GS-CO-CO-26120-604B-L140")
+        self.assertEqual(sku_b, "GS-CO-CO-26120-604B-L177")
+        self.assertNotEqual(sku_a, sku_b)
+
+    def test_build_inventory_item_sku_sanitizes_and_limits_length(self) -> None:
+        sku = build_ebay_inventory_item_sku(
+            "GS CO CO 26120 604B " + ("X" * 80),
+            listing_id=123456,
+            suffix="single lot",
+        )
+
+        self.assertLessEqual(len(sku), EBAY_INVENTORY_SKU_MAX_CHARS)
+        self.assertTrue(sku.endswith("-L123456-single-lot"))
+        self.assertNotIn(" ", sku)
 
     def test_authorize_url_contains_expected_params(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
@@ -103,6 +127,15 @@ class EbayClientTests(unittest.TestCase):
         payload = post.call_args.kwargs["data"]
         self.assertEqual(payload.get("grant_type"), "refresh_token")
         self.assertEqual(payload.get("refresh_token"), "oldref")
+        self.assertNotIn("buy.marketplace.insights", str(payload.get("scope") or ""))
+
+    def test_marketplace_insights_scope_is_requested_explicitly_for_app_token(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(payload={"access_token": "apptok"})) as post:
+            out = client.fetch_application_token(scopes=[EbayClient.MARKETPLACE_INSIGHTS_SCOPE])
+        self.assertEqual(out["access_token"], "apptok")
+        self.assertIn("buy.marketplace.insights", str(post.call_args.kwargs["data"].get("scope") or ""))
 
     def test_get_account_privileges(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
@@ -342,6 +375,45 @@ class EbayClientTests(unittest.TestCase):
         self.assertEqual(rows[0]["item_id"], "123")
         self.assertEqual(rows[0]["total_price"], 13.0)
 
+    def test_marketplace_insights_sold_comps_parses_rows(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        response = _FakeResponse(
+            payload={
+                "itemSales": [
+                    {
+                        "itemId": "v1|123|0",
+                        "title": "MPM 3 oz silver bar",
+                        "price": {"value": "180.00", "currency": "USD"},
+                        "shippingOptions": [{"shippingCost": {"value": "5.99", "currency": "USD"}}],
+                        "condition": "Used",
+                        "itemEndDate": "2026-05-01T12:00:00Z",
+                        "itemWebUrl": "https://www.ebay.com/itm/123",
+                        "image": {"imageUrl": "https://i.ebayimg.com/images/g/abc/s-l1600.jpg"},
+                    }
+                ]
+            },
+            text="ok",
+        )
+        with patch("app.services.ebay.requests.get", return_value=response) as req_get:
+            rows = client.search_marketplace_insights_sold_comps(
+                access_token="tok",
+                query="MPM 3 oz silver",
+                marketplace_id="EBAY_US",
+                category_id="39482",
+                limit=10,
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "ebay_marketplace_insights")
+        self.assertEqual(rows[0]["evidence"], "sold_market")
+        self.assertEqual(rows[0]["sold_price"], 180.0)
+        self.assertEqual(rows[0]["shipping_cost"], 5.99)
+        self.assertAlmostEqual(rows[0]["total_price"], 185.99)
+        self.assertIn("/buy/marketplace_insights/v1_beta/item_sales/search", req_get.call_args.args[0])
+        self.assertEqual(req_get.call_args.kwargs["params"]["q"], "MPM 3 oz silver")
+        self.assertEqual(req_get.call_args.kwargs["params"]["category_ids"], "39482")
+        self.assertEqual(req_get.call_args.kwargs["headers"]["X-EBAY-C-MARKETPLACE-ID"], "EBAY_US")
+
     def test_find_completed_items_rate_limited_raises_runtime_error(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
@@ -455,7 +527,11 @@ class EbayClientTests(unittest.TestCase):
             client = EbayClient()
 
         with patch("app.services.ebay.requests.put", return_value=_FakeResponse(status_code=204, payload={}, text="")):
-            client.create_or_replace_inventory_item(access_token="tok", sku="SKU1", payload={"availability": {}})
+            client.create_or_replace_inventory_item(
+                access_token="tok",
+                sku="SKU1",
+                payload={"availability": {}, "product": {"title": "Test", "description": "Valid description"}},
+            )
 
         with patch("app.services.ebay.requests.post", return_value=_FakeResponse(payload={"offerId": "off1"})):
             out = client.create_offer(access_token="tok", payload={"sku": "SKU1"})
@@ -581,6 +657,75 @@ class EbayClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Trading GetItem failed"):
                 client.get_trading_item_video_ids(access_token="tok", item_id="123")
 
+    def test_get_store_categories_parses_nested_category_paths(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production")):
+            client = EbayClient()
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <GetStoreResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+          <Ack>Success</Ack>
+          <Store>
+            <CustomCategories>
+              <CustomCategory>
+                <CategoryID>10</CategoryID>
+                <Name>Coins</Name>
+                <Order>1</Order>
+                <ChildCategory>
+                  <CategoryID>11</CategoryID>
+                  <Name>Bullion</Name>
+                  <Order>2</Order>
+                  <ChildCategory>
+                    <CategoryID>12</CategoryID>
+                    <Name>Copper</Name>
+                    <Order>3</Order>
+                  </ChildCategory>
+                </ChildCategory>
+              </CustomCategory>
+              <CustomCategory>
+                <CategoryID>20</CategoryID>
+                <Name>Supplies</Name>
+                <Order>4</Order>
+              </CustomCategory>
+            </CustomCategories>
+          </Store>
+        </GetStoreResponse>"""
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(text=xml)) as post:
+            out = client.get_store_categories(access_token="tok", marketplace_id="EBAY_US")
+
+        self.assertEqual(
+            [row["category_path"] for row in out["categories"]],
+            ["/Coins", "/Coins/Bullion", "/Coins/Bullion/Copper", "/Supplies"],
+        )
+        self.assertEqual(out["categories"][2]["category_name"], "Copper")
+        self.assertEqual(out["categories"][2]["parent_path"], "/Coins/Bullion")
+        self.assertEqual(out["categories"][2]["external_category_id"], "12")
+        self.assertEqual(out["categories"][2]["sort_order"], 3)
+        self.assertEqual(out["categories"][2]["level"], 3)
+        self.assertEqual(out["site_id"], "0")
+        self.assertEqual(out["marketplace_id"], "EBAY_US")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-EBAY-API-CALL-NAME"], "GetStore")
+        self.assertEqual(post.call_args.kwargs["headers"]["X-EBAY-API-IAF-TOKEN"], "tok")
+        self.assertIn(
+            "<CategoryStructureOnly>true</CategoryStructureOnly>",
+            post.call_args.kwargs["data"].decode("utf-8"),
+        )
+
+    def test_get_store_categories_raises_on_failure_ack(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production")):
+            client = EbayClient()
+
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <GetStoreResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+          <Ack>Failure</Ack>
+          <Errors>
+            <ShortMessage>Invalid token.</ShortMessage>
+            <ErrorCode>932</ErrorCode>
+          </Errors>
+        </GetStoreResponse>"""
+        with patch("app.services.ebay.requests.post", return_value=_FakeResponse(text=xml)):
+            with self.assertRaisesRegex(RuntimeError, "Trading GetStore failed"):
+                client.get_store_categories(access_token="tok", marketplace_id="EBAY_US")
+
     def test_create_inventory_item_blocks_overlong_condition_description_before_api_call(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
             client = EbayClient()
@@ -598,6 +743,58 @@ class EbayClientTests(unittest.TestCase):
                     },
                 )
         put.assert_not_called()
+
+    def test_create_inventory_item_blocks_overlong_product_description_before_api_call(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        with patch("app.services.ebay.requests.put") as put:
+            with self.assertRaisesRegex(ValueError, "4000 characters or fewer"):
+                client.create_or_replace_inventory_item(
+                    access_token="tok",
+                    sku="SKU1",
+                    payload={
+                        "availability": {},
+                        "condition": "USED_EXCELLENT",
+                        "product": {"title": "Test", "description": "x" * 4001},
+                    },
+                )
+        put.assert_not_called()
+
+    def test_create_inventory_item_blocks_empty_product_description_before_api_call(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+
+        with patch("app.services.ebay.requests.put") as put:
+            with self.assertRaisesRegex(ValueError, "between 1 and 4000"):
+                client.create_or_replace_inventory_item(
+                    access_token="tok",
+                    sku="SKU1",
+                    payload={
+                        "availability": {},
+                        "condition": "USED_EXCELLENT",
+                        "product": {"title": "Test", "description": ""},
+                    },
+                )
+        put.assert_not_called()
+
+    def test_get_account_user_preferences_uses_sell_account_v2_endpoint(self) -> None:
+        with patch("app.services.ebay.settings", self._settings(ebay_environment="production")):
+            client = EbayClient()
+
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(payload={"combinedPaymentPreferences": {"combinedPaymentOption": "NO_COMBINED_PAYMENT"}}),
+        ) as get:
+            payload = client.get_account_user_preferences(access_token="tok", marketplace_id="EBAY_US")
+
+        self.assertEqual(payload["combinedPaymentPreferences"]["combinedPaymentOption"], "NO_COMBINED_PAYMENT")
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://api.ebay.com/sell/account/v2/user_preferences",
+        )
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer tok")
+        self.assertEqual(get.call_args.kwargs["headers"]["X-EBAY-C-MARKETPLACE-ID"], "EBAY_US")
 
     def test_verify_publish_dependencies_blocks_immediate_pay_auction_without_bin(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):
@@ -781,6 +978,40 @@ class EbayClientTests(unittest.TestCase):
         self.assertEqual(rows[0]["sold_price"], 39.95)
         self.assertEqual(rows[0]["shipping_cost"], 4.99)
         self.assertAlmostEqual(float(rows[0]["total_price"]), 44.94, places=2)
+
+    def test_search_sold_items_html_parses_single_quoted_classes(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        html = """
+        <li class='s-item'>
+          <a class='s-item__link' href='https://www.ebay.com/itm/137217809542'>
+            <h3 class='s-item__title'>MPM 3 Troy oz Silver Ingot</h3>
+          </a>
+          <span class='s-item__price'>US $149.95</span>
+          <span class='s-item__shipping'>Free shipping</span>
+        </li>
+        """
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(status_code=200, text=html, payload={}),
+        ):
+            rows = client.search_sold_items_html(keywords="mpm 3 oz silver", limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "MPM 3 Troy oz Silver Ingot")
+        self.assertEqual(rows[0]["sold_price"], 149.95)
+
+    def test_search_sold_items_html_records_fetch_diagnostics(self) -> None:
+        with patch("app.services.ebay.settings", self._settings()):
+            client = EbayClient()
+        with patch(
+            "app.services.ebay.requests.get",
+            return_value=_FakeResponse(status_code=403, text="Access Denied", payload={}),
+        ):
+            rows = client.search_sold_items_html(keywords="mpm 3 oz silver", limit=10)
+        self.assertEqual(rows, [])
+        diag = client.sold_html_last_error()
+        self.assertEqual(diag["type"], "HTTPError")
+        self.assertEqual(diag["status_code"], 403)
 
     def test_find_completed_items_with_fallback_uses_html_on_rate_limit(self) -> None:
         with patch("app.services.ebay.settings", self._settings()):

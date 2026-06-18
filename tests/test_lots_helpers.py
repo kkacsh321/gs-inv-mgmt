@@ -81,6 +81,38 @@ class LotsHelpersTests(unittest.TestCase):
         self.assertEqual(lots._extract_decimal_candidate(" -7.5 "), -7.5)
         self.assertIsNone(lots._extract_decimal_candidate("abc"))
 
+    def test_build_purchase_lot_updates_prefers_subtotal_over_order_total(self):
+        updates, candidates = lots._build_purchase_lot_updates_from_payload(
+            {
+                "vendor_name": "eBay Seller",
+                "invoice_date": "04/23/2026",
+                "subtotal": "$269.99",
+                "tax": "$20.25",
+                "handling": "$0.28",
+                "total": "$290.52",
+            }
+        )
+
+        self.assertEqual(updates["total_cost"], lots.to_decimal_or_none(269.99))
+        self.assertEqual(updates["total_tax_paid"], lots.to_decimal_or_none(20.25))
+        self.assertEqual(updates["total_handling_paid"], lots.to_decimal_or_none(0.28))
+        self.assertEqual(candidates["subtotal"], 269.99)
+        self.assertEqual(candidates["total"], 290.52)
+
+    def test_build_purchase_lot_updates_derives_subtotal_when_missing(self):
+        updates, candidates = lots._build_purchase_lot_updates_from_payload(
+            {
+                "vendor_name": "eBay Seller",
+                "invoice_date": "04/23/2026",
+                "tax": "$20.25",
+                "handling": "$0.28",
+                "total": "$290.52",
+            }
+        )
+
+        self.assertEqual(updates["total_cost"], lots.to_decimal_or_none(269.99))
+        self.assertEqual(candidates["subtotal"], 269.99)
+
     def test_extract_invoice_date_candidate(self):
         self.assertEqual(str(lots._extract_invoice_date_candidate("2026-04-01")), "2026-04-01")
         self.assertEqual(str(lots._extract_invoice_date_candidate("04/01/2026")), "2026-04-01")

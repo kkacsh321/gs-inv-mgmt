@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -422,9 +423,13 @@ class LLMRuntimeTests(unittest.TestCase):
         chat_resp = Mock()
         chat_resp.raise_for_status.return_value = None
         chat_resp.json.return_value = {"choices": [{"message": {"content": "chat ok"}}]}
-        with patch("app.services.llm_runtime.requests.post", return_value=chat_resp):
+        with patch("app.services.llm_runtime.requests.post", return_value=chat_resp) as mock_post:
             text = llm_runtime.generate_comp_ai_summary(chat_cfg, query="q", ebay_rows=[], web_rows=[])
             self.assertEqual(text, "chat ok")
+        chat_body = mock_post.call_args.kwargs["json"]
+        chat_payload = json.loads(chat_body["messages"][1]["content"])
+        self.assertEqual(chat_payload["confidence_policy"]["max_confidence_without_sold_ebay_comps"], "medium")
+        self.assertIn("never say High confidence", chat_payload["instruction"])
 
         resp_cfg = LLMRuntimeConfig(
             source="db",

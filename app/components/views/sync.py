@@ -1,4 +1,5 @@
 from datetime import timedelta
+import json
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +24,38 @@ from app.services.sync_jobs import (
     sync_job_retry_policy,
 )
 from app.utils.time import utcnow_naive
+
+
+def _store_category_sync_event_summary_rows(events) -> list[dict]:
+    rows: list[dict] = []
+    for event in list(events or []):
+        if str(getattr(event, "entity_type", "") or "").strip() != "ebay_store_categories":
+            continue
+        raw_payload = str(getattr(event, "payload_json", "") or "").strip()
+        payload = {}
+        if raw_payload:
+            try:
+                parsed = json.loads(raw_payload)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+        rows.append(
+            {
+                "event_id": int(getattr(event, "id", 0) or 0),
+                "status": str(getattr(event, "status", "") or ""),
+                "marketplace_id": str(payload.get("marketplace_id") or getattr(event, "entity_id", "") or ""),
+                "site_id": str(payload.get("site_id") or ""),
+                "ack": str(payload.get("ack") or ""),
+                "imported_count": int(payload.get("imported_count") or 0),
+                "missing_count": int(payload.get("missing_count") or 0),
+                "deactivated_count": int(payload.get("deactivated_count") or 0),
+                "deactivate_missing": bool(payload.get("deactivate_missing", False)),
+                "message": str(getattr(event, "message", "") or ""),
+                "created_at": getattr(event, "created_at", None),
+            }
+        )
+    return rows
 
 
 def _retry_allowed_for_run(run, repo: InventoryRepository) -> tuple[bool, str]:
@@ -219,6 +252,7 @@ def render_sync(repo: InventoryRepository) -> None:
         "`sync_job_shopify_orders_pull_offset` "
         "(fallback env: `SYNC_JOB_EBAY_ORDERS_PULL_IMPORT_ENABLED`, "
         "`SYNC_JOB_EBAY_SHIPPING_TRACKING_PUSH_ENABLED`, "
+        "`SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_ENABLED`, "
         "`SYNC_JOB_SHOPIFY_ORDERS_PULL_ENABLED`, "
         "`SYNC_JOB_SHOPIFY_ORDERS_PULL_SHOP_DOMAIN`, "
         "`SYNC_JOB_SHOPIFY_ORDERS_PULL_LIMIT`, "
@@ -298,6 +332,27 @@ def render_sync(repo: InventoryRepository) -> None:
                 type="password",
                 key="sync_execute_now_access_token",
             )
+        if selected_job_name == "ebay_store_categories_sync":
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                execute_marketplace_id = st.text_input(
+                    "eBay Marketplace ID",
+                    value=str(settings.ebay_marketplace_id or "EBAY_US").strip() or "EBAY_US",
+                    key="sync_execute_now_ebay_store_marketplace_id",
+                )
+            with sc2:
+                execute_deactivate_missing = st.checkbox(
+                    "Deactivate stale eBay-synced categories",
+                    value=False,
+                    key="sync_execute_now_ebay_store_deactivate_missing",
+                    help=(
+                        "Only previously eBay-imported store categories missing from the latest GetStore response "
+                        "are deactivated. Manual categories are left active."
+                    ),
+                )
+        else:
+            execute_marketplace_id = str(settings.ebay_marketplace_id or "EBAY_US").strip() or "EBAY_US"
+            execute_deactivate_missing = False
         if st.button(
             "Execute Selected Job Now",
             key="sync_execute_now_submit",
@@ -318,6 +373,8 @@ def render_sync(repo: InventoryRepository) -> None:
                     shop_domain=execute_shop_domain.strip(),
                     limit=int(execute_limit),
                     offset=int(execute_offset),
+                    marketplace_id=execute_marketplace_id.strip(),
+                    deactivate_missing=bool(execute_deactivate_missing),
                 )
                 st.success(
                     f"Run #{result.get('run_id')} completed with status `{result.get('status')}` "
@@ -739,6 +796,11 @@ def render_sync(repo: InventoryRepository) -> None:
 
         ev_tab, er_tab, upd_tab = st.tabs(["Events", "Errors", "Update Run"])
         with ev_tab:
+            if str(getattr(selected, "job_name", "") or "").strip().lower() == "ebay_store_categories_sync":
+                summary_rows = _store_category_sync_event_summary_rows(events)
+                if summary_rows:
+                    st.markdown("#### Store Category Sync Summary")
+                    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
             st.dataframe(
                 pd.DataFrame(
                     [

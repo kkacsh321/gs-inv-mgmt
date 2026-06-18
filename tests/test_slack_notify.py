@@ -84,6 +84,18 @@ class SlackNotifyTests(unittest.TestCase):
         self.assertEqual(out["ts"], "123")
         self.assertEqual(post.call_args.kwargs["json"]["channel"], "#default")
 
+    def test_send_slack_message_rejects_unresolved_template_placeholders(self) -> None:
+        cfg = SimpleNamespace(enabled=True, bot_token="x", default_channel="#default", timeout_seconds=10)
+        with patch("app.services.slack_notify.resolve_slack_notify_config", return_value=cfg), patch(
+            "app.services.slack_notify.requests.post"
+        ) as post:
+            with self.assertRaisesRegex(ValueError, "unresolved template placeholders"):
+                slack_notify.send_slack_message(
+                    object(),
+                    text=":warning: GoldenStackers sync run {job_name} {status}",
+                )
+        post.assert_not_called()
+
     def test_send_slack_message_http_and_api_error(self) -> None:
         cfg = SimpleNamespace(enabled=True, bot_token="x", default_channel="#default", timeout_seconds=10)
         with patch("app.services.slack_notify.resolve_slack_notify_config", return_value=cfg), patch(
@@ -133,6 +145,19 @@ class SlackNotifyTests(unittest.TestCase):
         self.assertIn("dev", text)
         self.assertIn("42", text)
         self.assertIn("{missing}", text)
+
+    def test_build_slack_alert_text_formats_double_braced_saved_templates(self) -> None:
+        with patch(
+            "app.services.slack_notify.get_runtime_str",
+            return_value="Sync {{job_name}} {{status}} {{run_id}}",
+        ), patch("app.services.slack_notify.settings", SimpleNamespace(app_env="prod")):
+            text = slack_notify.build_slack_alert_text(
+                object(),
+                event_type="sync_failures",
+                default_template="default",
+                context={"job_name": "ebay_orders_pull_import", "status": "partial", "run_id": 5857},
+            )
+        self.assertEqual(text, "Sync ebay_orders_pull_import partial 5857")
 
     def test_build_slack_alert_text_returns_template_on_format_error(self) -> None:
         with patch("app.services.slack_notify.get_runtime_str", return_value="Alert {env"), patch(

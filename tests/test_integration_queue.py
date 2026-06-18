@@ -30,9 +30,65 @@ class _FakeRepo:
         self.created_documents: list[dict] = []
         self.created_listings: list[dict] = []
         self.created_products: list[dict] = []
+        self.audit_events: list[dict] = []
+        self.saved_workflow_drafts: list[dict] = []
+        self.workflow_draft_rows: list[object] = []
+        self.repaired_lot_listing_movements: list[dict] = []
+        self.repaired_lot_allocations: list[dict] = []
+        self.repaired_lot_embedded_components: list[dict] = []
+        self.repaired_equal_quantity_weights: list[dict] = []
+        self.repaired_shipping_label_finance_entries: list[dict] = []
+        self.repaired_bundle_stock_shortages: list[dict] = []
+        self.repaired_component_overcommits: list[dict] = []
+        self.suppressed_accounting_exceptions: list[dict] = []
+        self.unsuppressed_accounting_exceptions: list[dict] = []
+        self.customers: list[object] = []
 
     def update_sale(self, sale_id: int, updates: dict, *, actor: str):
         self.updated_sales.append((sale_id, updates, actor))
+
+    def repair_sale_lot_listing_inventory_movements(self, sale_id: int, **kwargs):
+        row = {"sale_id": int(sale_id), **dict(kwargs)}
+        self.repaired_lot_listing_movements.append(row)
+        return {"sale_id": int(sale_id), "total_repair_units": 19, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_purchase_lot_assignment_allocations(self, lot_id: int, **kwargs):
+        row = {"lot_id": int(lot_id), **dict(kwargs)}
+        self.repaired_lot_allocations.append(row)
+        return {"lot_id": int(lot_id), "delta": 2.5, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_purchase_lot_embedded_landed_components(self, lot_id: int, **kwargs):
+        row = {"lot_id": int(lot_id), **dict(kwargs)}
+        self.repaired_lot_embedded_components.append(row)
+        return {"lot_id": int(lot_id), "adjusted_total_cost": 269.99, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_purchase_lot_equal_quantity_allocation_weights(self, lot_id: int, **kwargs):
+        row = {"lot_id": int(lot_id), **dict(kwargs)}
+        self.repaired_equal_quantity_weights.append(row)
+        return {"lot_id": int(lot_id), "target_assignment_count": 2, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_unmatched_shipping_label_finance_entry(self, finance_entry_id: int, **kwargs):
+        row = {"finance_entry_id": int(finance_entry_id), **dict(kwargs)}
+        self.repaired_shipping_label_finance_entries.append(row)
+        return {"finance_entry_id": int(finance_entry_id), "sale_id": 9, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_active_bundle_listing_stock_shortage(self, listing_id: int, **kwargs):
+        row = {"listing_id": int(listing_id), **dict(kwargs)}
+        self.repaired_bundle_stock_shortages.append(row)
+        return {"listing_id": int(listing_id), "remaining_after": 1, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def repair_active_bundle_component_overcommit(self, product_id: int, **kwargs):
+        row = {"product_id": int(product_id), **dict(kwargs)}
+        self.repaired_component_overcommits.append(row)
+        return {"product_id": int(product_id), "overcommitted_units": 3, "dry_run": bool(kwargs.get("dry_run"))}
+
+    def suppress_accounting_exception(self, **kwargs):
+        self.suppressed_accounting_exceptions.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.suppressed_accounting_exceptions), **kwargs)
+
+    def unsuppress_accounting_exception(self, **kwargs):
+        self.unsuppressed_accounting_exceptions.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.unsuppressed_accounting_exceptions), **kwargs)
 
     def update_integration_queue_job(self, job_id: int, updates: dict, *, actor: str):
         self.updated_jobs.append((job_id, updates, actor))
@@ -82,6 +138,20 @@ class _FakeRepo:
             if media_id in updated_ids:
                 media.update(dict(updates or {}))
         return {"updated_ids": updated_ids, "missing_ids": []}
+
+    def record_audit_event(self, **kwargs):
+        self.audit_events.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.audit_events), **kwargs, created_at=utcnow_naive())
+
+    def save_workflow_draft(self, **kwargs):
+        self.saved_workflow_drafts.append(dict(kwargs))
+        return SimpleNamespace(id=len(self.saved_workflow_drafts), **kwargs)
+
+    def list_workflow_drafts(self, **_kwargs):
+        return list(self.workflow_draft_rows)
+
+    def list_customers(self):
+        return list(self.customers)
 
 
 class IntegrationQueueTests(unittest.TestCase):
@@ -151,6 +221,379 @@ class IntegrationQueueTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Unsupported integration", message)
 
+    def test_execute_integration_queue_job_business_chat_room_write_acknowledges_only(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=44,
+            integration="business_chat_room",
+            action="write_action_request",
+            payload_json=json.dumps(
+                {
+                    "room_key": "goldenstackers_business",
+                    "source_message_id": 12,
+                    "prompt": "Murdock, create a listing draft for product 9",
+                    "requester": {"username": "keith", "role": "admin"},
+                    "directed_to": ["murdock_listing_agent"],
+                    "action_route": {
+                        "route_key": "listing",
+                        "label": "Listing Draft",
+                        "recommended_workflow": "listing_wizard",
+                        "next_step": "Review/create a listing draft.",
+                    },
+                    "approval": {"status": "pending"},
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("awaiting workflow-specific executor", message)
+        self.assertEqual(repo.audit_events[-1]["entity_type"], "business_chat_room")
+        room_payload = repo.audit_events[-1]["changes"]["after"]
+        self.assertIn("No direct write was executed", room_payload["message"])
+        self.assertIn("Listing Draft", room_payload["message"])
+        self.assertIn("Draft handoff", room_payload["message"])
+        self.assertEqual(room_payload["metadata"]["action_route"]["route_key"], "listing")
+        self.assertEqual(room_payload["metadata"]["workflow_draft"]["workflow_key"], "listing_wizard")
+        self.assertEqual(repo.saved_workflow_drafts[0]["workflow_key"], "listing_wizard")
+        self.assertEqual(repo.saved_workflow_drafts[0]["scope_key"], "business_chat_room:44")
+        self.assertEqual(room_payload["directed_to"], ["keith"])
+        self.assertEqual(room_payload["metadata"]["queue_job_id"], 44)
+
+    def test_execute_integration_queue_job_business_chat_room_rejects_unknown_action(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="business_chat_room",
+            action="other",
+            payload_json="{}",
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertFalse(ok)
+        self.assertIn("Unsupported business_chat_room action", message)
+
+    def test_execute_integration_queue_job_accounting_repair_requires_approval(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_sale_lot_listing_movements",
+            payload_json=json.dumps({"sale_id": 56, "approval": {"required": True, "status": "pending"}}),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertFalse(ok)
+        self.assertIn("requires approved human approval", message)
+        self.assertEqual(repo.repaired_lot_listing_movements, [])
+
+    def test_execute_integration_queue_job_accounting_repair_applies(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_sale_lot_listing_movements",
+            payload_json=json.dumps(
+                {
+                    "sale_id": 56,
+                    "approval": {"required": True, "status": "approved"},
+                    "allow_negative_inventory": False,
+                    "preserve_current_inventory": True,
+                    "dry_run": False,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("repair applied for sale #56", message)
+        self.assertEqual(repo.repaired_lot_listing_movements[0]["sale_id"], 56)
+        self.assertFalse(repo.repaired_lot_listing_movements[0]["dry_run"])
+        self.assertFalse(repo.repaired_lot_listing_movements[0]["allow_negative_inventory"])
+        self.assertTrue(repo.repaired_lot_listing_movements[0]["preserve_current_inventory"])
+
+    def test_execute_integration_queue_job_accounting_repair_dry_run_without_approval_when_not_required(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_sale_lot_listing_movements",
+            payload_json=json.dumps(
+                {
+                    "sale_id": 56,
+                    "approval": {"required": False, "status": "not_required"},
+                    "dry_run": True,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("repair dry-run for sale #56", message)
+        self.assertTrue(repo.repaired_lot_listing_movements[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_repair_rejects_bad_payload(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_sale_lot_listing_movements",
+            payload_json=json.dumps({"approval": {"required": False}}),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertFalse(ok)
+        self.assertIn("Missing/invalid `sale_id`", message)
+
+    def test_execute_integration_queue_job_accounting_exception_repair_lot_allocation(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "lot_underallocated",
+                    "entity_id": 39,
+                    "approval": {"required": True, "status": "approved"},
+                    "dry_run": False,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("lot_underallocated #39", message)
+        self.assertEqual(repo.repaired_lot_allocations[0]["lot_id"], 39)
+        self.assertFalse(repo.repaired_lot_allocations[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_exception_repair_embedded_lot_components(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "lot_total_cost_includes_landed_components",
+                    "entity_id": 28,
+                    "approval": {"required": True, "status": "approved"},
+                    "dry_run": False,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("lot_total_cost_includes_landed_components #28", message)
+        self.assertEqual(repo.repaired_lot_embedded_components[0]["lot_id"], 28)
+        self.assertFalse(repo.repaired_lot_embedded_components[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_exception_repair_equal_quantity_weights(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "lot_equal_fallback_review_needed",
+                    "entity_id": 56,
+                    "approval": {"required": True, "status": "approved"},
+                    "dry_run": False,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("lot_equal_fallback_review_needed #56", message)
+        self.assertEqual(repo.repaired_equal_quantity_weights[0]["lot_id"], 56)
+        self.assertFalse(repo.repaired_equal_quantity_weights[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_exception_repair_bundle_stock_dry_run(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "active_bundle_listing_stock_shortage",
+                    "entity_id": 206,
+                    "approval": {"required": False, "status": "not_required"},
+                    "dry_run": True,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("dry-run", message)
+        self.assertEqual(repo.repaired_bundle_stock_shortages[0]["listing_id"], 206)
+        self.assertTrue(repo.repaired_bundle_stock_shortages[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_exception_repair_component_overcommit(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "active_bundle_component_overcommitted",
+                    "entity_id": 2,
+                    "approval": {"required": True, "status": "approved"},
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("active_bundle_component_overcommitted #2", message)
+        self.assertEqual(repo.repaired_component_overcommits[0]["product_id"], 2)
+
+    def test_execute_integration_queue_job_accounting_exception_repair_unmatched_shipping_label(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "unmatched_shipping_label_finance_entry",
+                    "entity_id": 45,
+                    "approval": {"required": True, "status": "approved"},
+                    "dry_run": False,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("unmatched_shipping_label_finance_entry #45", message)
+        self.assertEqual(repo.repaired_shipping_label_finance_entries[0]["finance_entry_id"], 45)
+        self.assertFalse(repo.repaired_shipping_label_finance_entries[0]["dry_run"])
+
+    def test_execute_integration_queue_job_accounting_exception_repair_rejects_review_only_type(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="repair_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "nonpositive_margin",
+                    "entity_id": 66,
+                    "approval": {"required": True, "status": "approved"},
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertFalse(ok)
+        self.assertIn("Unsupported accounting exception repair", message)
+
+    def test_execute_integration_queue_job_accounting_exception_suppression_requires_approval(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="suppress_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "nonpositive_margin",
+                    "target_entity_type": "sale",
+                    "target_entity_id": 66,
+                    "approval": {"required": True, "status": "pending"},
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertFalse(ok)
+        self.assertIn("requires approved human approval", message)
+        self.assertEqual(repo.suppressed_accounting_exceptions, [])
+
+    def test_execute_integration_queue_job_accounting_exception_suppression_dry_run(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="accounting",
+            action="suppress_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "nonpositive_margin",
+                    "entity_type": "sale",
+                    "entity_id": 66,
+                    "approval": {"required": False, "status": "not_required"},
+                    "dry_run": True,
+                }
+            ),
+        )
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("suppression dry-run", message)
+        self.assertEqual(repo.suppressed_accounting_exceptions, [])
+
+    def test_execute_integration_queue_job_accounting_exception_suppression_applies_and_restores(self) -> None:
+        repo = _FakeRepo()
+        suppress_job = SimpleNamespace(
+            integration="accounting",
+            action="suppress_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "nonpositive_margin",
+                    "target_entity_type": "sale",
+                    "target_entity_id": 66,
+                    "reason": "Accepted low margin promo.",
+                    "details": "Owner confirmed no repair needed.",
+                    "approval": {"required": True, "status": "approved"},
+                }
+            ),
+        )
+        restore_job = SimpleNamespace(
+            integration="accounting",
+            action="unsuppress_accounting_exception",
+            payload_json=json.dumps(
+                {
+                    "exception_type": "nonpositive_margin",
+                    "target_entity_type": "sale",
+                    "target_entity_id": 66,
+                    "reason": "Needs review again.",
+                    "approval": {"required": True, "status": "approved"},
+                }
+            ),
+        )
+
+        suppress_ok, suppress_message = integration_queue.execute_integration_queue_job(
+            repo,
+            suppress_job,
+            actor="qa",
+        )
+        restore_ok, restore_message = integration_queue.execute_integration_queue_job(
+            repo,
+            restore_job,
+            actor="qa",
+        )
+
+        self.assertTrue(suppress_ok)
+        self.assertIn("suppression applied", suppress_message)
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["exception_type"], "nonpositive_margin")
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["target_entity_type"], "sale")
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["target_entity_id"], 66)
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["actor"], "qa")
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["reason"], "Accepted low margin promo.")
+        self.assertEqual(repo.suppressed_accounting_exceptions[0]["details"], "Owner confirmed no repair needed.")
+        self.assertTrue(restore_ok)
+        self.assertIn("suppression restored", restore_message)
+        self.assertEqual(repo.unsuppressed_accounting_exceptions[0]["exception_type"], "nonpositive_margin")
+        self.assertEqual(repo.unsuppressed_accounting_exceptions[0]["target_entity_type"], "sale")
+        self.assertEqual(repo.unsuppressed_accounting_exceptions[0]["target_entity_id"], 66)
+        self.assertEqual(repo.unsuppressed_accounting_exceptions[0]["actor"], "qa")
+
     def test_execute_integration_queue_job_bad_payload_json(self) -> None:
         job = SimpleNamespace(integration="slack", action="post_message", payload_json="{bad-json")
         with patch("app.services.integration_queue.send_slack_message") as send_slack:
@@ -171,6 +614,19 @@ class IntegrationQueueTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("Slack post completed", message)
         send_slack.assert_called_once()
+
+    def test_execute_integration_queue_job_drops_stale_slack_template_payload(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            integration="slack",
+            action="post_message",
+            payload_json=json.dumps({"text": "GoldenStackers sync run {job_name} {status}", "channel": "#ops"}),
+        )
+        with patch("app.services.integration_queue.send_slack_message") as send_slack:
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+        self.assertTrue(ok)
+        self.assertIn("Dropped stale", message)
+        send_slack.assert_not_called()
 
     def test_execute_integration_queue_job_slack_unsupported_action(self) -> None:
         job = SimpleNamespace(integration="slack", action="other", payload_json="{}")
@@ -352,6 +808,59 @@ class IntegrationQueueTests(unittest.TestCase):
         payload = json.loads(str(job.payload_json))
         self.assertEqual(payload["ai_response"]["intent"], "accountant")
         self.assertIn("Profit dropped", payload["ai_response"]["summary"])
+
+    def test_execute_integration_queue_job_slack_ops_customer_ai_summary_persisted(self) -> None:
+        repo = _FakeRepo()
+        repo.customers = [
+            SimpleNamespace(
+                id=1,
+                ebay_username="repeatbuyer",
+                display_name="Repeat Buyer",
+                primary_email="repeat@example.com",
+                order_count=3,
+                total_spend=123.45,
+                is_repeat_buyer=True,
+                notes="Prefers combined shipping.",
+                last_order_at=utcnow_naive(),
+            )
+        ]
+        job = SimpleNamespace(
+            id=80,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "customer",
+                        "command_text": "customer repeat buyers with notes",
+                    },
+                    "request_context": {"channel_id": "COPS"},
+                }
+            ),
+        )
+        repo.db.rows[80] = job
+        captured = {"workflow": "", "spot_context": {}}
+
+        def fake_execute_comp_summary(*_args, **kwargs):
+            captured["workflow"] = str(kwargs.get("workflow") or "")
+            captured["spot_context"] = dict(kwargs.get("spot_context") or {})
+            return SimpleNamespace(text="Repeat buyer has internal notes.", citation={})
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=fake_execute_comp_summary,
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+        with patch.dict(sys.modules, {"app.services.ai_orchestration": fake_ai_module}):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        self.assertEqual(captured["workflow"], "chat")
+        self.assertEqual(captured["spot_context"]["intent"], "customer")
+        self.assertIn("Customer snapshot", captured["spot_context"]["customer_snapshot"])
+        payload = json.loads(str(job.payload_json))
+        self.assertEqual(payload["ai_response"]["intent"], "customer")
+        self.assertIn("Repeat buyer", payload["ai_response"]["summary"])
 
     def test_execute_integration_queue_job_slack_ops_accountant_web_research_defaults_on(self) -> None:
         repo = _FakeRepo()
@@ -2330,6 +2839,196 @@ class IntegrationQueueTests(unittest.TestCase):
         self.assertEqual(int(created["current_quantity"]), 2)
         self.assertEqual(str(created["acquisition_cost"]), "15.50")
         self.assertEqual(repo.created_media[0]["product_id"], 101)
+        self.assertTrue(repo.audit_events)
+        self.assertEqual(repo.audit_events[-1]["entity_type"], "business_chat_room")
+        self.assertEqual(repo.audit_events[-1]["actor"], "kurt_intake_agent")
+        room_payload = repo.audit_events[-1]["changes"]["after"]
+        self.assertEqual(room_payload["source"], "slack_ops")
+        self.assertEqual(room_payload["metadata"]["intent"], "intake")
+
+    def test_execute_integration_queue_job_slack_ops_listing_mirrors_to_business_room(self) -> None:
+        repo = _FakeRepo()
+        repo.db.rows[46] = SimpleNamespace(
+            id=46,
+            sku="CO-46",
+            title="Copper Round",
+            category="bullion",
+            inventory_class="sellable",
+            current_quantity=3,
+            metal_type="Copper",
+            weight_oz="1",
+        )
+        job = SimpleNamespace(
+            id=92,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "listing",
+                        "command_text": "murdock product_id=46 write listing copy",
+                        "args": ["product_id=46", "write", "listing", "copy"],
+                        "files": [],
+                    },
+                    "request_context": {
+                        "channel_id": "COPS",
+                        "thread_ts": "123.456",
+                        "app_username": "ops-user",
+                    },
+                }
+            ),
+        )
+        repo.db.rows[92] = job
+
+        fake_ai_module = SimpleNamespace(
+            execute_comp_summary=lambda *_args, **_kwargs: SimpleNamespace(text="<p>Exciting copper round.</p>"),
+            execute_multimodal_task=lambda *_args, **_kwargs: SimpleNamespace(text=""),
+        )
+        with patch.dict(sys.modules, {"app.services.ai_orchestration": fake_ai_module}):
+            ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("AI summary generated", message)
+        payload = json.loads(str(job.payload_json))
+        self.assertEqual(payload["ai_response"]["intent"], "listing")
+        self.assertEqual(payload["ai_response"]["draft_contract"]["agent_key"], "murdock_listing_agent")
+        self.assertEqual(payload["ai_response"]["apply_plan"]["reason"], "pending_human_approval")
+        self.assertTrue(repo.audit_events)
+        self.assertEqual(repo.audit_events[-1]["entity_type"], "business_chat_room")
+        self.assertEqual(repo.audit_events[-1]["actor"], "murdock_listing_agent")
+        room_payload = repo.audit_events[-1]["changes"]["after"]
+        self.assertEqual(room_payload["thread_key"], "123.456")
+        self.assertEqual(room_payload["metadata"]["intent"], "listing")
+        self.assertTrue(room_payload["metadata"]["has_draft_contract"])
+        self.assertEqual(room_payload["metadata"]["draft_contract"]["agent_key"], "murdock_listing_agent")
+        self.assertEqual(room_payload["metadata"]["apply_plan"]["reason"], "pending_human_approval")
+
+    def test_execute_integration_queue_job_slack_ops_agent_answer_does_not_create_product(self) -> None:
+        repo = _FakeRepo()
+        job = SimpleNamespace(
+            id=93,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "command": {
+                        "intent": "intake",
+                        "command_text": "kurt answer quantity: 20",
+                        "args": ["answer", "quantity:", "20"],
+                        "files": [],
+                        "ai_agent_answer": {
+                            "agent": "kurt",
+                            "field": "quantity",
+                            "answer": "20",
+                        },
+                    },
+                    "request_context": {
+                        "channel_id": "COPS",
+                        "thread_ts": "123.789",
+                        "app_username": "ops-user",
+                    },
+                }
+            ),
+        )
+        repo.db.rows[93] = job
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("agent answer captured", message)
+        self.assertEqual(repo.created_products, [])
+        payload = json.loads(str(job.payload_json))
+        self.assertEqual(payload["ai_response"]["ai_agent_answer"]["field"], "quantity")
+        self.assertTrue(repo.audit_events)
+        self.assertEqual(repo.audit_events[-1]["entity_type"], "business_chat_room")
+        room_payload = repo.audit_events[-1]["changes"]["after"]
+        self.assertIn("No product/listing write was executed", room_payload["message"])
+        self.assertEqual(room_payload["metadata"]["ai_agent_answer"]["answer"], "20")
+        self.assertEqual(repo.audit_events[-1]["actor"], "kurt_intake_agent")
+
+    def test_execute_integration_queue_job_slack_ops_agent_answer_updates_active_handoff(self) -> None:
+        repo = _FakeRepo()
+        repo.workflow_draft_rows.append(
+            SimpleNamespace(
+                id=501,
+                workflow_key="inventory_intake_wizard",
+                username="ops-user",
+                scope_key="business_chat_room:44",
+                status="active",
+                created_at=None,
+                updated_at=None,
+                draft_json=json.dumps(
+                    {
+                        "source": "business_chat_room",
+                        "schema": "business_room_action_handoff_v1",
+                        "queue_job_id": 44,
+                        "prompt": "Kurt intake this lot",
+                        "requester": {"username": "ops-user"},
+                        "action_route": {"recommended_workflow": "inventory_intake_wizard"},
+                        "draft_contract": {
+                            "contract": {"type": "ai_agent_draft", "version": 1},
+                            "signature": "before",
+                            "agent_key": "kurt_intake_agent",
+                            "draft_type": "intake",
+                            "fields": [
+                                {"key": "title", "value": "Mixed coin lot", "confidence": 0.9},
+                                {"key": "category", "value": "coins", "confidence": 0.8},
+                                {"key": "quantity", "value": "", "confidence": 0.0},
+                            ],
+                            "missing_questions": [
+                                {"field": "quantity", "question": "Confirm Quantity.", "blocking": True},
+                            ],
+                            "proposed_actions": [],
+                            "warnings": [],
+                            "approval": {"required": True, "status": "pending"},
+                        },
+                        "apply_plan": {"status": "blocked", "reason": "missing_required_confirmations"},
+                    }
+                ),
+            )
+        )
+        job = SimpleNamespace(
+            id=94,
+            integration="slack_ops",
+            action="command_ingest",
+            payload_json=json.dumps(
+                {
+                    "environment": "prod",
+                    "command": {
+                        "intent": "intake",
+                        "command_text": "kurt answer quantity: 20",
+                        "args": ["answer", "quantity:", "20"],
+                        "files": [],
+                        "ai_agent_answer": {
+                            "agent": "kurt",
+                            "field": "quantity",
+                            "answer": "20",
+                        },
+                    },
+                    "request_context": {
+                        "channel_id": "COPS",
+                        "thread_ts": "123.790",
+                        "app_username": "ops-user",
+                    },
+                }
+            ),
+        )
+        repo.db.rows[94] = job
+
+        ok, message = integration_queue.execute_integration_queue_job(repo, job, actor="qa")
+
+        self.assertTrue(ok)
+        self.assertIn("agent answer captured", message)
+        self.assertEqual(repo.created_products, [])
+        saved_payload = repo.saved_workflow_drafts[0]["draft_payload"]
+        fields = {row["key"]: row["value"] for row in saved_payload["draft_contract"]["fields"]}
+        self.assertEqual(fields["quantity"], "20")
+        self.assertEqual(saved_payload["draft_contract"]["missing_questions"], [])
+        self.assertEqual(saved_payload["apply_plan"]["reason"], "pending_human_approval")
+        payload = json.loads(str(job.payload_json))
+        self.assertIn("Updated handoff", payload["ai_response"]["summary"])
+        room_payload = repo.audit_events[-1]["changes"]["after"]
+        self.assertTrue(room_payload["metadata"]["ai_agent_answer"]["apply_result"]["applied"])
 
     def test_execute_integration_queue_job_shipping_dry_run(self) -> None:
         repo = _FakeRepo()

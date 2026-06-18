@@ -3,11 +3,14 @@ import json
 import sys
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 
 def _bootstrap_views_package() -> None:
+    root = Path(__file__).resolve().parents[1]
+    views_path = str(root / "app" / "components" / "views")
     if "boto3" not in sys.modules:
         fake_boto3 = types.ModuleType("boto3")
         fake_boto3.session = types.SimpleNamespace(Session=lambda *args, **kwargs: None)
@@ -25,10 +28,13 @@ def _bootstrap_views_package() -> None:
         sys.modules["botocore.exceptions"] = fake_botocore_exceptions
     if "app.components.views" not in sys.modules:
         pkg = types.ModuleType("app.components.views")
-        pkg.__path__ = []
+        pkg.__path__ = [views_path]
         sys.modules["app.components.views"] = pkg
+    else:
+        existing_path = list(getattr(sys.modules["app.components.views"], "__path__", []) or [])
+        if views_path not in existing_path:
+            sys.modules["app.components.views"].__path__ = [views_path, *existing_path]
 
-    root = Path(__file__).resolve().parents[1]
     for name in ("shared", "workspace_shell", "entity_ops"):
         full_name = f"app.components.views.{name}"
         if full_name in sys.modules:
@@ -124,12 +130,21 @@ class ListingsHelperTests(unittest.TestCase):
 
     def test_known_unit_cost_sums_landed_components(self):
         product = types.SimpleNamespace(
+            product_cost=0.0,
+            acquisition_cost=10.0,
+            acquisition_tax_paid=1.5,
+            acquisition_shipping_paid=0.75,
+            acquisition_handling_paid=0.25,
+        )
+        explicit = types.SimpleNamespace(
+            product_cost=9.25,
             acquisition_cost=10.0,
             acquisition_tax_paid=1.5,
             acquisition_shipping_paid=0.75,
             acquisition_handling_paid=0.25,
         )
         self.assertEqual(listings._known_unit_cost(product), 12.5)
+        self.assertEqual(listings._known_unit_cost(explicit), 9.25)
         self.assertEqual(listings._known_unit_cost(None), 0.0)
 
     def test_default_ebay_video_label_prefers_first_supported_video(self):
@@ -335,6 +350,9 @@ class ListingsHelperTests(unittest.TestCase):
         self.assertEqual(float(score.get("known_cogs_total") or 0.0), 40.0)
         self.assertEqual(float(score.get("estimated_local_shipping_total") or 0.0), 10.0)
         self.assertEqual(float(score.get("expected_net") or 0.0), 38.0)
+        self.assertEqual(float(score.get("breakeven_listing_price") or 0.0), 56.82)
+        self.assertEqual(float(score.get("breakeven_unit_price") or 0.0), 28.41)
+        self.assertEqual(float(score.get("price_cushion") or 0.0), 43.18)
         self.assertEqual(str(score.get("score") or ""), "strong")
 
     def test_build_listing_bundle_metadata_for_single_product_lot(self):
@@ -475,10 +493,63 @@ class ListingsHelperTests(unittest.TestCase):
     def test_publish_draft_contract_keyset_includes_business_critical_fields(self):
         keyset = set(listings.LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS)
         self.assertIn("ebay_pub_category_id", keyset)
+        self.assertIn("ebay_pub_store_category_names", keyset)
         self.assertIn("ebay_pub_dependency_preflight_result", keyset)
         self.assertIn("ebay_pub_category_query_seed_product_id", keyset)
         self.assertIn("ebay_pub_volume_pricing_json", keyset)
         self.assertIn("ebay_pub_access_token", keyset)
+
+    def test_latest_ebay_store_category_sync_summary_picks_store_category_job(self):
+        class _Repo:
+            def list_sync_runs(self, provider="ebay", limit=100):
+                self.args = {"provider": provider, "limit": limit}
+                return [
+                    types.SimpleNamespace(
+                        id=9,
+                        job_name="ebay_orders_pull_import",
+                        status="success",
+                        records_processed=99,
+                    ),
+                    types.SimpleNamespace(
+                        id=8,
+                        job_name="ebay_store_categories_sync",
+                        status="success",
+                        records_processed=12,
+                        records_updated=13,
+                        records_failed=0,
+                        completed_at=datetime(2026, 6, 16, 12, 30, 5),
+                        started_at=datetime(2026, 6, 16, 12, 30, 0),
+                    ),
+                ]
+
+        repo = _Repo()
+        summary = listings._latest_ebay_store_category_sync_summary(repo)
+
+        self.assertEqual(repo.args, {"provider": "ebay", "limit": 100})
+        self.assertEqual(summary["run_id"], 8)
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(summary["processed"], 12)
+        self.assertEqual(summary["updated"], 13)
+        self.assertEqual(summary["failed"], 0)
+        caption = listings._format_ebay_store_category_sync_summary(summary)
+        self.assertIn("run #8 success", caption)
+        self.assertIn("processed 12", caption)
+
+    def test_latest_ebay_store_category_sync_summary_handles_missing_or_failed_repo(self):
+        class _EmptyRepo:
+            def list_sync_runs(self, provider="ebay", limit=100):
+                return [types.SimpleNamespace(id=1, job_name="ebay_orders_pull_import")]
+
+        class _BrokenRepo:
+            def list_sync_runs(self, provider="ebay", limit=100):
+                raise RuntimeError("db unavailable")
+
+        self.assertEqual(listings._latest_ebay_store_category_sync_summary(_EmptyRepo()), {})
+        self.assertEqual(listings._latest_ebay_store_category_sync_summary(_BrokenRepo()), {})
+        self.assertIn(
+            "No eBay store category sync run",
+            listings._format_ebay_store_category_sync_summary({}),
+        )
 
     def test_load_custom_listing_html_blocks_filters_invalid_entries(self):
         payload = json.dumps({"A": "<p>x</p>", "  ": "<p>bad</p>", "B": "", "C": " <p>y</p> "})
@@ -509,6 +580,30 @@ class ListingsHelperTests(unittest.TestCase):
         self.assertEqual(merged["Golden Stackers Header"], "<div>custom</div>")
         self.assertEqual(merged["Custom Block"], "<p>ok</p>")
         self.assertIn("Shipping Policy", merged)
+
+    def test_sanitize_listing_html_formats_plain_text_for_ebay(self):
+        raw = (
+            "Built for Stackers & Collectors\n\n"
+            "This piece looks fantastic on your desk or in your stack room.\n\n"
+            "What's Included\n"
+            "- Display piece\n"
+            "- Certificate of Authenticity"
+        )
+        formatted, notes = listings._sanitize_listing_html(raw)
+        self.assertIn("Formatted plain text", " ".join(notes))
+        self.assertIn("<h3>Built for Stackers &amp; Collectors</h3>", formatted)
+        self.assertIn("<p>This piece looks fantastic on your desk or in your stack room.</p>", formatted)
+        self.assertIn("<ul>", formatted)
+        self.assertIn("<li>Display piece</li>", formatted)
+        self.assertIn("<li>Certificate of Authenticity</li>", formatted)
+
+    def test_sanitize_listing_html_keeps_existing_html_and_removes_unsafe_content(self):
+        raw = "<div onclick='bad()'>Nice</div><script>x()</script>"
+        sanitized, notes = listings._sanitize_listing_html(raw)
+        self.assertIn("<div>Nice</div>", sanitized)
+        self.assertNotIn("onclick", sanitized.lower())
+        self.assertNotIn("<script", sanitized.lower())
+        self.assertTrue(notes)
 
     def test_with_ai_grading_notes_appends_once(self):
         out = listings._with_ai_grading_notes(
@@ -623,9 +718,11 @@ class ListingsHelperTests(unittest.TestCase):
             auction_start_price=0.0,
             auction_reserve_price=0.0,
             auction_buy_now_price=0.0,
+            store_category_names=["/Coins/Bullion", "/Copper/Rounds", "/Ignored/Third"],
         )
         self.assertEqual(payload.get("format"), "FIXED_PRICE")
         self.assertEqual(payload.get("availableQuantity"), 5)
+        self.assertEqual(payload.get("storeCategoryNames"), ["/Coins/Bullion", "/Copper/Rounds"])
         self.assertEqual((payload.get("pricingSummary") or {}).get("price", {}).get("value"), "10.0")
         self.assertEqual(
             ((payload.get("listingPolicies") or {}).get("bestOfferTerms") or {}).get("bestOfferEnabled"),
@@ -759,6 +856,48 @@ class ListingsHelperTests(unittest.TestCase):
         self.assertEqual(publish.get("primary_image_label"), "Reverse")
         self.assertEqual(publish.get("primary_image_media_id"), 9)
 
+    def test_listing_ebay_inventory_sku_is_listing_scoped_for_new_rows(self):
+        product = types.SimpleNamespace(sku="GS-CO-CO-26120-604B")
+        listing = types.SimpleNamespace(id=140, external_listing_id="", marketplace_details="")
+
+        self.assertEqual(
+            listings._listing_ebay_inventory_sku(product, listing),
+            "GS-CO-CO-26120-604B-L140",
+        )
+
+    def test_listing_ebay_inventory_sku_prefers_stored_publish_metadata(self):
+        product = types.SimpleNamespace(sku="GS-CO-CO-26120-604B")
+        listing = types.SimpleNamespace(
+            id=140,
+            external_listing_id="137359011107",
+            marketplace_details=json.dumps(
+                {
+                    "ebay_publish": {
+                        "inventory_sku": "CUSTOM-LISTING-SKU",
+                        "offer_id": "166783746011",
+                    }
+                }
+            ),
+        )
+
+        self.assertEqual(
+            listings._listing_ebay_inventory_sku(product, listing),
+            "CUSTOM-LISTING-SKU",
+        )
+
+    def test_listing_ebay_inventory_sku_preserves_legacy_live_listing_without_metadata(self):
+        product = types.SimpleNamespace(sku="GS-CO-CO-26120-604B")
+        listing = types.SimpleNamespace(
+            id=140,
+            external_listing_id="137359011107",
+            marketplace_details=json.dumps({"ebay_publish": {"offer_id": "166783746011"}}),
+        )
+
+        self.assertEqual(
+            listings._listing_ebay_inventory_sku(product, listing),
+            "GS-CO-CO-26120-604B",
+        )
+
     def test_persist_listing_publish_error_writes_metadata(self):
         repo = _FakeRepo()
         listing = types.SimpleNamespace(
@@ -771,7 +910,11 @@ class ListingsHelperTests(unittest.TestCase):
             actor="tester",
             error_message="failed stage",
             stage="create_offer",
-            context={"post_mode": "Publish Live Listing"},
+            context={
+                "post_mode": "Publish Live Listing",
+                "inventory_sku": "GS-CO-CO-26120-604B-L140",
+                "product_sku": "GS-CO-CO-26120-604B",
+            },
         )
         self.assertEqual(len(repo.update_calls), 1)
         call = repo.update_calls[0]
@@ -782,9 +925,18 @@ class ListingsHelperTests(unittest.TestCase):
         payload = json.loads(str(updates["marketplace_details"]))
         publish = payload.get("ebay_publish") or {}
         self.assertEqual(publish.get("offer_id"), "abc")
+        self.assertEqual(publish.get("inventory_sku"), "GS-CO-CO-26120-604B-L140")
+        self.assertEqual(publish.get("product_sku"), "GS-CO-CO-26120-604B")
         self.assertEqual(publish.get("last_publish_error"), "failed stage")
         self.assertEqual(publish.get("last_publish_error_stage"), "create_offer")
-        self.assertEqual(publish.get("last_publish_error_context"), {"post_mode": "Publish Live Listing"})
+        self.assertEqual(
+            publish.get("last_publish_error_context"),
+            {
+                "post_mode": "Publish Live Listing",
+                "inventory_sku": "GS-CO-CO-26120-604B-L140",
+                "product_sku": "GS-CO-CO-26120-604B",
+            },
+        )
         self.assertTrue(str(publish.get("last_publish_error_at") or "").strip())
 
     def test_build_publish_draft_payload_uses_shared_contract_and_filters_state_keys(self):

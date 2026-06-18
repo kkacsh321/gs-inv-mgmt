@@ -1,4 +1,5 @@
 from app.components.views.admin import render_admin
+from app.components.views.customers import render_customers
 from app.components.views.dashboard import render_dashboard
 from app.components.views.documents import render_documents
 from app.components.views.ebay import render_ebay
@@ -9,6 +10,7 @@ from app.components.views.lots import render_lots
 from app.components.views.media import render_media
 from app.components.views.orders import render_orders
 from app.components.views.products import render_products
+from app.components.views.quickbooks import render_quickbooks
 from app.components.views.reports import render_reports
 from app.components.views.returns import render_returns
 from app.components.views.sales import render_sales

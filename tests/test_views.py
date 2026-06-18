@@ -4,6 +4,7 @@ import importlib
 import sys
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 
 
 class ViewsCompatibilityTests(unittest.TestCase):
@@ -18,6 +19,7 @@ class ViewsCompatibilityTests(unittest.TestCase):
             infer_media_type=lambda _x: "image",
             pretty_json=lambda obj: str(obj),
             render_admin=lambda *_a, **_k: None,
+            render_customers=lambda *_a, **_k: None,
             render_dashboard=lambda *_a, **_k: None,
             render_documents=lambda *_a, **_k: None,
             render_ebay=lambda *_a, **_k: None,
@@ -40,6 +42,7 @@ class ViewsCompatibilityTests(unittest.TestCase):
             views = importlib.import_module("app.views")
 
         self.assertTrue(callable(views.render_dashboard))
+        self.assertTrue(callable(views.render_customers))
         self.assertTrue(callable(views.render_products))
         self.assertTrue(callable(views.render_listings))
         self.assertTrue(callable(views.render_tools))

@@ -12,7 +12,7 @@ from app.components.views.shared import render_help_panel
 from app.repository import InventoryRepository
 from app.services.ai_orchestration import execute_multimodal_task
 from app.services.media_storage import MediaStorageService
-from app.services.purchase_doc_extraction import extract_with_textract, merge_llm_and_textract
+from app.services.purchase_doc_extraction import extract_with_textract_best_effort, merge_llm_and_textract
 from app.services.runtime_settings import get_runtime_bool, get_runtime_str
 from app.utils.time import utc_today
 
@@ -69,6 +69,26 @@ def _extract_decimal_candidate(value: object) -> float | None:
         return None
 
 
+def _derive_lot_item_subtotal(payload: dict, total: float | None) -> float | None:
+    subtotal = _extract_decimal_candidate(payload.get("subtotal"))
+    if subtotal is not None:
+        return subtotal
+    if total is None:
+        return None
+    components = sum(
+        value or 0.0
+        for value in (
+            _extract_decimal_candidate(payload.get("tax")),
+            _extract_decimal_candidate(payload.get("shipping")),
+            _extract_decimal_candidate(payload.get("handling")),
+        )
+    )
+    if components <= 0:
+        return total
+    derived = round(float(total) - float(components), 2)
+    return derived if derived >= 0 else total
+
+
 def _extract_invoice_date_candidate(value: object):
     text = str(value or "").strip()
     if not text:
@@ -97,6 +117,7 @@ def _build_purchase_lot_updates_from_payload(parsed_json: dict) -> tuple[dict[st
     ai_vendor = str(parsed_json.get("vendor_name") or "").strip()
     ai_invoice_date = _extract_invoice_date_candidate(parsed_json.get("invoice_date"))
     ai_total = _extract_decimal_candidate(parsed_json.get("total"))
+    ai_subtotal = _derive_lot_item_subtotal(parsed_json, ai_total)
     ai_tax = _extract_decimal_candidate(parsed_json.get("tax"))
     ai_shipping = _extract_decimal_candidate(parsed_json.get("shipping"))
     ai_handling = _extract_decimal_candidate(parsed_json.get("handling"))
@@ -105,8 +126,8 @@ def _build_purchase_lot_updates_from_payload(parsed_json: dict) -> tuple[dict[st
         apply_updates["vendor"] = ai_vendor
     if ai_invoice_date is not None:
         apply_updates["purchase_date"] = datetime.combine(ai_invoice_date, datetime.min.time())
-    if ai_total is not None:
-        apply_updates["total_cost"] = to_decimal_or_none(ai_total)
+    if ai_subtotal is not None:
+        apply_updates["total_cost"] = to_decimal_or_none(ai_subtotal)
     if ai_tax is not None:
         apply_updates["total_tax_paid"] = to_decimal_or_none(ai_tax)
     if ai_shipping is not None:
@@ -116,6 +137,7 @@ def _build_purchase_lot_updates_from_payload(parsed_json: dict) -> tuple[dict[st
     candidates = {
         "vendor": ai_vendor,
         "invoice_date": ai_invoice_date.isoformat() if ai_invoice_date else "n/a",
+        "subtotal": ai_subtotal if ai_subtotal is not None else "n/a",
         "total": ai_total if ai_total is not None else "n/a",
         "tax": ai_tax if ai_tax is not None else "n/a",
         "shipping": ai_shipping if ai_shipping is not None else "n/a",
@@ -236,7 +258,13 @@ def render_lots(repo: InventoryRepository) -> None:
         placeholder="Optional manual value when no common source is selected.",
     )
     st.date_input("Purchase Date", key="lots_create_purchase_date")
-    st.number_input("Total Lot Cost", min_value=0.0, step=1.0, key="lots_create_total_cost")
+    st.number_input(
+        "Lot Item Subtotal (before tax/shipping/fees)",
+        min_value=0.0,
+        step=1.0,
+        key="lots_create_total_cost",
+        help="Enter the item subtotal only. Do not enter the order total here when tax/shipping/fees are entered separately.",
+    )
     st.number_input("Total Lot Tax Paid", min_value=0.0, step=1.0, key="lots_create_total_tax_paid")
     st.number_input("Total Lot Shipping Paid", min_value=0.0, step=1.0, key="lots_create_total_shipping_paid")
     st.number_input("Total Lot Handling Paid", min_value=0.0, step=1.0, key="lots_create_total_handling_paid")
@@ -555,6 +583,7 @@ def render_lots(repo: InventoryRepository) -> None:
                     ai_summary = ""
                     llm_summary = ""
                     textract_summary = ""
+                    textract_error = ""
                     if run_ai_extract:
                         if extraction_mode in {"llm", "both"}:
                             default_sys = get_runtime_str(
@@ -608,12 +637,13 @@ def render_lots(repo: InventoryRepository) -> None:
                             llm_summary = str(ai_result.text or "").strip()
                             ai_payload = _extract_json_object(llm_summary)
                         if extraction_mode in {"textract", "both"}:
-                            textract_result = extract_with_textract(file_bytes=file_bytes, content_type=content_type)
-                            textract_summary = str(textract_result.summary_text or "").strip()
-                            textract_payload = dict(textract_result.payload or {})
+                            textract_payload, textract_summary, textract_error = extract_with_textract_best_effort(
+                                file_bytes=file_bytes,
+                                content_type=content_type,
+                            )
                             if extraction_mode == "textract":
                                 ai_payload = textract_payload
-                            else:
+                            elif not textract_error:
                                 ai_payload = merge_llm_and_textract(ai_payload, textract_payload)
                         if extraction_mode == "llm":
                             ai_summary = llm_summary
@@ -647,6 +677,11 @@ def render_lots(repo: InventoryRepository) -> None:
                         uploaded_by="employee",
                         actor="employee",
                     )
+                    if textract_error:
+                        st.warning(
+                            "Purchase document was stored, but Textract extraction was skipped/failed: "
+                            f"{textract_error}"
+                        )
                     auto_apply_enabled = bool(
                         get_runtime_bool(repo, "purchase_doc_auto_apply_linked_lot_fields", False)
                     )
@@ -978,6 +1013,7 @@ def render_lots(repo: InventoryRepository) -> None:
                     ai_invoice_number_for_create = str(parsed_json.get("invoice_number") or "").strip()
                     ai_invoice_date_for_create = _extract_invoice_date_candidate(parsed_json.get("invoice_date"))
                     ai_total_for_create = _extract_decimal_candidate(parsed_json.get("total"))
+                    ai_subtotal_for_create = _derive_lot_item_subtotal(parsed_json, ai_total_for_create)
                     ai_tax_for_create = _extract_decimal_candidate(parsed_json.get("tax"))
                     ai_shipping_for_create = _extract_decimal_candidate(parsed_json.get("shipping"))
                     ai_handling_for_create = _extract_decimal_candidate(parsed_json.get("handling"))
@@ -998,10 +1034,14 @@ def render_lots(repo: InventoryRepository) -> None:
                                 value=(ai_invoice_date_for_create or utc_today()),
                             )
                             create_lot_total = st.number_input(
-                                "Total Lot Cost",
+                                "Lot Item Subtotal (before tax/shipping/fees)",
                                 min_value=0.0,
-                                value=float(ai_total_for_create or 0.0),
+                                value=float(ai_subtotal_for_create or 0.0),
                                 step=1.0,
+                                help=(
+                                    "Enter the item subtotal only. Do not enter the order total here when "
+                                    "tax/shipping/fees are entered separately."
+                                ),
                             )
                         with cl2:
                             create_lot_tax = st.number_input(

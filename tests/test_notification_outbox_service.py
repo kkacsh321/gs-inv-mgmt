@@ -108,6 +108,21 @@ class NotificationOutboxServiceTests(unittest.TestCase):
         self.assertIn("network down", row.last_error)
         self.assertGreater(row.next_attempt_at, datetime(2026, 4, 12, 10, 10, 0))
 
+    def test_process_outbox_row_drops_unresolved_template_payload(self) -> None:
+        repo = _FakeRepo()
+        row_id = repo.seed(
+            status="queued",
+            payload={"text": "GoldenStackers sync run {job_name} {status}", "channel": "#ops"},
+        )
+        with patch("app.services.notification_outbox.utcnow_naive", return_value=datetime(2026, 4, 12, 10, 10, 0)), patch(
+            "app.services.notification_outbox.send_slack_message"
+        ) as send_slack:
+            ok, msg = notification_outbox.process_notification_outbox_row(repo, outbox_id=row_id, actor="worker")
+        self.assertTrue(ok)
+        self.assertIn("Dropped stale", msg)
+        self.assertEqual(repo.rows[row_id].status, "sent")
+        send_slack.assert_not_called()
+
     def test_process_due_notification_outbox_counts_due_rows(self) -> None:
         repo = _FakeRepo()
         due_id = repo.seed(status="queued", next_attempt_at=datetime(2026, 4, 12, 10, 0, 0))

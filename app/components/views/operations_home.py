@@ -319,6 +319,7 @@ def _action_rows_for_role(role: str) -> list[tuple[str, str, str]]:
             ("eBay Workspace", "pages/22_eBay_Workspace.py", "integration + bulk end/relist/revise + policies"),
             ("Shipping: Needs Label", "pages/11_Shipping.py", "print/export shipment batches"),
             ("Orders", "pages/14_Orders.py", "review incoming marketplace orders"),
+            ("Customers", "pages/29_Customers.py", "repeat buyer lookup + purchase history"),
             ("Sales", "pages/04_Sales.py", "tracking and shipment updates"),
             ("Sync: Failed Runs", "pages/18_Sync.py", "retry failed marketplace sync jobs"),
         ]

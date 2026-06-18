@@ -13,6 +13,7 @@ from app.components.views import (
     infer_media_type,
     pretty_json,
     render_admin,
+    render_customers,
     render_dashboard,
     render_documents,
     render_ebay,

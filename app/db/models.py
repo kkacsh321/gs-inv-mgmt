@@ -139,6 +139,37 @@ class MarketplaceListing(Base, TimestampMixin):
     media_assets: Mapped[list["MediaAsset"]] = relationship(back_populates="listing")
 
 
+class Customer(Base, TimestampMixin):
+    __tablename__ = "customers"
+    __table_args__ = (
+        UniqueConstraint("marketplace", "customer_key", name="uq_customer_marketplace_key"),
+        Index("ix_customers_marketplace_username", "marketplace", "ebay_username"),
+        Index("ix_customers_email", "primary_email"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    marketplace: Mapped[str] = mapped_column(String(64), default="ebay", index=True)
+    customer_key: Mapped[str] = mapped_column(String(320), default="", index=True)
+    ebay_username: Mapped[str] = mapped_column(String(128), default="", index=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    primary_email: Mapped[str] = mapped_column(String(255), default="", index=True)
+    shipping_name: Mapped[str] = mapped_column(String(255), default="")
+    shipping_address_line1: Mapped[str] = mapped_column(String(255), default="")
+    shipping_address_line2: Mapped[str] = mapped_column(String(255), default="")
+    shipping_city: Mapped[str] = mapped_column(String(128), default="")
+    shipping_state: Mapped[str] = mapped_column(String(64), default="")
+    shipping_postal_code: Mapped[str] = mapped_column(String(32), default="")
+    shipping_country: Mapped[str] = mapped_column(String(8), default="")
+    first_order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    order_count: Mapped[int] = mapped_column(default=0, index=True)
+    total_spend: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    is_repeat_buyer: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+    orders: Mapped[list["Order"]] = relationship(back_populates="customer")
+
+
 class Order(Base, TimestampMixin):
     __tablename__ = "orders"
     __table_args__ = (
@@ -147,6 +178,7 @@ class Order(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
     marketplace: Mapped[str] = mapped_column(String(64), index=True)
     external_order_id: Mapped[str] = mapped_column(String(128), default="")
     order_status: Mapped[str] = mapped_column(String(32), default="paid")
@@ -173,6 +205,7 @@ class Order(Base, TimestampMixin):
     marketplace_payload_json: Mapped[str] = mapped_column(Text, default="{}")
     notes: Mapped[str] = mapped_column(Text, default="")
 
+    customer: Mapped[Customer | None] = relationship(back_populates="orders")
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order")
     finance_entries: Mapped[list["OrderFinanceEntry"]] = relationship(
         back_populates="order",
@@ -456,6 +489,41 @@ class EbayCategoryAspect(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(32), default="ebay_taxonomy")
     hit_count: Mapped[int] = mapped_column(Integer, default=0)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive, index=True)
+    created_by: Mapped[str] = mapped_column(String(128), default="system")
+
+
+class EbayStoreCategory(Base, TimestampMixin):
+    __tablename__ = "ebay_store_categories"
+    __table_args__ = (
+        UniqueConstraint(
+            "environment",
+            "marketplace_id",
+            "category_path",
+            name="uq_ebay_store_category_env_market_path",
+        ),
+        Index(
+            "ix_ebay_store_category_lookup",
+            "environment",
+            "marketplace_id",
+            "is_active",
+            "sort_order",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    environment: Mapped[str] = mapped_column(String(32), default="local", index=True)
+    marketplace_id: Mapped[str] = mapped_column(String(32), default="EBAY_US", index=True)
+    category_name: Mapped[str] = mapped_column(String(128), default="", index=True)
+    category_path: Mapped[str] = mapped_column(String(512), default="", index=True)
+    parent_path: Mapped[str] = mapped_column(String(512), default="")
+    external_category_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="manual")
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    last_sync_status: Mapped[str] = mapped_column(String(32), default="", index=True)
+    last_sync_message: Mapped[str] = mapped_column(Text, default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String(128), default="system")
 
 

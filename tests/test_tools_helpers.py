@@ -6,11 +6,14 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 
 
 def _bootstrap_views_package() -> None:
+    root = Path(__file__).resolve().parents[1]
+    views_path = str(root / "app" / "components" / "views")
     if "boto3" not in sys.modules:
         fake_boto3 = types.ModuleType("boto3")
         fake_boto3.session = types.SimpleNamespace(Session=lambda *args, **kwargs: None)
@@ -29,10 +32,13 @@ def _bootstrap_views_package() -> None:
 
     if "app.components.views" not in sys.modules:
         pkg = types.ModuleType("app.components.views")
-        pkg.__path__ = []
+        pkg.__path__ = [views_path]
         sys.modules["app.components.views"] = pkg
+    else:
+        existing_path = list(getattr(sys.modules["app.components.views"], "__path__", []) or [])
+        if views_path not in existing_path:
+            sys.modules["app.components.views"].__path__ = [views_path, *existing_path]
 
-    root = Path(__file__).resolve().parents[1]
     for name in ("shared", "workspace_shell"):
         full = f"app.components.views.{name}"
         if full in sys.modules:
@@ -147,6 +153,12 @@ class ToolsHelpersTests(unittest.TestCase):
         domains = tools._parse_domain_csv("https://www.APMEX.com, jmbullion.com,\n")
         self.assertIn("apmex.com", domains)
         self.assertIn("jmbullion.com", domains)
+        self.assertEqual(
+            tools._resolve_duckduckgo_result_url(
+                "https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9tcG0"
+            ),
+            "https://example.com/mpm",
+        )
 
         tokens = tools._tokenize_query("1_oz-silver bar bar")
         self.assertEqual(tokens[0].lower(), "oz")
@@ -243,8 +255,143 @@ class ToolsHelpersTests(unittest.TestCase):
 
         stats = tools._comp_stats(rows)
         self.assertEqual(stats["count"], 2)
+        relevance = tools._comp_row_relevance(
+            "MPM Crown Monarch Precious Metals 3 Troy oz .999 Fine Silver Ingot Bar Silver",
+            {"title": "10 oz .999 Fine Silver Bar - Monarch Poured", "view_url": "https://example.com/10-oz"},
+        )
+        self.assertLess(relevance["score"], 0.55)
+        self.assertIn("weight_mismatch", relevance["flags"])
+        qualified_rows, qualification = tools._qualified_comp_rows(
+            [
+                {"listed_price": 15, "relevance_score": 1.0},
+                {"listed_price": 220, "relevance_score": 1.0},
+                {"listed_price": 235, "relevance_score": 1.0},
+                {"listed_price": 250, "relevance_score": 1.0},
+                {"listed_price": 365, "relevance_score": 1.0},
+                {"listed_price": 210, "relevance_score": 0.2, "relevance_flags": "weight_mismatch"},
+            ]
+        )
+        self.assertEqual(len(qualified_rows), 4)
+        self.assertEqual(qualification["removed_rows"], 2)
+        self.assertEqual(qualification["relevance_removed_rows"], 1)
+        self.assertEqual(qualification["method"], "median_band_45_185_pct")
+        self.assertEqual(qualification["removed_samples"][0]["price"], 15)
         breakdown = tools._comp_cost_breakdown(rows)
         self.assertGreater(breakdown["total_avg"], 0)
+        quality = tools._comp_evidence_quality([], [{"source": "web", "listed_price": 12, "price_confidence_score": 0.8}])
+        self.assertEqual(quality["label"], "active_market_priced")
+        self.assertEqual(quality["web_priced_rows"], 1)
+
+        ai_rows = tools._filter_ai_web_comp_rows(
+            [
+                {"source": "web", "listed_price": 0, "price_confidence_label": "very_low"},
+                {"source": "web", "listed_price": 12, "price_confidence_label": "low"},
+                {"source": "web", "listed_price": 0, "search_scope": "configured_dealer"},
+            ]
+        )
+        self.assertEqual(len(ai_rows), 2)
+        diagnostics = tools._comp_quality_diagnostics(
+            [{"note": "ebay_sold_html_HTTPError: status=403"}],
+            [],
+            [
+                {"domain": "priced.example", "listed_price": 10},
+                {"domain": "blank.example", "listed_price": 0},
+            ],
+        )
+        self.assertIn("403", diagnostics["ebay_status"])
+        self.assertEqual(diagnostics["top_priced_domains"][0][0], "priced.example")
+        self.assertEqual(diagnostics["top_unpriced_domains"][0][0], "blank.example")
+        diag_rows = tools._comp_quality_diagnostics_rows(diagnostics)
+        self.assertTrue(any(row["Signal"] == "eBay sold status" for row in diag_rows))
+        formatted_attempts = tools._format_attempt_rows(
+            [{"note": "ebay_sold_html_HTTPError: status=403"}, {"note": "ebay_finding_error: RuntimeError"}]
+        )
+        self.assertIn("blocked", formatted_attempts[0]["status"])
+        self.assertIn("fallback failed", formatted_attempts[1]["status"])
+        export_payload = tools._comp_evidence_export_payload(
+            query="mpm silver",
+            attempts=[{"note": "ebay_sold_html_HTTPError: status=403"}],
+            rows=[],
+            web_rows=[{"domain": "priced.example", "listed_price": 10}],
+            stats={"count": 1, "median": 10},
+            cost_breakdown={"total_avg": 10},
+            evidence_quality=quality,
+            diagnostics=diagnostics,
+            spot_context={"detected_metal": "silver"},
+        )
+        self.assertEqual(export_payload["query"], "mpm silver")
+        self.assertEqual(len(export_payload["web_rows"]), 1)
+        self.assertEqual(export_payload["spot_context"]["detected_metal"], "silver")
+        self.assertTrue(export_payload["notes"])
+
+    def test_web_comp_search_falls_back_to_bing_when_duckduckgo_anomaly_has_no_results(self):
+        class _Resp:
+            def __init__(self, status_code: int, text: str):
+                self.status_code = status_code
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        duck_html = "<html><body>anomaly</body></html>"
+        bing_html = """
+        <li class="b_algo">
+          <h2><a href="https://example.com/mpm">MPM 3 Troy oz Silver Ingot</a></h2>
+          <p>Dealer result with price $149.95.</p>
+        </li>
+        """
+        with patch.object(
+            tools.requests,
+            "get",
+            side_effect=[_Resp(202, duck_html), _Resp(200, bing_html)],
+        ), patch.object(
+            tools,
+            "_fetch_page_details_batch",
+            return_value={},
+        ):
+            rows = tools._web_comp_search("mpm 3 oz silver ingot", limit=5, page_fetch_limit=1)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["search_provider"], "bing")
+        self.assertEqual(rows[0]["domain"], "example.com")
+        self.assertAlmostEqual(float(rows[0]["listed_price"]), 149.95, places=2)
+
+    def test_web_comp_search_adds_configured_dealer_targeted_rows_when_broad_rows_are_weak(self):
+        calls = []
+
+        def _fake_get(_url, params=None, **_kwargs):
+            q = str((params or {}).get("q") or "")
+            calls.append(q)
+            if q.startswith("site:apmex.com"):
+                return SimpleNamespace(
+                    status_code=200,
+                    text=(
+                        '<a class="result__a" href="https://apmex.com/product/1">Dealer row</a>'
+                        '<div class="result__snippet">Dealer price $99.95</div>'
+                    ),
+                    raise_for_status=lambda: None,
+                )
+            return SimpleNamespace(
+                status_code=200,
+                text='<a class="result__a" href="https://example.com/weak">Weak row</a>',
+                raise_for_status=lambda: None,
+            )
+
+        with patch.object(tools.requests, "get", side_effect=_fake_get), patch.object(
+            tools,
+            "_fetch_page_details_batch",
+            return_value={},
+        ):
+            rows = tools._web_comp_search(
+                "mpm 3 oz silver ingot",
+                limit=5,
+                page_fetch_limit=1,
+                dealer_domains=("apmex.com",),
+            )
+
+        self.assertTrue(any(str(call).startswith("site:apmex.com") for call in calls))
+        self.assertTrue(any(row.get("search_scope") == "configured_dealer" for row in rows))
+        self.assertTrue(any(str(row.get("domain") or "") == "apmex.com" for row in rows))
 
     def test_confidence_and_parser_helpers(self):
         self.assertEqual(tools._detect_metal_from_query("1 oz silver round"), "silver")
@@ -298,6 +445,20 @@ class ToolsHelpersTests(unittest.TestCase):
         amz_html = '<span class="a-offscreen">$9.99</span>'
         prices2 = tools._extract_domain_specific_prices("https://www.amazon.com/dp/x", amz_html)
         self.assertIn(9.99, prices2)
+
+    def test_parse_ebay_product_research_csv_marks_sold_market(self):
+        csv_bytes = (
+            "Item ID,Title,Sold Price,Shipping,Item URL,Sold Date,Condition\n"
+            "123,MPM 3 oz silver bar,$180.00,$5.99,https://www.ebay.com/itm/123,2026-05-01,Used\n"
+        ).encode("utf-8")
+        rows = tools._parse_ebay_product_research_csv(csv_bytes)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "ebay_product_research")
+        self.assertEqual(rows[0]["evidence"], "sold_market")
+        self.assertEqual(rows[0]["item_id"], "123")
+        self.assertEqual(rows[0]["sold_price"], 180.0)
+        self.assertEqual(rows[0]["shipping_cost"], 5.99)
+        self.assertAlmostEqual(rows[0]["total_price"], 185.99)
 
 
     def test_build_inventory_mode_query_prefill_applies_once(self):

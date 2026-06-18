@@ -11,11 +11,21 @@ from app.db.models import AuditLog
 from app.db.session import SessionLocal
 from app.repository import InventoryRepository
 from app.services.runtime_settings import get_runtime_bool, get_runtime_float, get_runtime_int, get_runtime_str
+from app.services.accounting_cogs import (
+    cogs_evidence_split as build_cogs_evidence_split,
+    format_cogs_evidence_split,
+    net_before_cogs as accounting_net_before_cogs,
+    profit_after_returns as accounting_profit_after_returns,
+    profit_before_returns as accounting_profit_before_returns,
+    return_refund_total,
+    returns_profit_impact as accounting_returns_profit_impact,
+)
 from app.services.slack_notify import build_slack_alert_text, dispatch_slack_alert
 from app.services.notification_outbox import (
     cleanup_notification_outbox_retention,
     process_due_notification_outbox,
 )
+from app.services.ai_accountant_identity import AI_ACCOUNTANT_LABEL
 from app.services.ai_accountant_monitor import run_ai_accountant_monitor
 from app.services.lifecycle_retention import cleanup_lifecycle_retention
 from app.services.sync_jobs import execute_sync_job, is_sync_job_enabled, maybe_auto_refresh_ebay_user_token
@@ -151,6 +161,70 @@ def _run_ebay_connection_health_check() -> None:
         )
     except Exception as exc:
         _log(f"Job `ebay_connection_health_check` failed: {exc}")
+    finally:
+        db.close()
+
+
+def _run_ebay_store_categories_sync() -> None:
+    db = SessionLocal()
+    try:
+        repo = InventoryRepository(db)
+        if not is_sync_job_enabled("ebay_store_categories_sync", repo=repo):
+            _log("Job `ebay_store_categories_sync` disabled by configuration.")
+            return
+
+        interval_hours = max(
+            1,
+            int(
+                get_runtime_int(
+                    repo,
+                    "sync_job_ebay_store_categories_sync_interval_hours",
+                    int(getattr(settings, "sync_job_ebay_store_categories_sync_interval_hours", 24)),
+                )
+            ),
+        )
+        now = utcnow_naive()
+        existing = [
+            row
+            for row in repo.list_sync_runs(provider="ebay", limit=500)
+            if str(getattr(row, "job_name", "") or "").strip().lower() == "ebay_store_categories_sync"
+        ]
+        latest = existing[0] if existing else None
+        latest_at = getattr(latest, "completed_at", None) or getattr(latest, "started_at", None)
+        if latest_at is not None:
+            due_at = latest_at + timedelta(hours=int(interval_hours))
+            if due_at > now:
+                _log(
+                    "Skipping `ebay_store_categories_sync` (not due): "
+                    f"next_due={due_at.isoformat(timespec='seconds')} interval_hours={interval_hours}"
+                )
+                return
+
+        token = get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token).strip()
+        if not token:
+            _log("Skipping `ebay_store_categories_sync` (missing eBay access token).")
+            return
+        result = execute_sync_job(
+            repo,
+            job_name="ebay_store_categories_sync",
+            access_token=token,
+            actor=settings.sync_runner_actor,
+            marketplace_id=str(settings.ebay_marketplace_id or "EBAY_US").strip() or "EBAY_US",
+            deactivate_missing=get_runtime_bool(
+                repo,
+                "sync_job_ebay_store_categories_sync_deactivate_missing",
+                bool(getattr(settings, "sync_job_ebay_store_categories_sync_deactivate_missing", False)),
+            ),
+        )
+        _log(
+            "Completed `ebay_store_categories_sync`: "
+            f"run_id={result['run_id']} status={result['status']} "
+            f"processed={result['processed']} updated={result['updated']} "
+            f"missing={result.get('missing', 0)} deactivated={result.get('deactivated', 0)} "
+            f"failed={result['failed']}"
+        )
+    except Exception as exc:
+        _log(f"Job `ebay_store_categories_sync` failed: {exc}")
     finally:
         db.close()
 
@@ -856,7 +930,13 @@ def _run_daily_slack_report() -> None:
             cogs_source_totals[cost_source] = cogs_source_totals.get(cost_source, 0.0) + sale_cogs
             cogs_source_counts[cost_source] = cogs_source_counts.get(cost_source, 0) + 1
         cogs_source_mix = _format_cogs_source_mix(cogs_source_totals, cogs_source_counts)
-        cogs_source_mix_line = f"- COGS source mix 24h: {cogs_source_mix}\n" if cogs_source_mix else ""
+        cogs_evidence_split = build_cogs_evidence_split(cogs_source_totals, cogs_source_counts)
+        cogs_evidence_split_text = format_cogs_evidence_split(cogs_evidence_split)
+        cogs_source_mix_line = ""
+        if cogs_evidence_split_text:
+            cogs_source_mix_line += f"- COGS evidence split 24h: {cogs_evidence_split_text}\n"
+        if cogs_source_mix:
+            cogs_source_mix_line += f"- COGS source mix 24h: {cogs_source_mix}\n"
         actual_24h_rows = []
         if hasattr(repo, "report_sales_actual_econ_rows"):
             try:
@@ -876,7 +956,12 @@ def _run_daily_slack_report() -> None:
             label_spend_24h = float(
                 sum(float(getattr(s, "shipping_label_cost", 0.0) or 0.0) for s in sales_24h)
             )
-            net_24h = gross_24h + shipping_24h - fees_24h - label_spend_24h
+            net_24h = accounting_net_before_cogs(
+                gross=gross_24h,
+                shipping_charged=shipping_24h,
+                fees=fees_24h,
+                label_spend=label_spend_24h,
+            )
 
         returns_24h_rows = []
         if hasattr(repo, "report_returns_rows"):
@@ -890,9 +975,11 @@ def _run_daily_slack_report() -> None:
         returns_24h_count = len(returns_24h_rows)
         returns_refund_24h = round(
             sum(
-                _safe_float(row.get("refund_amount"))
-                + _safe_float(row.get("refund_fees"))
-                + _safe_float(row.get("refund_shipping"))
+                return_refund_total(
+                    refund_amount=row.get("refund_amount"),
+                    refund_fees=row.get("refund_fees"),
+                    refund_shipping=row.get("refund_shipping"),
+                )
                 for row in returns_24h_rows
             ),
             2,
@@ -907,10 +994,19 @@ def _run_daily_slack_report() -> None:
             elif product_id > 0:
                 returns_cogs_reversal_24h += _safe_float(default_unit_cost_by_product.get(product_id)) * return_qty
         returns_cogs_reversal_24h = round(float(returns_cogs_reversal_24h), 2)
-        returns_profit_impact_24h = round(-returns_refund_24h + returns_cogs_reversal_24h, 2)
-        profit_before_returns_24h = round(net_24h - cogs_24h, 2)
+        returns_profit_impact_24h = accounting_returns_profit_impact(
+            refund_total=returns_refund_24h,
+            cogs_reversal=returns_cogs_reversal_24h,
+        )
+        profit_before_returns_24h = accounting_profit_before_returns(
+            net_before_cogs_amount=net_24h,
+            cogs=cogs_24h,
+        )
         net_after_returns_24h = round(net_24h - returns_refund_24h, 2)
-        estimated_profit_24h = round(profit_before_returns_24h + returns_profit_impact_24h, 2)
+        estimated_profit_24h = accounting_profit_after_returns(
+            profit_before_returns_amount=profit_before_returns_24h,
+            returns_profit_impact_amount=returns_profit_impact_24h,
+        )
 
         draft_listings = [
             l for l in listings if str(getattr(l, "listing_status", "") or "").strip().lower() == "draft"
@@ -1017,6 +1113,8 @@ def _run_daily_slack_report() -> None:
                 "estimated_profit_24h": f"{estimated_profit_24h:,.2f}",
                 "cogs_source_mix": cogs_source_mix,
                 "cogs_source_mix_line": cogs_source_mix_line,
+                "cogs_evidence_split": cogs_evidence_split,
+                "cogs_evidence_split_text": cogs_evidence_split_text,
                 "order_count": int(len(orders)),
                 "orders_24h_count": int(len(orders_24h)),
                 "inventory_cost": f"{float(metrics.get('inventory_cost', 0.0)):,.2f}",
@@ -1071,6 +1169,7 @@ def _run_daily_slack_report() -> None:
                 "cogs_source_totals": {
                     source: round(float(total), 2) for source, total in sorted(cogs_source_totals.items())
                 },
+                "cogs_evidence_split": cogs_evidence_split,
                 "normalized_fee_coverage_triggered": bool(normalized_fee_coverage_health.get("triggered")),
                 "normalized_fee_coverage_latest_week_start": str(
                     normalized_fee_coverage_health.get("latest_week_start") or ""
@@ -1237,7 +1336,7 @@ def _run_ai_accountant_monitor_schedule() -> None:
     try:
         repo = InventoryRepository(db)
         if not get_runtime_bool(repo, "ai_accountant_monitor_enabled", True):
-            _log("AI Accountant monitor disabled: `ai_accountant_monitor_enabled=false`.")
+            _log(f"{AI_ACCOUNTANT_LABEL} monitor disabled: `ai_accountant_monitor_enabled=false`.")
             return
         schedule_mode = str(get_runtime_str(repo, "ai_accountant_monitor_schedule_mode", "interval") or "interval").strip().lower()
         if schedule_mode == "daily":
@@ -1260,7 +1359,7 @@ def _run_ai_accountant_monitor_schedule() -> None:
             )
         if not due:
             _log(
-                "Skipping AI Accountant monitor (not due): "
+                f"Skipping {AI_ACCOUNTANT_LABEL} monitor (not due): "
                 f"local_now={local_now.isoformat(timespec='seconds')}"
             )
             return
@@ -1324,7 +1423,7 @@ def _run_ai_accountant_monitor_schedule() -> None:
             },
         )
         _log(
-            "Completed AI Accountant monitor: "
+            f"Completed {AI_ACCOUNTANT_LABEL} monitor: "
             f"items={result.get('item_count')} actionable={result.get('actionable_count')} "
             f"audit_id={result.get('audit_id') or '-'} slack_outbox_id={result.get('slack_outbox_id') or '-'} "
             f"review_status="
@@ -1378,7 +1477,7 @@ def _run_ai_accountant_monitor_schedule() -> None:
             )
         except Exception:
             pass
-        _log(f"AI Accountant monitor failed: {exc}")
+        _log(f"{AI_ACCOUNTANT_LABEL} monitor failed: {exc}")
     finally:
         db.close()
 
@@ -1461,6 +1560,7 @@ def _run_lifecycle_archive_cleanup() -> None:
 def run_once() -> None:
     _run_ebay_token_auto_refresh()
     _run_ebay_connection_health_check()
+    _run_ebay_store_categories_sync()
     _run_ebay_orders_pull_import()
     _run_governance_snapshot_schedule()
     _run_scheduled_db_backup()

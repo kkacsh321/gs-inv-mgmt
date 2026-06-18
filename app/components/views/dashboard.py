@@ -4,7 +4,110 @@ import pandas as pd
 
 from app.repository import InventoryRepository
 from app.components.views.shared import as_money, render_help_panel
+from app.services.accounting_cogs import (
+    COGS_REVIEW_SOURCES,
+    net_before_cogs as accounting_net_before_cogs,
+    profit_after_returns as accounting_profit_after_returns,
+    profit_before_returns as accounting_profit_before_returns,
+    shipping_delta as accounting_shipping_delta,
+)
 from app.utils.time import utcnow_naive
+
+
+def _dashboard_active_suppression_keys(repo: InventoryRepository) -> set[tuple[str, str, int]]:
+    if not hasattr(repo, "accounting_exception_suppression_keys"):
+        return set()
+    try:
+        return set(repo.accounting_exception_suppression_keys() or set())
+    except Exception:
+        db = getattr(repo, "db", None)
+        if db is not None and hasattr(db, "rollback"):
+            db.rollback()
+        return set()
+
+
+def _render_profit_basis_review_actions(
+    repo: InventoryRepository,
+    profit_basis_df: pd.DataFrame,
+    active_suppression_keys: set[tuple[str, str, int]],
+) -> None:
+    if profit_basis_df is None or profit_basis_df.empty or not hasattr(repo, "suppress_accounting_exception"):
+        return
+    action_rows: list[dict[str, object]] = []
+    for row in profit_basis_df.to_dict("records"):
+        sale_id = int(row.get("sale_id") or 0)
+        if sale_id <= 0:
+            continue
+        if float(row.get("profit_before_returns") or 0.0) < 0:
+            key = ("nonpositive_margin", "sale", sale_id)
+            if key not in active_suppression_keys:
+                action_rows.append(
+                    {
+                        "sale_id": sale_id,
+                        "exception_type": "nonpositive_margin",
+                        "label": "Mark negative margin reviewed",
+                        "details": (
+                            f"Dashboard Profit Basis Audit margin review: SKU={row.get('sku')}; "
+                            f"net_before_cogs={row.get('net_before_cogs')}; fifo_cogs={row.get('fifo_cogs')}; "
+                            f"profit_before_returns={row.get('profit_before_returns')}; "
+                            f"cost_source={row.get('fifo_cost_source')}."
+                        ),
+                    }
+                )
+        if bool(row.get("basis_review_required")) and str(row.get("fifo_cost_source") or "") == "mixed_fifo_cost":
+            key = ("mixed_fifo_cost_review", "sale", sale_id)
+            if key not in active_suppression_keys:
+                action_rows.append(
+                    {
+                        "sale_id": sale_id,
+                        "exception_type": "mixed_fifo_cost_review",
+                        "label": "Mark mixed FIFO COGS reviewed",
+                        "details": (
+                            f"Dashboard Profit Basis Audit mixed FIFO review: SKU={row.get('sku')}; "
+                            f"fifo_cogs={row.get('fifo_cogs')}; evidence_rows={row.get('fifo_cogs_evidence_rows')}; "
+                            f"basis_reason={row.get('basis_review_reason')}."
+                        ),
+                    }
+                )
+    if not action_rows:
+        return
+
+    with st.expander("Profit Basis Review Actions", expanded=False):
+        st.caption(
+            "Record an audit-backed review decision after confirming the sale economics and COGS evidence. "
+            "This does not change sale totals or COGS; it only marks the live dashboard warning as reviewed."
+        )
+        note = st.text_input(
+            "Review note",
+            value="Reviewed from Dashboard Profit Basis Audit; no repair needed.",
+            key="dashboard_profit_basis_review_note",
+        )
+        seen: set[tuple[str, int]] = set()
+        for row in action_rows:
+            exception_type = str(row.get("exception_type") or "").strip()
+            sale_id = int(row.get("sale_id") or 0)
+            key = (exception_type, sale_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if st.button(
+                f"{row.get('label')}: sale #{sale_id}",
+                key=f"dashboard_profit_basis_review_{exception_type}_{sale_id}",
+            ):
+                try:
+                    repo.suppress_accounting_exception(
+                        exception_type=exception_type,
+                        target_entity_type="sale",
+                        target_entity_id=sale_id,
+                        actor="dashboard",
+                        reason=str(note or "").strip(),
+                        details=str(row.get("details") or "").strip(),
+                    )
+                    st.success(f"Recorded dashboard review decision for sale #{sale_id}.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Unable to record dashboard review decision for sale #{sale_id}: {exc}")
+
 
 def render_dashboard(repo: InventoryRepository) -> None:
     st.subheader("Dashboard")
@@ -74,9 +177,28 @@ def render_dashboard(repo: InventoryRepository) -> None:
         ebay_fee_type_breakdown_30d = dict(live.get("ebay_fee_type_breakdown_30d") or {})
         cogs_source_counts_30d = dict(live.get("sales_30d_cogs_source_counts") or {})
         cogs_review_count_30d = int(live.get("sales_30d_cogs_review_count") or 0)
+        cogs_review_amount_30d = float(live.get("sales_30d_cogs_review_amount") or 0.0)
+        cogs_review_sale_ids_30d = [
+            int(value)
+            for value in list(live.get("sales_30d_cogs_review_sale_ids") or [])
+            if int(value or 0) > 0
+        ]
+        cogs_estimate_amount_30d = float(live.get("sales_30d_cogs_estimate_amount") or 0.0)
+        cogs_verified_amount_30d = float(live.get("sales_30d_cogs_verified_amount") or 0.0)
         profit_basis_status_30d = str(live.get("sales_30d_profit_basis_status") or "ok").strip().lower()
         bundle_sale_count_30d = int(live.get("sales_30d_bundle_sale_count") or 0)
         bundle_inventory_units_sold_30d = int(live.get("sales_30d_bundle_inventory_units_sold") or 0)
+        lot_listing_movement_mismatch_count_30d = int(
+            live.get("sales_30d_lot_listing_movement_mismatch_count") or 0
+        )
+        lot_listing_movement_mismatch_units_30d = float(
+            live.get("sales_30d_lot_listing_movement_mismatch_units") or 0.0
+        )
+        lot_listing_movement_mismatch_sale_ids_30d = [
+            int(value)
+            for value in list(live.get("sales_30d_lot_listing_movement_mismatch_sale_ids") or [])
+            if int(value or 0) > 0
+        ]
     else:
         all_sales = repo.list_sales() if hasattr(repo, "list_sales") else []
         all_orders = repo.list_orders() if hasattr(repo, "list_orders") else []
@@ -120,7 +242,12 @@ def render_dashboard(repo: InventoryRepository) -> None:
             fees_7d = sum(float(s.fees or 0.0) for s in sales_7d)
             shipping_7d = sum(float(s.shipping_cost or 0.0) for s in sales_7d)
             label_spend_7d = sum(float(getattr(s, "shipping_label_cost", 0.0) or 0.0) for s in sales_7d)
-            net_7d = gross_7d + shipping_7d - fees_7d - label_spend_7d
+            net_7d = accounting_net_before_cogs(
+                gross=gross_7d,
+                shipping_charged=shipping_7d,
+                fees=fees_7d,
+                label_spend=label_spend_7d,
+            )
         gross_30d = sum(float(s.sold_price or 0.0) for s in sales_30d)
         fees_30d = sum(float(s.fees or 0.0) for s in sales_30d)
         shipping_30d = sum(float(s.shipping_cost or 0.0) for s in sales_30d)
@@ -133,7 +260,12 @@ def render_dashboard(repo: InventoryRepository) -> None:
             shipping_label_spend_30d = order_shipping_label_spend_30d
         else:
             shipping_label_spend_30d = sales_shipping_label_spend_30d
-        net_30d = gross_30d + shipping_30d - fees_30d - shipping_label_spend_30d
+        net_30d = accounting_net_before_cogs(
+            gross=gross_30d,
+            shipping_charged=shipping_30d,
+            fees=fees_30d,
+            label_spend=shipping_label_spend_30d,
+        )
         if actual_30d_rows:
             gross_30d = sum(float(row.get("sold_price") or 0.0) for row in actual_30d_rows)
             fees_30d = sum(float(row.get("allocated_fee_actual") or 0.0) for row in actual_30d_rows)
@@ -159,9 +291,6 @@ def render_dashboard(repo: InventoryRepository) -> None:
             else 0.0
             for s in sales_30d
         )
-        profit_before_returns_30d = net_30d - est_cogs_30d
-        est_profit_30d = profit_before_returns_30d
-        shipping_delta_30d = shipping_30d - shipping_label_spend_30d
         shipped_30d = sum(
             1 for o in orders_30d if str(o.order_status or "").strip().lower() in {"shipped", "delivered"}
         )
@@ -178,14 +307,33 @@ def render_dashboard(repo: InventoryRepository) -> None:
         ebay_fee_type_breakdown_30d = {}
         cogs_source_counts_30d = {}
         cogs_review_count_30d = 0
+        cogs_review_amount_30d = 0.0
+        cogs_review_sale_ids_30d = []
+        cogs_estimate_amount_30d = 0.0
+        cogs_verified_amount_30d = 0.0
         profit_basis_status_30d = "ok"
         bundle_sale_count_30d = 0
         bundle_inventory_units_sold_30d = 0
+        lot_listing_movement_mismatch_count_30d = 0
+        lot_listing_movement_mismatch_units_30d = 0.0
+        lot_listing_movement_mismatch_sale_ids_30d = []
         returns_30d_count = 0
         returns_refund_total_30d = 0.0
         returns_cogs_reversal_30d = 0.0
         returns_profit_impact_30d = 0.0
         net_after_returns_30d = net_30d
+        profit_before_returns_30d = accounting_profit_before_returns(
+            net_before_cogs_amount=net_30d,
+            cogs=est_cogs_30d,
+        )
+        est_profit_30d = accounting_profit_after_returns(
+            profit_before_returns_amount=profit_before_returns_30d,
+            returns_profit_impact_amount=returns_profit_impact_30d,
+        )
+        shipping_delta_30d = accounting_shipping_delta(
+            shipping_charged=shipping_30d,
+            label_spend=shipping_label_spend_30d,
+        )
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Products", metrics["product_count"])
@@ -234,8 +382,13 @@ def render_dashboard(repo: InventoryRepository) -> None:
         "then applies return profit impact (`-refunds - returned fees/shipping + returned COGS reversal`). "
         "When available, COGS uses time-aware FIFO lot costs; otherwise it falls back to product landed cost "
         "(`acquisition + tax + inbound shipping + handling`) and then `product_cost`. "
-        "Use Reports for detailed reconciliation and close packet evidence."
+        "Use Reports for detailed reconciliation and close packet evidence. Reports close-ready means the selected "
+        "period has reviewed evidence/decisions; Dashboard remains a live 30-day operational view."
     )
+
+    def caption_money(value: float) -> str:
+        return as_money(value).replace("$", r"\$")
+
     if returns_30d_count > 0:
         st.caption(
             f"Returns adjusted 30d profit from {as_money(profit_before_returns_30d)} "
@@ -246,6 +399,19 @@ def render_dashboard(repo: InventoryRepository) -> None:
             f"Bundle accounting detected {bundle_sale_count_30d} bundle sale(s) in the last 30 days, "
             f"representing {bundle_inventory_units_sold_30d} inventory unit(s) consumed by bundle components."
         )
+    if lot_listing_movement_mismatch_count_30d > 0:
+        sale_id_hint = (
+            f" Sale IDs: {', '.join(str(value) for value in lot_listing_movement_mismatch_sale_ids_30d[:10])}."
+            if lot_listing_movement_mismatch_sale_ids_30d
+            else ""
+        )
+        st.warning(
+            "Lot listing inventory movement mismatch detected: "
+            f"{lot_listing_movement_mismatch_count_30d} sale(s) need reconciliation, "
+            f"covering {lot_listing_movement_mismatch_units_30d:g} inventory unit(s). "
+            "Review Reports > Accounting Exception Queue before close sign-off."
+            f"{sale_id_hint}"
+        )
     if cogs_source_counts_30d:
         cogs_source_labels = ", ".join(
             f"{source}: {count}"
@@ -255,16 +421,31 @@ def render_dashboard(repo: InventoryRepository) -> None:
         if cogs_source_labels:
             st.caption(f"COGS source mix (30d sales): {cogs_source_labels}.")
     if profit_basis_status_30d == "review_needed":
+        sale_id_hint = (
+            f" Sale IDs: {', '.join(str(value) for value in cogs_review_sale_ids_30d[:10])}."
+            if cogs_review_sale_ids_30d
+            else ""
+        )
         st.warning(
             "Estimated profit needs cost-basis review: "
-            f"{cogs_review_count_30d} sale(s) used equal-fallback, mixed, or missing COGS basis. "
+            f"{cogs_review_count_30d} sale(s) / {as_money(cogs_review_amount_30d)} COGS used equal-fallback, "
+            "mixed, or missing COGS basis. "
             "For lots that are not fully checked in, set expected lot quantity, allocation weights, "
             "or assignment-level costs so sold COGS is not overstated."
+            f"{sale_id_hint}"
         )
     elif profit_basis_status_30d == "partial_lot_estimate":
         st.caption(
-            "Estimated profit includes partial-lot COGS based on expected lot quantity. "
+            f"Estimated profit includes {as_money(cogs_estimate_amount_30d)} partial-lot COGS "
+            "based on expected lot quantity. "
             "Finalize lot check-in/allocation before close sign-off."
+        )
+    if cogs_verified_amount_30d > 0 or cogs_estimate_amount_30d > 0 or cogs_review_amount_30d > 0:
+        st.caption(
+            "COGS evidence split (30d): "
+            f"verified {caption_money(cogs_verified_amount_30d)}, "
+            f"estimated {caption_money(cogs_estimate_amount_30d)}, "
+            f"needs review {caption_money(cogs_review_amount_30d)}."
         )
 
     if load_profit_basis_audit:
@@ -284,18 +465,89 @@ def render_dashboard(repo: InventoryRepository) -> None:
                 st.warning(f"Profit basis audit could not be loaded: {exc}")
             if profit_basis_rows:
                 profit_basis_df = pd.DataFrame(profit_basis_rows)
+                active_suppression_keys = _dashboard_active_suppression_keys(repo)
+                if "listing_bundle_inventory_units_sold" in profit_basis_df.columns:
+                    bundle_inventory_units = int(
+                        pd.to_numeric(
+                            profit_basis_df["listing_bundle_inventory_units_sold"],
+                            errors="coerce",
+                        )
+                        .fillna(0)
+                        .sum()
+                    )
+                    bundle_sale_rows = int(
+                        (
+                            pd.to_numeric(
+                                profit_basis_df["listing_bundle_inventory_units_sold"],
+                                errors="coerce",
+                            ).fillna(0)
+                            > 0
+                        ).sum()
+                    )
+                    if bundle_inventory_units > 0:
+                        st.caption(
+                            "Bundle/lot quantity note: `quantity_sold` is marketplace listing units sold. "
+                            "`listing_bundle_inventory_units_sold` is inventory units consumed for COGS "
+                            f"({bundle_inventory_units} inventory unit(s) across {bundle_sale_rows} row(s) in this view)."
+                        )
+                if "listing_lot_movement_mismatch_units" in profit_basis_df.columns:
+                    mismatch_units = int(
+                        pd.to_numeric(
+                            profit_basis_df["listing_lot_movement_mismatch_units"],
+                            errors="coerce",
+                        )
+                        .fillna(0)
+                        .sum()
+                    )
+                    mismatch_rows = int(
+                        (
+                            pd.to_numeric(
+                                profit_basis_df["listing_lot_movement_mismatch_units"],
+                                errors="coerce",
+                            ).fillna(0)
+                            > 0
+                        ).sum()
+                    )
+                    if mismatch_units > 0:
+                        st.warning(
+                            "Profit Basis Audit found lot-listing movement drift in this view: "
+                            f"{mismatch_units} inventory unit(s) across {mismatch_rows} sale row(s). "
+                            "Compare `inventory_movement_units_expected` to `inventory_movement_units_recorded`."
+                        )
                 st.dataframe(profit_basis_df, use_container_width=True, hide_index=True)
-                negative_count = int((profit_basis_df["profit_before_returns"] < 0).sum())
-                review_count = int(
-                    profit_basis_df["fifo_cost_source"]
-                    .astype(str)
-                    .isin({"lot_equal_quantity_fallback", "missing_cost_basis", "mixed_fifo_cost"})
-                    .sum()
-                )
-                if negative_count or review_count:
+                _render_profit_basis_review_actions(repo, profit_basis_df, active_suppression_keys)
+                negative_mask = profit_basis_df["profit_before_returns"] < 0
+                negative_count = int(negative_mask.sum())
+                if active_suppression_keys and "sale_id" in profit_basis_df.columns:
+                    suppressed_negative_mask = profit_basis_df["sale_id"].map(
+                        lambda sale_id: (
+                            "nonpositive_margin",
+                            "sale",
+                            int(sale_id or 0),
+                        )
+                        in active_suppression_keys
+                    )
+                    unreviewed_negative_count = int((negative_mask & ~suppressed_negative_mask).sum())
+                else:
+                    unreviewed_negative_count = negative_count
+                if "basis_review_required" in profit_basis_df.columns:
+                    review_count = int(profit_basis_df["basis_review_required"].astype(bool).sum())
+                else:
+                    review_count = int(
+                        profit_basis_df["fifo_cost_source"]
+                        .astype(str)
+                        .isin(COGS_REVIEW_SOURCES)
+                        .sum()
+                    )
+                if unreviewed_negative_count or review_count:
                     st.warning(
-                        f"Profit basis audit found {negative_count} negative before-return sale row(s) "
+                        f"Profit basis audit found {unreviewed_negative_count} unreviewed negative before-return sale row(s) "
                         f"and {review_count} row(s) with review-needed COGS source."
+                    )
+                elif negative_count:
+                    st.caption(
+                        f"Profit basis audit includes {negative_count} negative before-return sale row(s), "
+                        "all marked reviewed/accepted for close."
                     )
             else:
                 st.info("No dashboard profit-basis rows found for the last 30 days.")

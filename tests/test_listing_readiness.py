@@ -161,6 +161,26 @@ class ListingReadinessTests(unittest.TestCase):
             result.blockers,
         )
 
+    def test_listing_description_over_4000_chars_blocks_publish(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update({"listing_description": "x" * 4001})
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "blocked")
+        self.assertIn(
+            "eBay listing description must be 4000 characters or fewer (currently 4001)",
+            result.blockers,
+        )
+
+    def test_empty_listing_description_blocks_publish_when_provided(self) -> None:
+        kwargs = self._base_kwargs()
+        kwargs.update({"listing_description": ""})
+        result = evaluate_ebay_readiness(**kwargs)
+        self.assertEqual(result.status, "blocked")
+        self.assertIn(
+            "eBay listing description must be between 1 and 4000 characters",
+            result.blockers,
+        )
+
     def test_numerical_coin_grade_requires_approved_grader_evidence(self) -> None:
         kwargs = self._base_kwargs()
         kwargs.update(

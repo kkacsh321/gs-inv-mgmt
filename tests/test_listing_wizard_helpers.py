@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 
 
 def _bootstrap_views_package() -> None:
+    root = Path(__file__).resolve().parents[1]
+    views_path = str(root / "app" / "components" / "views")
     if "boto3" not in sys.modules:
         fake_boto3 = types.ModuleType("boto3")
         fake_boto3.session = types.SimpleNamespace(Session=lambda *args, **kwargs: None)
@@ -24,10 +26,13 @@ def _bootstrap_views_package() -> None:
         sys.modules["botocore.exceptions"] = fake_botocore_exceptions
     if "app.components.views" not in sys.modules:
         pkg = types.ModuleType("app.components.views")
-        pkg.__path__ = []
+        pkg.__path__ = [views_path]
         sys.modules["app.components.views"] = pkg
+    else:
+        existing_path = list(getattr(sys.modules["app.components.views"], "__path__", []) or [])
+        if views_path not in existing_path:
+            sys.modules["app.components.views"].__path__ = [views_path, *existing_path]
 
-    root = Path(__file__).resolve().parents[1]
     for name in ("shared", "workspace_shell", "entity_ops"):
         full_name = f"app.components.views.{name}"
         if full_name in sys.modules:
@@ -128,6 +133,38 @@ class ListingWizardHelperTests(unittest.TestCase):
         self.assertEqual([row.id for row in rows], [1])
         self.assertEqual(len(repo.calls), 1)
         self.assertEqual(repo.calls[0]["limit"], 75)
+
+    def test_wizard_promote_direct_post_retry_metadata_keeps_retry_identity(self):
+        publish_meta = {"format": "AUCTION", "offer_id": "old-offer"}
+
+        updated = listing_wizard._wizard_promote_direct_post_retry_metadata(
+            publish_meta,
+            {
+                "inventory_sku": "GS-CO-CO-26120-604B-L140",
+                "product_sku": "GS-CO-CO-26120-604B",
+                "offer_id": "new-offer",
+            },
+        )
+
+        self.assertEqual(updated["format"], "AUCTION")
+        self.assertEqual(updated["inventory_sku"], "GS-CO-CO-26120-604B-L140")
+        self.assertEqual(updated["product_sku"], "GS-CO-CO-26120-604B")
+        self.assertEqual(updated["offer_id"], "new-offer")
+        self.assertEqual(publish_meta["offer_id"], "old-offer")
+
+    def test_wizard_promote_direct_post_retry_metadata_ignores_blank_context_values(self):
+        updated = listing_wizard._wizard_promote_direct_post_retry_metadata(
+            {
+                "inventory_sku": "EXISTING-SKU",
+                "product_sku": "EXISTING-PRODUCT",
+                "offer_id": "EXISTING-OFFER",
+            },
+            {"inventory_sku": "", "product_sku": None, "offer_id": "   "},
+        )
+
+        self.assertEqual(updated["inventory_sku"], "EXISTING-SKU")
+        self.assertEqual(updated["product_sku"], "EXISTING-PRODUCT")
+        self.assertEqual(updated["offer_id"], "EXISTING-OFFER")
 
     def test_build_listing_bundle_metadata_for_single_product_lot(self):
         product = types.SimpleNamespace(
@@ -267,12 +304,21 @@ class ListingWizardHelperTests(unittest.TestCase):
 
     def test_known_unit_cost_sums_landed_components(self):
         product = types.SimpleNamespace(
+            product_cost=0.0,
+            acquisition_cost=10.0,
+            acquisition_tax_paid=1.5,
+            acquisition_shipping_paid=0.75,
+            acquisition_handling_paid=0.25,
+        )
+        explicit = types.SimpleNamespace(
+            product_cost=9.25,
             acquisition_cost=10.0,
             acquisition_tax_paid=1.5,
             acquisition_shipping_paid=0.75,
             acquisition_handling_paid=0.25,
         )
         self.assertEqual(listing_wizard._known_unit_cost(product), 12.5)
+        self.assertEqual(listing_wizard._known_unit_cost(explicit), 9.25)
         self.assertEqual(listing_wizard._known_unit_cost(None), 0.0)
 
     def test_order_media_rows_for_primary_prefers_media_id_or_upload_filename(self):
@@ -639,6 +685,9 @@ class ListingWizardHelperTests(unittest.TestCase):
         self.assertEqual(float(score.get("known_cogs_total") or 0.0), 40.0)
         self.assertEqual(float(score.get("estimated_local_shipping_total") or 0.0), 10.0)
         self.assertEqual(float(score.get("expected_net") or 0.0), 38.0)
+        self.assertEqual(float(score.get("breakeven_listing_price") or 0.0), 56.82)
+        self.assertEqual(float(score.get("breakeven_unit_price") or 0.0), 28.41)
+        self.assertEqual(float(score.get("price_cushion") or 0.0), 43.18)
         self.assertEqual(str(score.get("score") or ""), "strong")
 
     def test_suggested_price_band_derives_missing_values(self):
@@ -675,6 +724,30 @@ class ListingWizardHelperTests(unittest.TestCase):
         self.assertNotIn("onclick", sanitized.lower())
         self.assertNotIn("javascript:", sanitized.lower())
 
+    def test_format_listing_description_for_ebay_preserves_plain_text_structure(self):
+        raw = (
+            "In Case of FIAT Emergency\n\n"
+            "Limited Edition Silver Shot Display\n\n"
+            "Offered here is a handcrafted display piece.\n\n"
+            "What's Included\n"
+            "• Handcrafted stained wood display\n"
+            "• 1/2 Troy Ounce of .999 Fine Silver Shot\n\n"
+            "Thank you for supporting Golden Stackers."
+        )
+        formatted = listing_wizard._format_listing_description_for_ebay(raw)
+        self.assertIn("<h3>In Case of FIAT Emergency</h3>", formatted)
+        self.assertIn("<p>Offered here is a handcrafted display piece.</p>", formatted)
+        self.assertIn("<ul>", formatted)
+        self.assertIn("<li>Handcrafted stained wood display</li>", formatted)
+        self.assertIn("<li>1/2 Troy Ounce of .999 Fine Silver Shot</li>", formatted)
+
+    def test_format_listing_description_for_ebay_sanitizes_existing_html(self):
+        raw = "<div onclick='bad()'>Nice</div><script>x()</script>"
+        formatted = listing_wizard._format_listing_description_for_ebay(raw)
+        self.assertIn("<div>Nice</div>", formatted)
+        self.assertNotIn("onclick", formatted.lower())
+        self.assertNotIn("<script", formatted.lower())
+
     def test_build_ebay_offer_payload_fixed_price_includes_quantity_and_best_offer(self):
         payload = listing_wizard._wizard_build_ebay_offer_payload(
             sku="SKU-1",
@@ -696,9 +769,11 @@ class ListingWizardHelperTests(unittest.TestCase):
             auction_start_price=0.0,
             auction_reserve_price=0.0,
             auction_buy_now_price=0.0,
+            store_category_names=["/Coins/Bullion", "/Copper/Rounds", ""],
         )
         self.assertEqual(payload["format"], "FIXED_PRICE")
         self.assertEqual(payload["availableQuantity"], 5)
+        self.assertEqual(payload["storeCategoryNames"], ["/Coins/Bullion", "/Copper/Rounds"])
         self.assertEqual(payload["pricingSummary"]["price"]["value"], "19.99")
         self.assertEqual(
             payload["listingPolicies"]["bestOfferTerms"]["autoAcceptPrice"]["value"],

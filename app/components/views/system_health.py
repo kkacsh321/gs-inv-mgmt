@@ -18,6 +18,8 @@ from app.db.models import IntegrationQueueJob
 from app.services.config_health import health_state, required_env_keys, required_runtime_keys
 from app.services.ebay import EbayClient
 from app.services.env_manager import read_env_file
+from app.services.ai_accountant_monitor import list_ai_accountant_answers
+from app.services.ai_accountant_identity import AI_ACCOUNTANT_NAME
 from app.services.integration_queue import process_integration_queue_job
 from app.services.media_storage import MediaStorageService
 from app.services.llm_runtime import describe_llm_runtime_chain
@@ -262,16 +264,16 @@ def _ai_accountant_monitor_health_row(repo: Any, *, now: datetime) -> dict:
     )
     if next_due:
         details = f"{details} next_due={next_due}"
-    return _status_row("AI Accountant Monitor", status, details)
+    return _status_row(f"{AI_ACCOUNTANT_NAME} Monitor", status, details)
 
 
 def _ai_accountant_runtime_route_health_row(repo: Any) -> dict:
     try:
         rows = describe_llm_runtime_chain(repo, workflow="accounting")
     except Exception as exc:
-        return _status_row("AI Accountant LLM Route", "error", f"runtime_chain_error={str(exc)[:240]}")
+        return _status_row(f"{AI_ACCOUNTANT_NAME} LLM Route", "error", f"runtime_chain_error={str(exc)[:240]}")
     if not rows:
-        return _status_row("AI Accountant LLM Route", "error", "runtime_chain=empty workflow=accounting")
+        return _status_row(f"{AI_ACCOUNTANT_NAME} LLM Route", "error", "runtime_chain=empty workflow=accounting")
     error_rows = [row for row in rows if str(row.get("status") or "").strip().lower() == "error"]
     ready_rows = [
         row
@@ -304,7 +306,7 @@ def _ai_accountant_runtime_route_health_row(repo: Any) -> dict:
     )
     if error_rows:
         details = f"{details} error={str(error_rows[0].get('error') or '')[:240]}"
-    return _status_row("AI Accountant LLM Route", status, details)
+    return _status_row(f"{AI_ACCOUNTANT_NAME} LLM Route", status, details)
 
 
 def _ai_accountant_latest_review_health_row(repo: Any) -> dict:
@@ -318,7 +320,7 @@ def _ai_accountant_latest_review_health_row(repo: Any) -> dict:
         ORDER BY created_at DESC, id DESC
         LIMIT 10
         """,
-        label="AI Accountant monitor review event",
+        label=f"{AI_ACCOUNTANT_NAME} monitor review event",
     )
     latest_payload: dict[str, Any] = {}
     latest_created_at = ""
@@ -337,7 +339,7 @@ def _ai_accountant_latest_review_health_row(repo: Any) -> dict:
         break
     if not latest_payload:
         return _status_row(
-            "AI Accountant Review Evidence",
+            f"{AI_ACCOUNTANT_NAME} Review Evidence",
             "warn",
             "no recent ai_accountant monitor integration event found",
         )
@@ -367,7 +369,35 @@ def _ai_accountant_latest_review_health_row(repo: Any) -> dict:
         details = f"{details} route={review_route[:180]}"
     if review_error:
         details = f"{details} error={review_error[:220]}"
-    return _status_row("AI Accountant Review Evidence", status, details)
+    return _status_row(f"{AI_ACCOUNTANT_NAME} Review Evidence", status, details)
+
+
+def _ai_accountant_answer_followup_health_row(repo: Any) -> dict:
+    try:
+        rows = list_ai_accountant_answers(repo, limit=100)
+    except Exception as exc:
+        return _status_row(
+            f"{AI_ACCOUNTANT_NAME} Answer Follow-Ups",
+            "warn",
+            f"unable_to_load_answer_followups error={str(exc)[:220]}",
+        )
+    status_counts: dict[str, int] = {}
+    for row in rows or []:
+        status = str(row.get("followup_status") or "unreviewed").strip().lower() or "unreviewed"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    needs_more_info = _safe_int(status_counts.get("needs_more_info"))
+    obsolete = _safe_int(status_counts.get("obsolete"))
+    applied = _safe_int(status_counts.get("applied"))
+    unreviewed = _safe_int(status_counts.get("unreviewed"))
+    answered = _safe_int(status_counts.get("answered"))
+    status = "warn" if needs_more_info or obsolete else "ok"
+    details = (
+        f"answers={len(rows or [])} needs_more_info={needs_more_info} obsolete={obsolete} "
+        f"applied={applied} unreviewed={unreviewed} answered={answered}"
+    )
+    if needs_more_info or obsolete:
+        details = f"{details} action=record_replacement_answer_or_mark_resolved"
+    return _status_row(f"{AI_ACCOUNTANT_NAME} Answer Follow-Ups", status, details)
 
 
 def _system_health_critical_slack_policy(repo: Any) -> dict[str, Any]:
@@ -899,6 +929,7 @@ def render_system_health(repo) -> None:
     service_rows.append(_ai_accountant_monitor_health_row(repo, now=local_now))
     service_rows.append(_ai_accountant_runtime_route_health_row(repo))
     service_rows.append(_ai_accountant_latest_review_health_row(repo))
+    service_rows.append(_ai_accountant_answer_followup_health_row(repo))
     service_rows.append(_system_health_critical_alert_policy_row(repo))
 
     st.dataframe(pd.DataFrame(service_rows), use_container_width=True)
@@ -2353,6 +2384,9 @@ def render_system_health(repo) -> None:
         "sync_job_ebay_shipping_tracking_push_enabled",
         "sync_job_ebay_connection_health_check_enabled",
         "sync_job_ebay_connection_health_check_interval_minutes",
+        "sync_job_ebay_store_categories_sync_enabled",
+        "sync_job_ebay_store_categories_sync_interval_hours",
+        "sync_job_ebay_store_categories_sync_deactivate_missing",
         "sync_job_quickbooks_export_enabled",
         "sync_job_shopify_orders_pull_enabled",
         "comp_llm_system_message",

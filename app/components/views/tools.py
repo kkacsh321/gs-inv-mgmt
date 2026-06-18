@@ -1,6 +1,7 @@
 import re
 import json
 import io
+import base64
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,14 @@ from app.services.ai_text import (
     normalize_ai_text,
     parse_coin_grader_structured,
 )
-from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str, is_ai_domain_enabled
+from app.services.ebay_fee_estimator import calculate_ebay_fee_profit_estimate, resolve_product_known_unit_cost
+from app.services.runtime_settings import (
+    get_runtime_bool,
+    get_runtime_float,
+    get_runtime_int,
+    get_runtime_str,
+    is_ai_domain_enabled,
+)
 from app.services.spot_price import (
     SpotPriceService,
     SpotRateLimitError,
@@ -269,6 +277,278 @@ def _parse_domain_csv(value: str) -> tuple[str, ...]:
     return tuple(domains) if domains else DEFAULT_COMP_DEALER_DOMAINS
 
 
+
+
+def _money_decimal(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0.00")
+    if isinstance(value, Decimal):
+        return value
+    raw = str(value).strip().replace("$", "").replace(",", "")
+    if not raw:
+        return Decimal("0.00")
+    try:
+        return Decimal(raw)
+    except Exception:
+        return Decimal("0.00")
+
+
+def calculate_ebay_fee_estimate(
+    *,
+    sale_price: Any,
+    buyer_shipping_charged: Any = 0,
+    sales_tax_collected: Any = 0,
+    item_cost: Any = 0,
+    shipping_label_cost: Any = 0,
+    packaging_cost: Any = 0,
+    final_value_fee_percent: Any = 13.25,
+    fixed_order_fee: Any | None = None,
+    promoted_ad_percent: Any = 0,
+    additional_fee_percent: Any = 0,
+    insertion_or_upgrade_fee: Any = 0,
+    include_sales_tax_in_fee_basis: bool = True,
+) -> dict[str, Decimal]:
+    return calculate_ebay_fee_profit_estimate(
+        sale_price=sale_price,
+        buyer_shipping_charged=buyer_shipping_charged,
+        sales_tax_collected=sales_tax_collected,
+        item_cost=item_cost,
+        shipping_label_cost=shipping_label_cost,
+        packaging_cost=packaging_cost,
+        final_value_fee_percent=final_value_fee_percent,
+        fixed_order_fee=fixed_order_fee,
+        promoted_ad_percent=promoted_ad_percent,
+        additional_fee_percent=additional_fee_percent,
+        insertion_or_upgrade_fee=insertion_or_upgrade_fee,
+        include_sales_tax_in_fee_basis=include_sales_tax_in_fee_basis,
+    )
+
+
+def _money_text(value: Any) -> str:
+    return f"${float(_money_decimal(value)):,.2f}"
+
+
+def _product_known_unit_cost(product: Any) -> Decimal:
+    return resolve_product_known_unit_cost(product)
+
+
+def _render_ebay_fee_calculator(repo: InventoryRepository) -> None:
+    st.caption(
+        "Estimate eBay fees, shipping economics, cost basis, and profit before posting or repricing. "
+        "Rates are editable because eBay fees vary by category, store subscription, seller performance, "
+        "listing upgrades, ads, and order details."
+    )
+    st.info(
+        "eBay describes final value fees as a percentage of the total sale amount plus a per-order fee. "
+        "The total sale amount can include item price, buyer-paid shipping/handling, sales tax, and other applicable fees. "
+        "Use this as a pricing estimate and reconcile actual sales against imported eBay finance entries."
+    )
+
+    with st.expander("Load Cost From Inventory Product", expanded=False):
+        ps1, ps2 = st.columns([2, 1])
+        with ps1:
+            product_search = st.text_input(
+                "Search product by SKU, title, category, metal, or ID",
+                key="ebay_fee_calc_product_search",
+                placeholder="Optional",
+            )
+        with ps2:
+            product_limit = st.number_input(
+                "Result limit",
+                min_value=5,
+                max_value=100,
+                value=25,
+                step=5,
+                key="ebay_fee_calc_product_limit",
+            )
+        try:
+            product_rows = repo.list_products(
+                search_query=str(product_search or "").strip() or None,
+                limit=int(product_limit or 25),
+            )
+        except Exception as exc:
+            product_rows = []
+            st.warning(f"Unable to load products for fee calculator: {exc}")
+        if product_rows:
+            product_options = {
+                f"#{int(getattr(row, 'id', 0) or 0)} | {getattr(row, 'sku', '')} | {getattr(row, 'title', '')}": row
+                for row in product_rows
+            }
+            selected_product_label = st.selectbox(
+                "Product",
+                options=list(product_options.keys()),
+                key="ebay_fee_calc_product_pick",
+            )
+            selected_product = product_options.get(selected_product_label)
+            selected_product_cost = _product_known_unit_cost(selected_product)
+            st.caption(
+                f"Resolved product cost: {_money_text(selected_product_cost)}. "
+                "Uses `product_cost` first, then landed acquisition fields."
+            )
+            if st.button("Use Product Cost In Calculator", key="ebay_fee_calc_apply_product_cost"):
+                st.session_state["ebay_fee_calc_item_cost"] = float(selected_product_cost)
+                st.success(f"Applied {_money_text(selected_product_cost)} to Item cost / COGS.")
+        else:
+            st.caption("No matching products found.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sale_price = st.number_input(
+            "Sale price",
+            min_value=0.0,
+            value=100.0,
+            step=1.0,
+            format="%.2f",
+            key="ebay_fee_calc_sale_price",
+        )
+        item_cost = st.number_input(
+            "Item cost / COGS",
+            min_value=0.0,
+            value=50.0,
+            step=1.0,
+            format="%.2f",
+            key="ebay_fee_calc_item_cost",
+        )
+        buyer_shipping_charged = st.number_input(
+            "Buyer shipping charged",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            format="%.2f",
+            key="ebay_fee_calc_shipping_charged",
+        )
+    with c2:
+        shipping_label_cost = st.number_input(
+            "Shipping label cost",
+            min_value=0.0,
+            value=5.0,
+            step=0.5,
+            format="%.2f",
+            key="ebay_fee_calc_label_cost",
+        )
+        packaging_cost = st.number_input(
+            "Packaging / handling cost",
+            min_value=0.0,
+            value=0.75,
+            step=0.25,
+            format="%.2f",
+            key="ebay_fee_calc_packaging_cost",
+        )
+        sales_tax_collected = st.number_input(
+            "Sales tax collected by marketplace",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            format="%.2f",
+            key="ebay_fee_calc_sales_tax",
+        )
+    with c3:
+        final_value_fee_percent = st.number_input(
+            "Final value fee %",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(get_runtime_float(repo, "ebay_fee_estimate_final_value_rate_percent", 13.25)),
+            step=0.05,
+            format="%.2f",
+            key="ebay_fee_calc_fvf_pct",
+        )
+        fixed_order_fee = st.number_input(
+            "Fixed per-order fee",
+            min_value=0.0,
+            value=float(get_runtime_float(repo, "ebay_fee_estimate_final_value_fixed_per_order_usd", 0.30)),
+            step=0.05,
+            format="%.2f",
+            key="ebay_fee_calc_fixed_fee",
+        )
+        promoted_ad_percent = st.number_input(
+            "Promoted listing ad rate %",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(get_runtime_float(repo, "ebay_fee_estimate_promoted_rate_percent", 0.0)),
+            step=0.25,
+            format="%.2f",
+            key="ebay_fee_calc_ad_pct",
+        )
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        additional_fee_percent = st.number_input(
+            "Additional fee / surcharge %",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(get_runtime_float(repo, "ebay_fee_estimate_payment_rate_percent", 0.0)),
+            step=0.25,
+            format="%.2f",
+            key="ebay_fee_calc_additional_pct",
+            help="Use for international fees, below-standard seller surcharges, or another percentage fee.",
+        )
+    with a2:
+        insertion_or_upgrade_fee = st.number_input(
+            "Insertion / upgrade / fixed surcharge",
+            min_value=0.0,
+            value=float(get_runtime_float(repo, "ebay_fee_estimate_payment_fixed_per_order_usd", 0.0)),
+            step=0.25,
+            format="%.2f",
+            key="ebay_fee_calc_upgrade_fee",
+        )
+    with a3:
+        include_sales_tax_in_fee_basis = st.checkbox(
+            "Include sales tax in fee basis",
+            value=True,
+            key="ebay_fee_calc_include_tax",
+        )
+
+    estimate = calculate_ebay_fee_estimate(
+        sale_price=sale_price,
+        buyer_shipping_charged=buyer_shipping_charged,
+        sales_tax_collected=sales_tax_collected,
+        item_cost=item_cost,
+        shipping_label_cost=shipping_label_cost,
+        packaging_cost=packaging_cost,
+        final_value_fee_percent=final_value_fee_percent,
+        fixed_order_fee=fixed_order_fee,
+        promoted_ad_percent=promoted_ad_percent,
+        additional_fee_percent=additional_fee_percent,
+        insertion_or_upgrade_fee=insertion_or_upgrade_fee,
+        include_sales_tax_in_fee_basis=bool(include_sales_tax_in_fee_basis),
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Estimated eBay Fees", _money_text(estimate["estimated_total_fees"]))
+    m2.metric("Net Before COGS", _money_text(estimate["net_before_cogs"]))
+    m3.metric("Estimated Profit", _money_text(estimate["estimated_profit"]))
+    m4.metric("Margin", f"{estimate['margin_percent']:,.2f}%")
+    st.caption(
+        f"Estimated sale price needed to break even with these assumptions: "
+        f"{_money_text(estimate['breakeven_sale_price'])}."
+    )
+
+    breakdown_rows = [
+        {"Component": "Sale price", "Amount": estimate["sale_price"]},
+        {"Component": "Buyer shipping charged", "Amount": estimate["buyer_shipping_charged"]},
+        {"Component": "Sales tax collected", "Amount": estimate["sales_tax_collected"]},
+        {"Component": "Fee basis", "Amount": estimate["fee_basis"]},
+        {"Component": "Final value fee", "Amount": -estimate["final_value_fee"]},
+        {"Component": "Fixed order fee", "Amount": -estimate["fixed_order_fee"]},
+        {"Component": "Promoted listing ad fee", "Amount": -estimate["promoted_ad_fee"]},
+        {"Component": "Additional fee / surcharge", "Amount": -estimate["additional_fee"]},
+        {"Component": "Insertion / upgrade fee", "Amount": -estimate["insertion_or_upgrade_fee"]},
+        {"Component": "Shipping label cost", "Amount": -estimate["shipping_label_cost"]},
+        {"Component": "Packaging / handling cost", "Amount": -estimate["packaging_cost"]},
+        {"Component": "Item cost / COGS", "Amount": -estimate["item_cost"]},
+        {"Component": "Estimated profit", "Amount": estimate["estimated_profit"]},
+    ]
+    breakdown_df = pd.DataFrame(
+        [{"Component": row["Component"], "Amount": float(row["Amount"])} for row in breakdown_rows]
+    )
+    st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download Fee Estimate CSV",
+        data=breakdown_df.to_csv(index=False).encode("utf-8"),
+        file_name="ebay_fee_profit_estimate.csv",
+        mime="text/csv",
+        key="download_ebay_fee_estimate_csv",
+    )
 
 
 def _tokenize_query(value: str) -> list[str]:
@@ -554,6 +834,204 @@ def _effective_total_price(row: dict) -> float:
     return listed + shipping
 
 
+def _comp_csv_money(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        if pd.isna(value):
+            return 0.0
+    except Exception:
+        pass
+    raw = str(value or "").strip()
+    if not raw or raw.lower() in {"nan", "none", "null", "--"}:
+        return 0.0
+    negative = raw.startswith("(") and raw.endswith(")")
+    cleaned = (
+        raw.replace("$", "")
+        .replace(",", "")
+        .replace("USD", "")
+        .replace("US", "")
+        .replace("(", "")
+        .replace(")", "")
+        .strip()
+    )
+    match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", cleaned)
+    if not match:
+        return 0.0
+    try:
+        amount = float(match.group(0))
+    except Exception:
+        return 0.0
+    if negative and amount > 0:
+        amount *= -1
+    return max(0.0, amount)
+
+
+def _comp_csv_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    raw = str(value or "").strip()
+    if raw.lower() in {"nan", "none", "null"}:
+        return ""
+    return raw
+
+
+def _normalize_comp_csv_column(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _first_present_csv_col(column_map: dict[str, str], candidates: list[str]) -> str:
+    for candidate in candidates:
+        key = _normalize_comp_csv_column(candidate)
+        if key in column_map:
+            return column_map[key]
+    return ""
+
+
+def _parse_ebay_product_research_csv(data: bytes | str | None) -> list[dict]:
+    if data is None:
+        return []
+    try:
+        raw_bytes = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    except Exception:
+        return []
+    if not raw_bytes:
+        return []
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes), dtype=str, encoding="utf-8-sig")
+    except Exception:
+        try:
+            df = pd.read_csv(io.BytesIO(raw_bytes), dtype=str)
+        except Exception:
+            return []
+    if df.empty:
+        return []
+    column_map = {_normalize_comp_csv_column(col): col for col in df.columns}
+    title_col = _first_present_csv_col(
+        column_map,
+        ["title", "item title", "listing title", "name", "product title"],
+    )
+    sold_col = _first_present_csv_col(
+        column_map,
+        ["sold price", "sale price", "item price", "price", "avg sold price"],
+    )
+    total_col = _first_present_csv_col(
+        column_map,
+        ["total price", "total", "order total", "sold total", "item total"],
+    )
+    shipping_col = _first_present_csv_col(
+        column_map,
+        ["shipping", "shipping cost", "shipping price", "postage"],
+    )
+    url_col = _first_present_csv_col(
+        column_map,
+        ["item url", "listing url", "url", "view item url", "link"],
+    )
+    item_id_col = _first_present_csv_col(
+        column_map,
+        ["item id", "itemid", "listing id", "legacy item id"],
+    )
+    date_col = _first_present_csv_col(
+        column_map,
+        ["sold date", "date sold", "sale date", "end date", "date"],
+    )
+    condition_col = _first_present_csv_col(column_map, ["condition", "item condition"])
+    currency_col = _first_present_csv_col(column_map, ["currency", "currency id"])
+    rows: list[dict] = []
+    for _, source_row in df.iterrows():
+        sold_price = _comp_csv_money(source_row.get(sold_col)) if sold_col else 0.0
+        shipping_cost = _comp_csv_money(source_row.get(shipping_col)) if shipping_col else 0.0
+        total_price = _comp_csv_money(source_row.get(total_col)) if total_col else 0.0
+        if total_price <= 0 and sold_price > 0:
+            total_price = sold_price + shipping_cost
+        if sold_price <= 0 and total_price > 0:
+            sold_price = max(0.0, total_price - shipping_cost)
+        if total_price <= 0:
+            continue
+        rows.append(
+            {
+                "item_id": _comp_csv_text(source_row.get(item_id_col)) if item_id_col else "",
+                "title": _comp_csv_text(source_row.get(title_col)) if title_col else "",
+                "sold_price": sold_price,
+                "shipping_cost": shipping_cost,
+                "total_price": total_price,
+                "currency": (_comp_csv_text(source_row.get(currency_col)) if currency_col else "USD") or "USD",
+                "condition": _comp_csv_text(source_row.get(condition_col)) if condition_col else "",
+                "end_time": _comp_csv_text(source_row.get(date_col)) if date_col else "",
+                "view_url": _comp_csv_text(source_row.get(url_col)) if url_col else "",
+                "gallery_url": "",
+                "source": "ebay_product_research",
+                "evidence": "sold_market",
+            }
+        )
+    return rows
+
+
+def _extract_target_weight_oz(text: str) -> float:
+    raw = str(text or "").lower()
+    patterns = [
+        r"\b([0-9]+(?:\.[0-9]+)?)\s*(?:troy\s*)?oz\b",
+        r"\b([0-9]+(?:\.[0-9]+)?)\s*(?:troy\s*)?ounces?\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1))
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _comp_row_relevance(query: str, row: dict) -> dict[str, Any]:
+    target_weight = _extract_target_weight_oz(query)
+    title = str(row.get("title") or "")
+    snippet = str(row.get("snippet") or "")
+    url = str(row.get("view_url") or "")
+    title_blob = f"{title} {url}".lower()
+    full_blob = f"{title} {snippet} {url}".lower()
+    flags: list[str] = []
+    score = 1.0
+    if target_weight > 0:
+        title_weight = _extract_target_weight_oz(title_blob)
+        full_weight = _extract_target_weight_oz(full_blob)
+        if title_weight > 0 and abs(title_weight - target_weight) > 0.05:
+            score -= 0.65
+            flags.append("weight_mismatch")
+        elif title_weight <= 0 and full_weight <= 0:
+            score -= 0.35
+            flags.append("target_weight_missing")
+        elif title_weight <= 0 and full_weight > 0:
+            score -= 0.20
+            flags.append("target_weight_not_in_title")
+    generic_terms = [
+        "for sale | ebay",
+        "bullion bars for sale",
+        "buy monarch silver bullion bars",
+        "silver-bullion/silver-bars",
+    ]
+    if any(term in full_blob for term in generic_terms):
+        score -= 0.30
+        flags.append("generic_category_page")
+    if len(title.strip()) < 12:
+        score -= 0.15
+        flags.append("thin_title")
+    score = max(0.0, min(1.0, score))
+    return {
+        "score": round(score, 4),
+        "flags": flags,
+        "target_weight_oz": target_weight,
+    }
+
+
 def _representative_price(prices: list[float]) -> float:
     vals = sorted(float(p) for p in prices if float(p) > 0)
     if not vals:
@@ -579,6 +1057,73 @@ def _comp_stats(rows: list[dict]) -> dict[str, float]:
         "low": min(prices),
         "high": max(prices),
     }
+
+
+def _qualified_comp_rows(rows: list[dict]) -> tuple[list[dict], dict[str, Any]]:
+    priced = [row for row in rows if _effective_total_price(row) > 0.0]
+    relevance_excluded = [
+        row
+        for row in priced
+        if float(row.get("relevance_score", 1.0) or 0.0) < 0.55
+    ]
+    relevance_ok = [
+        row
+        for row in priced
+        if float(row.get("relevance_score", 1.0) or 0.0) >= 0.55
+    ]
+    candidate_priced = relevance_ok if len(relevance_ok) >= 3 else priced
+    if len(priced) < 4:
+        return candidate_priced, {
+            "method": "all_priced_lt4",
+            "priced_rows": len(priced),
+            "qualified_rows": len(candidate_priced),
+            "removed_rows": max(0, len(priced) - len(candidate_priced)),
+            "low_cut": 0.0,
+            "high_cut": 0.0,
+            "relevance_removed_rows": len(relevance_excluded) if candidate_priced is not priced else 0,
+            "removed_samples": _comp_removed_sample_rows(relevance_excluded if candidate_priced is not priced else []),
+        }
+    prices = sorted(_effective_total_price(row) for row in candidate_priced)
+    median = _representative_price(prices)
+    low_cut = max(0.0, median * 0.45)
+    high_cut = median * 1.85
+    qualified = [
+        row for row in candidate_priced if low_cut <= _effective_total_price(row) <= high_cut
+    ]
+    if len(qualified) < 3:
+        qualified = candidate_priced
+        method = "all_priced_guardrail_min3"
+    else:
+        method = "median_band_45_185_pct"
+    qualified_ids = {id(row) for row in qualified}
+    removed = [row for row in priced if id(row) not in qualified_ids]
+    removed_samples = _comp_removed_sample_rows(removed)
+    return qualified, {
+        "method": method,
+        "priced_rows": len(priced),
+        "qualified_rows": len(qualified),
+        "removed_rows": max(0, len(priced) - len(qualified)),
+        "low_cut": round(low_cut, 2),
+        "high_cut": round(high_cut, 2),
+        "relevance_removed_rows": len(relevance_excluded) if len(relevance_ok) >= 3 else 0,
+        "removed_samples": removed_samples,
+    }
+
+
+def _comp_removed_sample_rows(rows: list[dict]) -> list[dict[str, Any]]:
+    return [
+        {
+            "price": round(_effective_total_price(row), 2),
+            "domain": str(row.get("domain") or "").strip(),
+            "title": str(row.get("title") or "").strip()[:160],
+            "view_url": str(row.get("view_url") or "").strip(),
+            "price_confidence_score": float(row.get("price_confidence_score") or 0.0),
+            "price_confidence_label": str(row.get("price_confidence_label") or "").strip(),
+            "relevance_score": float(row.get("relevance_score", 1.0) or 0.0),
+            "relevance_flags": str(row.get("relevance_flags") or ""),
+        }
+        for row in rows[:10]
+    ]
 
 
 def _comp_cost_breakdown(rows: list[dict]) -> dict[str, float]:
@@ -612,6 +1157,192 @@ def _comp_cost_breakdown(rows: list[dict]) -> dict[str, float]:
         "shipping_avg": shipping_avg,
         "total_avg": total_avg,
         "shipping_pct_of_total": shipping_pct,
+    }
+
+
+def _comp_evidence_quality(rows: list[dict], web_rows: list[dict]) -> dict[str, Any]:
+    sold_rows = [row for row in rows if float(row.get("sold_price") or 0.0) > 0.0]
+    web_priced_rows = [row for row in web_rows if _effective_total_price(row) > 0.0]
+    web_high_confidence_rows = [
+        row
+        for row in web_priced_rows
+        if float(row.get("price_confidence_score") or 0.0) >= 0.65
+        and float(row.get("relevance_score", 1.0) or 0.0) >= 0.55
+    ]
+    web_active_market_rows = [
+        row
+        for row in web_rows
+        if str(row.get("source") or "").strip().lower() == "web"
+        and str(row.get("domain") or "").strip().lower()
+    ]
+    dealer_rows = [
+        row
+        for row in web_rows
+        if str(row.get("search_scope") or "").strip().lower() == "configured_dealer"
+    ]
+    if sold_rows:
+        label = "sold_market"
+        note = "Pricing metrics are based on sold eBay comparable rows."
+    elif web_high_confidence_rows:
+        label = "active_market_priced"
+        note = (
+            "No sold eBay rows were available; pricing metrics use priced active/listed web evidence. "
+            "Treat confidence as medium at most until sold comps are available."
+        )
+    elif web_priced_rows:
+        label = "active_market_low_confidence"
+        note = "No sold eBay rows were available; priced web evidence should be treated as active/listed-market guidance."
+    elif web_active_market_rows:
+        label = "research_links_only"
+        note = "No sold or priced rows were available; rows are research links only and should not drive pricing."
+    else:
+        label = "no_evidence"
+        note = "No comparable evidence was returned."
+    return {
+        "label": label,
+        "note": note,
+        "sold_rows": len(sold_rows),
+        "web_rows": len(web_rows or []),
+        "web_priced_rows": len(web_priced_rows),
+        "web_high_confidence_rows": len(web_high_confidence_rows),
+        "configured_dealer_rows": len(dealer_rows),
+    }
+
+
+def _filter_ai_web_comp_rows(web_rows: list[dict]) -> list[dict]:
+    return [
+        row
+        for row in (web_rows or [])
+        if _effective_total_price(row) > 0.0
+        or str(row.get("price_confidence_label") or "").strip().lower() in {"medium", "high"}
+        or str(row.get("search_scope") or "").strip().lower() == "configured_dealer"
+    ]
+
+
+def _comp_quality_diagnostics(
+    attempts: list[dict],
+    rows: list[dict],
+    web_rows: list[dict],
+) -> dict[str, Any]:
+    web_priced_by_domain: dict[str, int] = {}
+    web_unpriced_by_domain: dict[str, int] = {}
+    for row in web_rows or []:
+        domain = str(row.get("domain") or "").strip().lower() or "(unknown)"
+        if _effective_total_price(row) > 0.0:
+            web_priced_by_domain[domain] = int(web_priced_by_domain.get(domain, 0) + 1)
+        else:
+            web_unpriced_by_domain[domain] = int(web_unpriced_by_domain.get(domain, 0) + 1)
+    top_priced_domains = sorted(web_priced_by_domain.items(), key=lambda kv: int(kv[1]), reverse=True)[:8]
+    top_unpriced_domains = sorted(web_unpriced_by_domain.items(), key=lambda kv: int(kv[1]), reverse=True)[:8]
+    ebay_notes = [
+        str(attempt.get("note") or "")
+        for attempt in attempts or []
+        if str(attempt.get("note") or "").strip().lower().startswith("ebay_")
+    ]
+    retry_actions: list[str] = []
+    if not rows:
+        retry_actions.append("Use broader item terms or production eBay sold/research data for true sold comps.")
+    if web_rows and not web_priced_by_domain:
+        retry_actions.append("Increase Web Detail Fetch Limit or use a specific dealer/domain include filter.")
+    if top_unpriced_domains:
+        retry_actions.append(f"Try Domain Focus for `{top_unpriced_domains[0][0]}`.")
+    if not web_rows:
+        retry_actions.append("Enable web fallback or broaden the query to brand + type + weight.")
+    return {
+        "ebay_status": "; ".join(ebay_notes[-4:]) if ebay_notes else "not attempted",
+        "top_priced_domains": top_priced_domains,
+        "top_unpriced_domains": top_unpriced_domains,
+        "retry_actions": retry_actions,
+    }
+
+
+def _comp_quality_diagnostics_rows(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = [
+        {"Signal": "eBay sold status", "Value": str(diagnostics.get("ebay_status") or "")}
+    ]
+    priced = diagnostics.get("top_priced_domains") or []
+    unpriced = diagnostics.get("top_unpriced_domains") or []
+    rows.append(
+        {
+            "Signal": "Top priced domains",
+            "Value": ", ".join(f"{domain} ({count})" for domain, count in priced) or "none",
+        }
+    )
+    rows.append(
+        {
+            "Signal": "Top unpriced domains",
+            "Value": ", ".join(f"{domain} ({count})" for domain, count in unpriced) or "none",
+        }
+    )
+    for idx, action in enumerate(diagnostics.get("retry_actions") or [], start=1):
+        rows.append({"Signal": f"Suggested retry {idx}", "Value": str(action)})
+    return rows
+
+
+def _friendly_ebay_attempt_note(note: str) -> str:
+    raw = str(note or "").strip()
+    lowered = raw.lower()
+    if lowered.startswith("ebay_sold_html_httperror") and "status=403" in lowered:
+        return "eBay public sold-results HTML blocked this server with HTTP 403; web fallback was used."
+    if lowered.startswith("ebay_finding_error"):
+        return "eBay Finding API fallback failed; see detail column. Web fallback was used."
+    if lowered.startswith("ebay_finding_sandbox"):
+        return "eBay Finding API searched sandbox data, which usually has little/no real sold comp inventory."
+    if lowered.startswith("ebay_finding_production"):
+        return "eBay Finding API searched production data."
+    if lowered == "ebay_product_research_csv_import":
+        return "Manual eBay Product Research/Terapeak CSV imported as sold-market evidence."
+    if lowered == "ebay_marketplace_insights":
+        return "Official eBay Marketplace Insights item-sales API returned sold-market rows."
+    if lowered.startswith("ebay_marketplace_insights_denied"):
+        return "Marketplace Insights API denied access; verify the token includes the required buy.marketplace.insights scope."
+    if lowered.startswith("ebay_marketplace_insights_token_error"):
+        return "Marketplace Insights app-token request failed; verify eBay app credentials and API access."
+    if lowered.startswith("ebay_marketplace_insights_not_configured"):
+        return "Marketplace Insights API was not configured because no eBay access token is available."
+    if lowered == "ebay_sold_html_empty":
+        return "eBay public sold-results HTML returned no parsed sold rows."
+    return raw
+
+
+def _format_attempt_rows(attempts: list[dict]) -> list[dict]:
+    formatted: list[dict] = []
+    for attempt in attempts or []:
+        row = dict(attempt or {})
+        note = str(row.get("note") or "")
+        row["status"] = _friendly_ebay_attempt_note(note)
+        formatted.append(row)
+    return formatted
+
+
+def _comp_evidence_export_payload(
+    *,
+    query: str,
+    attempts: list[dict],
+    rows: list[dict],
+    web_rows: list[dict],
+    stats: dict[str, float],
+    cost_breakdown: dict[str, float],
+    evidence_quality: dict[str, Any],
+    diagnostics: dict[str, Any],
+    spot_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "query": str(query or "").strip(),
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "stats": dict(stats or {}),
+        "cost_breakdown": dict(cost_breakdown or {}),
+        "evidence_quality": dict(evidence_quality or {}),
+        "diagnostics": dict(diagnostics or {}),
+        "spot_context": dict(spot_context or {}),
+        "attempts": list(attempts or []),
+        "ebay_sold_rows": list(rows or []),
+        "web_rows": list(web_rows or []),
+        "notes": [
+            "eBay sold rows with sold_price are sold-market evidence.",
+            "Web rows are active/listed/research evidence unless explicitly proven sold.",
+            "Use diagnostics and raw URLs before relying on low-confidence rows for pricing.",
+        ],
     }
 
 
@@ -1314,7 +2045,21 @@ def _resolve_duckduckgo_result_url(raw_url: str) -> str:
     if not url:
         return ""
     if "duckduckgo.com/l/?" not in url:
-        return url
+        if "bing.com/ck/a" not in url:
+            return url
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        encoded_target = params.get("u", [""])[0]
+        if not encoded_target:
+            return url
+        if encoded_target.startswith("a1"):
+            encoded_target = encoded_target[2:]
+        try:
+            padded = encoded_target + ("=" * (-len(encoded_target) % 4))
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="ignore")
+            return decoded if decoded.startswith(("http://", "https://")) else url
+        except Exception:
+            return url
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     uddg = params.get("uddg", [""])[0]
@@ -1326,6 +2071,7 @@ def _web_comp_search(
     limit: int = 20,
     page_fetch_limit: int = 8,
     dealer_domains: tuple[str, ...] | None = None,
+    include_dealer_targeted: bool = True,
 ) -> list[dict]:
     q = (query or "").strip()
     if not q:
@@ -1336,16 +2082,55 @@ def _web_comp_search(
     response.raise_for_status()
     html_text = response.text or ""
 
+    search_provider = "duckduckgo"
     anchors = re.findall(
-        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        r'<a[^>]*class=["\'][^"\']*result__a[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
         html_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
     snippets = re.findall(
-        r'<[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</[^>]+>',
+        r'<[^>]*class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>(.*?)</[^>]+>',
         html_text,
         flags=re.IGNORECASE | re.DOTALL,
     )
+    if not anchors and ("anomaly" in html_text.lower() or response.status_code == 202):
+        try:
+            bing_response = requests.get(
+                "https://www.bing.com/search",
+                params={"q": q},
+                headers=headers,
+                timeout=30,
+            )
+            bing_response.raise_for_status()
+            bing_html = bing_response.text or ""
+            blocks = re.findall(
+                r'<li[^>]*class=["\'][^"\']*\bb_algo\b[^"\']*["\'][^>]*>(.*?)</li>',
+                bing_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            bing_anchors: list[tuple[str, str]] = []
+            bing_snippets: list[str] = []
+            for block in blocks:
+                link_match = re.search(
+                    r'<h2[^>]*>\s*<a[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                    block,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if not link_match:
+                    continue
+                bing_anchors.append((link_match.group(1), link_match.group(2)))
+                snippet_match = re.search(
+                    r'<p[^>]*>(.*?)</p>',
+                    block,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                bing_snippets.append(snippet_match.group(1) if snippet_match else "")
+            if bing_anchors:
+                anchors = bing_anchors
+                snippets = bing_snippets
+                search_provider = "bing"
+        except Exception:
+            pass
     rows: list[dict] = []
     candidates: list[dict] = []
     max_page_fetches = min(max(1, int(limit)), max(1, int(page_fetch_limit)))
@@ -1442,35 +2227,70 @@ def _web_comp_search(
             domain="",
             dealer_domains=dealer_domains,
         )
-        rows.append(
-            {
-                "source": "web",
-                "domain": host,
-                "title": title,
-                "snippet": snippet,
-                "view_url": resolved_url,
-                "sold_price": 0.0,
-                "listed_price": listed_price,
-                "listed_price_low": listed_low,
-                "listed_price_high": listed_high,
-                "tier_price_low": float(page_details.get("tier_low") or 0.0),
-                "tier_price_high": float(page_details.get("tier_high") or 0.0),
-                "tier_count": tier_count,
-                "tier_prices_json": str(page_details.get("tiers_json") or "[]"),
-                "page_parser_source": parser_source,
-                "page_source_counts_json": str(page_details.get("source_counts_json") or "{}"),
-                "shipping_cost": 0.0,
-                "total_price": listed_price,
-                "currency": "USD",
-                "condition": "",
-                "end_time": "",
-                "price_hint_count": len(price_hints),
-                "price_hint_source": price_hint_source,
-                "price_confidence_score": confidence_score,
-                "price_confidence_label": confidence_label,
-                "price_confidence_domain_delta": round(float(confidence_score) - float(baseline_score), 4),
-            }
-        )
+        row = {
+            "source": "web",
+            "search_provider": search_provider,
+            "search_scope": "broad_web",
+            "search_query": q,
+            "domain": host,
+            "title": title,
+            "snippet": snippet,
+            "view_url": resolved_url,
+            "sold_price": 0.0,
+            "listed_price": listed_price,
+            "listed_price_low": listed_low,
+            "listed_price_high": listed_high,
+            "tier_price_low": float(page_details.get("tier_low") or 0.0),
+            "tier_price_high": float(page_details.get("tier_high") or 0.0),
+            "tier_count": tier_count,
+            "tier_prices_json": str(page_details.get("tiers_json") or "[]"),
+            "page_parser_source": parser_source,
+            "page_source_counts_json": str(page_details.get("source_counts_json") or "{}"),
+            "shipping_cost": 0.0,
+            "total_price": listed_price,
+            "currency": "USD",
+            "condition": "",
+            "end_time": "",
+            "price_hint_count": len(price_hints),
+            "price_hint_source": price_hint_source,
+            "price_confidence_score": confidence_score,
+            "price_confidence_label": confidence_label,
+            "price_confidence_domain_delta": round(float(confidence_score) - float(baseline_score), 4),
+        }
+        relevance = _comp_row_relevance(q, row)
+        row["relevance_score"] = relevance["score"]
+        row["relevance_flags"] = ",".join(relevance["flags"])
+        row["target_weight_oz"] = relevance["target_weight_oz"]
+        rows.append(row)
+    if include_dealer_targeted and dealer_domains:
+        priced_rows = [row for row in rows if float(row.get("total_price") or 0.0) > 0.0]
+        if len(priced_rows) < 3:
+            seen_urls = {str(row.get("view_url") or "").strip() for row in rows if str(row.get("view_url") or "").strip()}
+            dealer_limit = min(6, len(dealer_domains))
+            for dealer_domain in list(dealer_domains)[:dealer_limit]:
+                domain = str(dealer_domain or "").strip().lower()
+                if not domain:
+                    continue
+                targeted_query = f"site:{domain} {q}"
+                try:
+                    targeted_rows = _web_comp_search(
+                        targeted_query,
+                        limit=min(5, max(1, int(limit))),
+                        page_fetch_limit=min(2, max(1, int(page_fetch_limit))),
+                        dealer_domains=dealer_domains,
+                        include_dealer_targeted=False,
+                    )
+                except Exception:
+                    targeted_rows = []
+                for row in targeted_rows:
+                    view_url = str(row.get("view_url") or "").strip()
+                    if view_url and view_url in seen_urls:
+                        continue
+                    if view_url:
+                        seen_urls.add(view_url)
+                    row["search_scope"] = "configured_dealer"
+                    row["search_query"] = targeted_query
+                    rows.append(row)
     return rows
 
 
@@ -1494,10 +2314,11 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
         ],
         roadmap_phase="v0.2 Operations Foundation",
     )
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
             "Gram ↔ Troy Oz",
             "Spot Estimator",
+            "eBay Fee Calculator",
             "Comp Tool",
             "Coin Grader",
             "Coin Identifier",
@@ -1583,6 +2404,9 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
         st.caption(f"Premium/discount vs melt: ${spread:,.2f}")
 
     with tab3:
+        _render_ebay_fee_calculator(repo)
+
+    with tab4:
         if not comp_tool_enabled:
             st.info("Comp Tool is currently disabled by Admin AI domain toggle.")
         if not can_use_comp_tool:
@@ -1877,6 +2701,16 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
             accept_multiple_files=True,
             key="comp_evidence_screenshots",
         )
+        product_research_csv = st.file_uploader(
+            "eBay Product Research/Terapeak CSV (optional sold comps)",
+            type=["csv"],
+            accept_multiple_files=False,
+            key="comp_ebay_product_research_csv",
+            help=(
+                "Upload a manual eBay Product Research/Terapeak export when public sold HTML or "
+                "API access is blocked. Imported priced rows are treated as sold-market evidence."
+            ),
+        )
         save_comp_hint_media = st.checkbox(
             "Save hint image/video to Media Library when linked product is selected",
             value=True,
@@ -1925,6 +2759,84 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
             f"fallback_profiles: `{fallback_profiles}`"
         )
         client = EbayClient()
+        ebay_user_access_token = get_runtime_str(
+            repo,
+            "ebay_user_access_token",
+            str(getattr(settings, "ebay_user_access_token", "") or ""),
+        ).strip()
+        marketplace_insights_scope = EbayClient.MARKETPLACE_INSIGHTS_SCOPE
+        marketplace_id = str(getattr(settings, "ebay_marketplace_id", "EBAY_US") or "EBAY_US").strip() or "EBAY_US"
+        with st.expander("eBay Sold Comps Sources", expanded=False):
+            html_diag = client.sold_html_last_error()
+            html_status = "not tested"
+            if html_diag:
+                status_code = int(html_diag.get("status_code") or 0)
+                if status_code == 403:
+                    html_status = "blocked"
+                elif status_code >= 200 and status_code < 400:
+                    html_status = "available"
+                else:
+                    html_status = f"{html_diag.get('type') or 'checked'}"
+            finding_status = "not configured"
+            if client.is_configured():
+                cooldown = int(client.finding_rate_limit_cooldown_remaining_seconds())
+                finding_status = f"{client.environment}/cooldown {cooldown}s" if cooldown > 0 else f"{client.environment}/ready"
+            source_status_rows = [
+                {
+                    "Source": "Marketplace Insights API",
+                    "Status": (
+                        "ready to test"
+                        if ebay_user_access_token or client.is_configured()
+                        else "not configured"
+                    ),
+                    "Detail": "Uses saved user token, or app token with buy.marketplace.insights scope.",
+                },
+                {
+                    "Source": "Finding API",
+                    "Status": finding_status,
+                    "Detail": str((client.finding_last_error() or {}).get("type") or ""),
+                },
+                {
+                    "Source": "Public sold HTML",
+                    "Status": html_status,
+                    "Detail": str((html_diag or {}).get("response_excerpt") or "")[:160],
+                },
+                {
+                    "Source": "Manual Terapeak/Product Research CSV import",
+                    "Status": "available",
+                    "Detail": "Upload CSV above; imported rows are source=ebay_product_research, evidence=sold_market.",
+                },
+            ]
+            st.dataframe(pd.DataFrame(source_status_rows), use_container_width=True, hide_index=True)
+            if st.button("Smoke-Test Marketplace Insights", key="comp_marketplace_insights_smoke_btn"):
+                smoke_query = str(query or "silver").strip() or "silver"
+                smoke_access_token = ebay_user_access_token
+                if not smoke_access_token and client.is_configured():
+                    try:
+                        smoke_token_payload = client.fetch_application_token(scopes=[marketplace_insights_scope])
+                        smoke_access_token = str(smoke_token_payload.get("access_token") or "").strip()
+                    except Exception as exc:
+                        st.error(f"Marketplace Insights app-token request failed: {type(exc).__name__}: {str(exc)[:500]}")
+                        smoke_access_token = ""
+                if not smoke_access_token:
+                    st.warning("Marketplace Insights API is not configured: no eBay access token is available.")
+                else:
+                    try:
+                        smoke_rows = client.search_marketplace_insights_sold_comps(
+                            access_token=smoke_access_token,
+                            query=smoke_query,
+                            marketplace_id=marketplace_id,
+                            category_id=str(category_id or ""),
+                            limit=1,
+                        )
+                    except requests.HTTPError as exc:
+                        status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                        status_label = "denied" if status_code in {401, 403} else f"error {status_code or ''}".strip()
+                        st.error(f"Marketplace Insights API {status_label}: {str(exc)[:500]}")
+                    except Exception as exc:
+                        st.error(f"Marketplace Insights API error: {type(exc).__name__}: {str(exc)[:500]}")
+                    else:
+                        st.success(f"Marketplace Insights API available. Smoke-test rows returned: {len(smoke_rows)}.")
         run_button_label = "Run Photo-Comp Workflow" if photo_workflow_mode else "Run Comp Search"
         run_comp_clicked = st.button(run_button_label, disabled=(not comp_tool_enabled or not can_use_comp_tool))
         run_comp = bool(run_comp_clicked or st.session_state.pop("comp_autorun_once", False))
@@ -2138,41 +3050,187 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                     attempts: list[dict] = []
                     rows: list[dict] = []
                     web_rows: list[dict] = []
-                    ebay_configured = bool(client.is_configured())
-                    if not ebay_configured:
+                    if product_research_csv is not None:
+                        manual_rows = _parse_ebay_product_research_csv(product_research_csv.getvalue())
+                        attempts.append(
+                            {
+                                "query": str(getattr(product_research_csv, "name", "") or "uploaded_csv"),
+                                "sold_only": "manual_import",
+                                "results": len(manual_rows),
+                                "note": "ebay_product_research_csv_import",
+                                "detail": "Manual Product Research/Terapeak CSV rows imported as sold-market evidence.",
+                            }
+                        )
+                        if manual_rows:
+                            rows.extend(manual_rows)
+                    ebay_api_configured = bool(client.is_configured())
+                    if not ebay_api_configured:
                         attempts.append(
                             {
                                 "query": effective_query,
                                 "sold_only": "n/a",
                                 "results": 0,
-                                "note": "ebay_not_configured_web_only",
+                                "note": "ebay_api_not_configured_html_still_attempted",
                             }
                         )
-                        st.info("eBay client is not configured; running web fallback search only.")
+                        st.info(
+                            "eBay API credentials are not configured; still attempting public eBay sold-result HTML "
+                            "and web fallback search."
+                        )
                     variants = _query_variants(effective_query)
                     if not variants:
                         variants = [effective_query]
 
-                    if ebay_configured:
-                        for query_try in variants:
-                            try:
-                                attempt_rows = client.search_sold_items_html(
-                                    keywords=query_try,
-                                    limit=int(comp_limit),
+                    for query_try in variants:
+                        try:
+                            attempt_rows = client.search_sold_items_html(
+                                keywords=query_try,
+                                limit=int(comp_limit),
+                            )
+                            html_diag = client.sold_html_last_error()
+                            if attempt_rows:
+                                attempt_note = "ebay_sold_html_primary"
+                            elif html_diag:
+                                html_status = int(html_diag.get("status_code") or 0)
+                                attempt_note = (
+                                    "ebay_sold_html_"
+                                    f"{html_diag.get('type') or 'empty'}"
+                                    f": status={html_status}"
                                 )
-                            except Exception:
-                                attempt_rows = []
+                            else:
+                                attempt_note = "ebay_sold_html_empty"
+                        except Exception as ebay_html_exc:
+                            attempt_rows = []
+                            attempt_note = f"ebay_sold_html_error: {type(ebay_html_exc).__name__}"
+                        attempts.append(
+                            {
+                                "query": query_try,
+                                "sold_only": "true" if bool(effective_sold_only) else "false",
+                                "results": len(attempt_rows),
+                                "note": attempt_note,
+                                "detail": _friendly_ebay_attempt_note(attempt_note),
+                            }
+                        )
+                        if attempt_rows:
+                            rows.extend(attempt_rows)
+                            break
+
+                    if not rows and ebay_user_access_token:
+                        marketplace_insights_access_token = ebay_user_access_token
+                    elif not rows and ebay_api_configured:
+                        try:
+                            token_payload = client.fetch_application_token(scopes=[marketplace_insights_scope])
+                            marketplace_insights_access_token = str(token_payload.get("access_token") or "").strip()
+                        except Exception as token_exc:
+                            marketplace_insights_access_token = ""
                             attempts.append(
                                 {
-                                    "query": query_try,
-                                    "sold_only": "true" if bool(effective_sold_only) else "false",
-                                    "results": len(attempt_rows),
-                                    "note": "ebay_sold_html_primary",
+                                    "query": effective_query,
+                                    "sold_only": "marketplace_insights",
+                                    "results": 0,
+                                    "note": "ebay_marketplace_insights_token_error",
+                                    "detail": str(token_exc)[:500],
                                 }
                             )
-                            if attempt_rows:
-                                rows = attempt_rows
-                                break
+                    else:
+                        marketplace_insights_access_token = ""
+
+                    if not rows and marketplace_insights_access_token:
+                        try:
+                            marketplace_insights_rows = client.search_marketplace_insights_sold_comps(
+                                access_token=marketplace_insights_access_token,
+                                query=effective_query,
+                                marketplace_id=marketplace_id,
+                                category_id=str(category_id or ""),
+                                limit=int(comp_limit),
+                            )
+                        except requests.HTTPError as insights_exc:
+                            status_code = int(
+                                getattr(getattr(insights_exc, "response", None), "status_code", 0) or 0
+                            )
+                            attempts.append(
+                                {
+                                    "query": effective_query,
+                                    "sold_only": "marketplace_insights",
+                                    "results": 0,
+                                    "note": (
+                                        "ebay_marketplace_insights_denied"
+                                        if status_code in {401, 403}
+                                        else "ebay_marketplace_insights_error"
+                                    ),
+                                    "detail": str(insights_exc)[:500],
+                                }
+                            )
+                        except Exception as insights_exc:
+                            attempts.append(
+                                {
+                                    "query": effective_query,
+                                    "sold_only": "marketplace_insights",
+                                    "results": 0,
+                                    "note": f"ebay_marketplace_insights_error: {type(insights_exc).__name__}",
+                                    "detail": str(insights_exc)[:500],
+                                }
+                            )
+                        else:
+                            attempts.append(
+                                {
+                                    "query": effective_query,
+                                    "sold_only": "marketplace_insights",
+                                    "results": len(marketplace_insights_rows),
+                                    "note": "ebay_marketplace_insights",
+                                }
+                            )
+                            if marketplace_insights_rows:
+                                rows.extend(marketplace_insights_rows)
+                    elif not rows:
+                        attempts.append(
+                            {
+                                "query": effective_query,
+                                "sold_only": "marketplace_insights",
+                                "results": 0,
+                                "note": "ebay_marketplace_insights_not_configured",
+                                "detail": "No saved eBay user access token.",
+                            }
+                        )
+
+                    if not rows and ebay_api_configured:
+                        try:
+                            finding_rows = client.find_completed_items(
+                                keywords=effective_query,
+                                sold_only=bool(effective_sold_only),
+                                category_id=str(category_id or ""),
+                                entries_per_page=int(comp_limit),
+                                source="comp_tool_ui",
+                            )
+                        except Exception as finding_exc:
+                            finding_rows = []
+                            finding_diag = client.finding_last_error()
+                            finding_detail = str(finding_exc)
+                            if finding_diag:
+                                finding_detail = (
+                                    f"{finding_diag.get('type') or type(finding_exc).__name__}: "
+                                    f"{finding_diag.get('response_excerpt') or finding_diag.get('keywords') or finding_detail}"
+                                )
+                            attempts.append(
+                                {
+                                    "query": effective_query,
+                                    "sold_only": "true" if bool(effective_sold_only) else "false",
+                                    "results": 0,
+                                    "note": f"ebay_finding_error: {type(finding_exc).__name__}",
+                                    "detail": finding_detail[:500],
+                                }
+                            )
+                        else:
+                            attempts.append(
+                                {
+                                    "query": effective_query,
+                                    "sold_only": "true" if bool(effective_sold_only) else "false",
+                                    "results": len(finding_rows),
+                                    "note": f"ebay_finding_{str(getattr(client, 'environment', '') or 'unknown')}",
+                                }
+                            )
+                            if finding_rows:
+                                rows = finding_rows
 
                     if not rows:
                         if effective_use_web_fallback:
@@ -2240,6 +3298,15 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                     "query": effective_query,
                                     "sold_only": "web_fallback",
                                     "results": len(web_rows),
+                                    "note": ", ".join(
+                                        sorted(
+                                            {
+                                                str(row.get("search_provider") or "web").strip()
+                                                for row in web_rows
+                                            }
+                                        )
+                                    )
+                                    or "web_fallback_no_rows",
                                 }
                             )
                     elif photo_workflow_mode and photo_always_include_web_fallback:
@@ -2316,18 +3383,21 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                 "Try broader keywords (brand + item type) and optionally disable sold-only. "
                                 "Legacy Finding diagnostics are informational only."
                             )
-                        st.dataframe(pd.DataFrame(attempts), use_container_width=True)
+                        st.dataframe(pd.DataFrame(_format_attempt_rows(attempts)), use_container_width=True)
                     else:
                         effective_rows = rows if rows else web_rows
                         priced_rows = [r for r in effective_rows if _effective_total_price(r) > 0]
-                        stats_rows = priced_rows if priced_rows else effective_rows
+                        qualified_rows, qualification = _qualified_comp_rows(priced_rows)
+                        stats_rows = qualified_rows or priced_rows or effective_rows
                         stats = _comp_stats(stats_rows)
                         cost_breakdown = _comp_cost_breakdown(stats_rows)
-                        m1, m2, m3, m4 = st.columns(4)
+                        evidence_quality = _comp_evidence_quality(rows, web_rows)
+                        m1, m2, m3, m4, m5 = st.columns(5)
                         m1.metric("Comps", int(stats["count"]))
                         m2.metric("Median Total", f"${stats['median']:,.2f}")
                         m3.metric("Average Total", f"${stats['avg']:,.2f}")
                         m4.metric("Range", f"${stats['low']:,.2f} - ${stats['high']:,.2f}")
+                        m5.metric("Evidence", str(evidence_quality["label"]).replace("_", " ").title())
                         b1, b2, b3 = st.columns(3)
                         b1.metric("Avg Sold Price", f"${cost_breakdown['sold_avg']:,.2f}")
                         b2.metric("Avg Shipping", f"${cost_breakdown['shipping_avg']:,.2f}")
@@ -2339,6 +3409,54 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                             f"Suggested list range (90%-110% median): "
                             f"${stats['median'] * 0.9:,.2f} - ${stats['median'] * 1.1:,.2f}"
                         )
+                        if int(qualification.get("removed_rows") or 0) > 0:
+                            st.caption(
+                                "Qualified price filter removed "
+                                f"{int(qualification.get('removed_rows') or 0)} outlier row(s). "
+                                f"Method: `{qualification.get('method')}`; "
+                                f"kept ${float(qualification.get('low_cut') or 0):,.2f}-"
+                                f"${float(qualification.get('high_cut') or 0):,.2f}."
+                            )
+                            with st.expander("Qualified Price Filter Removed Rows", expanded=False):
+                                st.dataframe(
+                                    pd.DataFrame(qualification.get("removed_samples") or []),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                        st.caption(str(evidence_quality["note"]))
+                        st.caption(
+                            "Evidence mix: "
+                            f"sold eBay rows={int(evidence_quality['sold_rows'])}, "
+                            f"priced web rows={int(evidence_quality['web_priced_rows'])}, "
+                            f"high-confidence web rows={int(evidence_quality['web_high_confidence_rows'])}, "
+                            f"configured-dealer rows={int(evidence_quality['configured_dealer_rows'])}."
+                        )
+                        quality_diagnostics = _comp_quality_diagnostics(attempts, rows, web_rows)
+                        with st.expander("Comp Run Diagnostics", expanded=False):
+                            st.dataframe(
+                                pd.DataFrame(_comp_quality_diagnostics_rows(quality_diagnostics)),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        evidence_export_payload = _comp_evidence_export_payload(
+                            query=effective_query,
+                            attempts=attempts,
+                            rows=rows,
+                            web_rows=web_rows,
+                            stats=stats,
+                            cost_breakdown=cost_breakdown,
+                            evidence_quality=evidence_quality,
+                            diagnostics=quality_diagnostics,
+                            spot_context={},
+                        )
+                        evidence_export_payload["qualification"] = qualification
+                        st.download_button(
+                            "Download Comp Evidence JSON",
+                            data=json.dumps(evidence_export_payload, indent=2, default=str).encode("utf-8"),
+                            file_name="comp_evidence_package.json",
+                            mime="application/json",
+                            key="download_comp_evidence_json",
+                        )
                         if web_rows and not rows:
                             priced_count = sum(1 for r in web_rows if _effective_total_price(r) > 0)
                             st.caption(
@@ -2346,7 +3464,7 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                             )
                         if attempts:
                             st.caption("Search strategy used:")
-                            st.dataframe(pd.DataFrame(attempts), use_container_width=True)
+                            st.dataframe(pd.DataFrame(_format_attempt_rows(attempts)), use_container_width=True)
                         if rows:
                             st.markdown("##### eBay Comparable Results")
                             st.dataframe(pd.DataFrame(rows), use_container_width=True)
@@ -2356,7 +3474,10 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                             web_df = pd.DataFrame(web_rows)
                             if not web_df.empty:
                                 source_summary = (
-                                    web_df.groupby(["page_parser_source", "price_confidence_label"], dropna=False)
+                                    web_df.groupby(
+                                        ["search_scope", "search_provider", "page_parser_source", "price_confidence_label"],
+                                        dropna=False,
+                                    )
                                     .size()
                                     .reset_index(name="rows")
                                     .sort_values(["rows"], ascending=[False])
@@ -2709,16 +3830,6 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                 st.caption("Recent Retry Telemetry")
                                 st.dataframe(pd.DataFrame(telemetry_rows), use_container_width=True)
 
-                        st.session_state["comp_last_query"] = effective_query
-                        st.session_state["comp_last_ebay_rows"] = rows
-                        st.session_state["comp_last_web_rows"] = web_rows
-                        st.session_state["comp_last_product_context"] = {
-                            "sku": (selected_product.sku or "").strip() if selected_product is not None else "",
-                            "metal_type": (selected_product.metal_type or "").strip() if selected_product is not None else "",
-                            "weight_oz": float(selected_product.weight_oz) if selected_product is not None and selected_product.weight_oz is not None else 0.0,
-                            "category": (selected_product.category or "").strip() if selected_product is not None else "",
-                        }
-
                         spot_context: dict = {}
                         if include_spot_context:
                             try:
@@ -2744,20 +3855,34 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                                 spot_context["product_sku"] = (selected_product.sku or "").strip()
                                 spot_context["product_category"] = (selected_product.category or "").strip()
                         spot_context["comp_cost_breakdown"] = {
-                            "stats_source": "priced_rows" if priced_rows else "all_rows",
+                            "stats_source": "qualified_rows" if qualified_rows else ("priced_rows" if priced_rows else "all_rows"),
                             "avg_item_price": cost_breakdown["item_avg"],
                             "avg_shipping_cost": cost_breakdown["shipping_avg"],
                             "avg_total_price": cost_breakdown["total_avg"],
                             "shipping_pct_of_total": cost_breakdown["shipping_pct_of_total"],
+                            "qualification": qualification,
                         }
+                        spot_context["comp_evidence_quality"] = evidence_quality
                         st.session_state["comp_last_spot_context"] = spot_context
+                        evidence_export_payload["spot_context"] = spot_context
+                        ai_web_rows = _filter_ai_web_comp_rows(web_rows)
+                        st.session_state["comp_last_query"] = effective_query
+                        st.session_state["comp_last_ebay_rows"] = rows
+                        st.session_state["comp_last_web_rows"] = web_rows
+                        st.session_state["comp_last_ai_web_rows"] = ai_web_rows
+                        st.session_state["comp_last_product_context"] = {
+                            "sku": (selected_product.sku or "").strip() if selected_product is not None else "",
+                            "metal_type": (selected_product.metal_type or "").strip() if selected_product is not None else "",
+                            "weight_oz": float(selected_product.weight_oz) if selected_product is not None and selected_product.weight_oz is not None else 0.0,
+                            "category": (selected_product.category or "").strip() if selected_product is not None else "",
+                        }
                         if effective_use_ai_summary:
                             try:
                                 comp_result = execute_comp_summary(
                                     repo,
                                     query=effective_query,
                                     ebay_rows=rows,
-                                    web_rows=web_rows,
+                                    web_rows=ai_web_rows,
                                     spot_context=spot_context,
                                     system_message=comp_system_message,
                                     instruction=comp_instruction,
@@ -2837,22 +3962,25 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                     raise RuntimeError("comp_tool_disabled")
                 if not ensure_permission(user, "ai_comp_use", "Generate AI Comp Summary"):
                     raise RuntimeError("comp_tool_no_permission")
-                last_query = str(st.session_state.get("comp_last_query") or "").strip()
-                if not last_query:
-                    st.error("Run a comp search first.")
-                else:
-                    last_ebay_rows = st.session_state.get("comp_last_ebay_rows") or []
-                    last_web_rows = st.session_state.get("comp_last_web_rows") or []
-                    last_spot_context = st.session_state.get("comp_last_spot_context") or {}
-                    comp_result = execute_comp_summary(
-                        repo,
-                        query=last_query,
-                        ebay_rows=last_ebay_rows,
-                        web_rows=last_web_rows,
-                        spot_context=last_spot_context,
-                        system_message=comp_system_message,
-                        instruction=comp_instruction,
-                    )
+                    last_query = str(st.session_state.get("comp_last_query") or "").strip()
+                    if not last_query:
+                        st.error("Run a comp search first.")
+                    else:
+                        last_ebay_rows = st.session_state.get("comp_last_ebay_rows") or []
+                        last_web_rows = st.session_state.get("comp_last_web_rows") or []
+                        last_ai_web_rows = st.session_state.get("comp_last_ai_web_rows")
+                        if last_ai_web_rows is None:
+                            last_ai_web_rows = _filter_ai_web_comp_rows(last_web_rows)
+                        last_spot_context = st.session_state.get("comp_last_spot_context") or {}
+                        comp_result = execute_comp_summary(
+                            repo,
+                            query=last_query,
+                            ebay_rows=last_ebay_rows,
+                            web_rows=last_ai_web_rows,
+                            spot_context=last_spot_context,
+                            system_message=comp_system_message,
+                            instruction=comp_instruction,
+                        )
                     summary = comp_result.text
                     used_cfg = comp_result.used_config
                     fallback_errors = comp_result.fallback_errors
@@ -3166,7 +4294,7 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
             st.markdown(f"[eBay Sold Listings Search](https://www.ebay.com/sch/i.html?_nkw={encoded}&LH_Sold=1&LH_Complete=1)")
             st.markdown(f"[Google Shopping Search](https://www.google.com/search?tbm=shop&q={encoded})")
 
-    with tab4:
+    with tab5:
         if not coin_grader_enabled:
             st.info("Coin Grader is currently disabled by Admin AI domain toggle.")
         if not can_use_coin_grader:
@@ -3436,7 +4564,7 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                 use_container_width=True,
             )
 
-    with tab5:
+    with tab6:
         if not coin_identifier_enabled:
             st.info("Coin Identifier is currently disabled by Admin AI domain toggle.")
         if not can_use_coin_identifier:
@@ -3783,7 +4911,7 @@ def render_tools(spot: SpotPriceService, repo: InventoryRepository, storage: Med
                 use_container_width=True,
             )
 
-    with tab6:
+    with tab7:
         st.caption(
             "Build and maintain your in-house coin reference database (series/specs/value bands) "
             "without depending on paid Greysheet APIs."

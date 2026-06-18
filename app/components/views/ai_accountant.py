@@ -20,6 +20,11 @@ from app.config import settings
 from app.db.models import AuditLog
 from app.repository import InventoryRepository
 from app.components.views.shared import render_help_panel
+from app.services.ai_accountant_identity import (
+    AI_ACCOUNTANT_LABEL,
+    AI_ACCOUNTANT_NAME,
+    DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
+)
 from app.services.ai_orchestration import execute_comp_summary
 from app.services.llm_runtime import describe_llm_runtime_chain
 from app.services.notification_outbox import process_notification_outbox_row
@@ -36,103 +41,103 @@ AI_ACCOUNTANT_RECOMMENDED_RUNTIME_SETTINGS: tuple[dict[str, str], ...] = (
         "key": "ai_accountant_monitor_enabled",
         "value": "true",
         "value_type": "bool",
-        "description": "Enable the scheduled AI Accountant monitor.",
+        "description": f"Enable the scheduled {AI_ACCOUNTANT_NAME} monitor.",
     },
     {
         "key": "ai_accountant_monitor_schedule_mode",
         "value": "interval",
         "value_type": "str",
-        "description": "Run the AI Accountant monitor on an interval cadence.",
+        "description": f"Run the {AI_ACCOUNTANT_NAME} monitor on an interval cadence.",
     },
     {
         "key": "ai_accountant_monitor_interval_hours",
         "value": "6",
         "value_type": "int",
-        "description": "Run the AI Accountant monitor every six hours.",
+        "description": f"Run the {AI_ACCOUNTANT_NAME} monitor every six hours.",
     },
     {
         "key": "ai_accountant_monitor_timezone",
         "value": "America/Denver",
         "value_type": "str",
-        "description": "IANA timezone used by the scheduled AI Accountant monitor.",
+        "description": f"IANA timezone used by the scheduled {AI_ACCOUNTANT_NAME} monitor.",
     },
     {
         "key": "ai_accountant_monitor_local_time",
         "value": "08:30",
         "value_type": "str",
-        "description": "Local HH:MM trigger for daily AI Accountant monitor mode.",
+        "description": f"Local HH:MM trigger for daily {AI_ACCOUNTANT_NAME} monitor mode.",
     },
     {
         "key": "ai_accountant_monitor_lookback_days",
         "value": "30",
         "value_type": "int",
-        "description": "Lookback window in days for scheduled AI Accountant monitor checks.",
+        "description": f"Lookback window in days for scheduled {AI_ACCOUNTANT_NAME} monitor checks.",
     },
     {
         "key": "ai_accountant_monitor_min_severity",
         "value": "P1",
         "value_type": "str",
-        "description": "Queue AI Accountant monitor alerts for P1 and higher findings.",
+        "description": f"Queue {AI_ACCOUNTANT_NAME} monitor alerts for P1 and higher findings.",
     },
     {
         "key": "ai_accountant_monitor_slack_enabled",
         "value": "true",
         "value_type": "bool",
-        "description": "Queue Slack alerts for AI Accountant monitor findings.",
+        "description": f"Queue Slack alerts for {AI_ACCOUNTANT_NAME} monitor findings.",
     },
     {
         "key": "notification_route_ai_accountant_monitor",
         "value": "slack",
         "value_type": "str",
-        "description": "Route scheduled AI Accountant monitor alerts to Slack by default.",
+        "description": f"Route scheduled {AI_ACCOUNTANT_NAME} monitor alerts to Slack by default.",
     },
     {
         "key": "ai_accountant_monitor_record_empty",
         "value": "false",
         "value_type": "bool",
-        "description": "Avoid recording empty AI Accountant monitor runs by default.",
+        "description": f"Avoid recording empty {AI_ACCOUNTANT_NAME} monitor runs by default.",
     },
     {
         "key": "ai_accountant_monitor_llm_review_enabled",
         "value": "true",
         "value_type": "bool",
-        "description": "Run scheduled read-only LLM reviews for AI Accountant monitor findings.",
+        "description": f"Run scheduled read-only LLM reviews for {AI_ACCOUNTANT_NAME} monitor findings.",
     },
     {
         "key": "ai_accountant_monitor_review_max_rows",
         "value": "25",
         "value_type": "int",
-        "description": "Maximum monitor rows sent to scheduled AI Accountant LLM reviews.",
+        "description": f"Maximum monitor rows sent to scheduled {AI_ACCOUNTANT_NAME} LLM reviews.",
     },
     {
         "key": "ai_accountant_monitor_review_max_exception_rows",
         "value": "25",
         "value_type": "int",
-        "description": "Maximum accounting exception rows sent to scheduled AI Accountant LLM reviews.",
+        "description": f"Maximum accounting exception rows sent to scheduled {AI_ACCOUNTANT_NAME} LLM reviews.",
     },
     {
         "key": "ai_accountant_chat_ai_enabled",
         "value": "true",
         "value_type": "bool",
-        "description": "Enable the AI Accountant identity for accounting and tax chat answers.",
+        "description": f"Enable the {AI_ACCOUNTANT_NAME} identity for accounting and tax chat answers.",
     },
     {
         "key": "ai_accountant_web_research_enabled",
         "value": "true",
         "value_type": "bool",
-        "description": "Enable external web-research context for AI Accountant tax/accounting questions.",
+        "description": f"Enable external web-research context for {AI_ACCOUNTANT_NAME} tax/accounting questions.",
     },
     {
         "key": "ai_accountant_web_research_limit",
         "value": "5",
         "value_type": "int",
-        "description": "Maximum external web-search rows attached to AI Accountant research context.",
+        "description": f"Maximum external web-search rows attached to {AI_ACCOUNTANT_NAME} research context.",
     },
     {
         "key": "ai_accountant_web_research_timeout_seconds",
         "value": "10",
         "value_type": "int",
-        "description": "HTTP timeout for AI Accountant external web research.",
+        "description": f"HTTP timeout for {AI_ACCOUNTANT_NAME} external web research.",
     },
 )
 
@@ -301,6 +306,8 @@ def _recommended_accounting_action(exception_type: str) -> str:
         return "Review refund totals, returned listing/inventory units, restock status, and COGS reversal evidence."
     if key == "missing_product_link":
         return "Link the sale to the correct product so FIFO COGS can be proven."
+    if key == "listing_lot_inventory_movement_mismatch":
+        return "Reconcile the sale inventory movement to the inferred lot quantity, then verify FIFO COGS and stock."
     if key == "active_bundle_listing_stock_shortage":
         return "Reduce/end the active bundle listing quantity or restock the short bundle component inventory."
     if key == "active_bundle_component_overcommitted":
@@ -320,7 +327,7 @@ def build_ai_accountant_message(
     p1 = sum(1 for row in rows if str(row.get("severity") or "").upper() == "P1")
     p2 = sum(1 for row in rows if str(row.get("severity") or "").upper() == "P2")
     lines = [
-        f"AI Accountant monitor for {period_label}: {len(rows)} item(s) need review.",
+        f"{AI_ACCOUNTANT_LABEL} monitor for {period_label}: {len(rows)} item(s) need review.",
         f"Severity mix: P0={p0}, P1={p1}, P2={p2}.",
     ]
     for row in rows[: max(1, int(max_items or 6))]:
@@ -331,19 +338,27 @@ def build_ai_accountant_message(
             f"{str(row.get('recommended_action') or row.get('details') or '').strip()}"
         )
     if len(rows) > max_items:
-        lines.append(f"- Plus {len(rows) - max_items} more item(s) in the AI Accountant workspace.")
+        lines.append(f"- Plus {len(rows) - max_items} more item(s) in the {AI_ACCOUNTANT_NAME} workspace.")
     return "\n".join(lines)
 
 
 def _audit_row_to_message(row: AuditLog) -> dict[str, Any]:
     changes = row.changes if hasattr(row, "changes") else {}
     automated_review = changes.get("automated_review") if isinstance(changes.get("automated_review"), dict) else {}
+    question_counts = (
+        changes.get("question_status_counts") if isinstance(changes.get("question_status_counts"), dict) else {}
+    )
     return {
         "created_at": getattr(row, "created_at", None),
         "actor": getattr(row, "actor", ""),
         "message": str(changes.get("message") or ""),
         "period": str(changes.get("period") or ""),
         "item_count": _safe_int(changes.get("item_count")),
+        "questions_unanswered": _safe_int(question_counts.get("unanswered")),
+        "questions_needs_more_info": _safe_int(question_counts.get("needs_more_info")),
+        "questions_obsolete": _safe_int(question_counts.get("obsolete")),
+        "questions_answered": _safe_int(question_counts.get("answered")),
+        "questions_applied": _safe_int(question_counts.get("applied")),
         "min_severity": str(changes.get("min_severity") or "").strip(),
         "requested_min_severity": str(changes.get("requested_min_severity") or "").strip(),
         "min_severity_fallback_applied": bool(changes.get("min_severity_fallback_applied")),
@@ -387,10 +402,46 @@ def summarize_ai_accountant_message_thresholds(messages: Iterable[dict[str, Any]
         "latest_requested_min_severity": requested,
         "latest_effective_min_severity": effective,
         "warning": (
-            "Recent AI Accountant monitor evidence used the severity fallback "
+            f"Recent {AI_ACCOUNTANT_NAME} monitor evidence used the severity fallback "
             f"({requested or 'blank'} -> {effective or 'P1'}). Review "
             "`ai_accountant_monitor_min_severity` in Admin runtime settings."
         ),
+    }
+
+
+def summarize_ai_accountant_message_question_status(messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    rows = list(messages or [])
+    totals = {
+        "unanswered": sum(_safe_int(row.get("questions_unanswered")) for row in rows),
+        "needs_more_info": sum(_safe_int(row.get("questions_needs_more_info")) for row in rows),
+        "obsolete": sum(_safe_int(row.get("questions_obsolete")) for row in rows),
+        "answered": sum(_safe_int(row.get("questions_answered")) for row in rows),
+        "applied": sum(_safe_int(row.get("questions_applied")) for row in rows),
+    }
+    unresolved = totals["unanswered"] + totals["needs_more_info"] + totals["obsolete"]
+    latest_unresolved = next(
+        (
+            row
+            for row in rows
+            if _safe_int(row.get("questions_unanswered"))
+            or _safe_int(row.get("questions_needs_more_info"))
+            or _safe_int(row.get("questions_obsolete"))
+        ),
+        None,
+    )
+    warning = ""
+    if unresolved:
+        warning = (
+            f"Recent {AI_ACCOUNTANT_NAME} messages include {unresolved} unresolved question(s): "
+            f"unanswered={totals['unanswered']}, needs_more_info={totals['needs_more_info']}, "
+            f"obsolete={totals['obsolete']}. Answer them in Ask or Slack, or record follow-up evidence."
+        )
+    return {
+        **totals,
+        "unresolved_count": unresolved,
+        "latest_unresolved_period": str((latest_unresolved or {}).get("period") or ""),
+        "latest_unresolved_at": (latest_unresolved or {}).get("created_at") or "",
+        "warning": warning,
     }
 
 
@@ -519,13 +570,13 @@ def summarize_ai_accountant_review_outcomes(outcomes: list[dict[str, Any]]) -> d
         or (expected_manifest_rows > 0 and manifest_rows != expected_manifest_rows)
     )
     if outcome == "accepted":
-        status = "Latest AI Accountant review was accepted."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review was accepted."
     elif outcome == "edited":
-        status = "Latest AI Accountant review needs edits before close sign-off."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review needs edits before close sign-off."
     elif outcome == "rejected":
-        status = "Latest AI Accountant review was rejected and needs follow-up."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review was rejected and needs follow-up."
     else:
-        status = f"Latest AI Accountant review outcome is `{outcome or 'unknown'}`."
+        status = f"Latest {AI_ACCOUNTANT_NAME} review outcome is `{outcome or 'unknown'}`."
     return {
         "latest_outcome": outcome or "unknown",
         "status": status,
@@ -600,7 +651,31 @@ def build_ai_accountant_packet_review_action_rows(review_summary: dict[str, Any]
                 f"errors={_safe_int(summary.get('packet_integrity_error_count'))}"
             ),
             "recommended_action": (
-                "Regenerate or inspect the AI Accountant evidence packet before trusting this review outcome."
+                f"Regenerate or inspect the {AI_ACCOUNTANT_NAME} evidence packet before trusting this review outcome."
+            ),
+        }
+    ]
+
+
+def build_ai_accountant_message_question_action_rows(question_summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    summary = dict(question_summary or {})
+    unresolved_count = _safe_int(summary.get("unresolved_count"))
+    if unresolved_count <= 0:
+        return []
+    return [
+        {
+            "severity": "P1",
+            "task_type": "ai_accountant_unresolved_questions",
+            "entity_type": "ai_accountant_messages",
+            "entity_id": "",
+            "reference": (
+                f"unanswered={_safe_int(summary.get('unanswered'))}; "
+                f"needs_more_info={_safe_int(summary.get('needs_more_info'))}; "
+                f"obsolete={_safe_int(summary.get('obsolete'))}; "
+                f"period={summary.get('latest_unresolved_period') or 'unknown'}"
+            ),
+            "recommended_action": (
+                f"Answer open {AI_ACCOUNTANT_NAME} questions in Ask/Slack or record follow-up evidence before close sign-off."
             ),
         }
     ]
@@ -706,7 +781,7 @@ def build_ai_accountant_runtime_summary(repo: InventoryRepository) -> list[dict[
         {
             "setting": "Interactive Chat",
             "status": "enabled" if get_runtime_bool(repo, "ai_accountant_chat_ai_enabled", True) else "disabled",
-            "value": "AI Accountant identity prompt",
+            "value": f"{AI_ACCOUNTANT_NAME} identity prompt",
             "runtime_key": "ai_accountant_chat_ai_enabled",
         },
         {
@@ -728,7 +803,7 @@ def run_ai_accountant_runtime_smoke_test(repo: InventoryRepository) -> dict[str,
     try:
         result = execute_comp_summary(
             repo,
-            query="AI Accountant runtime smoke test. Reply with short JSON confirming runtime availability.",
+            query=f"{AI_ACCOUNTANT_NAME} runtime smoke test. Reply with short JSON confirming runtime availability.",
             ebay_rows=[],
             web_rows=[],
             spot_context={
@@ -737,7 +812,7 @@ def run_ai_accountant_runtime_smoke_test(repo: InventoryRepository) -> dict[str,
                 "instructions": "Do not analyze business data; only confirm the LLM route can respond.",
             },
             system_message=(
-                "You are GoldenStackers' read-only AI Accountant runtime health check. "
+                f"You are GoldenStackers' read-only {AI_ACCOUNTANT_NAME} runtime health check. "
                 "Return a concise JSON object only."
             ),
             instruction='Return ONLY JSON: {"status":"ok","note":"runtime available"}.',
@@ -845,7 +920,7 @@ def build_ai_accountant_setup_checks(runtime_rows: list[dict[str, Any]]) -> list
     slack_route = str(slack_row.get("configured_route") or "slack").strip().lower()
     slack_allows_outbox = slack_route in {"", "slack", "both", "all"}
     slack_alert_status = "pass"
-    slack_alert_details = "Slack notification route is enabled for scheduled AI Accountant monitor alerts."
+    slack_alert_details = f"Slack notification route is enabled for scheduled {AI_ACCOUNTANT_NAME} monitor alerts."
     if slack_status != "enabled":
         slack_alert_status = "warn"
         slack_alert_details = "Enable `ai_accountant_monitor_slack_enabled` for out-of-app follow-up alerts."
@@ -859,16 +934,20 @@ def build_ai_accountant_setup_checks(runtime_rows: list[dict[str, Any]]) -> list
     if delivery_row:
         if str(delivery_row.get("status") or "").strip().lower() != "enabled":
             slack_delivery_status = "warn"
-            slack_delivery_details = "Enable `slack_notifications_enabled` so queued AI Accountant alerts can dispatch."
+            slack_delivery_details = f"Enable `slack_notifications_enabled` so queued {AI_ACCOUNTANT_NAME} alerts can dispatch."
         elif not bool(delivery_row.get("configured_token_present")):
             slack_delivery_status = "warn"
-            slack_delivery_details = "Set `slack_bot_token`; AI Accountant Slack alerts will retry until a bot token exists."
+            slack_delivery_details = (
+                f"Set `slack_bot_token`; {AI_ACCOUNTANT_NAME} Slack alerts will retry until a bot token exists."
+            )
         elif not (
             bool(delivery_row.get("configured_default_channel_present"))
             or bool(delivery_row.get("configured_monitor_channel_present"))
         ):
             slack_delivery_status = "warn"
-            slack_delivery_details = "Set `slack_default_channel` or `ai_accountant_monitor_channel` for AI Accountant alerts."
+            slack_delivery_details = (
+                f"Set `slack_default_channel` or `ai_accountant_monitor_channel` for {AI_ACCOUNTANT_NAME} alerts."
+            )
 
     checks = [
         {
@@ -1090,6 +1169,25 @@ def build_ai_accountant_answer_followup_status_counts(
     return dict(sorted(counts.items()))
 
 
+def build_ai_accountant_fee_shipping_evidence_exposure(
+    rows: list[dict[str, Any]] | None,
+) -> dict[str, float]:
+    fee_amount = 0.0
+    shipping_amount = 0.0
+    for row in rows or []:
+        task_type = str(row.get("task_type") or row.get("exception_type") or "").strip()
+        amount = _safe_float(row.get("amount"))
+        if task_type in {"missing_fee_evidence", "fee_source_fallback"}:
+            fee_amount += amount
+        elif task_type in {"missing_shipping_label_spend", "unmatched_shipping_label_finance_entry"}:
+            shipping_amount += amount
+    return {
+        "fee_evidence_amount": round(float(fee_amount), 2),
+        "shipping_label_evidence_amount": round(float(shipping_amount), 2),
+        "total_evidence_amount": round(float(fee_amount + shipping_amount), 2),
+    }
+
+
 def build_ai_accountant_evidence_summary(
     *,
     period_label: str,
@@ -1111,6 +1209,10 @@ def build_ai_accountant_evidence_summary(
     for row in action_summary or []:
         task_type = str(row.get("task_type") or "unknown").strip() or "unknown"
         action_summary_task_counts[task_type] = action_summary_task_counts.get(task_type, 0) + 1
+    message_question_status = summarize_ai_accountant_message_question_status(messages or [])
+    fee_shipping_exposure = build_ai_accountant_fee_shipping_evidence_exposure(
+        list(monitor_rows or []) + list(exception_rows or [])
+    )
     return {
         "packet_schema_version": "ai_accountant_evidence_packet_v1",
         "period_label": str(period_label or "").strip(),
@@ -1126,8 +1228,25 @@ def build_ai_accountant_evidence_summary(
             "sale_fifo_cogs_evidence": int(len(sale_fifo_cogs_evidence_rows or [])),
         },
         "action_summary_task_counts": dict(sorted(action_summary_task_counts.items())),
+        "message_question_status_counts": {
+            "unanswered": _safe_int(message_question_status.get("unanswered")),
+            "needs_more_info": _safe_int(message_question_status.get("needs_more_info")),
+            "obsolete": _safe_int(message_question_status.get("obsolete")),
+            "answered": _safe_int(message_question_status.get("answered")),
+            "applied": _safe_int(message_question_status.get("applied")),
+            "unresolved_count": _safe_int(message_question_status.get("unresolved_count")),
+        },
         "answer_followup_status_counts": build_ai_accountant_answer_followup_status_counts(answer_rows),
+        "fee_shipping_evidence_exposure": fee_shipping_exposure,
         "dashboard_profit_basis_status": (dashboard_metrics or {}).get("sales_30d_profit_basis_status"),
+        "dashboard_cogs_evidence_split": {
+            "verified_amount": _safe_float((dashboard_metrics or {}).get("sales_30d_cogs_verified_amount")),
+            "estimated_amount": _safe_float((dashboard_metrics or {}).get("sales_30d_cogs_estimate_amount")),
+            "review_needed_amount": _safe_float((dashboard_metrics or {}).get("sales_30d_cogs_review_amount")),
+            "review_needed_count": _safe_int((dashboard_metrics or {}).get("sales_30d_cogs_review_count")),
+            "review_sale_ids": list((dashboard_metrics or {}).get("sales_30d_cogs_review_sale_ids") or []),
+            "estimate_sale_ids": list((dashboard_metrics or {}).get("sales_30d_cogs_estimate_sale_ids") or []),
+        },
         "artifact_count": int(len(artifact_names)),
         "artifact_names": artifact_names,
         "artifact_hashes_sha256": hashes,
@@ -1157,6 +1276,11 @@ def build_ai_accountant_review_hash_index(
                 "monitor_rows": row.get("review_monitor_rows"),
                 "exception_rows": row.get("review_exception_rows"),
                 "fifo_evidence_rows": row.get("review_fifo_evidence_rows"),
+                "questions_unanswered": row.get("questions_unanswered"),
+                "questions_needs_more_info": row.get("questions_needs_more_info"),
+                "questions_obsolete": row.get("questions_obsolete"),
+                "questions_answered": row.get("questions_answered"),
+                "questions_applied": row.get("questions_applied"),
                 "evidence_packet_integrity_status": row.get("evidence_packet_integrity_status"),
                 "evidence_packet_integrity_error_count": row.get(
                     "evidence_packet_integrity_error_count"
@@ -1403,11 +1527,26 @@ def build_deterministic_ai_accountant_review(
     recommended_actions = [action for idx, action in enumerate(recommended_actions) if action and action not in recommended_actions[:idx]]
     if not recommended_actions and monitor_rows:
         recommended_actions = ["Review source evidence and resolve monitor items before close sign-off."]
+    fee_shipping_exposure = build_ai_accountant_fee_shipping_evidence_exposure(monitor_rows or [])
+    if _safe_float(fee_shipping_exposure.get("total_evidence_amount")) > 0:
+        exposure_action = (
+            "Resolve fee/shipping evidence exposure before close sign-off: "
+            f"fee ${_safe_float(fee_shipping_exposure.get('fee_evidence_amount')):,.2f}; "
+            f"label ${_safe_float(fee_shipping_exposure.get('shipping_label_evidence_amount')):,.2f}."
+        )
+        if exposure_action not in recommended_actions:
+            recommended_actions.append(exposure_action)
     payload = {
         "close_status": close_status,
         "profit_basis_notes": [
             f"Dashboard 30-day profit basis status: {profit_status or 'unknown'}.",
             f"COGS review count: {_safe_int((dashboard_metrics or {}).get('sales_30d_cogs_review_count'))}.",
+            (
+                "COGS evidence split: "
+                f"verified ${_safe_float((dashboard_metrics or {}).get('sales_30d_cogs_verified_amount')):,.2f}; "
+                f"estimated ${_safe_float((dashboard_metrics or {}).get('sales_30d_cogs_estimate_amount')):,.2f}; "
+                f"needs review ${_safe_float((dashboard_metrics or {}).get('sales_30d_cogs_review_amount')):,.2f}."
+            ),
             (
                 "Dashboard 30-day profit before returns: "
                 f"${_safe_float((dashboard_metrics or {}).get('sales_30d_profit_before_returns')):,.2f}; "
@@ -1422,6 +1561,12 @@ def build_deterministic_ai_accountant_review(
                 f"refunds ${_safe_float((dashboard_metrics or {}).get('returns_30d_refund_total')):,.2f}, "
                 f"COGS reversal ${_safe_float((dashboard_metrics or {}).get('returns_30d_cogs_reversal')):,.2f}, "
                 f"profit impact ${_safe_float((dashboard_metrics or {}).get('returns_30d_profit_impact')):,.2f}."
+            ),
+            (
+                "Fee/shipping evidence exposure: "
+                f"fee ${_safe_float(fee_shipping_exposure.get('fee_evidence_amount')):,.2f}; "
+                f"label ${_safe_float(fee_shipping_exposure.get('shipping_label_evidence_amount')):,.2f}; "
+                f"total ${_safe_float(fee_shipping_exposure.get('total_evidence_amount')):,.2f}."
             ),
         ],
         "cost_basis_findings": cost_basis_findings,
@@ -1641,6 +1786,7 @@ from app.services.ai_accountant_monitor import (  # noqa: E402
     build_ai_accountant_message,
     build_ai_accountant_monitor_rows,
     build_ai_accountant_question_rows,
+    build_ai_accountant_question_status_counts,
     build_sale_fifo_cogs_evidence_rows,
     enqueue_ai_accountant_slack_message,
     list_ai_accountant_answer_followups,
@@ -1712,19 +1858,19 @@ def _render_ai_accountant_json_sections(raw_payload: str | None) -> bool:
 
 
 def render_ai_accountant(repo: InventoryRepository) -> None:
-    st.subheader("AI Accountant")
+    st.subheader(AI_ACCOUNTANT_LABEL)
     render_help_panel(
-        section_title="AI Accountant",
+        section_title=AI_ACCOUNTANT_LABEL,
         goal="Monitor accounting cleanup items, leave in-app review notes, and queue Slack follow-ups.",
         steps=[
             "Review exception severity and recommended accounting cleanup actions.",
-            "Record an in-app AI Accountant message for audit and close-review follow-up.",
+            f"Record an in-app {AI_ACCOUNTANT_NAME} message for audit and close-review follow-up.",
             "Queue Slack alerts when accounting cleanup needs operator attention outside the app.",
         ],
         roadmap_phase="GS-V10-020 Accounting Verification + AI Accountant",
     )
     user = current_user()
-    if not ensure_permission(user, "ai_accountant_use", "Use AI Accountant"):
+    if not ensure_permission(user, "ai_accountant_use", f"Use {AI_ACCOUNTANT_LABEL}"):
         st.stop()
 
     today = utcnow_naive().date()
@@ -1784,6 +1930,8 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
     m3.metric("P1", p1)
     m4.metric("P2", p2)
 
+    messages = list_ai_accountant_messages(repo)
+    message_question_summary = summarize_ai_accountant_message_question_status(messages)
     review_summary = summarize_ai_accountant_review_outcomes(review_outcomes)
     if review_summary["latest_outcome"] != "none":
         status_detail = " | ".join(
@@ -1809,12 +1957,13 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
         else:
             st.success(f"{review_summary['status']} {status_detail}".strip())
     else:
-        st.info("No AI Accountant review outcome has been recorded yet.")
+        st.info(f"No {AI_ACCOUNTANT_NAME} review outcome has been recorded yet.")
 
     packet_action_rows = build_ai_accountant_packet_review_action_rows(review_summary)
-    action_input_rows = [*packet_action_rows, *list(monitor_rows or [])]
+    message_question_action_rows = build_ai_accountant_message_question_action_rows(message_question_summary)
+    action_input_rows = [*packet_action_rows, *message_question_action_rows, *list(monitor_rows or [])]
     if action_input_rows:
-        st.warning("AI Accountant found accounting cleanup items that should be resolved before close sign-off.")
+        st.warning(f"{AI_ACCOUNTANT_NAME} found accounting cleanup items that should be resolved before close sign-off.")
         action_summary = build_ai_accountant_action_summary(action_input_rows)
         if action_summary:
             st.markdown("### Action Summary")
@@ -1829,7 +1978,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 1 for row in question_rows if str(row.get("answer_status") or "") in {"answered", "applied"}
             )
             st.caption(
-                "Use these prompts in Ask GoldenStackers or Slack so the AI Accountant can connect your answer "
+                f"Use these prompts in Ask GoldenStackers or Slack so {AI_ACCOUNTANT_NAME} can connect your answer "
                 "back to the open accounting issue. The app stays read-only; corrections still need normal workflow edits. "
                 f"{answered_count} of {len(question_rows)} visible question(s) already have recorded answer evidence."
             )
@@ -1849,16 +1998,16 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
     applied_defaults = st.session_state.pop("ai_accountant_applied_runtime_defaults", [])
     if applied_defaults:
         st.success(
-            "Applied AI Accountant automation defaults: "
+            f"Applied {AI_ACCOUNTANT_NAME} automation defaults: "
             + ", ".join(str(row.get("key") or "") for row in applied_defaults)
         )
     if warn_checks:
         st.warning(
-            "AI Accountant setup has warning(s): "
+            f"{AI_ACCOUNTANT_NAME} setup has warning(s): "
             + ", ".join(str(row.get("check") or "") for row in warn_checks[:4])
         )
     else:
-        st.success("AI Accountant automation setup is ready.")
+        st.success(f"{AI_ACCOUNTANT_NAME} automation setup is ready.")
     with st.expander("Setup Checks", expanded=bool(warn_checks)):
         st.dataframe(pd.DataFrame(setup_checks), hide_index=True, use_container_width=True)
     runtime_chain_rows = build_ai_accountant_runtime_chain_rows(repo)
@@ -1866,9 +2015,9 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
     with st.expander("Accounting AI Runtime Chain", expanded=runtime_chain_blocked):
         st.dataframe(pd.DataFrame(runtime_chain_rows), hide_index=True, use_container_width=True)
         st.caption(
-            "This is the sanitized fallback order used by AI Accountant scheduled reviews, manual reviews, and smoke tests."
+            f"This is the sanitized fallback order used by {AI_ACCOUNTANT_NAME} scheduled reviews, manual reviews, and smoke tests."
         )
-        if st.button("Run AI Accountant LLM Smoke Test", key="ai_accountant_runtime_smoke_test_btn"):
+        if st.button(f"Run {AI_ACCOUNTANT_NAME} LLM Smoke Test", key="ai_accountant_runtime_smoke_test_btn"):
             smoke_result = run_ai_accountant_runtime_smoke_test(repo)
             st.session_state["ai_accountant_runtime_smoke_test_result"] = smoke_result
             st.rerun()
@@ -1876,7 +2025,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
         if isinstance(smoke_result, dict) and smoke_result:
             if smoke_result.get("status") == "ok":
                 st.success(
-                    "AI Accountant LLM route responded: "
+                    f"{AI_ACCOUNTANT_NAME} LLM route responded: "
                     f"{smoke_result.get('provider')}/{smoke_result.get('model')}"
                 )
                 if smoke_result.get("fallback_attempts"):
@@ -1887,7 +2036,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 if smoke_result.get("text_preview"):
                     st.code(str(smoke_result.get("text_preview") or ""), language="json")
             else:
-                st.error(f"AI Accountant LLM route failed: {smoke_result.get('error') or 'unknown error'}")
+                st.error(f"{AI_ACCOUNTANT_NAME} LLM route failed: {smoke_result.get('error') or 'unknown error'}")
     try:
         outbox_rows = build_ai_accountant_outbox_delivery_rows(repo, limit=10)
     except Exception as exc:
@@ -1895,7 +2044,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
         if db is not None:
             db.rollback()
         outbox_rows = []
-        st.warning(f"AI Accountant Slack delivery status could not load: {exc}")
+        st.warning(f"{AI_ACCOUNTANT_NAME} Slack delivery status could not load: {exc}")
     if outbox_rows:
         outbox_summary = summarize_ai_accountant_outbox_delivery_rows(outbox_rows)
         d1, d2, d3, d4 = st.columns(4)
@@ -1909,16 +2058,16 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
             if str(row.get("status") or "").strip().lower() in {"retrying", "failed"}
         ]
         if blocking_outbox:
-            st.warning("Recent AI Accountant Slack delivery rows need attention.")
+            st.warning(f"Recent {AI_ACCOUNTANT_NAME} Slack delivery rows need attention.")
             if outbox_summary.get("latest_error"):
                 st.caption(f"Latest delivery error: {outbox_summary['latest_error']}")
         with st.expander("Recent Slack Delivery", expanded=bool(blocking_outbox)):
             st.dataframe(pd.DataFrame(outbox_rows), hide_index=True, use_container_width=True)
-            if st.button("Process Due AI Accountant Slack Deliveries", key="ai_accountant_process_due_outbox_btn"):
+            if st.button(f"Process Due {AI_ACCOUNTANT_NAME} Slack Deliveries", key="ai_accountant_process_due_outbox_btn"):
                 try:
                     outbox_result = process_due_ai_accountant_outbox_rows(repo, actor=user.username, limit=10)
                     st.success(
-                        "Processed due AI Accountant Slack delivery rows: "
+                        f"Processed due {AI_ACCOUNTANT_NAME} Slack delivery rows: "
                         f"attempted={outbox_result['attempted']} sent={outbox_result['sent']} "
                         f"failed={outbox_result['failed']}"
                     )
@@ -1929,7 +2078,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                     db = getattr(repo, "db", None)
                     if db is not None:
                         db.rollback()
-                    st.error(f"Could not process due AI Accountant Slack deliveries: {exc}")
+                    st.error(f"Could not process due {AI_ACCOUNTANT_NAME} Slack deliveries: {exc}")
     if warn_checks:
         if st.button("Enable Recommended Automation Defaults", key="ai_accountant_enable_defaults_btn"):
             try:
@@ -1940,7 +2089,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 db = getattr(repo, "db", None)
                 if db is not None:
                     db.rollback()
-                st.error(f"Could not apply AI Accountant automation defaults: {exc}")
+                st.error(f"Could not apply {AI_ACCOUNTANT_NAME} automation defaults: {exc}")
         st.caption(
             "Recommended defaults enable the six-hour monitor, Slack alert queue, scheduled LLM review, accountant chat, and external web research context."
         )
@@ -1974,7 +2123,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
             key="ai_accountant_run_now_slack_channel",
             help="Optional. Uses Slack routing/default channel if blank.",
         )
-    if st.button("Run AI Accountant Monitor Now", key="ai_accountant_run_monitor_now_btn"):
+    if st.button(f"Run {AI_ACCOUNTANT_NAME} Monitor Now", key="ai_accountant_run_monitor_now_btn"):
         try:
             lookback_days = max(1, int((to_date - from_date).days) + 1)
             result = run_ai_accountant_monitor(
@@ -1993,7 +2142,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
             db = getattr(repo, "db", None)
             if db is not None and hasattr(db, "rollback"):
                 db.rollback()
-            st.error(f"AI Accountant monitor run failed: {exc}")
+            st.error(f"{AI_ACCOUNTANT_NAME} monitor run failed: {exc}")
     last_monitor_result = st.session_state.get("ai_accountant_last_monitor_run_result")
     if isinstance(last_monitor_result, dict) and last_monitor_result:
         monitor_run_summary = summarize_monitor_run_result(last_monitor_result)
@@ -2018,16 +2167,13 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
     st.caption(
         "Runs a read-only LLM review over the monitor, exception queue, and dashboard profit-basis evidence."
     )
-    if st.button("Run AI Accountant Review", key="ai_accountant_run_review_btn"):
+    if st.button(f"Run {AI_ACCOUNTANT_NAME} Review", key="ai_accountant_run_review_btn"):
         try:
             started = time.perf_counter()
             system_message = get_runtime_str(
                 repo,
                 "accountant_llm_system_message",
-                (
-                    "You are GoldenStackers' read-only AI Accountant. Cite source tables/rows, "
-                    "label estimated versus actual values, and never provide tax/legal conclusions."
-                ),
+                DEFAULT_AI_ACCOUNTANT_SYSTEM_MESSAGE,
             ).strip()
             instruction = (
                 "Return ONLY JSON with keys: `close_status`, `profit_basis_notes`, "
@@ -2039,7 +2185,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 "Do not propose direct writes; draft only human-review recommendations. "
                 "Use tax evidence only to identify advisor-review needs, not filing or legal conclusions."
             )
-            prompt = "AI Accountant workspace monitor review"
+            prompt = f"{AI_ACCOUNTANT_NAME} workspace monitor review"
             review_result = execute_ai_accountant_workspace_review(
                 repo,
                 prompt=prompt,
@@ -2172,19 +2318,19 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 except Exception:
                     pass
             if deterministic_fallback_error:
-                st.warning("AI Accountant LLM runtime failed; deterministic monitor review was generated instead.")
+                st.warning(f"{AI_ACCOUNTANT_NAME} LLM runtime failed; deterministic monitor review was generated instead.")
             else:
-                st.success("AI Accountant review complete.")
+                st.success(f"{AI_ACCOUNTANT_NAME} review complete.")
             st.rerun()
         except Exception as exc:
             db = getattr(repo, "db", None)
             if db is not None and hasattr(db, "rollback"):
                 db.rollback()
-            st.error(f"AI Accountant review failed: {exc}")
+            st.error(f"{AI_ACCOUNTANT_NAME} review failed: {exc}")
 
     raw_review = str(st.session_state.get("ai_accountant_review_raw") or "").strip()
     if raw_review:
-        with st.expander("AI Accountant Review Result", expanded=False):
+        with st.expander(f"{AI_ACCOUNTANT_NAME} Review Result", expanded=False):
             if not _render_ai_accountant_json_sections(raw_review):
                 st.write(raw_review)
             st.code(raw_review, language="json")
@@ -2197,7 +2343,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                     answer_text=raw_review,
                     review_metadata=st.session_state.get("ai_accountant_review_metadata") or {},
                 )
-                st.success("AI Accountant review acceptance recorded.")
+                st.success(f"{AI_ACCOUNTANT_NAME} review acceptance recorded.")
                 st.rerun()
             if f2.button("Needs Edits", key="ai_accountant_review_edit_btn"):
                 record_ai_accountant_review_outcome(
@@ -2207,7 +2353,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                     answer_text=raw_review,
                     review_metadata=st.session_state.get("ai_accountant_review_metadata") or {},
                 )
-                st.success("AI Accountant review edit outcome recorded.")
+                st.success(f"{AI_ACCOUNTANT_NAME} review edit outcome recorded.")
                 st.rerun()
             if f3.button("Reject Review", key="ai_accountant_review_reject_btn"):
                 record_ai_accountant_review_outcome(
@@ -2217,7 +2363,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                     answer_text=raw_review,
                     review_metadata=st.session_state.get("ai_accountant_review_metadata") or {},
                 )
-                st.success("AI Accountant review rejection recorded.")
+                st.success(f"{AI_ACCOUNTANT_NAME} review rejection recorded.")
                 st.rerun()
 
     message = build_ai_accountant_message(
@@ -2225,8 +2371,12 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
         period_label=period_label,
         answer_rows=answer_rows,
     )
+    question_status_counts = build_ai_accountant_question_status_counts(
+        monitor_rows,
+        answer_rows=answer_rows,
+    )
     st.markdown("### Message Draft")
-    edited_message = st.text_area("AI Accountant message", value=message, height=220)
+    edited_message = st.text_area(f"{AI_ACCOUNTANT_NAME} message", value=message, height=220)
     alert_channel = st.text_input("Slack channel override", value="", help="Optional. Uses Slack routing/default channel if blank.")
 
     a1, a2 = st.columns(2)
@@ -2237,8 +2387,9 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
             message=edited_message,
             period_label=period_label,
             rows=monitor_rows,
+            question_status_counts=question_status_counts,
         )
-        st.success("AI Accountant message recorded in the app.")
+        st.success(f"{AI_ACCOUNTANT_NAME} message recorded in the app.")
         st.rerun()
     if a2.button("Queue Slack Message", disabled=not edited_message.strip()):
         outbox = enqueue_ai_accountant_slack_message(
@@ -2255,27 +2406,29 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
             period_label=period_label,
             rows=monitor_rows,
             slack_outbox_id=int(getattr(outbox, "id", 0) or 0) or None,
+            question_status_counts=question_status_counts,
         )
         st.success(f"Slack message queued in notification outbox #{int(getattr(outbox, 'id', 0) or 0)}.")
         st.rerun()
 
-    st.markdown("### Recent AI Accountant Messages")
-    messages = list_ai_accountant_messages(repo)
+    st.markdown(f"### Recent {AI_ACCOUNTANT_NAME} Messages")
     if messages:
         threshold_summary = summarize_ai_accountant_message_thresholds(messages)
         if threshold_summary["warning"]:
             st.warning(threshold_summary["warning"])
+        if message_question_summary["warning"]:
+            st.warning(message_question_summary["warning"])
         st.dataframe(pd.DataFrame(messages), hide_index=True, use_container_width=True)
     else:
-        st.caption("No AI Accountant messages recorded yet.")
+        st.caption(f"No {AI_ACCOUNTANT_NAME} messages recorded yet.")
 
     st.markdown("### Recent AI Review Outcomes")
     if review_outcomes:
         st.dataframe(pd.DataFrame(review_outcomes), hide_index=True, use_container_width=True)
     else:
-        st.caption("No AI Accountant review outcomes recorded yet.")
+        st.caption(f"No {AI_ACCOUNTANT_NAME} review outcomes recorded yet.")
 
-    st.markdown("### Recent AI Accountant Answers")
+    st.markdown(f"### Recent {AI_ACCOUNTANT_NAME} Answers")
     if answer_rows:
         st.caption(
             "Operator answers captured from Ask or Slack prompts. These are evidence for follow-up, not automatic corrections."
@@ -2286,7 +2439,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
         )
         if unresolved_answer_count:
             st.warning(
-                f"{unresolved_answer_count} AI Accountant answer(s) still need replacement evidence or follow-up."
+                f"{unresolved_answer_count} {AI_ACCOUNTANT_NAME} answer(s) still need replacement evidence or follow-up."
             )
         if answer_followup_status_counts:
             st.dataframe(
@@ -2337,10 +2490,10 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 outcome=str(answer_followup_outcome or ""),
                 notes=str(answer_followup_notes or ""),
             )
-            st.success("AI Accountant answer follow-up recorded.")
+            st.success(f"{AI_ACCOUNTANT_NAME} answer follow-up recorded.")
             st.rerun()
     else:
-        st.caption("No AI Accountant operator answers recorded yet.")
+        st.caption(f"No {AI_ACCOUNTANT_NAME} operator answers recorded yet.")
 
     evidence_zip = build_ai_accountant_evidence_zip(
         period_label=period_label,
@@ -2397,6 +2550,52 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 hide_index=True,
                 use_container_width=True,
             )
+    dashboard_cogs_split = evidence_summary.get("dashboard_cogs_evidence_split")
+    if isinstance(dashboard_cogs_split, dict) and dashboard_cogs_split:
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Dashboard Verified COGS", f"${_safe_float(dashboard_cogs_split.get('verified_amount')):,.2f}")
+        d2.metric("Dashboard Estimated COGS", f"${_safe_float(dashboard_cogs_split.get('estimated_amount')):,.2f}")
+        d3.metric(
+            "Dashboard Review COGS",
+            f"${_safe_float(dashboard_cogs_split.get('review_needed_amount')):,.2f}",
+        )
+        if _safe_float(dashboard_cogs_split.get("review_needed_amount")) > 0:
+            st.warning("Evidence packet includes dashboard COGS that needs cost-basis review.")
+    fee_shipping_exposure = evidence_summary.get("fee_shipping_evidence_exposure")
+    if isinstance(fee_shipping_exposure, dict) and fee_shipping_exposure:
+        f1, f2, f3 = st.columns(3)
+        f1.metric(
+            "Fee Evidence Exposure",
+            f"${_safe_float(fee_shipping_exposure.get('fee_evidence_amount')):,.2f}",
+        )
+        f2.metric(
+            "Label Evidence Exposure",
+            f"${_safe_float(fee_shipping_exposure.get('shipping_label_evidence_amount')):,.2f}",
+        )
+        f3.metric(
+            "Total Evidence Exposure",
+            f"${_safe_float(fee_shipping_exposure.get('total_evidence_amount')):,.2f}",
+        )
+        if _safe_float(fee_shipping_exposure.get("total_evidence_amount")) > 0:
+            st.warning("Evidence packet includes fee or shipping-label dollars that still need source evidence.")
+    message_question_counts = evidence_summary.get("message_question_status_counts")
+    if isinstance(message_question_counts, dict) and message_question_counts:
+        unresolved_questions = _safe_int(message_question_counts.get("unresolved_count"))
+        if unresolved_questions:
+            st.warning(
+                f"Evidence packet contains {unresolved_questions} unresolved {AI_ACCOUNTANT_NAME} message question(s)."
+            )
+        with st.expander("Evidence Packet Message Question Status Counts", expanded=False):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"question_status": key, "question_count": _safe_int(value)}
+                        for key, value in sorted(message_question_counts.items())
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
     answer_status_counts = evidence_summary.get("answer_followup_status_counts")
     if isinstance(answer_status_counts, dict) and answer_status_counts:
         with st.expander("Evidence Packet Answer Status Counts", expanded=False):
@@ -2411,7 +2610,7 @@ def render_ai_accountant(repo: InventoryRepository) -> None:
                 use_container_width=True,
             )
     st.download_button(
-        "Download AI Accountant Evidence Packet",
+        f"Download {AI_ACCOUNTANT_NAME} Evidence Packet",
         data=evidence_zip,
         file_name=f"ai_accountant_evidence_{from_date.isoformat()}_{to_date.isoformat()}.zip",
         mime="application/zip",

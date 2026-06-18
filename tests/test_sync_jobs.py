@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 import requests
@@ -13,6 +14,7 @@ class _FakeRepo:
         self.created_runs: list[dict] = []
         self.updated_runs: list[tuple[int, dict, str]] = []
         self.events: list[dict] = []
+        self.errors: list[dict] = []
         self.next_run_id = 100
 
     def create_sync_run(self, **kwargs):
@@ -26,6 +28,27 @@ class _FakeRepo:
 
     def add_sync_event(self, **kwargs):
         self.events.append(kwargs)
+
+    def add_sync_error(self, **kwargs):
+        self.errors.append(kwargs)
+
+    def get_runtime_setting(self, *, environment: str, key: str, active_only: bool = True):
+        return None
+
+
+class _StoreCategorySyncRepo(_FakeRepo):
+    def __init__(self) -> None:
+        super().__init__()
+        self.upserted_categories: list[dict] = []
+        self.reconcile_calls: list[dict] = []
+
+    def upsert_ebay_store_category(self, **kwargs):
+        self.upserted_categories.append(kwargs)
+        return SimpleNamespace(id=len(self.upserted_categories), category_path=kwargs.get("category_path"))
+
+    def reconcile_ebay_store_category_sync(self, **kwargs):
+        self.reconcile_calls.append(kwargs)
+        return {"missing_count": 1, "deactivated_count": 1 if kwargs.get("deactivate_missing") else 0}
 
 
 class _FakeScalarResult:
@@ -69,16 +92,20 @@ class _FakeRepoWithDB(_FakeRepo):
 
 
 class _BuildItemsDB:
-    def __init__(self, existing_listing=None):
+    def __init__(self, existing_listing=None, listings_by_id=None):
         self.existing_listing = existing_listing
+        self.listings_by_id = listings_by_id or {}
 
     def scalar(self, _query):
         return self.existing_listing
 
+    def get(self, _model, row_id):
+        return self.listings_by_id.get(int(row_id))
+
 
 class _BuildItemsRepo:
-    def __init__(self, *, existing_listing=None, create_listing_raises: bool = False):
-        self.db = _BuildItemsDB(existing_listing=existing_listing)
+    def __init__(self, *, existing_listing=None, listings_by_id=None, create_listing_raises: bool = False):
+        self.db = _BuildItemsDB(existing_listing=existing_listing, listings_by_id=listings_by_id)
         self.create_listing_raises = create_listing_raises
         self.created_listing_args = []
         self._next_id = 700
@@ -93,20 +120,32 @@ class _BuildItemsRepo:
 
 
 class _UpsertDB:
-    def __init__(self, *, existing_order=None, existing_sales=None):
+    def __init__(self, *, existing_order=None, existing_sales=None, existing_order_items=None):
         self.existing_order = existing_order
         self.existing_sales = existing_sales or []
+        self.existing_order_items = existing_order_items or []
+        self._scalars_calls = 0
 
     def scalar(self, _query):
         return self.existing_order
 
     def scalars(self, _query):
+        self._scalars_calls += 1
+        if self._scalars_calls == 2:
+            return _FakeScalarResult(self.existing_order_items)
         return _FakeScalarResult(self.existing_sales)
+
+    def commit(self):
+        return None
 
 
 class _UpsertRepo:
-    def __init__(self, *, existing_order=None, existing_sales=None):
-        self.db = _UpsertDB(existing_order=existing_order, existing_sales=existing_sales)
+    def __init__(self, *, existing_order=None, existing_sales=None, existing_order_items=None):
+        self.db = _UpsertDB(
+            existing_order=existing_order,
+            existing_sales=existing_sales,
+            existing_order_items=existing_order_items,
+        )
         self.errors = []
         self.created_orders = []
         self.updated_orders = []
@@ -809,6 +848,33 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(unmapped, 0)
         self.assertEqual(listing_map["LEG-1"], 77)
 
+    def test_build_order_items_recovers_product_id_from_legacy_listing_match(self) -> None:
+        listing = SimpleNamespace(id=206, product_id=2)
+        rows, listings_created, linked, unmapped = sync_jobs._build_order_items(
+            {
+                "lineItems": [
+                    {
+                        "sku": "GS-CO-PR-26100-ABCD-L206",
+                        "legacyItemId": "137394544357",
+                        "quantity": 1,
+                        "lineItemCost": {"value": "79.95"},
+                        "title": "Full Tube of 20 1 oz American Prospector Copper Tribute Coins",
+                    }
+                ]
+            },
+            repo=_BuildItemsRepo(listings_by_id={206: listing}),
+            product_map={},
+            listing_map={"137394544357": 206},
+            sku_listing_candidates={},
+            actor="qa",
+        )
+
+        self.assertEqual(rows[0]["listing_id"], 206)
+        self.assertEqual(rows[0]["product_id"], 2)
+        self.assertEqual(listings_created, 0)
+        self.assertEqual(linked, 1)
+        self.assertEqual(unmapped, 0)
+
     def test_build_order_items_ambiguous_candidate_selection_paths(self) -> None:
         c1 = SimpleNamespace(id=11, listing_title="Alpha", listing_price=Decimal("9.99"), listing_status="draft")
         c2 = SimpleNamespace(id=12, listing_title="Bravo", listing_price=Decimal("10.00"), listing_status="draft")
@@ -945,6 +1011,69 @@ class SyncJobsTests(unittest.TestCase):
             kwargs = dispatch.call_args.kwargs
             self.assertEqual(kwargs["event_type"], "order_imported")
             self.assertEqual(kwargs["override_channel"], "#orders")
+            context = build_text.call_args.kwargs["context"]
+            self.assertFalse(context["repeat_buyer"])
+            self.assertIn("new/first observed buyer", context["repeat_line"])
+
+    def test_notify_ebay_order_import_slack_includes_repeat_buyer_context(self) -> None:
+        ebay_order = {
+            "orderId": "ORDER-REPEAT",
+            "buyer": {"username": "repeatbuyer"},
+            "pricingSummary": {"total": {"value": "42.00"}},
+            "lineItems": [],
+        }
+        with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
+            "app.services.sync_jobs.get_runtime_bool", return_value=True
+        ), patch("app.services.sync_jobs.get_runtime_str", return_value="#orders"), patch(
+            "app.services.sync_jobs.build_slack_alert_text",
+            return_value="order-alert",
+        ) as build_text, patch("app.services.sync_jobs.dispatch_slack_alert"):
+            sync_jobs._notify_ebay_order_import_slack(
+                object(),
+                ebay_order=ebay_order,
+                actor="qa",
+                customer_context={
+                    "repeat_buyer": True,
+                    "customer_order_count": 3,
+                    "customer_total_spend": 123.45,
+                },
+            )
+
+        context = build_text.call_args.kwargs["context"]
+        self.assertTrue(context["repeat_buyer"])
+        self.assertEqual(context["customer_order_count"], 3)
+        self.assertEqual(context["customer_total_spend"], "123.45")
+        self.assertIn("repeat buyer", context["repeat_line"])
+
+    def test_notify_ebay_order_import_slack_includes_customer_notes_preview(self) -> None:
+        ebay_order = {
+            "orderId": "ORDER-NOTES",
+            "buyer": {"username": "repeatbuyer"},
+            "pricingSummary": {"total": {"value": "42.00"}},
+            "lineItems": [],
+        }
+        with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
+            "app.services.sync_jobs.get_runtime_bool", return_value=True
+        ), patch("app.services.sync_jobs.get_runtime_str", return_value="#orders"), patch(
+            "app.services.sync_jobs.build_slack_alert_text",
+            return_value="order-alert",
+        ) as build_text, patch("app.services.sync_jobs.dispatch_slack_alert"):
+            sync_jobs._notify_ebay_order_import_slack(
+                object(),
+                ebay_order=ebay_order,
+                actor="qa",
+                customer_context={
+                    "repeat_buyer": True,
+                    "customer_order_count": 3,
+                    "customer_total_spend": 123.45,
+                    "customer_notes_preview": "Prefers combined shipping. " * 20,
+                },
+            )
+
+        context = build_text.call_args.kwargs["context"]
+        self.assertTrue(context["customer_has_internal_notes"])
+        self.assertLessEqual(len(context["customer_notes_preview"]), 180)
+        self.assertIn("Internal customer notes", context["customer_notes_line"])
 
     def test_notify_ebay_order_import_slack_respects_runtime_toggle(self) -> None:
         with patch("app.services.sync_jobs.resolve_slack_notify_config", return_value=_FakeSlackConfig(True, True)), patch(
@@ -979,6 +1108,20 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         scaffold.assert_called_once()
 
+    def test_execute_sync_job_dispatches_quickbooks_export_dry_run(self) -> None:
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.execute_quickbooks_export_dry_run",
+            return_value={"run_id": 6, "status": "success"},
+        ) as qbo:
+            result = sync_jobs.execute_sync_job(
+                object(),
+                job_name="quickbooks_export",
+                actor="qa",
+                lookback_days=7,
+            )
+        self.assertEqual(result["status"], "success")
+        qbo.assert_called_once()
+
     def test_execute_sync_job_dispatches_ebay_jobs(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
             "app.services.sync_jobs.execute_ebay_orders_pull_import",
@@ -989,7 +1132,10 @@ class SyncJobsTests(unittest.TestCase):
         ) as push, patch(
             "app.services.sync_jobs.execute_ebay_connection_health_check",
             return_value={"run_id": 3, "status": "success"},
-        ) as health:
+        ) as health, patch(
+            "app.services.sync_jobs.execute_ebay_store_categories_sync",
+            return_value={"run_id": 4, "status": "success"},
+        ) as store_sync:
             out1 = sync_jobs.execute_sync_job(
                 object(),
                 job_name="ebay_orders_pull_import",
@@ -1011,12 +1157,22 @@ class SyncJobsTests(unittest.TestCase):
                 actor="qa",
                 access_token="tok",
             )
+            out4 = sync_jobs.execute_sync_job(
+                object(),
+                job_name="ebay_store_categories_sync",
+                actor="qa",
+                access_token="tok",
+                marketplace_id="EBAY_US",
+                deactivate_missing=True,
+            )
         self.assertEqual(out1["status"], "success")
         self.assertEqual(out2["status"], "success")
         self.assertEqual(out3["status"], "success")
+        self.assertEqual(out4["status"], "success")
         pull.assert_called_once()
         push.assert_called_once()
         health.assert_called_once()
+        store_sync.assert_called_once()
 
     def test_sync_job_catalog_contains_retry_and_dispatch_metadata(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
@@ -1026,12 +1182,88 @@ class SyncJobsTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertIn("retry_policy", rows[0])
         self.assertIn("dispatch_meta", rows[0])
+        qbo = next(row for row in rows if row["job_name"] == "quickbooks_export")
+        self.assertTrue(qbo["implemented"])
+        self.assertTrue(qbo["dispatch_meta"]["supports_execute_now"])
+
+    def test_store_categories_sync_dispatch_meta_avoids_order_import_retry_ui(self) -> None:
+        meta = sync_jobs.sync_job_dispatch_meta("ebay_store_categories_sync")
+        self.assertTrue(meta["supports_execute_now"])
+        self.assertFalse(meta["supports_retry_execute_now"])
+        self.assertIn("marketplace_id", meta["optional_args"])
+        self.assertIn("deactivate_missing", meta["optional_args"])
+
+    def test_quickbooks_export_dispatch_meta_supports_execute_now(self) -> None:
+        meta = sync_jobs.sync_job_dispatch_meta("quickbooks_export")
+        self.assertTrue(meta["supports_execute_now"])
+        self.assertTrue(meta["supports_retry_execute_now"])
+        self.assertIn("lookback_days", meta["optional_args"])
+        self.assertIn("live_post", meta["optional_args"])
+
+    def test_execute_quickbooks_export_dry_run_records_payload_manifest(self) -> None:
+        class Repo(_FakeRepo):
+            def report_sales_actual_econ_rows(self, *, start_dt, end_dt):
+                return [
+                    {
+                        "sale_id": 66,
+                        "sold_at": "2026-06-09T06:48:24",
+                        "external_order_id": "13-14720-44255",
+                        "marketplace": "ebay",
+                        "sku": "DOC-3-0407",
+                        "product_title": "1 oz American Prospector Copper Coin",
+                        "qty": 20,
+                        "sold_price": 79.95,
+                        "allocated_fee_actual": 8.63,
+                        "allocated_shipping_charged": 13.41,
+                        "allocated_shipping_actual": 7.9,
+                    }
+                ]
+
+        repo = Repo()
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):
+            result = sync_jobs.execute_quickbooks_export_dry_run(
+                repo,
+                actor="qa",
+                start_dt=datetime(2026, 6, 1),
+                end_dt=datetime(2026, 6, 10),
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["processed"], 3)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(repo.created_runs[0]["provider"], "quickbooks")
+        self.assertEqual(repo.created_runs[0]["job_name"], "quickbooks_export")
+        self.assertEqual(len(repo.events), 2)
+        self.assertEqual(repo.events[0]["action"], "payload_preview_summary")
+        summary_payload = json.loads(repo.events[0]["payload_json"])
+        self.assertEqual(summary_payload["payload_rows"], 3)
+        self.assertEqual(summary_payload["action_counts"]["sales_receipt"], 1)
+        self.assertEqual(summary_payload["action_counts"]["order_fee_purchase"], 1)
+        self.assertEqual(summary_payload["action_counts"]["shipping_label_purchase"], 1)
+        self.assertTrue(summary_payload["evidence_sha256"])
+        self.assertEqual(repo.updated_runs[-1][1]["status"], "success")
+
+    def test_execute_quickbooks_export_dry_run_blocks_live_post(self) -> None:
+        repo = _FakeRepo()
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):
+            result = sync_jobs.execute_quickbooks_export_dry_run(
+                repo,
+                actor="qa",
+                live_post=True,
+                start_dt=datetime(2026, 6, 1),
+                end_dt=datetime(2026, 6, 10),
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(repo.errors[0]["code"], "quickbooks_live_post_disabled")
+        self.assertEqual(repo.updated_runs[-1][1]["status"], "failed")
 
     def test_is_sync_job_enabled_uses_settings_without_repo(self) -> None:
         fake_settings = SimpleNamespace(
             sync_job_ebay_orders_pull_import_enabled=True,
             sync_job_ebay_shipping_tracking_push_enabled=False,
             sync_job_ebay_connection_health_check_enabled=True,
+            sync_job_ebay_store_categories_sync_enabled=True,
             sync_job_quickbooks_export_enabled=False,
             sync_job_shopify_orders_pull_enabled=True,
         )
@@ -1046,6 +1278,7 @@ class SyncJobsTests(unittest.TestCase):
                 "sync_job_ebay_orders_pull_import_enabled": True,
                 "sync_job_ebay_shipping_tracking_push_enabled": False,
                 "sync_job_ebay_connection_health_check_enabled": True,
+                "sync_job_ebay_store_categories_sync_enabled": True,
                 "sync_job_quickbooks_export_enabled": True,
                 "sync_job_shopify_orders_pull_enabled": False,
             }
@@ -1055,11 +1288,63 @@ class SyncJobsTests(unittest.TestCase):
             self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_orders_pull_import", repo=object()))
             self.assertFalse(sync_jobs.is_sync_job_enabled("ebay_shipping_tracking_push", repo=object()))
             self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_connection_health_check", repo=object()))
+            self.assertTrue(sync_jobs.is_sync_job_enabled("ebay_store_categories_sync", repo=object()))
 
     def test_execute_sync_job_unknown_raises(self) -> None:
         with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True):
             with self.assertRaises(NotImplementedError):
                 sync_jobs.execute_sync_job(object(), job_name="unknown_job", actor="qa")
+
+    def test_execute_ebay_store_categories_sync_imports_and_reconciles(self) -> None:
+        repo = _StoreCategorySyncRepo()
+        client = SimpleNamespace(
+            is_configured=lambda: True,
+            get_store_categories=lambda **_kwargs: {
+                "ack": "Success",
+                "site_id": "0",
+                "categories": [
+                    {
+                        "category_path": "/Coins/Bullion",
+                        "external_category_id": "101",
+                        "sort_order": 2,
+                    },
+                    {
+                        "category_path": "/Supplies",
+                        "external_category_id": "102",
+                        "sort_order": 3,
+                    },
+                ],
+            },
+        )
+        settings = SimpleNamespace(
+            app_env="local",
+            ebay_marketplace_id="EBAY_US",
+            ebay_user_access_token="",
+            ebay_user_refresh_token="",
+        )
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.settings", settings
+        ), patch("app.services.sync_jobs.get_runtime_str", side_effect=lambda *_args, **_kwargs: ""):
+            result = sync_jobs.execute_ebay_store_categories_sync(
+                repo,
+                actor="qa",
+                access_token="tok",
+                marketplace_id="EBAY_US",
+                deactivate_missing=True,
+                client=client,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["updated"], 3)
+        self.assertEqual(result["missing"], 1)
+        self.assertEqual(result["deactivated"], 1)
+        self.assertEqual([row["category_path"] for row in repo.upserted_categories], ["/Coins/Bullion", "/Supplies"])
+        self.assertTrue(all(row["mark_synced"] for row in repo.upserted_categories))
+        self.assertEqual(repo.reconcile_calls[0]["synced_category_paths"], ["/Coins/Bullion", "/Supplies"])
+        self.assertTrue(repo.reconcile_calls[0]["deactivate_missing"])
+        self.assertEqual(repo.updated_runs[-1][1]["status"], "success")
+        self.assertTrue(repo.events)
 
     def test_execute_shopify_scaffold_creates_and_completes_run(self) -> None:
         repo = _FakeRepo()
@@ -1315,6 +1600,41 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(out["status"], "success")
         self.assertEqual(client.calls, 2)
 
+    def test_execute_ebay_orders_pull_import_skips_when_refresh_token_reconnect_required(self) -> None:
+        repo = _FakeRepoWithDB(db=_FakeDB(products=[], listings=[]))
+
+        auth_error = requests.HTTPError("expired")
+        auth_error.response = SimpleNamespace(status_code=401)
+        refresh_error = requests.HTTPError(
+            "400 Client Error: Bad Request for url: https://api.ebay.com/identity/v1/oauth2/token"
+        )
+        refresh_error.response = SimpleNamespace(status_code=400)
+
+        class _Client:
+            def pull_recent_orders(self, *_args, **_kwargs):
+                raise auth_error
+
+            def refresh_user_token(self, _refresh_token, scopes=None):
+                _ = scopes
+                raise refresh_error
+
+        with patch("app.services.sync_jobs.is_sync_job_enabled", return_value=True), patch(
+            "app.services.sync_jobs.get_runtime_str",
+            side_effect=lambda _repo, key, default: "ref-1" if key == "ebay_user_refresh_token" else default,
+        ):
+            out = sync_jobs.execute_ebay_orders_pull_import(
+                repo,
+                access_token="tok-1",
+                actor="qa",
+                client=_Client(),
+            )
+        self.assertEqual(out["status"], "skipped")
+        self.assertEqual(out["reason"], "ebay_reconnect_required")
+        self.assertEqual(out["failed"], 0)
+        self.assertIn("reconnect eBay", str(out.get("error") or ""))
+        self.assertTrue(any(e.get("code") == "EBAY_RECONNECT_REQUIRED" for e in repo.errors))
+        self.assertTrue(any(u[1].get("status") == "skipped" and u[1].get("records_failed") == 0 for u in repo.updated_runs))
+
     def test_upsert_ebay_order_updates_existing_order_and_sales(self) -> None:
         existing_order = SimpleNamespace(id=41)
         existing_sales = [SimpleNamespace(id=91), SimpleNamespace(id=92)]
@@ -1375,6 +1695,77 @@ class SyncJobsTests(unittest.TestCase):
         self.assertEqual(order_updates.get("ship_to_city"), "Golden")
         self.assertIn('"orderId": "ORD-1"', str(order_updates.get("marketplace_payload_json") or ""))
         self.assertIn("listings_marked_sold", out)
+
+    def test_upsert_ebay_order_backfills_existing_sale_listing_and_product_links(self) -> None:
+        existing_order = SimpleNamespace(id=42)
+        existing_sale = SimpleNamespace(
+            id=93,
+            listing_id=None,
+            product_id=None,
+            quantity_sold=1,
+            sold_price=Decimal("79.95"),
+            fees=Decimal("0"),
+            shipping_cost=Decimal("0"),
+            shipping_label_cost=Decimal("0"),
+        )
+        existing_order_item = SimpleNamespace(
+            id=94,
+            order_id=42,
+            listing_id=None,
+            product_id=None,
+            quantity=1,
+            unit_price=Decimal("79.95"),
+        )
+        repo = _UpsertRepo(
+            existing_order=existing_order,
+            existing_sales=[existing_sale],
+            existing_order_items=[existing_order_item],
+        )
+        ebay_client = SimpleNamespace(list_shipping_fulfillments=lambda **_kwargs: [])
+        with patch(
+            "app.services.sync_jobs._build_order_items",
+            return_value=(
+                [
+                    {
+                        "product_id": 2,
+                        "listing_id": 206,
+                        "quantity": 1,
+                        "unit_price": Decimal("79.95"),
+                    }
+                ],
+                0,
+                1,
+                0,
+            ),
+        ):
+            out = sync_jobs._upsert_ebay_order_into_local(
+                repo,
+                {
+                    "orderId": "ORD-LINK",
+                    "creationDate": "2026-06-09T07:02:21Z",
+                    "pricingSummary": {"total": {"value": "79.95"}},
+                },
+                actor="qa",
+                product_map={},
+                listing_map={"137394544357": 206},
+                sku_listing_candidates={},
+                ebay_client=ebay_client,
+                access_token="tok",
+                sync_run_id=126,
+            )
+
+        self.assertEqual(out["orders_updated"], 1)
+        self.assertEqual(out["sales_skipped"], 1)
+        self.assertEqual(out["sales_updated"], 1)
+        self.assertEqual(out["order_item_links_backfilled"], 1)
+        self.assertEqual(len(repo.updated_sales), 1)
+        sale_id, updates, actor = repo.updated_sales[0]
+        self.assertEqual(sale_id, 93)
+        self.assertEqual(actor, "qa")
+        self.assertEqual(updates.get("listing_id"), 206)
+        self.assertEqual(updates.get("product_id"), 2)
+        self.assertEqual(existing_order_item.listing_id, 206)
+        self.assertEqual(existing_order_item.product_id, 2)
 
     def test_upsert_ebay_order_creates_order_and_sales_even_when_fulfillment_enrich_fails(self) -> None:
         repo = _UpsertRepo(existing_order=None, existing_sales=[])

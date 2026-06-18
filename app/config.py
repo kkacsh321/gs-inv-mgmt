@@ -103,6 +103,15 @@ class Settings:
     sync_job_ebay_connection_health_check_interval_minutes: int = int(
         os.getenv("SYNC_JOB_EBAY_CONNECTION_HEALTH_CHECK_INTERVAL_MINUTES", "30")
     )
+    sync_job_ebay_store_categories_sync_enabled: bool = (
+        os.getenv("SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_ENABLED", "true").lower() == "true"
+    )
+    sync_job_ebay_store_categories_sync_interval_hours: int = int(
+        os.getenv("SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_INTERVAL_HOURS", "24")
+    )
+    sync_job_ebay_store_categories_sync_deactivate_missing: bool = (
+        os.getenv("SYNC_JOB_EBAY_STORE_CATEGORIES_SYNC_DEACTIVATE_MISSING", "false").lower() == "true"
+    )
     sync_job_quickbooks_export_enabled: bool = (
         os.getenv("SYNC_JOB_QUICKBOOKS_EXPORT_ENABLED", "false").lower() == "true"
     )

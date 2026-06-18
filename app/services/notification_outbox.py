@@ -6,7 +6,7 @@ from typing import Any
 
 from app.config import settings
 from app.services.runtime_settings import get_runtime_int
-from app.services.slack_notify import send_slack_message
+from app.services.slack_notify import has_unresolved_slack_template_placeholders, send_slack_message
 from app.utils.time import utcnow_naive
 
 
@@ -36,6 +36,8 @@ def _deliver_outbox_row(repo: Any, row: Any) -> tuple[bool, str]:
         target_channel = str(payload.get("channel") or "").strip()
         if not text:
             return False, "Missing slack payload text."
+        if has_unresolved_slack_template_placeholders(text):
+            return True, "Dropped stale Slack payload with unresolved template placeholders."
         try:
             send_slack_message(repo, text=text, channel=target_channel)
             return True, "Delivered to Slack."

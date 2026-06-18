@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -243,6 +244,131 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertIn("ebay_user_token_auto_refresh_failure_cooldown_minutes", keys)
         self.assertIn("slack_notify_ebay_oauth_refresh_failures", keys)
 
+    def test_ebay_buyer_blocklist_helpers(self):
+        rows = admin._normalize_ebay_buyer_usernames(
+            " @BuyerOne, buyer-two\nhttps://www.ebay.com/usr/BuyerThree; buyerone bad@email.com "
+        )
+        self.assertEqual(rows, ["BuyerOne", "buyer-two", "BuyerThree"])
+        self.assertEqual(admin._ebay_buyer_blocklist_csv(rows), "BuyerOne\nbuyer-two\nBuyerThree")
+        diff = admin._ebay_buyer_blocklist_diff(["BuyerOne", "oldbuyer"], rows)
+        self.assertEqual(diff["added"], ["buyer-two", "BuyerThree"])
+        self.assertEqual(diff["removed"], ["oldbuyer"])
+        prod_urls = admin._ebay_buyer_management_urls("production")
+        sandbox_urls = admin._ebay_buyer_management_urls("sandbox")
+        self.assertEqual(prod_urls["blocked_buyer_list"], "https://www.ebay.com/bmgt/BuyerBlock")
+        self.assertEqual(sandbox_urls["blocked_buyer_list"], "https://www.sandbox.ebay.com/bmgt/BuyerBlock")
+
+    def test_ebay_buyer_blocklist_customer_rows(self):
+        customers = [
+            SimpleNamespace(
+                id=1,
+                marketplace="ebay",
+                ebay_username="BuyerOne",
+                display_name="Buyer One",
+                order_count=2,
+                total_spend=Decimal("123.45"),
+                is_repeat_buyer=True,
+                last_order_at=datetime(2026, 6, 1, 12, 0, 0),
+                shipping_city="Golden",
+                shipping_state="CO",
+                shipping_postal_code="80401",
+                notes="Watch future orders closely.",
+            ),
+            SimpleNamespace(
+                id=2,
+                marketplace="local",
+                ebay_username="LocalOnly",
+                display_name="Local Only",
+                order_count=1,
+                total_spend=Decimal("10.00"),
+                is_repeat_buyer=False,
+                last_order_at=datetime(2026, 5, 1, 12, 0, 0),
+                shipping_city="",
+                shipping_state="",
+                shipping_postal_code="",
+                notes="",
+            ),
+        ]
+        rows = admin._ebay_buyer_blocklist_customer_rows(["buyerone", "missingbuyer", "LocalOnly"], customers)
+        self.assertEqual(rows[0]["local_customer"], "yes")
+        self.assertEqual(rows[0]["customer_id"], 1)
+        self.assertEqual(rows[0]["orders"], 2)
+        self.assertTrue(rows[0]["repeat_buyer"])
+        self.assertEqual(rows[0]["ship_to"], "Golden, CO, 80401")
+        self.assertTrue(rows[0]["has_internal_notes"])
+        self.assertEqual(rows[1]["local_customer"], "no")
+        self.assertEqual(rows[2]["local_customer"], "no")
+
+    def test_ebay_buyer_blocklist_candidate_customer_rows(self):
+        customers = [
+            SimpleNamespace(
+                id=1,
+                marketplace="ebay",
+                ebay_username="AlreadyBlocked",
+                display_name="Already Blocked",
+                order_count=9,
+                total_spend=Decimal("999.00"),
+                is_repeat_buyer=True,
+                last_order_at=datetime(2026, 6, 1, 12, 0, 0),
+                notes="Blocked already.",
+            ),
+            SimpleNamespace(
+                id=2,
+                marketplace="ebay",
+                ebay_username="NeedsReview",
+                display_name="Needs Review",
+                order_count=1,
+                total_spend=Decimal("20.00"),
+                is_repeat_buyer=False,
+                last_order_at=datetime(2026, 5, 1, 12, 0, 0),
+                notes="Internal note makes this high priority.",
+            ),
+            SimpleNamespace(
+                id=3,
+                marketplace="ebay",
+                ebay_username="RepeatBuyer",
+                display_name="Repeat Buyer",
+                order_count=4,
+                total_spend=Decimal("400.00"),
+                is_repeat_buyer=True,
+                last_order_at=datetime(2026, 6, 2, 12, 0, 0),
+                notes="",
+            ),
+            SimpleNamespace(
+                id=4,
+                marketplace="local",
+                ebay_username="LocalOnly",
+                display_name="Local Only",
+                order_count=10,
+                total_spend=Decimal("1000.00"),
+                is_repeat_buyer=True,
+                last_order_at=datetime(2026, 6, 3, 12, 0, 0),
+                notes="",
+            ),
+        ]
+        rows = admin._ebay_buyer_blocklist_candidate_customer_rows(["alreadyblocked"], customers)
+
+        self.assertEqual([row["username"] for row in rows], ["NeedsReview", "RepeatBuyer"])
+        self.assertEqual(rows[0]["suggestion_reason"], "internal notes, 1 order(s)")
+        self.assertEqual(rows[1]["suggestion_reason"], "repeat buyer, 4 order(s)")
+
+    def test_ebay_buyer_block_api_capability_rows(self):
+        rows = admin._ebay_buyer_block_api_capability_rows(
+            {"combinedPaymentPreferences": {}, "sellerEligibility": {"eligible": True}}
+        )
+        by_surface = {row["surface"]: row for row in rows}
+        self.assertEqual(by_surface["Blocked buyer list"]["status"], "manual_ui_required")
+        self.assertEqual(by_surface["Buyer requirements"]["status"], "partial_api_surface")
+        self.assertEqual(by_surface["Unpaid item excluded users"]["status"], "trading_api_available_distinct")
+        self.assertEqual(by_surface["Account user preferences smoke test"]["status"], "available")
+        self.assertIn("combinedPaymentPreferences", by_surface["Account user preferences smoke test"]["meaning"])
+
+    def test_runtime_seed_defaults_include_ebay_buyer_blocklist_mirror(self):
+        rows = admin._runtime_setting_seed_defaults()
+        keys = {str(row.get("key") or "") for row in rows}
+        self.assertIn("ebay_buyer_blocklist_usernames_csv", keys)
+        self.assertIn("ebay_buyer_blocklist_notes", keys)
+
     def test_ebay_token_auto_refresh_diagnostics(self):
         now = datetime(2026, 4, 18, 12, 0, 0)
         runtime_int_values = {
@@ -366,7 +492,19 @@ class AdminHelpersTests(unittest.TestCase):
         )
         self.assertEqual(
             out["cogs_source_mix_line"],
+            "- COGS evidence split: verified $0.00; estimated $25.00; review-needed $0.00\n"
             "- COGS source mix: lot_expected_quantity_fallback $25.00/1 sale(s)\n",
+        )
+        self.assertEqual(
+            out["cogs_evidence_split"],
+            {
+                "verified_amount": 0.0,
+                "estimated_amount": 25.0,
+                "review_needed_amount": 0.0,
+                "verified_sale_rows": 0,
+                "estimated_sale_rows": 1,
+                "review_needed_sale_rows": 0,
+            },
         )
 
     def test_build_env_coverage_rows_statuses(self):
@@ -590,6 +728,12 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertEqual(by_key["notification_outbox_runner_limit"]["value_type"], "int")
         self.assertEqual(by_key["notification_outbox_cleanup_enabled"]["value"], "true")
         self.assertEqual(by_key["notification_outbox_cleanup_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_enabled"]["value"], "true")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_enabled"]["value_type"], "bool")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_interval_hours"]["value"], "24")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_interval_hours"]["value_type"], "int")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_deactivate_missing"]["value"], "false")
+        self.assertEqual(by_key["sync_job_ebay_store_categories_sync_deactivate_missing"]["value_type"], "bool")
         self.assertEqual(by_key["ai_accountant_web_research_enabled"]["value"], "true")
         self.assertEqual(by_key["ai_accountant_web_research_enabled"]["value_type"], "bool")
         self.assertEqual(by_key["ai_accountant_web_research_limit"]["value"], "5")
@@ -598,6 +742,24 @@ class AdminHelpersTests(unittest.TestCase):
         self.assertEqual(by_key["ai_accountant_web_research_timeout_seconds"]["value_type"], "int")
         self.assertEqual(by_key["listing_wizard_recent_product_limit"]["value"], "75")
         self.assertEqual(by_key["listing_wizard_recent_product_limit"]["value_type"], "int")
+        self.assertEqual(by_key["ebay_fee_estimate_final_value_rate_percent"]["value"], "13.25")
+        self.assertEqual(by_key["ebay_fee_estimate_final_value_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["ebay_fee_estimate_final_value_fixed_per_order_usd"]["value"], "0.30")
+        self.assertEqual(by_key["ebay_fee_estimate_final_value_fixed_per_order_usd"]["value_type"], "float")
+        self.assertEqual(by_key["ebay_fee_estimate_payment_rate_percent"]["value"], "0.0")
+        self.assertEqual(by_key["ebay_fee_estimate_payment_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["ebay_fee_estimate_payment_fixed_per_order_usd"]["value"], "0.0")
+        self.assertEqual(by_key["ebay_fee_estimate_payment_fixed_per_order_usd"]["value_type"], "float")
+        self.assertEqual(by_key["ebay_fee_estimate_promoted_rate_percent"]["value"], "0.0")
+        self.assertEqual(by_key["ebay_fee_estimate_promoted_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["quarterly_estimated_tax_federal_income_rate_percent"]["value"], "22.0")
+        self.assertEqual(by_key["quarterly_estimated_tax_federal_income_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["quarterly_estimated_tax_colorado_income_rate_percent"]["value"], "4.40")
+        self.assertEqual(by_key["quarterly_estimated_tax_colorado_income_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["quarterly_estimated_tax_self_employment_rate_percent"]["value"], "15.30")
+        self.assertEqual(by_key["quarterly_estimated_tax_self_employment_rate_percent"]["value_type"], "float")
+        self.assertEqual(by_key["quarterly_estimated_tax_se_net_earnings_multiplier_percent"]["value"], "92.35")
+        self.assertEqual(by_key["quarterly_estimated_tax_se_net_earnings_multiplier_percent"]["value_type"], "float")
         self.assertTrue(all("value_type" in row for row in defaults))
 
 

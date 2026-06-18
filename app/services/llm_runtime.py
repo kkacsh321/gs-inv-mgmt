@@ -287,7 +287,19 @@ def generate_comp_ai_summary(
         "ebay_comps": ebay_rows[:30],
         "web_comps": web_rows[:30],
         "spot_context": spot_context or {},
-        "instruction": (instruction or DEFAULT_COMP_INSTRUCTION).strip(),
+        "confidence_policy": {
+            "has_sold_ebay_comps": bool(ebay_rows),
+            "max_confidence_without_sold_ebay_comps": "medium",
+            "web_rows_are_active_or_research_evidence": True,
+        },
+        "instruction": (
+            (instruction or DEFAULT_COMP_INSTRUCTION).strip()
+            + "\n\nEvidence handling: Treat ebay_comps with sold_price as sold-market evidence. "
+            "Treat web_comps as active/listed or research evidence unless a row explicitly proves a sold result. "
+            "Do not describe web listed prices as sold comps. If ebay_comps is empty, state that eBay sold comps "
+            "were unavailable and lower pricing confidence accordingly. When ebay_comps is empty, the maximum "
+            "allowed confidence level is Medium; never say High confidence from web/listed evidence alone."
+        ),
     }
 
     headers = {"Content-Type": "application/json"}

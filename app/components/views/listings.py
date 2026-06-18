@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from html import escape
 import hashlib
 import json
 import re
@@ -52,11 +53,17 @@ from app.services.ebay_aspects import (
 from app.services.ebay import (
     EBAY_DEFAULT_INVENTORY_CONDITIONS,
     EBAY_MAX_CONDITION_DESCRIPTION_CHARS,
+    EBAY_MAX_INVENTORY_DESCRIPTION_CHARS,
     EbayClient,
+    build_ebay_inventory_item_sku,
     ebay_condition_label,
     normalize_ebay_condition_policy_rows,
 )
-from app.services.ebay_fee_estimator import estimate_ebay_fees
+from app.services.ebay_fee_estimator import (
+    calculate_expected_net_score,
+    estimate_ebay_fees,
+    resolve_product_known_unit_cost,
+)
 from app.services.listing_orchestration import (
     build_channel_adapters,
     capability_matrix_rows,
@@ -65,6 +72,7 @@ from app.services.listing_orchestration import (
 from app.services.listing_readiness import evaluate_ebay_readiness
 from app.services.media_storage import MediaStorageService
 from app.services.runtime_settings import get_runtime_bool, get_runtime_str, get_runtime_values
+from app.services.sync_jobs import execute_sync_job
 from app.services.validation import ValidationService, ValidationError
 from app.services.video_processing import (
     is_ebay_video_upload_candidate,
@@ -87,6 +95,7 @@ LISTINGS_EBAY_PUBLISH_DRAFT_SESSION_KEYS = [
     "ebay_pub_qty",
     "ebay_pub_condition",
     "ebay_pub_category_id",
+    "ebay_pub_store_category_names",
     "ebay_pub_fixed_price",
     "ebay_pub_auction_start",
     "ebay_pub_auction_reserve",
@@ -177,18 +186,7 @@ def _to_float(value, default: float = 0.0) -> float:
 
 
 def _known_unit_cost(product: object | None) -> float:
-    if product is None:
-        return 0.0
-    return round(
-        max(
-            0.0,
-            _to_float(getattr(product, "acquisition_cost", 0))
-            + _to_float(getattr(product, "acquisition_tax_paid", 0))
-            + _to_float(getattr(product, "acquisition_shipping_paid", 0))
-            + _to_float(getattr(product, "acquisition_handling_paid", 0)),
-        ),
-        2,
-    )
+    return round(float(resolve_product_known_unit_cost(product)), 2)
 
 
 def _bundle_component(product: object, quantity_per_listing: int) -> dict[str, object]:
@@ -209,32 +207,12 @@ def _expected_net_score(
     known_unit_cost: float,
     estimated_local_shipping_cost_per_item: float,
 ) -> dict[str, float | str]:
-    qty = max(1, int(quantity or 1))
-    gross = max(0.0, _to_float(fee_estimate.get("gross_total")))
-    est_fees = max(0.0, _to_float(fee_estimate.get("estimated_total_fees")))
-    est_payout = max(0.0, _to_float(fee_estimate.get("estimated_net_payout_before_shipping_cost")))
-    cogs_total = max(0.0, _to_float(known_unit_cost) * float(qty))
-    local_ship_total = max(0.0, _to_float(estimated_local_shipping_cost_per_item) * float(qty))
-    expected_net = round(est_payout - local_ship_total - cogs_total, 2)
-    expected_margin_pct = round(((expected_net / gross) * 100.0), 2) if gross > 0 else 0.0
-    if expected_margin_pct >= 25.0:
-        score = "strong"
-    elif expected_margin_pct >= 10.0:
-        score = "good"
-    elif expected_margin_pct >= 0.0:
-        score = "thin"
-    else:
-        score = "negative"
-    return {
-        "gross_total": round(gross, 2),
-        "estimated_total_fees": round(est_fees, 2),
-        "estimated_payout_before_shipping": round(est_payout, 2),
-        "known_cogs_total": round(cogs_total, 2),
-        "estimated_local_shipping_total": round(local_ship_total, 2),
-        "expected_net": expected_net,
-        "expected_margin_pct_of_gross": expected_margin_pct,
-        "score": score,
-    }
+    return calculate_expected_net_score(
+        fee_estimate=fee_estimate,
+        quantity=quantity,
+        known_unit_cost=known_unit_cost,
+        estimated_local_shipping_cost_per_item=estimated_local_shipping_cost_per_item,
+    )
 
 
 def _build_listing_bundle_metadata(
@@ -829,6 +807,237 @@ def _merge_ebay_publish_metadata(raw_details: str, metadata: dict) -> str:
     return json.dumps(details_obj, indent=2)
 
 
+def _normalize_store_category_names(values: object) -> list[str]:
+    if isinstance(values, str):
+        raw_values = [values]
+    elif isinstance(values, (list, tuple, set)):
+        raw_values = list(values)
+    else:
+        raw_values = []
+    names: list[str] = []
+    for value in raw_values:
+        clean = str(value or "").strip()
+        if clean and clean not in names:
+            names.append(clean)
+        if len(names) >= 2:
+            break
+    return names
+
+
+def _store_category_option_rows(repo: InventoryRepository, *, marketplace_id: str) -> list[object]:
+    return list(
+        repo.list_ebay_store_categories(
+            environment=settings.app_env,
+            marketplace_id=str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+            active_only=True,
+        )
+    )
+
+
+def _sync_run_int(row: object, primary_attr: str, fallback_attr: str = "") -> int:
+    value = getattr(row, primary_attr, None)
+    if value is None and fallback_attr:
+        value = getattr(row, fallback_attr, None)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _latest_ebay_store_category_sync_summary(repo: InventoryRepository) -> dict:
+    try:
+        runs = repo.list_sync_runs(provider="ebay", limit=100)
+    except Exception:
+        return {}
+    for run in runs or []:
+        if str(getattr(run, "job_name", "") or "").strip() != "ebay_store_categories_sync":
+            continue
+        completed_at = getattr(run, "completed_at", None) or getattr(run, "finished_at", None)
+        started_at = getattr(run, "started_at", None)
+        return {
+            "run_id": int(getattr(run, "id", 0) or 0),
+            "status": str(getattr(run, "status", "") or "").strip() or "unknown",
+            "processed": _sync_run_int(run, "records_processed", "processed"),
+            "updated": _sync_run_int(run, "records_updated", "updated"),
+            "failed": _sync_run_int(run, "records_failed", "failed"),
+            "completed_at": completed_at,
+            "started_at": started_at,
+        }
+    return {}
+
+
+def _format_ebay_store_category_sync_summary(summary: dict) -> str:
+    if not summary:
+        return "No eBay store category sync run has been recorded yet."
+    timestamp = summary.get("completed_at") or summary.get("started_at")
+    if isinstance(timestamp, datetime):
+        timestamp_text = timestamp.replace(microsecond=0).isoformat(sep=" ")
+    elif timestamp:
+        timestamp_text = str(timestamp)
+    else:
+        timestamp_text = "time unavailable"
+    run_id = int(summary.get("run_id") or 0)
+    run_text = f"run #{run_id}" if run_id else "latest run"
+    return (
+        "Latest eBay store category sync: "
+        f"{run_text} {str(summary.get('status') or 'unknown')} at {timestamp_text}; "
+        f"processed {int(summary.get('processed') or 0)}, "
+        f"updated {int(summary.get('updated') or 0)}, "
+        f"failed {int(summary.get('failed') or 0)}."
+    )
+
+
+def _render_ebay_store_category_manager(
+    repo: InventoryRepository,
+    *,
+    marketplace_id: str,
+    actor: str,
+    key_prefix: str,
+) -> None:
+    with st.expander("Manage eBay Store Categories", expanded=False):
+        st.caption(
+            "Use the full eBay store category path. eBay Inventory API offers accept up to two "
+            "store category paths, for example `/Coins/Bullion/Copper`."
+        )
+        latest_sync = _latest_ebay_store_category_sync_summary(repo)
+        st.caption(_format_ebay_store_category_sync_summary(latest_sync))
+        sync_col1, sync_col2 = st.columns([1, 3])
+        with sync_col1:
+            sync_from_ebay = st.button("Sync From eBay Store", key=f"{key_prefix}_store_category_sync_btn")
+        with sync_col2:
+            st.caption(
+                "Uses eBay Trading API `GetStore` to import your current store category hierarchy into the local selector."
+            )
+        deactivate_missing = st.checkbox(
+            "Deactivate previously synced categories missing from eBay response",
+            value=False,
+            key=f"{key_prefix}_store_category_sync_deactivate_missing",
+            help=(
+                "Only categories imported from eBay by this sync tool are deactivated. "
+                "Manually entered categories are left alone."
+            ),
+        )
+        if sync_from_ebay:
+            user = current_user()
+            if user and not ensure_permission(user, "update", "Sync eBay Store Categories"):
+                st.stop()
+            try:
+                result = execute_sync_job(
+                    repo,
+                    job_name="ebay_store_categories_sync",
+                    actor=actor,
+                    marketplace_id=str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+                    deactivate_missing=bool(deactivate_missing),
+                )
+                imported = int(result.get("processed") or 0)
+                missing_count = int(result.get("missing") or 0)
+                deactivated_count = int(result.get("deactivated") or 0)
+                stale_note = ""
+                if missing_count and deactivated_count:
+                    stale_note = f" Deactivated {deactivated_count} stale eBay-synced categor{'y' if deactivated_count == 1 else 'ies'}."
+                elif missing_count:
+                    stale_note = (
+                        f" {missing_count} previously synced categor{'y is' if missing_count == 1 else 'ies are'} "
+                        "missing from eBay and remain active because deactivation was not selected."
+                    )
+                run_note = f" Sync run #{int(result.get('run_id') or 0)} recorded."
+                st.success(
+                    f"Synced {imported} eBay store categor{'y' if imported == 1 else 'ies'}.{stale_note}{run_note}"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"eBay store category sync failed: {exc}")
+        c1, c2, c3 = st.columns([3, 1, 1])
+        with c1:
+            category_path = st.text_input(
+                "Store Category Path",
+                key=f"{key_prefix}_store_category_path",
+                placeholder="/Coins/Bullion/Copper",
+            )
+        with c2:
+            external_category_id = st.text_input(
+                "Store Category ID",
+                key=f"{key_prefix}_store_category_external_id",
+                help="Optional eBay store category id, if known.",
+            )
+        with c3:
+            sort_order = st.number_input(
+                "Sort",
+                min_value=0,
+                step=1,
+                key=f"{key_prefix}_store_category_sort_order",
+            )
+        active = st.checkbox("Active", value=True, key=f"{key_prefix}_store_category_active")
+        notes = st.text_input("Notes", key=f"{key_prefix}_store_category_notes")
+        if st.button("Save Store Category", key=f"{key_prefix}_store_category_save_btn"):
+            try:
+                row = repo.upsert_ebay_store_category(
+                    environment=settings.app_env,
+                    marketplace_id=str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+                    category_path=category_path,
+                    external_category_id=external_category_id,
+                    sort_order=int(sort_order or 0),
+                    is_active=bool(active),
+                    source="manual",
+                    notes=notes,
+                    actor=actor,
+                )
+                st.success(f"Saved store category `{row.category_path}`.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Unable to save store category: {exc}")
+        rows = repo.list_ebay_store_categories(
+            environment=settings.app_env,
+            marketplace_id=str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+            active_only=False,
+        )
+        if rows:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "id": int(getattr(row, "id", 0) or 0),
+                            "path": getattr(row, "category_path", ""),
+                            "store_category_id": getattr(row, "external_category_id", ""),
+                            "active": bool(getattr(row, "is_active", False)),
+                            "sort": int(getattr(row, "sort_order", 0) or 0),
+                            "source": getattr(row, "source", ""),
+                            "last_sync_status": getattr(row, "last_sync_status", ""),
+                            "last_synced_at": getattr(row, "last_synced_at", ""),
+                            "notes": getattr(row, "notes", ""),
+                        }
+                        for row in rows
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No eBay store categories saved yet.")
+
+
+def _listing_ebay_publish_meta(listing) -> dict:
+    details_obj = _listing_marketplace_details_obj(str(getattr(listing, "marketplace_details", "") or ""))
+    publish_meta = details_obj.get("ebay_publish")
+    return publish_meta if isinstance(publish_meta, dict) else {}
+
+
+def _listing_ebay_inventory_sku(product, listing) -> str:
+    publish_meta = _listing_ebay_publish_meta(listing)
+    stored_inventory_sku = str(publish_meta.get("inventory_sku") or "").strip()
+    if stored_inventory_sku:
+        return stored_inventory_sku
+    product_sku = str(getattr(product, "sku", "") or "").strip()
+    legacy_offer_id = str(publish_meta.get("offer_id") or "").strip()
+    legacy_external_listing_id = str(getattr(listing, "external_listing_id", "") or "").strip()
+    if legacy_offer_id or legacy_external_listing_id:
+        return product_sku
+    return build_ebay_inventory_item_sku(
+        product_sku,
+        listing_id=int(getattr(listing, "id", 0) or 0),
+    )
+
+
 def _merge_bundle_metadata(raw_details: str, bundle_metadata: dict) -> str:
     details_obj = _listing_marketplace_details_obj(raw_details)
     details_obj["bundle"] = bundle_metadata or {"enabled": False}
@@ -879,7 +1088,14 @@ def _persist_listing_publish_error(
     publish_meta["last_publish_error"] = str(error_message or "").strip()
     publish_meta["last_publish_error_at"] = utcnow_naive().isoformat()
     publish_meta["last_publish_error_stage"] = str(stage or "").strip()
-    publish_meta["last_publish_error_context"] = context if isinstance(context, dict) else {}
+    context_obj = context if isinstance(context, dict) else {}
+    publish_meta["last_publish_error_context"] = context_obj
+    inventory_sku = str(context_obj.get("inventory_sku") or "").strip()
+    product_sku = str(context_obj.get("product_sku") or "").strip()
+    if inventory_sku:
+        publish_meta["inventory_sku"] = inventory_sku
+    if product_sku:
+        publish_meta["product_sku"] = product_sku
     details_obj["ebay_publish"] = publish_meta
     repo.update_listing(
         int(getattr(listing, "id", 0) or 0),
@@ -1570,6 +1786,7 @@ def _build_ebay_offer_payload(
     auction_start_price: float,
     auction_reserve_price: float,
     auction_buy_now_price: float,
+    store_category_names: list[str] | None = None,
 ) -> dict:
     fmt = str(format_type or "FIXED_PRICE").strip().upper()
     if fmt not in {"FIXED_PRICE", "AUCTION"}:
@@ -1592,6 +1809,13 @@ def _build_ebay_offer_payload(
     }
     if fmt != "AUCTION":
         payload["availableQuantity"] = max(1, int(available_quantity or 1))
+    store_paths = [
+        str(path or "").strip()
+        for path in (store_category_names or [])
+        if str(path or "").strip()
+    ][:2]
+    if store_paths:
+        payload["storeCategoryNames"] = store_paths
 
     pricing_summary = payload["pricingSummary"]
     if not isinstance(pricing_summary, dict):
@@ -2265,11 +2489,14 @@ def render_ebay_template_workspace(repo: InventoryRepository) -> None:
 
 
 def _sanitize_listing_html(value: str) -> tuple[str, list[str]]:
-    html = (value or "").strip()
+    raw = (value or "").strip()
+    html = _plain_text_listing_to_html(raw) if raw and not _looks_like_listing_html(raw) else raw
     if not html:
         return "", []
 
     notes: list[str] = []
+    if html != raw:
+        notes.append("Formatted plain text into eBay-safe HTML paragraphs/lists")
     sanitized = html
     patterns = [
         (r"(?is)<\s*script[^>]*>.*?<\s*/\s*script\s*>", "Removed <script> blocks"),
@@ -2294,6 +2521,62 @@ def _sanitize_listing_html(value: str) -> tuple[str, list[str]]:
         sanitized = js_proto_cleaned
 
     return sanitized.strip(), notes
+
+
+def _looks_like_listing_html(value: str) -> bool:
+    return bool(re.search(r"(?is)<\s*(p|br|div|ul|ol|li|h[1-6]|strong|b|em|span|table|section)\b", str(value or "")))
+
+
+def _plain_text_listing_to_html(value: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    blocks = re.split(r"\n\s*\n+", text)
+    html_parts: list[str] = []
+    pending_bullets: list[str] = []
+
+    def _flush_bullets() -> None:
+        if not pending_bullets:
+            return
+        items = "".join(f"<li>{escape(item.strip())}</li>" for item in pending_bullets if item.strip())
+        if items:
+            html_parts.append(f"<ul>{items}</ul>")
+        pending_bullets.clear()
+
+    heading_pattern = re.compile(r"^[A-Z][A-Za-z0-9 &'/.:-]{2,80}$")
+    bullet_pattern = re.compile(r"^\s*(?:[-*•]|[0-9]+[.)])\s+(.+?)\s*$")
+    for block in blocks:
+        lines = [line.rstrip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1:
+            raw_line = lines[0].strip()
+            bullet_match = bullet_pattern.match(raw_line)
+            if bullet_match:
+                pending_bullets.append(bullet_match.group(1).strip())
+                continue
+            _flush_bullets()
+            if heading_pattern.match(raw_line) and len(raw_line.split()) <= 8 and not raw_line.endswith("."):
+                html_parts.append(f"<h3>{escape(raw_line)}</h3>")
+            else:
+                html_parts.append(f"<p>{escape(raw_line)}</p>")
+            continue
+        _flush_bullets()
+        paragraph_lines: list[str] = []
+        for line in lines:
+            bullet_match = bullet_pattern.match(line)
+            if bullet_match:
+                if paragraph_lines:
+                    html_parts.append(f"<p>{escape(' '.join(paragraph_lines).strip())}</p>")
+                    paragraph_lines = []
+                pending_bullets.append(bullet_match.group(1).strip())
+            else:
+                _flush_bullets()
+                paragraph_lines.append(line.strip())
+        if paragraph_lines:
+            html_parts.append(f"<p>{escape(' '.join(paragraph_lines).strip())}</p>")
+    _flush_bullets()
+    return "\n".join(html_parts).strip()
 
 
 def _validate_listing_html(value: str) -> list[str]:
@@ -2335,10 +2618,11 @@ def _execute_batch_publish_for_listing(
     listing_id = int(listing_obj.id)
     offer_id = ""
     external_listing_id = ""
+    inventory_sku = ""
     message = ""
     status = "error"
+    product_obj = None
     try:
-        product_obj = None
         if product_by_id:
             product_obj = product_by_id.get(int(listing_obj.product_id or 0))
         if product_obj is None:
@@ -2358,6 +2642,7 @@ def _execute_batch_publish_for_listing(
         if not image_urls:
             raise ValueError("No HTTPS listing images available.")
         image_urls = image_urls[:24]
+        inventory_sku = _listing_ebay_inventory_sku(product_obj, listing_obj)
 
         inventory_payload = {
             "availability": {
@@ -2373,13 +2658,13 @@ def _execute_batch_publish_for_listing(
         _maybe_add_package_data(inventory_payload, product_obj)
         ebay.create_or_replace_inventory_item(
             access_token=access_token,
-            sku=product_obj.sku,
+            sku=inventory_sku,
             payload=inventory_payload,
             content_language=content_language,
         )
 
         offer_payload = {
-            "sku": product_obj.sku,
+            "sku": inventory_sku,
             "marketplaceId": marketplace_id,
             "format": "FIXED_PRICE",
             "availableQuantity": int(listing_obj.quantity_listed or 1),
@@ -2404,14 +2689,14 @@ def _execute_batch_publish_for_listing(
             access_token=access_token,
             payload=offer_payload,
             content_language=content_language,
-            sku=product_obj.sku,
+            sku=inventory_sku,
             marketplace_id=marketplace_id,
             format_type="FIXED_PRICE",
         )
         publish_result = ebay.publish_offer(
             access_token=access_token,
             offer_id=offer_id,
-            inventory_sku=str(product_obj.sku or "").strip(),
+            inventory_sku=inventory_sku,
             content_language=content_language,
         )
         external_listing_id = str(publish_result.get("listingId") or "").strip()
@@ -2451,12 +2736,27 @@ def _execute_batch_publish_for_listing(
             "executed_at": utcnow_naive().isoformat(),
             "executed_by": actor,
             "offer_id": offer_id,
+            "inventory_sku": inventory_sku,
+            "product_sku": str(getattr(product_obj, "sku", "") or "").strip(),
             "listing_id": external_listing_id,
             "status": status,
             "message": message,
         }
     )
     details_obj["publish_batch_execution"] = exec_history[-100:]
+    publish_meta = details_obj.get("ebay_publish")
+    if not isinstance(publish_meta, dict):
+        publish_meta = {}
+    batch_publish_meta = {
+        "offer_id": offer_id,
+        "inventory_sku": inventory_sku,
+        "product_sku": str(getattr(product_obj, "sku", "") or "").strip(),
+        "marketplace_id": marketplace_id,
+    }
+    if status == "success":
+        batch_publish_meta["published_at"] = utcnow_naive().isoformat()
+    publish_meta.update(batch_publish_meta)
+    details_obj["ebay_publish"] = publish_meta
     return_payload["marketplace_details"] = json.dumps(details_obj, indent=2)
     repo.update_listing(listing_id, return_payload, actor=actor)
     return {
@@ -2995,6 +3295,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     st.session_state.setdefault("create_listing_ebay_marketplace_id", str(create_ebay_defaults.get("marketplace_id") or settings.ebay_marketplace_id))
     st.session_state.setdefault("create_listing_ebay_currency", str(create_ebay_defaults.get("currency") or settings.ebay_currency))
     st.session_state.setdefault("create_listing_ebay_content_language", str(create_ebay_defaults.get("content_language") or settings.ebay_content_language))
+    st.session_state.setdefault(
+        "create_listing_ebay_store_category_names",
+        _normalize_store_category_names(create_ebay_defaults.get("store_category_names")),
+    )
     st.session_state.setdefault("create_listing_ebay_auction_start_price", float(create_ebay_defaults.get("auction_start_price") or 1.0))
     st.session_state.setdefault("create_listing_ebay_auction_reserve_price", float(create_ebay_defaults.get("auction_reserve_price") or 0.0))
     st.session_state.setdefault("create_listing_ebay_auction_buy_now_price", float(create_ebay_defaults.get("auction_buy_now_price") or 0.0))
@@ -3024,6 +3328,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         create_default_preset = _get_default_create_preset()
         readiness_preview = evaluate_ebay_readiness(
             listing_title=str(st.session_state.get("create_listing_title") or "").strip(),
+            listing_description=str(st.session_state.get("create_listing_desc") or "").strip(),
             listing_price=float(st.session_state.get("create_listing_price") or 0.0),
             auction_start_price=float(st.session_state.get("create_listing_ebay_auction_start_price") or create_ebay_defaults.get("auction_start_price") or st.session_state.get("create_listing_price") or 0.0),
             auction_reserve_price=float(st.session_state.get("create_listing_ebay_auction_reserve_price") or create_ebay_defaults.get("auction_reserve_price") or 0.0),
@@ -3288,6 +3593,46 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 st.text_input("Currency", key="create_listing_ebay_currency")
             with ec2:
                 st.text_input("Content Language", key="create_listing_ebay_content_language")
+            create_store_category_marketplace_id = str(
+                st.session_state.get("create_listing_ebay_marketplace_id")
+                or settings.ebay_marketplace_id
+                or "EBAY_US"
+            ).strip()
+            _render_ebay_store_category_manager(
+                repo,
+                marketplace_id=create_store_category_marketplace_id,
+                actor=user.username,
+                key_prefix="create_listing_ebay",
+            )
+            create_store_category_options = [
+                str(getattr(row, "category_path", "") or "").strip()
+                for row in _store_category_option_rows(
+                    repo,
+                    marketplace_id=create_store_category_marketplace_id,
+                )
+                if str(getattr(row, "category_path", "") or "").strip()
+            ]
+            create_store_category_default = [
+                path
+                for path in _normalize_store_category_names(
+                    st.session_state.get("create_listing_ebay_store_category_names")
+                )
+                if path in create_store_category_options
+            ]
+            if _normalize_store_category_names(
+                st.session_state.get("create_listing_ebay_store_category_names")
+            ) != create_store_category_default:
+                st.session_state["create_listing_ebay_store_category_names"] = create_store_category_default
+            st.multiselect(
+                "Store Categories (optional)",
+                options=create_store_category_options,
+                default=create_store_category_default,
+                max_selections=2,
+                key="create_listing_ebay_store_category_names",
+                help="Optional eBay store category full paths; eBay allows up to two per offer.",
+            )
+            if not create_store_category_options:
+                st.caption("No saved eBay store categories yet. Add one above to use it on listings.")
             ea1, ea2, ea3 = st.columns(3)
             with ea1:
                 st.number_input(
@@ -3424,6 +3769,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                             "marketplace_id": str(st.session_state.get("create_listing_ebay_marketplace_id") or "").strip(),
                             "currency": str(st.session_state.get("create_listing_ebay_currency") or "").strip(),
                             "content_language": str(st.session_state.get("create_listing_ebay_content_language") or "").strip(),
+                            "store_category_names": _normalize_store_category_names(
+                                st.session_state.get("create_listing_ebay_store_category_names")
+                            ),
                             "auction_start_price": float(st.session_state.get("create_listing_ebay_auction_start_price") or 0.0),
                             "auction_reserve_price": float(st.session_state.get("create_listing_ebay_auction_reserve_price") or 0.0),
                             "auction_buy_now_price": float(st.session_state.get("create_listing_ebay_auction_buy_now_price") or 0.0),
@@ -4599,6 +4947,12 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 readiness_aspects = _normalize_aspects_payload(str(publish_meta.get("aspects_json") or ""))
             readiness = evaluate_ebay_readiness(
                 listing_title=listing.listing_title,
+                listing_description=str(
+                    publish_meta.get("listing_description")
+                    or publish_meta.get("description")
+                    or listing.listing_title
+                    or ""
+                ),
                 listing_price=float(listing.listing_price or 0),
                 auction_start_price=float(auction_start_price or 0),
                 auction_reserve_price=float(auction_reserve_price or 0),
@@ -6466,6 +6820,72 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 except (ValueError, ValidationError) as exc:
                     st.error(str(exc))
 
+            st.markdown("##### Duplicate Listing")
+            st.caption(
+                "Creates a new local draft from this listing. External eBay IDs, URLs, publish history, "
+                "and stale publish errors are cleared so the duplicate can publish as a separate listing."
+            )
+            duplicate_default_title = str(selected_listing.listing_title or "").strip()
+            duplicate_suffix = " (copy)"
+            if duplicate_default_title and not duplicate_default_title.lower().endswith("(copy)"):
+                duplicate_default_title = f"{duplicate_default_title}{duplicate_suffix}"
+            with st.form(f"duplicate_listing_form_{selected_listing.id}"):
+                duplicate_title = st.text_input(
+                    "Duplicate Title",
+                    value=duplicate_default_title,
+                    key=f"duplicate_listing_title_{selected_listing.id}",
+                )
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    duplicate_price = st.number_input(
+                        "Duplicate Price",
+                        min_value=0.0,
+                        value=float(selected_listing.listing_price or 0),
+                        step=1.0,
+                        key=f"duplicate_listing_price_{selected_listing.id}",
+                    )
+                with dc2:
+                    duplicate_qty = st.number_input(
+                        "Duplicate Quantity",
+                        min_value=1,
+                        value=max(1, int(selected_listing.quantity_listed or 1)),
+                        step=1,
+                        key=f"duplicate_listing_qty_{selected_listing.id}",
+                    )
+                duplicate_copy_details = st.checkbox(
+                    "Copy reusable marketplace details",
+                    value=True,
+                    key=f"duplicate_listing_copy_details_{selected_listing.id}",
+                    help=(
+                        "Keeps reusable category, policy, bundle, and listing setup details while clearing "
+                        "eBay offer/listing identity fields."
+                    ),
+                )
+                duplicate_submit = st.form_submit_button("Create Duplicate Draft Listing")
+
+            if duplicate_submit:
+                if not ensure_permission(user, "create", "Duplicate Listing"):
+                    st.stop()
+                try:
+                    duplicate = repo.duplicate_listing(
+                        int(selected_listing.id),
+                        listing_title=str(duplicate_title or "").strip(),
+                        listing_price=to_decimal(duplicate_price),
+                        quantity_listed=int(duplicate_qty),
+                        copy_marketplace_details=bool(duplicate_copy_details),
+                        actor=user.username,
+                    )
+                    st.success(
+                        f"Created duplicate draft listing #{int(duplicate.id)}. "
+                        "Review media and eBay publish settings before posting."
+                    )
+                    st.session_state["manage_listing_id"] = int(duplicate.id)
+                    st.rerun()
+                except (ValueError, ValidationError) as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Unable to duplicate listing: {exc}")
+
             st.markdown("##### Danger Zone")
             listing_archived = bool(_listing_is_archived(selected_listing))
             if listing_archived:
@@ -6656,6 +7076,32 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         ),
     )
     selected_listing = listing_obj_by_id[int(selected_listing_id)]
+    mmc1, mmc2 = st.columns([3, 1])
+    with mmc1:
+        st.caption(
+            f"Managing listing #{int(selected_listing.id)}. Duplicate creates a separate draft with eBay identity cleared."
+        )
+    with mmc2:
+        if st.button(
+            "Duplicate Draft",
+            key=f"media_manager_duplicate_listing_{int(selected_listing.id)}",
+            use_container_width=True,
+        ):
+            if not ensure_permission(user, "create", "Duplicate Listing"):
+                st.stop()
+            try:
+                duplicate = repo.duplicate_listing(
+                    int(selected_listing.id),
+                    copy_marketplace_details=True,
+                    actor=user.username,
+                )
+                st.session_state["manage_listing_id"] = int(duplicate.id)
+                st.success(f"Created duplicate draft listing #{int(duplicate.id)}.")
+                st.rerun()
+            except (ValueError, ValidationError) as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Unable to duplicate listing: {exc}")
     load_listing_media_manager_data = st.checkbox(
         "Load Listing Media Manager Data (slower)",
         value=False,
@@ -6697,6 +7143,64 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     st.success(f"Uploaded {uploaded} media file(s).")
                 for error in errors:
                     st.error(f"Upload failed: {error}")
+
+        if int(selected_listing.product_id or 0) > 0:
+            try:
+                attachable_media_ids = repo.list_unlinked_product_media_ids(
+                    int(selected_listing.product_id),
+                    include_archived=False,
+                )
+                attachable_media_rows = repo.list_media_assets_by_ids(
+                    attachable_media_ids,
+                    include_archived=False,
+                )
+            except Exception:
+                attachable_media_rows = []
+            if attachable_media_rows:
+                with st.expander("Attach Existing Product Media", expanded=False):
+                    st.caption(
+                        "Attach unlinked product media to this listing without uploading another copy. "
+                        "Media already attached to another listing is not shown."
+                    )
+                    attachable_options: dict[str, int] = {
+                        (
+                            f"#{int(row.id)} | {str(row.media_type or '').strip() or '-'} | "
+                            f"{str(row.original_filename or '').strip() or '-'}"
+                        ): int(row.id)
+                        for row in attachable_media_rows
+                    }
+                    attach_selected_labels = st.multiselect(
+                        "Existing Product Media",
+                        options=list(attachable_options.keys()),
+                        key=f"listing_media_attach_existing_{int(selected_listing.id)}",
+                    )
+                    attach_selected_ids = [
+                        int(attachable_options[label])
+                        for label in attach_selected_labels
+                        if label in attachable_options
+                    ]
+                    if st.button(
+                        "Attach Selected Media",
+                        key=f"listing_media_attach_existing_btn_{int(selected_listing.id)}",
+                        use_container_width=True,
+                    ):
+                        if not ensure_permission(user, "update", "Attach Listing Media"):
+                            st.stop()
+                        if not attach_selected_ids:
+                            st.error("Select at least one existing product media file to attach.")
+                        else:
+                            result = repo.bulk_update_media_assets(
+                                attach_selected_ids,
+                                {"listing_id": int(selected_listing.id)},
+                                actor=user.username,
+                            )
+                            updated_ids = list(result.get("updated_ids") or [])
+                            missing_ids = list(result.get("missing_ids") or [])
+                            if updated_ids:
+                                st.success(f"Attached {len(updated_ids)} existing media file(s).")
+                            if missing_ids:
+                                st.warning(f"{len(missing_ids)} selected media file(s) were not found.")
+                            st.rerun()
 
         listing_media = _listing_media_rows_cached(int(selected_listing.id))
         if not listing_media:
@@ -6898,6 +7402,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         "ebay_pub_qty": max(1, int(selected_listing.quantity_listed or 1)),
         "ebay_pub_condition": "NEW",
         "ebay_pub_category_id": str(runtime_defaults.get("ebay_category_id") or "").strip(),
+        "ebay_pub_store_category_names": [],
         "ebay_pub_fixed_price": max(0.01, float(selected_listing.listing_price)),
         "ebay_pub_auction_start": max(0.01, float(default_auction_start)),
         "ebay_pub_auction_reserve": max(0.0, float(default_auction_reserve)),
@@ -7008,6 +7513,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 or defaults["ebay_pub_category_id"]
                 or ""
             ).strip(),
+            "ebay_pub_store_category_names": _normalize_store_category_names(
+                publish_meta.get("store_category_names")
+                or defaults["ebay_pub_store_category_names"]
+            ),
             "ebay_pub_fixed_price": max(0.01, float(selected_listing.listing_price or 0.01)),
             "ebay_pub_auction_start": max(
                 0.01,
@@ -8079,6 +8588,40 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 if publish_format == "FIXED_PRICE"
                 else st.selectbox("Auction Duration", auction_durations, key="ebay_pub_auction_duration")
             )
+        publish_store_category_marketplace_id = str(
+            st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id or "EBAY_US"
+        ).strip()
+        _render_ebay_store_category_manager(
+            repo,
+            marketplace_id=publish_store_category_marketplace_id,
+            actor=user.username,
+            key_prefix=f"ebay_pub_{int(selected_listing.id)}",
+        )
+        publish_store_category_options = [
+            str(getattr(row, "category_path", "") or "").strip()
+            for row in _store_category_option_rows(
+                repo,
+                marketplace_id=publish_store_category_marketplace_id,
+            )
+            if str(getattr(row, "category_path", "") or "").strip()
+        ]
+        publish_store_category_default = [
+            path
+            for path in _normalize_store_category_names(st.session_state.get("ebay_pub_store_category_names"))
+            if path in publish_store_category_options
+        ]
+        if _normalize_store_category_names(st.session_state.get("ebay_pub_store_category_names")) != publish_store_category_default:
+            _safe_session_set("ebay_pub_store_category_names", publish_store_category_default)
+        st.multiselect(
+            "eBay Store Categories (optional)",
+            options=publish_store_category_options,
+            default=publish_store_category_default,
+            max_selections=2,
+            key="ebay_pub_store_category_names",
+            help="Optional eBay store category full paths; eBay allows up to two per offer.",
+        )
+        if not publish_store_category_options:
+            st.caption("No saved eBay store categories yet. Add one above to use it on this listing.")
         if publish_format == "FIXED_PRICE":
             fixed_price = st.number_input(
                 "Buy It Now Price",
@@ -8239,7 +8782,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 estimated_local_shipping_cost_per_item=float(estimated_local_shipping_cost_per_item or 0.0),
             )
             st.markdown("##### Expected Net Score (Pre-Publish)")
-            en1, en2, en3, en4 = st.columns(4)
+            en1, en2, en3, en4, en5 = st.columns(5)
             with en1:
                 st.metric("Known Unit Cost", f"${float(known_unit_cost or 0.0):,.2f}")
             with en2:
@@ -8248,10 +8791,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 st.metric("Expected Net", f"${float(expected_net.get('expected_net') or 0.0):,.2f}")
             with en4:
                 st.metric("Expected Margin %", f"{float(expected_net.get('expected_margin_pct_of_gross') or 0.0):.2f}%")
+            with en5:
+                st.metric("Breakeven Listing", f"${float(expected_net.get('breakeven_listing_price') or 0.0):,.2f}")
             st.caption(
                 "Expected-net score: "
                 f"`{str(expected_net.get('score') or '').upper()}` | "
-                "formula = est net payout - local fulfillment cost - known COGS."
+                "formula = est net payout - local fulfillment cost - known COGS. "
+                f"Price cushion vs breakeven: ${float(expected_net.get('price_cushion') or 0.0):,.2f}."
             )
 
         load_volume_pricing_builder = st.checkbox(
@@ -8608,6 +9154,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         or st.session_state.get("ebay_pub_category_id")
         or ""
     ).strip()
+    effective_store_category_names = _normalize_store_category_names(
+        st.session_state.get("ebay_pub_store_category_names")
+    )
     subtitle = str(st.session_state.get("ebay_pub_subtitle") or "").strip()
     condition_description = str(st.session_state.get("ebay_pub_condition_description") or "").strip()
     condition_description_len = len(condition_description)
@@ -8992,7 +9541,10 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         if not resolved_offer_id and (selected_listing.external_listing_id or "").strip():
             try:
                 if offers_for_manage_cache is None:
-                    offers_payload = ebay.get_offers(access_token=token_clean, sku=product.sku)
+                    offers_payload = ebay.get_offers(
+                        access_token=token_clean,
+                        sku=_listing_ebay_inventory_sku(product, selected_listing) if product else "",
+                    )
                     offers_for_manage_cache = list(offers_payload.get("offers") or [])
                 for offer in offers_for_manage_cache:
                     offer_listing_id = str(offer.get("listingId") or "").strip()
@@ -9084,7 +9636,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 publish_result = ebay.publish_offer(
                     access_token=token_to_use,
                     offer_id=effective_offer_id,
-                    inventory_sku=str(product.sku or "").strip() if product else "",
+                    inventory_sku=_listing_ebay_inventory_sku(product, selected_listing) if product else "",
                     content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
                 )
                 listing_id = str(
@@ -9121,6 +9673,16 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 st.error("Listing description failed validation: " + " | ".join(listing_html_errors))
                 st.stop()
             effective_listing_description, sanitize_notes = _get_effective_listing_description_and_notes()
+            if not str(effective_listing_description or "").strip():
+                st.error("eBay listing description must be between 1 and 4000 characters.")
+                st.stop()
+            if len(str(effective_listing_description or "")) > EBAY_MAX_INVENTORY_DESCRIPTION_CHARS:
+                st.error(
+                    "eBay listing description must be "
+                    f"{EBAY_MAX_INVENTORY_DESCRIPTION_CHARS} characters or fewer "
+                    f"(currently {len(str(effective_listing_description or ''))})."
+                )
+                st.stop()
             if sanitize_notes:
                 st.info(
                     "Listing description was sanitized before eBay operations: "
@@ -9287,8 +9849,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             )
 
             currency = (st.session_state.get("ebay_pub_currency") or default_currency).strip()
+            inventory_sku = _listing_ebay_inventory_sku(product, selected_listing)
             revise_offer_payload = _build_ebay_offer_payload(
-                sku=product.sku,
+                sku=inventory_sku,
                 marketplace_id=(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
                 format_type=publish_format,
                 available_quantity=int(available_quantity),
@@ -9307,6 +9870,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 auction_start_price=float(auction_start_price or 0.0),
                 auction_reserve_price=float(auction_reserve_price or 0.0),
                 auction_buy_now_price=float(auction_buy_now_price or 0.0),
+                store_category_names=effective_store_category_names,
             )
             local_listing_price = (
                 float(fixed_price or 0.0)
@@ -9318,7 +9882,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 fell_back_inventory, inventory_error = _create_or_replace_inventory_item_with_fallback(
                     ebay=ebay,
                     access_token=token_to_use,
-                    sku=product.sku,
+                    sku=inventory_sku,
                     payload=inventory_payload,
                     content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
                 )
@@ -9339,10 +9903,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                     {
                         "format": publish_format,
                         "offer_id": effective_offer_id,
+                        "inventory_sku": inventory_sku,
+                        "product_sku": str(product.sku or "").strip(),
                         "marketplace_id": str(
                             st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id
                         ).strip(),
                         "category_id": effective_category_id,
+                        "store_category_names": effective_store_category_names,
                         "content_language": str(
                             st.session_state.get("ebay_pub_content_language") or default_content_language
                         ).strip(),
@@ -9439,6 +10006,16 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         st.error("Listing description failed validation: " + " | ".join(listing_html_errors))
         return
     effective_listing_description, sanitize_notes = _get_effective_listing_description_and_notes()
+    if not str(effective_listing_description or "").strip():
+        st.error("eBay listing description must be between 1 and 4000 characters.")
+        return
+    if len(str(effective_listing_description or "")) > EBAY_MAX_INVENTORY_DESCRIPTION_CHARS:
+        st.error(
+            "eBay listing description must be "
+            f"{EBAY_MAX_INVENTORY_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {len(str(effective_listing_description or ''))})."
+        )
+        return
     if sanitize_notes:
         st.info(
             "Listing description was sanitized before eBay operations: "
@@ -9705,8 +10282,9 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
     )
 
     currency = (st.session_state.get("ebay_pub_currency") or default_currency).strip()
+    inventory_sku = _listing_ebay_inventory_sku(product, selected_listing)
     offer_payload = _build_ebay_offer_payload(
-        sku=product.sku,
+        sku=inventory_sku,
         marketplace_id=(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
         format_type=publish_format,
         available_quantity=int(available_quantity),
@@ -9725,6 +10303,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         auction_start_price=float(auction_start_price or 0.0),
         auction_reserve_price=float(auction_reserve_price or 0.0),
         auction_buy_now_price=float(auction_buy_now_price or 0.0),
+        store_category_names=effective_store_category_names,
     )
 
     publish_stage = "init"
@@ -9733,10 +10312,13 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         "format": str(publish_format or "").strip().upper(),
         "marketplace_id": str(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
         "category_id": str(effective_category_id or "").strip(),
+        "store_category_names": effective_store_category_names,
         "merchant_location_key": str(effective_merchant_location_key or "").strip(),
         "payment_policy_id": str(payment_policy_id or "").strip(),
         "fulfillment_policy_id": str(fulfillment_policy_id or "").strip(),
         "return_policy_id": str(return_policy_id or "").strip(),
+        "inventory_sku": inventory_sku,
+        "product_sku": str(product.sku or "").strip(),
         "use_eps_images": bool(use_eps_images),
         "upload_video_to_ebay": bool(upload_video_to_ebay),
         "video_warning": video_selection_warning,
@@ -9764,7 +10346,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
         fell_back_inventory, inventory_error = _create_or_replace_inventory_item_with_fallback(
             ebay=ebay,
             access_token=token_to_use,
-            sku=product.sku,
+            sku=inventory_sku,
             payload=inventory_payload,
             content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
             preserve_video_ids=bool(video_ids),
@@ -9780,7 +10362,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             inventory_video_verification = _verify_inventory_video_ids(
                 ebay=ebay,
                 access_token=token_to_use,
-                sku=str(product.sku or "").strip(),
+                sku=inventory_sku,
                 expected_video_ids=video_ids,
                 content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
             )
@@ -9806,7 +10388,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 access_token=token_to_use,
                 payload=offer_payload,
                 content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
-                sku=product.sku,
+                sku=inventory_sku,
                 marketplace_id=(st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
                 format_type=publish_format,
             )
@@ -9815,7 +10397,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             post_offer_video_verification = _verify_inventory_video_ids(
                 ebay=ebay,
                 access_token=token_to_use,
-                sku=str(product.sku or "").strip(),
+                sku=inventory_sku,
                 expected_video_ids=video_ids,
                 content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
             )
@@ -9832,7 +10414,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             publish_result = ebay.publish_offer(
                 access_token=token_to_use,
                 offer_id=offer_id,
-                inventory_sku=str(product.sku or "").strip(),
+                inventory_sku=inventory_sku,
                 content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
             )
             listing_id = str(publish_result.get("listingId") or "").strip()
@@ -9844,7 +10426,7 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
                 post_publish_video_verification = _verify_inventory_video_ids(
                     ebay=ebay,
                     access_token=token_to_use,
-                    sku=str(product.sku or "").strip(),
+                    sku=inventory_sku,
                     expected_video_ids=video_ids,
                     content_language=(st.session_state.get("ebay_pub_content_language") or default_content_language).strip(),
                 )
@@ -9892,8 +10474,11 @@ def render_listings(repo: InventoryRepository, storage: MediaStorageService) -> 
             "auction_reserve_price": float(auction_reserve_price or 0) if publish_format == "AUCTION" else 0.0,
             "auction_buy_now_price": float(auction_buy_now_price or 0) if publish_format == "AUCTION" else 0.0,
             "offer_id": offer_id,
+            "inventory_sku": inventory_sku,
+            "product_sku": str(product.sku or "").strip(),
             "marketplace_id": (st.session_state.get("ebay_pub_marketplace_id") or default_marketplace_id).strip(),
             "category_id": effective_category_id,
+            "store_category_names": effective_store_category_names,
             "merchant_location_key": effective_merchant_location_key,
             "payment_policy_id": payment_policy_id.strip(),
             "fulfillment_policy_id": fulfillment_policy_id.strip(),

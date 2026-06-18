@@ -1,5 +1,6 @@
 import json
 import hashlib
+from html import escape
 import imghdr
 import re
 import statistics
@@ -28,6 +29,14 @@ from app.services.ai_quality import (
     is_weak_listing_title,
     load_ai_quality_policy,
 )
+from app.services.business_chat_room import (
+    build_business_room_answer_command_suggestions,
+    build_business_room_attachment_evidence_rows,
+    build_business_room_handoff_review_card,
+    build_business_room_operator_answer_rows,
+    list_business_room_workflow_handoffs,
+    mark_business_room_workflow_handoff_reviewed,
+)
 from app.services.ebay_aspects import (
     merge_ebay_aspects_defaults,
     missing_required_ebay_aspects,
@@ -36,11 +45,17 @@ from app.services.ebay_aspects import (
 from app.services.ebay import (
     EBAY_DEFAULT_INVENTORY_CONDITIONS,
     EBAY_MAX_CONDITION_DESCRIPTION_CHARS,
+    EBAY_MAX_INVENTORY_DESCRIPTION_CHARS,
     EbayClient,
+    build_ebay_inventory_item_sku,
     ebay_condition_label,
     normalize_ebay_condition_policy_rows,
 )
-from app.services.ebay_fee_estimator import estimate_ebay_fees
+from app.services.ebay_fee_estimator import (
+    calculate_expected_net_score,
+    estimate_ebay_fees,
+    resolve_product_known_unit_cost,
+)
 from app.services.listing_readiness import evaluate_ebay_readiness
 from app.services.llm_runtime import resolve_comp_llm_runtime_chain
 from app.services.media_storage import MediaStorageService
@@ -59,24 +74,33 @@ from app.utils.time import utcnow_naive
 EBAY_TITLE_MAX_CHARS = 80
 
 DEFAULT_LISTING_WIZARD_AI_SYSTEM_MESSAGE = (
-    "You are a master seller on eBay and online marketplaces. "
-    "Write listings that are detailed, engaging, fun, and to the point. "
-    "You are an expert in coins, precious metals, antiques, collectibles, bullion, and general resale goods. "
-    "Prioritize buyer clarity, trust, and conversion with accurate condition, specs, and standout value points."
+    "You are Golden Stackers' expert eBay listing copywriter and compliance reviewer. "
+    "Write buyer-facing listings that feel premium, trustworthy, energetic, and specific without hype that cannot be proven. "
+    "You are fluent in coins, bullion, precious metals, collectibles, antiques, handmade display pieces, and general resale goods. "
+    "Use a warm collector-focused voice, clear sections, scannable bullets, and accurate condition language. "
+    "Never invent certifications, grades, precious-metal content, mintage, handmade/original claims, brand affiliation, or scarcity. "
+    "Only say handmade, made by Golden Stackers, limited edition, COA included, or made in Colorado when the provided facts support it. "
+    "Avoid prohibited or risky marketplace claims, investment promises, medical claims, keyword spam, and unsupported guarantees."
 )
 
 DEFAULT_LISTING_WIZARD_AI_SEED_PROMPT = (
-    "You are a master of selling on eBay and online marketplaces. "
-    "Write detailed, engaging, and to-the-point listing copy that helps convert buyers while staying accurate. "
-    "Act as an expert in coins, precious metals, antiques, collectibles, bullion, and general resale goods. "
-    "Generate a strong title, clear description, and practical pricing/offer suggestions."
+    "Write an eBay-ready listing for the selected item. Make it engaging, polished, and buyer-focused. "
+    "Use a strong opening, collector/stacker appeal when relevant, accurate specs, condition notes, what's included, "
+    "shipping/service reassurance, and a concise reason the item stands out. "
+    "Keep claims conservative and evidence-based. Do not claim Golden Stackers made the item unless the product facts say so."
 )
 
 DEFAULT_LISTING_WIZARD_AI_INSTRUCTION_TEMPLATE = (
     "Return ONLY JSON with keys: "
     "suggested_title, suggested_details, suggested_price, suggested_marketplace_details, "
     "suggested_price_low, suggested_price_high, "
-    "best_offer_enabled, best_offer_auto_accept, best_offer_minimum, risk_summary."
+    "best_offer_enabled, best_offer_auto_accept, best_offer_minimum, risk_summary.\n\n"
+    "For suggested_details, write 350-900 words when enough facts exist. Use plain text with clear section headings and bullet lines. "
+    "Recommended structure: strong title-style opening, short hook paragraph, Item Highlights, Condition & Notes, What's Included, "
+    "Display/Use or Collector Appeal when relevant, Shipping & Service, and About Golden Stackers only when appropriate. "
+    "Use excitement and personality, but do not fabricate facts. If the item is a third-party product, describe it as offered/sourced/listed by Golden Stackers, not made by us. "
+    "For coins with numerical grades, only include the numerical grade when the input clearly says it is certified by PCGS, NGC, ANACS, ICG, CAC, or another approved grading company. "
+    "Do not include policy-unsafe words, investment guarantees, bullion return promises, or unsupported authenticity claims."
 )
 
 LISTING_WIZARD_WORKFLOW_KEY = "listing_wizard"
@@ -91,6 +115,7 @@ LISTING_WIZARD_DRAFT_SESSION_KEYS = [
     "listing_wizard_bundle_primary_qty",
     "listing_wizard_bundle_extra_product_labels",
     "listing_wizard_category_id",
+    "listing_wizard_store_category_names",
     "listing_wizard_auction_duration",
     "listing_wizard_auction_start",
     "listing_wizard_auction_reserve",
@@ -301,6 +326,255 @@ def _wizard_clear_local_draft_state() -> None:
         st.session_state.pop(key, None)
 
 
+def _wizard_promote_direct_post_retry_metadata(publish_meta: dict, context: dict | None) -> dict:
+    updated = dict(publish_meta or {})
+    context_obj = context if isinstance(context, dict) else {}
+    for key in ("inventory_sku", "product_sku", "offer_id"):
+        value = str(context_obj.get(key) or "").strip()
+        if value:
+            updated[key] = value
+    return updated
+
+
+def _wizard_normalize_store_category_names(values: object) -> list[str]:
+    if isinstance(values, str):
+        raw_values = [values]
+    elif isinstance(values, (list, tuple, set)):
+        raw_values = list(values)
+    else:
+        raw_values = []
+    names: list[str] = []
+    for value in raw_values:
+        clean = str(value or "").strip()
+        if clean and clean not in names:
+            names.append(clean)
+        if len(names) >= 2:
+            break
+    return names
+
+
+def _wizard_store_category_options(repo: InventoryRepository, *, marketplace_id: str) -> list[str]:
+    rows = repo.list_ebay_store_categories(
+        environment=settings.app_env,
+        marketplace_id=str(marketplace_id or "EBAY_US").strip() or "EBAY_US",
+        active_only=True,
+    )
+    return [
+        str(getattr(row, "category_path", "") or "").strip()
+        for row in rows
+        if str(getattr(row, "category_path", "") or "").strip()
+    ]
+
+
+def _render_listing_wizard_business_room_handoffs(repo: InventoryRepository, *, username: str) -> None:
+    handoffs = list_business_room_workflow_handoffs(
+        repo,
+        environment=settings.app_env,
+        workflow_key=LISTING_WIZARD_WORKFLOW_KEY,
+        username=username,
+        limit=20,
+    )
+    loaded = st.session_state.get("listing_wizard_business_room_handoff_context")
+    if isinstance(loaded, dict) and str(loaded.get("prompt") or "").strip():
+        st.info(
+            "Loaded Business Chat Room handoff context: "
+            + str(loaded.get("prompt") or "").strip()[:180]
+        )
+    if not handoffs:
+        st.caption("No Business Chat Room listing handoffs are waiting for this user.")
+        return
+
+    with st.expander(f"Business Chat Room Handoffs ({len(handoffs)})", expanded=False):
+        st.caption(
+            "Approved room requests routed to Listing Wizard appear here. Loading one adds its prompt to this session's AI draft context; it does not publish or create a listing by itself."
+        )
+        table_rows = [
+            {
+                "draft_id": row["id"],
+                "queue_job_id": row["queue_job_id"],
+                "route": row["route_label"] or row["route"],
+                "requester": row["requester"],
+                "attachments": row["attachment_count"],
+                "prompt": row["prompt"][:160],
+                "updated_at": row["updated_at"],
+            }
+            for row in handoffs
+        ]
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+        options = {
+            f"#{row['id']} | job {row['queue_job_id']} | {(row['prompt'] or 'No prompt')[:80]}": row
+            for row in handoffs
+        }
+        selected_label = st.selectbox(
+            "Select handoff",
+            options=list(options.keys()),
+            key="listing_wizard_business_room_handoff_select",
+        )
+        selected = options[selected_label]
+        review_card = build_business_room_handoff_review_card(
+            selected,
+            workflow_key=LISTING_WIZARD_WORKFLOW_KEY,
+        )
+        if review_card.get("fields"):
+            st.dataframe(
+                [
+                    {
+                        "field": row.get("key"),
+                        "value": row.get("value"),
+                        "confidence": row.get("confidence"),
+                        "source": row.get("source"),
+                    }
+                    for row in review_card.get("fields", [])
+                    if isinstance(row, dict)
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        for warning in review_card.get("warnings", [])[:3]:
+            st.caption(f"Review note: {warning}")
+        readiness_checks = [
+            row
+            for row in review_card.get("listing_readiness_checks", [])
+            if isinstance(row, dict) and str(row.get("label") or "").strip()
+        ]
+        if readiness_checks:
+            st.dataframe(
+                [
+                    {
+                        "check": row.get("label"),
+                        "status": row.get("status"),
+                        "message": row.get("message"),
+                    }
+                    for row in readiness_checks
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        missing_questions = [
+            row
+            for row in review_card.get("missing_questions", [])
+            if isinstance(row, dict) and str(row.get("question") or row.get("field") or "").strip()
+        ]
+        if missing_questions:
+            st.caption(
+                "Missing confirmations: "
+                + "; ".join(str(row.get("question") or row.get("field") or "") for row in missing_questions[:5])
+            )
+        answer_suggestions = build_business_room_answer_command_suggestions(
+            selected,
+            review_card=review_card,
+            max_suggestions=8,
+        )
+        if answer_suggestions:
+            st.caption("Reply in Business Chat Room or Slack with one of:")
+            st.code("\n".join(answer_suggestions), language="text")
+        selected_payload = selected.get("payload") if isinstance(selected.get("payload"), dict) else {}
+        operator_answers = build_business_room_operator_answer_rows(selected_payload)
+        if operator_answers:
+            st.dataframe(
+                operator_answers[:10],
+                use_container_width=True,
+                hide_index=True,
+            )
+        apply_plan = selected_payload.get("apply_plan") if isinstance(selected_payload.get("apply_plan"), dict) else {}
+        if apply_plan:
+            st.caption(
+                "Apply plan: "
+                f"`{apply_plan.get('status') or 'unknown'}`"
+                + (f" ({apply_plan.get('reason')})" if apply_plan.get("reason") else "")
+            )
+        proposed_actions = [
+            row
+            for row in review_card.get("proposed_actions", [])
+            if isinstance(row, dict) and str(row.get("action") or "").strip()
+        ]
+        if proposed_actions:
+            st.caption("Proposed actions: " + ", ".join(str(row.get("action") or "") for row in proposed_actions[:5]))
+        st.text_area(
+            "Handoff Prompt",
+            value=str(selected.get("prompt") or ""),
+            height=120,
+            disabled=True,
+            key="listing_wizard_business_room_handoff_prompt_preview",
+        )
+        next_step = str(selected.get("next_step") or "").strip()
+        if next_step:
+            st.caption(f"Recommended next step: {next_step}")
+        attachment_rows = build_business_room_attachment_evidence_rows(selected_payload)
+        if attachment_rows:
+            st.caption("Attachment evidence")
+            st.dataframe(attachment_rows, use_container_width=True, hide_index=True)
+        elif int(selected.get("attachment_count") or 0) > 0:
+            st.caption(f"Attachment evidence included: {int(selected.get('attachment_count') or 0)} file(s).")
+        if st.button("Load Handoff Context", key="listing_wizard_load_business_room_handoff_btn"):
+            payload = dict(selected.get("payload") or {})
+            prompt = str(payload.get("prompt") or selected.get("prompt") or "").strip()
+            st.session_state["listing_wizard_business_room_handoff_context"] = payload
+            st.session_state["listing_wizard_business_room_review_card"] = review_card
+            field_values = dict(review_card.get("field_values") or {})
+            product_id = field_values.get("product_id")
+            if product_id:
+                st.session_state["listing_wizard_product_search"] = str(product_id)
+            title = str(field_values.get("title") or "").strip()
+            if title and not str(st.session_state.get("listing_wizard_title") or "").strip():
+                st.session_state["listing_wizard_title"] = title[:EBAY_TITLE_MAX_CHARS].rstrip(" -_,.;:")
+            description = str(
+                field_values.get("description_html")
+                or field_values.get("description")
+                or field_values.get("listing_description")
+                or ""
+            ).strip()
+            if description and not str(st.session_state.get("listing_wizard_details") or "").strip():
+                st.session_state["listing_wizard_details"] = description
+            if prompt:
+                existing_seed = str(st.session_state.get("listing_wizard_ai_seed") or "").strip()
+                handoff_block = (
+                    "\n\nBusiness Chat Room handoff context:\n"
+                    + prompt
+                    + "\nUse this as operator intent and evidence context, but keep listing claims evidence-based."
+                )
+                if "Business Chat Room handoff context:" not in existing_seed:
+                    st.session_state["listing_wizard_ai_seed"] = (existing_seed + handoff_block).strip()
+            repo.append_workflow_event(
+                environment=settings.app_env,
+                workflow_key=LISTING_WIZARD_WORKFLOW_KEY,
+                username=username,
+                scope_key=str(selected.get("scope_key") or LISTING_WIZARD_WORKFLOW_SCOPE_DEFAULT),
+                action="load_business_room_handoff",
+                status="ok",
+                message="Operator loaded Business Chat Room handoff context into Listing Wizard session.",
+                payload={
+                    "handoff_draft_id": int(selected.get("id") or 0),
+                    "queue_job_id": int(selected.get("queue_job_id") or 0),
+                    "source_message_id": int(selected.get("source_message_id") or 0),
+                    "prompt_loaded": bool(prompt),
+                    "field_count": len(review_card.get("fields") or []),
+                    "draft_signature": str(review_card.get("signature") or ""),
+                    "route": str(selected.get("route") or ""),
+                },
+                draft_id=int(selected.get("id") or 0),
+                actor=username,
+            )
+            st.success("Loaded handoff context into this Listing Wizard session.")
+            st.rerun()
+        if st.button("Mark Handoff Reviewed", key="listing_wizard_reviewed_business_room_handoff_btn"):
+            scope_key = str(selected.get("scope_key") or "").strip()
+            if not scope_key:
+                st.warning("Selected handoff is missing a scope key.")
+            else:
+                mark_business_room_workflow_handoff_reviewed(
+                    repo,
+                    environment=settings.app_env,
+                    workflow_key=LISTING_WIZARD_WORKFLOW_KEY,
+                    username=username,
+                    actor=username,
+                    source="listing_wizard",
+                    handoff=selected,
+                )
+                st.success("Marked Business Chat Room handoff reviewed.")
+                st.rerun()
+
+
 def _category_query_seed(*, title: str, category: str = "", metal_type: str = "", sku: str = "") -> str:
     parts: list[str] = []
     for raw in [title, category, metal_type]:
@@ -477,19 +751,8 @@ def _safe_price_float(value: object, default: float = 0.0) -> float:
 
 
 def _known_unit_cost(product: object | None) -> float:
-    if product is None:
-        return 0.0
     try:
-        return round(
-            max(
-                0.0,
-                float(getattr(product, "acquisition_cost", 0) or 0)
-                + float(getattr(product, "acquisition_tax_paid", 0) or 0)
-                + float(getattr(product, "acquisition_shipping_paid", 0) or 0)
-                + float(getattr(product, "acquisition_handling_paid", 0) or 0),
-            ),
-            2,
-        )
+        return round(float(resolve_product_known_unit_cost(product)), 2)
     except Exception:
         return 0.0
 
@@ -528,32 +791,12 @@ def _expected_net_score(
     known_unit_cost: float,
     estimated_local_shipping_cost_per_item: float,
 ) -> dict[str, float | str]:
-    qty = max(1, int(quantity or 1))
-    gross = max(0.0, float(fee_estimate.get("gross_total") or 0.0))
-    est_fees = max(0.0, float(fee_estimate.get("estimated_total_fees") or 0.0))
-    est_payout = max(0.0, float(fee_estimate.get("estimated_net_payout_before_shipping_cost") or 0.0))
-    cogs_total = max(0.0, float(known_unit_cost or 0.0) * float(qty))
-    local_ship_total = max(0.0, float(estimated_local_shipping_cost_per_item or 0.0) * float(qty))
-    expected_net = round(est_payout - local_ship_total - cogs_total, 2)
-    expected_margin_pct = round(((expected_net / gross) * 100.0), 2) if gross > 0 else 0.0
-    if expected_margin_pct >= 25.0:
-        score = "strong"
-    elif expected_margin_pct >= 10.0:
-        score = "good"
-    elif expected_margin_pct >= 0.0:
-        score = "thin"
-    else:
-        score = "negative"
-    return {
-        "gross_total": round(gross, 2),
-        "estimated_total_fees": round(est_fees, 2),
-        "estimated_payout_before_shipping": round(est_payout, 2),
-        "known_cogs_total": round(cogs_total, 2),
-        "estimated_local_shipping_total": round(local_ship_total, 2),
-        "expected_net": expected_net,
-        "expected_margin_pct_of_gross": expected_margin_pct,
-        "score": score,
-    }
+    return calculate_expected_net_score(
+        fee_estimate=fee_estimate,
+        quantity=quantity,
+        known_unit_cost=known_unit_cost,
+        estimated_local_shipping_cost_per_item=estimated_local_shipping_cost_per_item,
+    )
 
 
 def _build_listing_bundle_metadata(
@@ -683,6 +926,7 @@ def _wizard_build_ebay_offer_payload(
     auction_start_price: float,
     auction_reserve_price: float,
     auction_buy_now_price: float,
+    store_category_names: list[str] | None = None,
 ) -> dict:
     fmt = str(format_type or "FIXED_PRICE").strip().upper()
     if fmt not in {"FIXED_PRICE", "AUCTION"}:
@@ -705,6 +949,13 @@ def _wizard_build_ebay_offer_payload(
     }
     if fmt != "AUCTION":
         payload["availableQuantity"] = max(1, int(listing_qty or 1))
+    store_paths = [
+        str(path or "").strip()
+        for path in (store_category_names or [])
+        if str(path or "").strip()
+    ][:2]
+    if store_paths:
+        payload["storeCategoryNames"] = store_paths
 
     pricing_summary = payload["pricingSummary"]
     if not isinstance(pricing_summary, dict):
@@ -801,6 +1052,71 @@ def _sanitize_preview_html(value: str) -> str:
     )
     sanitized = re.sub(r"(?i)javascript\s*:", "", sanitized)
     return sanitized.strip()
+
+
+def _looks_like_listing_html(value: str) -> bool:
+    return bool(re.search(r"(?is)<\s*(p|br|div|ul|ol|li|h[1-6]|strong|b|em|span|table|section)\b", str(value or "")))
+
+
+def _plain_text_listing_to_html(value: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    blocks = re.split(r"\n\s*\n+", text)
+    html_parts: list[str] = []
+    pending_bullets: list[str] = []
+
+    def _flush_bullets() -> None:
+        if not pending_bullets:
+            return
+        items = "".join(f"<li>{escape(item.strip())}</li>" for item in pending_bullets if item.strip())
+        if items:
+            html_parts.append(f"<ul>{items}</ul>")
+        pending_bullets.clear()
+
+    heading_pattern = re.compile(r"^[A-Z][A-Za-z0-9 &'/.:-]{2,80}$")
+    bullet_pattern = re.compile(r"^\s*(?:[-*•]|[0-9]+[.)])\s+(.+?)\s*$")
+    for block in blocks:
+        lines = [line.rstrip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1:
+            raw_line = lines[0].strip()
+            bullet_match = bullet_pattern.match(raw_line)
+            if bullet_match:
+                pending_bullets.append(bullet_match.group(1).strip())
+                continue
+            _flush_bullets()
+            if heading_pattern.match(raw_line) and len(raw_line.split()) <= 8 and not raw_line.endswith("."):
+                html_parts.append(f"<h3>{escape(raw_line)}</h3>")
+            else:
+                html_parts.append(f"<p>{escape(raw_line)}</p>")
+            continue
+        _flush_bullets()
+        paragraph_lines: list[str] = []
+        for line in lines:
+            bullet_match = bullet_pattern.match(line)
+            if bullet_match:
+                if paragraph_lines:
+                    html_parts.append(f"<p>{escape(' '.join(paragraph_lines).strip())}</p>")
+                    paragraph_lines = []
+                pending_bullets.append(bullet_match.group(1).strip())
+            else:
+                _flush_bullets()
+                paragraph_lines.append(line.strip())
+        if paragraph_lines:
+            html_parts.append(f"<p>{escape(' '.join(paragraph_lines).strip())}</p>")
+    _flush_bullets()
+    return "\n".join(html_parts).strip()
+
+
+def _format_listing_description_for_ebay(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if _looks_like_listing_html(raw):
+        return _sanitize_preview_html(raw)
+    return _sanitize_preview_html(_plain_text_listing_to_html(raw))
 
 
 def _wizard_normalize_aspects_payload(raw_text: str) -> dict[str, list[str]]:
@@ -2201,6 +2517,8 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                 st.session_state["listing_wizard_apply_flash"] = "Cleared saved workflow draft."
                 st.rerun()
 
+    _render_listing_wizard_business_room_handoffs(repo, username=user.username)
+
     st.markdown("### Step 1 of 9: Select Product")
     force_restore_from_resume = bool(st.session_state.pop("listing_wizard_resume_applied_once", False))
     saved_product_id = int(saved_context.get("selected_product_id") or saved_payload.get("selected_product_id") or 0)
@@ -2762,7 +3080,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         estimated_local_shipping_cost_per_item=float(estimated_local_shipping_cost_per_item or 0.0),
     )
     st.markdown("##### Expected Net Score (Pre-Publish)")
-    en1, en2, en3, en4 = st.columns(4)
+    en1, en2, en3, en4, en5 = st.columns(5)
     with en1:
         st.metric("Known Cost / Listing Unit", f"${float(expected_net_unit_cost or 0.0):,.2f}")
     with en2:
@@ -2771,10 +3089,13 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         st.metric("Expected Net", f"${float(expected_net.get('expected_net') or 0.0):,.2f}")
     with en4:
         st.metric("Expected Margin %", f"{float(expected_net.get('expected_margin_pct_of_gross') or 0.0):.2f}%")
+    with en5:
+        st.metric("Breakeven Listing", f"${float(expected_net.get('breakeven_listing_price') or 0.0):,.2f}")
     st.caption(
         "Expected-net score: "
         f"`{str(expected_net.get('score') or '').upper()}` | "
-        "formula = est net payout - local fulfillment cost - known COGS."
+        "formula = est net payout - local fulfillment cost - known COGS. "
+        f"Price cushion vs breakeven: ${float(expected_net.get('price_cushion') or 0.0):,.2f}."
     )
 
     st.markdown("#### eBay Category")
@@ -2828,6 +3149,34 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             if last_category_matches_product
             else ""
         )
+    wizard_store_category_marketplace_id = str(
+        st.session_state.get("listing_wizard_ebay_marketplace_id")
+        or get_runtime_str(repo, "ebay_marketplace_id", settings.ebay_marketplace_id)
+        or "EBAY_US"
+    ).strip()
+    wizard_store_category_options = _wizard_store_category_options(
+        repo,
+        marketplace_id=wizard_store_category_marketplace_id,
+    )
+    current_store_category_names = _wizard_normalize_store_category_names(
+        st.session_state.get("listing_wizard_store_category_names")
+    )
+    wizard_store_category_default = [
+        path for path in current_store_category_names if path in wizard_store_category_options
+    ]
+    if current_store_category_names != wizard_store_category_default:
+        st.session_state["listing_wizard_store_category_names"] = wizard_store_category_default
+    selected_store_category_names = st.multiselect(
+        "eBay Store Categories (optional)",
+        options=wizard_store_category_options,
+        default=wizard_store_category_default,
+        max_selections=2,
+        key="listing_wizard_store_category_names",
+        help="Optional. eBay store category full paths; eBay allows up to two per offer.",
+    )
+    selected_store_category_names = _wizard_normalize_store_category_names(selected_store_category_names)
+    if not wizard_store_category_options:
+        st.caption("No saved eBay store categories yet. Add them from Listings > eBay Store Categories.")
     seed_query = _category_query_seed(
         title=str(getattr(selected_product, "title", "") or "").strip() if selected_product is not None else "",
         category=str(getattr(selected_product, "category", "") or "").strip() if selected_product is not None else "",
@@ -4631,6 +4980,9 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                 saved_cat = str(payload.get("category_id") or "").strip()
                 if saved_cat:
                     _wizard_queue_pending_field_updates({"listing_wizard_category_id": saved_cat})
+                st.session_state["listing_wizard_store_category_names"] = _wizard_normalize_store_category_names(
+                    payload.get("store_category_names")
+                )
                 st.success(f"Applied wizard eBay post profile `{chosen}`.")
                 st.rerun()
             else:
@@ -4679,6 +5031,9 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     "use_eps_images": bool(st.session_state.get("listing_wizard_ebay_use_eps_images")),
                     "upload_video_to_ebay": bool(st.session_state.get("listing_wizard_ebay_upload_video")),
                     "category_id": str(st.session_state.get("listing_wizard_category_id") or "").strip(),
+                    "store_category_names": _wizard_normalize_store_category_names(
+                        st.session_state.get("listing_wizard_store_category_names")
+                    ),
                 }
                 _save_wizard_ebay_post_profiles(
                     repo,
@@ -4774,6 +5129,15 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         uploaded_files=wizard_files,
     )
     media_count_est = int(media_count_est + len(selected_existing_media_ids))
+    preflight_details_for_readiness = str(listing_details or "").strip()
+    if bool(st.session_state.get("listing_wizard_include_volume_pricing_in_details")) and volume_pricing_tiers:
+        volume_block = _wizard_volume_pricing_description_block(volume_pricing_tiers)
+        if volume_block and volume_block not in preflight_details_for_readiness:
+            preflight_details_for_readiness = (
+                f"{preflight_details_for_readiness}\n\n{volume_block}"
+                if preflight_details_for_readiness
+                else volume_block
+            )
     preflight = evaluate_ebay_readiness(
         listing_title=str(listing_title or "").strip(),
         listing_price=float(listing_price or 0.0),
@@ -4794,6 +5158,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         category_aspects=category_aspect_rows,
         condition=str(st.session_state.get("listing_wizard_ebay_condition") or "").strip().upper(),
         condition_description=str(st.session_state.get("listing_wizard_condition_description") or ""),
+        listing_description=_format_listing_description_for_ebay(preflight_details_for_readiness),
         category_conditions=category_condition_rows,
     )
     p1, p2, p3, p4 = st.columns(4)
@@ -5410,6 +5775,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
             "format_type": str(format_type).strip().upper(),
             "listing_duration": str(auction_duration).strip().upper(),
             "category_id": str(selected_category_id or "").strip(),
+            "store_category_names": selected_store_category_names,
             "merchant_location_key": str(st.session_state.get("listing_wizard_ebay_merchant_location_key") or "").strip(),
             "payment_policy_id": str(get_runtime_str(repo, "ebay_payment_policy_id", "") or "").strip(),
             "fulfillment_policy_id": str(get_runtime_str(repo, "ebay_fulfillment_policy_id", "") or "").strip(),
@@ -5635,6 +6001,10 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
         direct_post_failed = False
         direct_post_error = ""
         if post_to_ebay_now:
+            ebay_inventory_sku = build_ebay_inventory_item_sku(
+                str(selected_product.sku or "").strip(),
+                listing_id=int(created.id),
+            )
             token_to_use = str(st.session_state.get("listing_wizard_ebay_access_token") or "").strip() or str(
                 get_runtime_str(repo, "ebay_user_access_token", settings.ebay_user_access_token) or ""
             ).strip()
@@ -5678,6 +6048,9 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     "payment_policy_id": payment_policy_id,
                     "fulfillment_policy_id": fulfillment_policy_id,
                     "return_policy_id": return_policy_id,
+                    "inventory_sku": ebay_inventory_sku,
+                    "product_sku": str(selected_product.sku or "").strip(),
+                    "store_category_names": selected_store_category_names,
                     "use_eps_images": bool(use_eps_images),
                     "upload_video_to_ebay": bool(upload_video_to_ebay),
                     "listing_qty": int(listing_qty or 1),
@@ -5835,9 +6208,15 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                                     f"{skipped_video_count} additional video file(s)."
                                 )
 
-                    effective_listing_description = _sanitize_preview_html(effective_details_for_save)
+                    effective_listing_description = _format_listing_description_for_ebay(effective_details_for_save)
                     if not effective_listing_description:
                         raise RuntimeError("Listing details are empty after sanitization.")
+                    if len(effective_listing_description) > EBAY_MAX_INVENTORY_DESCRIPTION_CHARS:
+                        raise RuntimeError(
+                            "Direct eBay post blocked: eBay listing description must be "
+                            f"{EBAY_MAX_INVENTORY_DESCRIPTION_CHARS} characters or fewer "
+                            f"(currently {len(effective_listing_description)})."
+                        )
 
                     direct_post_stage = "create_or_replace_inventory_item"
                     inventory_payload = {
@@ -5879,7 +6258,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     _wizard_maybe_add_package_data(inventory_payload, selected_product)
 
                     offer_payload = _wizard_build_ebay_offer_payload(
-                        sku=str(selected_product.sku or "").strip(),
+                        sku=ebay_inventory_sku,
                         marketplace_id=marketplace_id,
                         format_type=str(format_type or "FIXED_PRICE").strip().upper(),
                         listing_qty=int(listing_qty or 1),
@@ -5898,6 +6277,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         auction_start_price=float(auction_start or 0.0),
                         auction_reserve_price=float(auction_reserve or 0.0),
                         auction_buy_now_price=float(auction_bin or 0.0),
+                        store_category_names=selected_store_category_names,
                     )
                     if str(format_type or "FIXED_PRICE").strip().upper() == "FIXED_PRICE" and volume_pricing_tiers:
                         st.info(
@@ -5909,7 +6289,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                     fell_back_inventory, inventory_error = _wizard_create_or_replace_inventory_item_with_fallback(
                         ebay=ebay,
                         access_token=token_to_use,
-                        sku=selected_product.sku,
+                        sku=ebay_inventory_sku,
                         payload=inventory_payload,
                         content_language=content_language,
                         preserve_video_ids=bool(video_ids),
@@ -5928,7 +6308,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         inventory_video_verification = _wizard_verify_inventory_video_ids(
                             ebay=ebay,
                             access_token=token_to_use,
-                            sku=str(selected_product.sku or "").strip(),
+                            sku=ebay_inventory_sku,
                             expected_video_ids=video_ids,
                             content_language=content_language,
                         )
@@ -5955,7 +6335,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         post_offer_video_verification = _wizard_verify_inventory_video_ids(
                             ebay=ebay,
                             access_token=token_to_use,
-                            sku=str(selected_product.sku or "").strip(),
+                            sku=ebay_inventory_sku,
                             expected_video_ids=video_ids,
                             content_language=content_language,
                         )
@@ -5973,7 +6353,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         publish_result = ebay.publish_offer(
                             access_token=token_to_use,
                             offer_id=offer_id,
-                            inventory_sku=str(selected_product.sku or "").strip(),
+                            inventory_sku=ebay_inventory_sku,
                             content_language=content_language,
                         )
                         listing_id = str(publish_result.get("listingId") or "").strip()
@@ -5985,7 +6365,7 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                             post_publish_video_verification = _wizard_verify_inventory_video_ids(
                                 ebay=ebay,
                                 access_token=token_to_use,
-                                sku=str(selected_product.sku or "").strip(),
+                                sku=ebay_inventory_sku,
                                 expected_video_ids=video_ids,
                                 content_language=content_language,
                             )
@@ -6053,12 +6433,15 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                             if str(format_type or "FIXED_PRICE").strip().upper() == "AUCTION"
                             else 0.0,
                             "offer_id": offer_id,
+                            "inventory_sku": ebay_inventory_sku,
+                            "product_sku": str(selected_product.sku or "").strip(),
                             "offer_status": str(offer_status or ("PUBLISHED" if run_publish_live else "UNPUBLISHED")).strip(),
                             "direct_post_last_error": "",
                             "direct_post_last_error_at": "",
                             "direct_post_last_error_stage": "",
                             "direct_post_last_context": {},
                             "marketplace_id": marketplace_id,
+                            "store_category_names": selected_store_category_names,
                             "published_at": utcnow_naive().isoformat(),
                             "image_source": image_source_mode,
                             "image_count": len(image_urls),
@@ -6193,6 +6576,10 @@ def render_listing_wizard(repo: InventoryRepository, storage: MediaStorageServic
                         publish_meta = details_obj.get("ebay_publish")
                         if not isinstance(publish_meta, dict):
                             publish_meta = {}
+                        publish_meta = _wizard_promote_direct_post_retry_metadata(
+                            publish_meta,
+                            direct_post_context,
+                        )
                         publish_meta["direct_post_last_error"] = direct_post_error
                         publish_meta["direct_post_last_error_at"] = utcnow_naive().isoformat()
                         publish_meta["direct_post_last_error_stage"] = str(direct_post_stage or "").strip()

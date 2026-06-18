@@ -5,7 +5,7 @@ from app.services.ebay_aspects import (
     missing_required_ebay_aspects,
     title_has_numerical_coin_grade,
 )
-from app.services.ebay import EBAY_MAX_CONDITION_DESCRIPTION_CHARS
+from app.services.ebay import EBAY_MAX_CONDITION_DESCRIPTION_CHARS, EBAY_MAX_INVENTORY_DESCRIPTION_CHARS
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,7 @@ def evaluate_ebay_readiness(
     category_aspects: list[dict] | None = None,
     condition: str | None = None,
     condition_description: str | None = None,
+    listing_description: str | None = None,
     category_conditions: list[dict] | None = None,
 ) -> ReadinessResult:
     blockers: list[str] = []
@@ -107,6 +108,15 @@ def evaluate_ebay_readiness(
             "eBay condition description must be "
             f"{EBAY_MAX_CONDITION_DESCRIPTION_CHARS} characters or fewer "
             f"(currently {len(condition_description_text)})"
+        )
+    listing_description_text = str(listing_description or "")
+    if listing_description is not None and not listing_description_text.strip():
+        blockers.append("eBay listing description must be between 1 and 4000 characters")
+    if len(listing_description_text) > EBAY_MAX_INVENTORY_DESCRIPTION_CHARS:
+        blockers.append(
+            "eBay listing description must be "
+            f"{EBAY_MAX_INVENTORY_DESCRIPTION_CHARS} characters or fewer "
+            f"(currently {len(listing_description_text)})"
         )
     if title_has_numerical_coin_grade(title) and not aspects_have_approved_grader_evidence(aspects or {}):
         blockers.append(

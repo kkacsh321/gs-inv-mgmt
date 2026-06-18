@@ -994,10 +994,14 @@ def render_search_edit(repo: InventoryRepository) -> None:
                     key="edit_lot_purchase_date",
                 )
                 total_cost = st.number_input(
-                    "Total Lot Cost",
+                    "Lot Item Subtotal (before tax/shipping/fees)",
                     min_value=0.0,
                     value=float(selected.total_cost or 0.0),
                     step=1.0,
+                    help=(
+                        "Enter the item subtotal only. Do not enter the order total here when "
+                        "tax/shipping/fees are entered separately."
+                    ),
                 )
                 total_tax_paid = st.number_input(
                     "Total Lot Tax Paid",

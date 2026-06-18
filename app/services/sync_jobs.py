@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+import hashlib
 import json
 
 import requests
 from sqlalchemy import func, select
 
-from app.db.models import MarketplaceListing, Order, Product, Sale
+from app.db.models import Customer, MarketplaceListing, Order, OrderItem, Product, Sale
 from app.config import settings
 from app.repository import InventoryRepository
 from app.services.ebay import EbayClient
+from app.services.quickbooks import (
+    quickbooks_config_from_runtime,
+    quickbooks_payload_preview_records,
+    quickbooks_rows_from_actual_economics,
+)
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
 from app.services.slack_notify import build_slack_alert_text, dispatch_slack_alert, resolve_slack_notify_config
 from app.utils.time import utcnow_naive
@@ -134,6 +140,19 @@ def _refresh_ebay_access_token(
         expires_in=int(payload.get("expires_in") or 0),
     )
     return new_access, new_refresh
+
+
+def _ebay_refresh_error_message(exc: Exception) -> str:
+    message = str(exc or "").strip()
+    response = getattr(exc, "response", None)
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code == 400 and "identity/v1/oauth2/token" in message:
+        return (
+            "eBay user token refresh failed with HTTP 400. The saved refresh token is likely expired, "
+            "revoked, or missing the requested scopes; reconnect eBay in Admin to generate a fresh user token."
+            f" Raw error: {message[:700]}"
+        )
+    return message
 
 
 def _parse_iso_naive(value: str) -> datetime | None:
@@ -295,15 +314,16 @@ def maybe_auto_refresh_ebay_user_token(
         )
     except Exception as exc:
         reason = "transient_network_unavailable" if _is_transient_ebay_network_error(exc) else "refresh_failed"
+        error_message = _ebay_refresh_error_message(exc)
         _persist_ebay_refresh_failure_state(
             repo,
             actor=actor,
-            error=str(exc or ""),
+            error=error_message,
         )
         return {
             "status": "failed",
             "reason": reason,
-            "error": str(exc)[:500],
+            "error": error_message[:500],
         }
     _clear_ebay_refresh_failure_state(repo, actor=actor)
     new_expires_at = _parse_iso_naive(get_runtime_str(repo, "ebay_user_access_token_expires_at", "").strip())
@@ -384,6 +404,7 @@ def _notify_ebay_order_import_slack(
     *,
     ebay_order: dict,
     actor: str,
+    customer_context: dict | None = None,
 ) -> None:
     try:
         cfg = resolve_slack_notify_config(repo)
@@ -407,6 +428,23 @@ def _notify_ebay_order_import_slack(
         line_item_count = len(line_items) if isinstance(line_items, list) else 0
         mapped_status = _map_order_status(ebay_order)
         created_at = str(ebay_order.get("creationDate") or "").strip()
+        customer_ctx = customer_context if isinstance(customer_context, dict) else {}
+        repeat_buyer = bool(customer_ctx.get("repeat_buyer"))
+        customer_order_count = int(customer_ctx.get("customer_order_count") or 0)
+        customer_total_spend = _to_decimal(customer_ctx.get("customer_total_spend") or 0)
+        customer_notes_preview = " ".join(
+            str(customer_ctx.get("customer_notes_preview") or "").strip().split()
+        )
+        if len(customer_notes_preview) > 180:
+            customer_notes_preview = customer_notes_preview[:177].rstrip() + "..."
+        customer_notes_line = (
+            f"- Internal customer notes: {customer_notes_preview}\n" if customer_notes_preview else ""
+        )
+        repeat_line = (
+            f"- Customer: `repeat buyer` ({customer_order_count} orders, `${customer_total_spend:.2f}` lifetime)\n"
+            if repeat_buyer
+            else "- Customer: `new/first observed buyer`\n"
+        )
 
         alert_text = build_slack_alert_text(
             repo,
@@ -416,6 +454,8 @@ def _notify_ebay_order_import_slack(
                 "- Env: `{env}`\n"
                 "- Order: `{order_id}`\n"
                 "- Buyer: `{buyer}`\n"
+                "{repeat_line}"
+                "{customer_notes_line}"
                 "- Status: `{status}`\n"
                 "- Total: `${total}` (shipping `${shipping}`, tax `${tax}`)\n"
                 "- Items: `{line_item_count}`\n"
@@ -427,6 +467,13 @@ def _notify_ebay_order_import_slack(
                 "env": settings.app_env,
                 "order_id": order_id or "(missing)",
                 "buyer": buyer,
+                "repeat_line": repeat_line,
+                "customer_notes_line": customer_notes_line,
+                "customer_notes_preview": customer_notes_preview,
+                "customer_has_internal_notes": bool(customer_notes_preview),
+                "repeat_buyer": repeat_buyer,
+                "customer_order_count": customer_order_count,
+                "customer_total_spend": f"{customer_total_spend:.2f}",
                 "status": mapped_status or "not_shipped",
                 "total": f"{total_value:.2f}",
                 "shipping": f"{shipping_value:.2f}",
@@ -514,11 +561,19 @@ def sync_job_catalog(repo: InventoryRepository | None = None) -> list[dict[str, 
             "enabled": bool(is_sync_job_enabled("ebay_connection_health_check", repo=repo)),
         },
         {
+            "job_name": "ebay_store_categories_sync",
+            "provider": "ebay",
+            "direction": "pull",
+            "implemented": True,
+            "description": "Sync eBay Store category hierarchy into local listing selectors.",
+            "enabled": bool(is_sync_job_enabled("ebay_store_categories_sync", repo=repo)),
+        },
+        {
             "job_name": "quickbooks_export",
             "provider": "quickbooks",
             "direction": "push",
-            "implemented": False,
-            "description": "Placeholder for accounting export dispatcher wiring.",
+            "implemented": True,
+            "description": "Generate dry-run QuickBooks clearing-account payload evidence without live API writes.",
             "enabled": bool(is_sync_job_enabled("quickbooks_export", repo=repo)),
         },
         {
@@ -559,12 +614,33 @@ def sync_job_dispatch_meta(job_name: str) -> dict[str, object]:
             "required_args": [],
             "optional_args": ["access_token", "run_id", "retry_of_run_id", "client"],
         }
+    if resolved == "ebay_store_categories_sync":
+        return {
+            "supports_execute_now": True,
+            "supports_retry_execute_now": False,
+            "required_args": [],
+            "optional_args": [
+                "access_token",
+                "marketplace_id",
+                "deactivate_missing",
+                "run_id",
+                "retry_of_run_id",
+                "client",
+            ],
+        }
     if resolved == "shopify_orders_pull":
         return {
             "supports_execute_now": True,
             "supports_retry_execute_now": True,
             "required_args": [],
             "optional_args": ["shop_domain", "access_token", "limit", "offset", "run_id", "retry_of_run_id"],
+        }
+    if resolved == "quickbooks_export":
+        return {
+            "supports_execute_now": True,
+            "supports_retry_execute_now": True,
+            "required_args": [],
+            "optional_args": ["start_dt", "end_dt", "lookback_days", "live_post", "run_id", "retry_of_run_id"],
         }
     return {
         "supports_execute_now": False,
@@ -590,6 +666,9 @@ def is_sync_job_enabled(job_name: str, repo: InventoryRepository | None = None) 
             "ebay_connection_health_check": bool(
                 getattr(settings, "sync_job_ebay_connection_health_check_enabled", True)
             ),
+            "ebay_store_categories_sync": bool(
+                getattr(settings, "sync_job_ebay_store_categories_sync_enabled", True)
+            ),
             "quickbooks_export": bool(settings.sync_job_quickbooks_export_enabled),
             "shopify_orders_pull": bool(settings.sync_job_shopify_orders_pull_enabled),
         }
@@ -609,6 +688,11 @@ def is_sync_job_enabled(job_name: str, repo: InventoryRepository | None = None) 
                 repo,
                 "sync_job_ebay_connection_health_check_enabled",
                 bool(getattr(settings, "sync_job_ebay_connection_health_check_enabled", True)),
+            ),
+            "ebay_store_categories_sync": get_runtime_bool(
+                repo,
+                "sync_job_ebay_store_categories_sync_enabled",
+                bool(getattr(settings, "sync_job_ebay_store_categories_sync_enabled", True)),
             ),
             "quickbooks_export": get_runtime_bool(
                 repo,
@@ -668,11 +752,33 @@ def execute_sync_job(
             run_id=kwargs.get("run_id"),
             retry_of_run_id=kwargs.get("retry_of_run_id"),
         )
+    if resolved == "quickbooks_export":
+        return execute_quickbooks_export_dry_run(
+            repo,
+            actor=actor,
+            start_dt=kwargs.get("start_dt"),
+            end_dt=kwargs.get("end_dt"),
+            lookback_days=kwargs.get("lookback_days"),
+            live_post=bool(kwargs.get("live_post", False)),
+            run_id=kwargs.get("run_id"),
+            retry_of_run_id=kwargs.get("retry_of_run_id"),
+        )
     if resolved == "ebay_connection_health_check":
         return execute_ebay_connection_health_check(
             repo,
             actor=actor,
             access_token=str(kwargs.get("access_token") or "").strip(),
+            run_id=kwargs.get("run_id"),
+            retry_of_run_id=kwargs.get("retry_of_run_id"),
+            client=kwargs.get("client"),
+        )
+    if resolved == "ebay_store_categories_sync":
+        return execute_ebay_store_categories_sync(
+            repo,
+            actor=actor,
+            access_token=str(kwargs.get("access_token") or "").strip(),
+            marketplace_id=str(kwargs.get("marketplace_id") or settings.ebay_marketplace_id or "EBAY_US").strip(),
+            deactivate_missing=bool(kwargs.get("deactivate_missing", False)),
             run_id=kwargs.get("run_id"),
             retry_of_run_id=kwargs.get("retry_of_run_id"),
             client=kwargs.get("client"),
@@ -878,6 +984,252 @@ def execute_ebay_connection_health_check(
     }
 
 
+def execute_ebay_store_categories_sync(
+    repo: InventoryRepository,
+    *,
+    actor: str,
+    access_token: str = "",
+    marketplace_id: str = "EBAY_US",
+    deactivate_missing: bool = False,
+    run_id: int | None = None,
+    retry_of_run_id: int | None = None,
+    client: EbayClient | None = None,
+) -> dict:
+    if not is_sync_job_enabled("ebay_store_categories_sync", repo=repo):
+        raise ValueError("Sync job `ebay_store_categories_sync` is disabled by configuration.")
+
+    ebay_client = client or EbayClient()
+    resolved_marketplace = str(marketplace_id or settings.ebay_marketplace_id or "EBAY_US").strip() or "EBAY_US"
+    resolved_access, refresh_token = _resolve_ebay_tokens(repo, access_token=access_token)
+
+    if run_id is None:
+        run = repo.create_sync_run(
+            provider="ebay",
+            job_name="ebay_store_categories_sync",
+            direction="pull",
+            status="queued",
+            retry_of_run_id=retry_of_run_id,
+            retry_count=1 if retry_of_run_id else 0,
+            notes=f"eBay store category sync queued (marketplace={resolved_marketplace}).",
+            actor=actor,
+        )
+        run_id = int(run.id)
+
+    repo.update_sync_run(
+        int(run_id),
+        {
+            "status": "running",
+            "started_at": utcnow_naive(),
+            "notes": f"eBay store category sync running (marketplace={resolved_marketplace}).",
+        },
+        actor=actor,
+    )
+
+    def _finish_failed(message: str, *, code: str = "ebay_store_categories_sync_failed", severity: str = "error") -> dict:
+        repo.add_sync_error(
+            sync_run_id=int(run_id),
+            code=code,
+            message=message,
+            severity=severity,
+            context_json=json.dumps({"marketplace_id": resolved_marketplace}),
+        )
+        repo.add_sync_event(
+            sync_run_id=int(run_id),
+            entity_type="ebay_store_categories",
+            entity_id=resolved_marketplace,
+            action="sync",
+            status="warn" if severity == "warning" else "error",
+            message=message,
+            payload_json=json.dumps({"marketplace_id": resolved_marketplace}),
+        )
+        status = "partial" if severity == "warning" else "failed"
+        repo.update_sync_run(
+            int(run_id),
+            {
+                "status": status,
+                "records_processed": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_failed": 0 if severity == "warning" else 1,
+                "completed_at": utcnow_naive(),
+                "notes": message[:900],
+            },
+            actor=actor,
+        )
+        return {
+            "run_id": int(run_id),
+            "status": status,
+            "processed": 0,
+            "created": 0,
+            "updated": 0,
+            "failed": 0 if severity == "warning" else 1,
+            "missing": 0,
+            "deactivated": 0,
+            "marketplace_id": resolved_marketplace,
+        }
+
+    if not ebay_client.is_configured():
+        return _finish_failed("eBay app credentials are not configured.")
+
+    if not resolved_access and refresh_token:
+        try:
+            resolved_access, refresh_token = _refresh_ebay_access_token(
+                repo,
+                ebay_client=ebay_client,
+                actor=actor,
+                refresh_token=refresh_token,
+            )
+        except Exception as refresh_exc:
+            message = _ebay_refresh_error_message(refresh_exc)
+            _persist_ebay_refresh_failure_state(repo, actor=actor, error=message)
+            return _finish_failed(message, code="EBAY_RECONNECT_REQUIRED")
+
+    if not resolved_access.strip():
+        return _finish_failed("Access token is required.")
+
+    try:
+        try:
+            payload = ebay_client.get_store_categories(
+                access_token=resolved_access.strip(),
+                marketplace_id=resolved_marketplace,
+            )
+        except Exception as exc:
+            if _is_ebay_auth_error(exc) and refresh_token:
+                try:
+                    resolved_access, refresh_token = _refresh_ebay_access_token(
+                        repo,
+                        ebay_client=ebay_client,
+                        actor=actor,
+                        refresh_token=refresh_token,
+                    )
+                    payload = ebay_client.get_store_categories(
+                        access_token=resolved_access.strip(),
+                        marketplace_id=resolved_marketplace,
+                    )
+                except Exception as refresh_exc:
+                    message = _ebay_refresh_error_message(refresh_exc)
+                    _persist_ebay_refresh_failure_state(repo, actor=actor, error=message)
+                    return _finish_failed(message, code="EBAY_RECONNECT_REQUIRED")
+            elif _is_transient_ebay_network_error(exc):
+                return _finish_failed(
+                    f"Transient eBay store category sync skipped: {exc}",
+                    code="EBAY_STORE_CATEGORY_TRANSIENT_NETWORK",
+                    severity="warning",
+                )
+            else:
+                raise
+
+        category_rows = [row for row in list(payload.get("categories") or []) if isinstance(row, dict)]
+        imported_paths: list[str] = []
+        imported_count = 0
+        for row in category_rows:
+            path = str(row.get("category_path") or "").strip()
+            if not path:
+                continue
+            imported_paths.append(path)
+            repo.upsert_ebay_store_category(
+                environment=settings.app_env,
+                marketplace_id=resolved_marketplace,
+                category_path=path,
+                external_category_id=str(row.get("external_category_id") or "").strip(),
+                sort_order=int(row.get("sort_order") or 0),
+                is_active=True,
+                source="ebay_get_store",
+                notes="Imported from scheduled eBay Trading API GetStore sync.",
+                actor=actor,
+                sync_status="synced",
+                sync_message="Imported from scheduled eBay Trading API GetStore sync.",
+                mark_synced=True,
+            )
+            imported_count += 1
+
+        reconcile = repo.reconcile_ebay_store_category_sync(
+            environment=settings.app_env,
+            marketplace_id=resolved_marketplace,
+            synced_category_paths=imported_paths,
+            deactivate_missing=bool(deactivate_missing),
+            actor=actor,
+            sync_message="Deactivated by scheduled eBay Store category sync because GetStore did not return this category.",
+        )
+        missing_count = int(reconcile.get("missing_count") or 0)
+        deactivated_count = int(reconcile.get("deactivated_count") or 0)
+        status = "success"
+        event_status = "ok"
+        if missing_count and not deactivate_missing:
+            status = "partial"
+            event_status = "warn"
+        notes = (
+            f"Synced {imported_count} eBay store categories for {resolved_marketplace}; "
+            f"missing={missing_count}; deactivated={deactivated_count}; "
+            f"deactivate_missing={'yes' if deactivate_missing else 'no'}."
+        )
+        event_payload = {
+            "ack": payload.get("ack"),
+            "marketplace_id": resolved_marketplace,
+            "site_id": payload.get("site_id"),
+            "imported_count": imported_count,
+            "missing_count": missing_count,
+            "deactivated_count": deactivated_count,
+            "deactivate_missing": bool(deactivate_missing),
+        }
+        repo.add_sync_event(
+            sync_run_id=int(run_id),
+            entity_type="ebay_store_categories",
+            entity_id=resolved_marketplace,
+            action="sync",
+            status=event_status,
+            message=notes,
+            payload_json=json.dumps(event_payload),
+        )
+        repo.update_sync_run(
+            int(run_id),
+            {
+                "status": status,
+                "records_processed": int(imported_count),
+                "records_created": 0,
+                "records_updated": int(imported_count + deactivated_count),
+                "records_failed": 0,
+                "completed_at": utcnow_naive(),
+                "notes": notes,
+            },
+            actor=actor,
+        )
+        return {
+            "run_id": int(run_id),
+            "status": status,
+            "processed": int(imported_count),
+            "created": 0,
+            "updated": int(imported_count + deactivated_count),
+            "failed": 0,
+            "missing": missing_count,
+            "deactivated": deactivated_count,
+            "marketplace_id": resolved_marketplace,
+        }
+    except Exception as exc:
+        message = f"eBay store category sync failed: {exc}"
+        repo.add_sync_error(
+            sync_run_id=int(run_id),
+            code="ebay_store_categories_sync_failed",
+            message=message,
+            severity="error",
+            context_json=json.dumps({"marketplace_id": resolved_marketplace}),
+        )
+        repo.update_sync_run(
+            int(run_id),
+            {
+                "status": "failed",
+                "records_processed": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_failed": 1,
+                "completed_at": utcnow_naive(),
+                "notes": message[:900],
+            },
+            actor=actor,
+        )
+        raise
+
+
 def execute_shopify_orders_pull_scaffold(
     repo: InventoryRepository,
     *,
@@ -986,6 +1338,191 @@ def execute_shopify_orders_pull_scaffold(
         "failed": 0,
         "scaffold": True,
     }
+
+
+def execute_quickbooks_export_dry_run(
+    repo: InventoryRepository,
+    *,
+    actor: str,
+    start_dt: datetime | str | None = None,
+    end_dt: datetime | str | None = None,
+    lookback_days: int | None = None,
+    live_post: bool = False,
+    run_id: int | None = None,
+    retry_of_run_id: int | None = None,
+) -> dict:
+    if not is_sync_job_enabled("quickbooks_export", repo=repo):
+        raise ValueError("Sync job `quickbooks_export` is disabled by configuration.")
+
+    resolved_end = _coerce_sync_datetime(end_dt) or utcnow_naive()
+    default_lookback = max(1, min(366, int(get_runtime_int(repo, "sync_job_quickbooks_export_lookback_days", 30))))
+    resolved_lookback = max(1, min(366, int(lookback_days if lookback_days is not None else default_lookback)))
+    resolved_start = _coerce_sync_datetime(start_dt) or (resolved_end - timedelta(days=resolved_lookback))
+
+    if run_id is None:
+        run = repo.create_sync_run(
+            provider="quickbooks",
+            job_name="quickbooks_export",
+            direction="push",
+            status="queued",
+            retry_of_run_id=retry_of_run_id,
+            retry_count=1 if retry_of_run_id else 0,
+            notes=(
+                "QuickBooks export dry-run queued "
+                f"({resolved_start.isoformat(timespec='seconds')} to {resolved_end.isoformat(timespec='seconds')})."
+            ),
+            actor=actor,
+        )
+        run_id = int(run.id)
+
+    repo.update_sync_run(
+        int(run_id),
+        {
+            "status": "running",
+            "started_at": utcnow_naive(),
+            "notes": "QuickBooks export dry-run generating clearing-account payload evidence.",
+        },
+        actor=actor,
+    )
+
+    if live_post:
+        message = (
+            "Live QuickBooks API posting is not enabled. This job currently generates dry-run payload evidence only."
+        )
+        repo.add_sync_error(
+            sync_run_id=int(run_id),
+            code="quickbooks_live_post_disabled",
+            message=message,
+            severity="error",
+            context_json=json.dumps({"start_dt": resolved_start.isoformat(), "end_dt": resolved_end.isoformat()}),
+        )
+        repo.add_sync_event(
+            sync_run_id=int(run_id),
+            entity_type="quickbooks_export",
+            entity_id="live_post",
+            action="blocked",
+            status="error",
+            message=message,
+            payload_json=json.dumps({"live_post": True}),
+        )
+        repo.update_sync_run(
+            int(run_id),
+            {
+                "status": "failed",
+                "records_processed": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_failed": 1,
+                "completed_at": utcnow_naive(),
+                "notes": message,
+            },
+            actor=actor,
+        )
+        return {"run_id": int(run_id), "status": "failed", "processed": 0, "failed": 1, "live_post": False}
+
+    actual_rows = []
+    if hasattr(repo, "report_sales_actual_econ_rows"):
+        actual_rows = list(repo.report_sales_actual_econ_rows(start_dt=resolved_start, end_dt=resolved_end) or [])
+    qbo_rows = quickbooks_rows_from_actual_economics(actual_rows)
+    payload_records = quickbooks_payload_preview_records(qbo_rows, config=quickbooks_config_from_runtime(repo))
+    review_records = [row for row in payload_records if str(row.get("validation_status") or "") != "ok"]
+    action_counts: dict[str, int] = {}
+    for row in payload_records:
+        action = str(row.get("action") or "unknown")
+        action_counts[action] = action_counts.get(action, 0) + 1
+
+    manifest = [
+        {
+            "payload_type": row.get("payload_type"),
+            "action": row.get("action"),
+            "source_doc_number": row.get("source_doc_number"),
+            "qbo_doc_number": row.get("qbo_doc_number"),
+            "validation_status": row.get("validation_status"),
+            "validation_issues": row.get("validation_issues"),
+            "payload_sha256": row.get("payload_sha256"),
+        }
+        for row in payload_records
+    ]
+    evidence_hash = _json_sha256({"window": [resolved_start.isoformat(), resolved_end.isoformat()], "manifest": manifest})
+    status = "partial" if review_records else "success"
+    event_status = "warn" if review_records else "ok"
+    summary_payload = {
+        "mode": "dry_run",
+        "live_post": False,
+        "window_start": resolved_start.isoformat(timespec="seconds"),
+        "window_end": resolved_end.isoformat(timespec="seconds"),
+        "source_rows": len(actual_rows),
+        "payload_rows": len(payload_records),
+        "review_rows": len(review_records),
+        "action_counts": action_counts,
+        "evidence_sha256": evidence_hash,
+    }
+    repo.add_sync_event(
+        sync_run_id=int(run_id),
+        entity_type="quickbooks_export",
+        entity_id="dry_run",
+        action="payload_preview_summary",
+        status=event_status,
+        message=f"QuickBooks dry-run generated {len(payload_records)} payload preview row(s).",
+        payload_json=json.dumps(summary_payload, sort_keys=True),
+    )
+    repo.add_sync_event(
+        sync_run_id=int(run_id),
+        entity_type="quickbooks_export",
+        entity_id="payload_manifest",
+        action="payload_preview_manifest",
+        status=event_status,
+        message="Bounded QuickBooks dry-run payload manifest; raw payloads stay in Reports exports.",
+        payload_json=json.dumps({"rows": manifest[:100], "omitted": max(0, len(manifest) - 100)}, sort_keys=True),
+    )
+    for idx, row in enumerate(review_records[:25], start=1):
+        repo.add_sync_error(
+            sync_run_id=int(run_id),
+            code="quickbooks_payload_validation_review",
+            message=(
+                f"QBO payload {row.get('qbo_doc_number') or row.get('source_doc_number') or idx} "
+                f"needs review: {', '.join(row.get('validation_issues') or [])}"
+            )[:900],
+            severity="warning",
+            context_json=json.dumps(row, sort_keys=True, default=str)[:4000],
+        )
+
+    notes = (
+        f"QuickBooks dry-run completed: source_rows={len(actual_rows)} payload_rows={len(payload_records)} "
+        f"review_rows={len(review_records)} evidence_sha256={evidence_hash}."
+    )
+    repo.update_sync_run(
+        int(run_id),
+        {
+            "status": status,
+            "records_processed": len(payload_records),
+            "records_created": 0,
+            "records_updated": 0,
+            "records_failed": len(review_records),
+            "completed_at": utcnow_naive(),
+            "notes": notes[:900],
+        },
+        actor=actor,
+    )
+    return {
+        "run_id": int(run_id),
+        "status": status,
+        "processed": len(payload_records),
+        "failed": len(review_records),
+        "source_rows": len(actual_rows),
+        "evidence_sha256": evidence_hash,
+        "live_post": False,
+    }
+
+
+def _coerce_sync_datetime(value: datetime | str | None) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    return _parse_iso_naive(str(value or ""))
+
+
+def _json_sha256(payload: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
@@ -1897,8 +2434,10 @@ def _build_order_items(
             unit_price = (line_total / qty) if qty > 0 else Decimal("0")
             sku = str(line.get("sku") or "").strip()
             product_id = product_map.get(sku)
+            sku_unmapped_counted = False
             if sku and product_id is None:
                 unmapped_sku_count += 1
+                sku_unmapped_counted = True
             legacy_item_id = str(line.get("legacyItemId") or "").strip()
             listing_id = listing_map.get(legacy_item_id)
             line_title = str(line.get("title") or line.get("lineItemTitle") or "").strip()
@@ -1930,6 +2469,8 @@ def _build_order_items(
                     if existing_listing is not None:
                         listing_id = existing_listing.id
                         listing_map[legacy_item_id] = listing_id
+                        if product_id is None and getattr(existing_listing, "product_id", None) is not None:
+                            product_id = int(existing_listing.product_id)
             # Harder edge case: no/unknown legacy item ID, but line has SKU and there are
             # potentially multiple local eBay listings for the same SKU.
             if listing_id is None and sku:
@@ -1937,6 +2478,8 @@ def _build_order_items(
                 if candidates:
                     if len(candidates) == 1:
                         listing_id = candidates[0].id
+                        if product_id is None and getattr(candidates[0], "product_id", None) is not None:
+                            product_id = int(candidates[0].product_id)
                     else:
                         normalized_title = line_title.strip().lower()
                         if normalized_title:
@@ -1945,6 +2488,8 @@ def _build_order_items(
                             ]
                             if len(title_exact) == 1:
                                 listing_id = title_exact[0].id
+                                if product_id is None and getattr(title_exact[0], "product_id", None) is not None:
+                                    product_id = int(title_exact[0].product_id)
                                 candidates = title_exact
                             elif len(title_exact) > 1:
                                 candidates = title_exact
@@ -1958,6 +2503,8 @@ def _build_order_items(
                             ]
                             if len(price_matches) == 1:
                                 listing_id = price_matches[0].id
+                                if product_id is None and getattr(price_matches[0], "product_id", None) is not None:
+                                    product_id = int(price_matches[0].product_id)
                                 candidates = price_matches
                             elif len(price_matches) > 1:
                                 candidates = price_matches
@@ -1968,6 +2515,17 @@ def _build_order_items(
                             ]
                             if len(active_candidates) == 1:
                                 listing_id = active_candidates[0].id
+                                if product_id is None and getattr(active_candidates[0], "product_id", None) is not None:
+                                    product_id = int(active_candidates[0].product_id)
+            if listing_id is not None and product_id is None and hasattr(repo, "db") and hasattr(repo.db, "get"):
+                try:
+                    matched_listing = repo.db.get(MarketplaceListing, int(listing_id))
+                except Exception:
+                    matched_listing = None
+                if matched_listing is not None and getattr(matched_listing, "product_id", None) is not None:
+                    product_id = int(matched_listing.product_id)
+            if product_id is not None and sku_unmapped_counted:
+                unmapped_sku_count = max(0, unmapped_sku_count - 1)
             if listing_id is not None:
                 listing_link_count += 1
 
@@ -2012,6 +2570,115 @@ def _sum_line_totals(items: list[dict]) -> Decimal:
     for item in items:
         total += _to_decimal(item.get("unit_price")) * int(item.get("quantity") or 0)
     return total
+
+
+def _match_existing_sales_to_order_items(existing_sales: list[Sale], order_items: list[dict]) -> dict[int, dict]:
+    if not existing_sales or not order_items:
+        return {}
+    if len(existing_sales) == len(order_items):
+        return {
+            int(getattr(sale, "id")): item
+            for sale, item in zip(existing_sales, order_items)
+            if getattr(sale, "id", None) is not None
+        }
+    if len(order_items) == 1:
+        return {
+            int(getattr(sale, "id")): order_items[0]
+            for sale in existing_sales
+            if getattr(sale, "id", None) is not None
+        }
+
+    remaining_items = list(order_items)
+    matched: dict[int, dict] = {}
+    for sale in existing_sales:
+        sale_id = getattr(sale, "id", None)
+        if sale_id is None:
+            continue
+        sale_qty = int(getattr(sale, "quantity_sold", 0) or 0)
+        sale_price = _to_decimal(getattr(sale, "sold_price", None))
+        match_index = None
+        for idx, item in enumerate(remaining_items):
+            item_qty = int(item.get("quantity") or 0)
+            item_total = _to_decimal(item.get("unit_price")) * item_qty
+            if sale_qty == item_qty and abs(sale_price - item_total) <= Decimal("0.01"):
+                match_index = idx
+                break
+        if match_index is None:
+            continue
+        matched[int(sale_id)] = remaining_items.pop(match_index)
+    return matched
+
+
+def _backfill_existing_order_item_links(
+    *,
+    repo: InventoryRepository,
+    order_id: int,
+    order_items: list[dict],
+    actor: str,
+) -> int:
+    if not hasattr(repo, "db") or not hasattr(repo.db, "scalars"):
+        return 0
+    try:
+        existing_items = repo.db.scalars(
+            select(OrderItem)
+            .where(OrderItem.order_id == int(order_id))
+            .order_by(OrderItem.id.asc())
+        ).all()
+    except Exception:
+        if hasattr(repo.db, "rollback"):
+            repo.db.rollback()
+        return 0
+    existing_items = [item for item in existing_items if hasattr(item, "order_id")]
+    if not existing_items or not order_items:
+        return 0
+    if len(existing_items) == len(order_items):
+        matches = {
+            int(getattr(item_row, "id")): item
+            for item_row, item in zip(existing_items, order_items)
+            if getattr(item_row, "id", None) is not None
+        }
+    elif len(order_items) == 1:
+        matches = {
+            int(getattr(item_row, "id")): order_items[0]
+            for item_row in existing_items
+            if getattr(item_row, "id", None) is not None
+        }
+    else:
+        matches = {}
+    updated = 0
+    for item_row in existing_items:
+        row_id = int(getattr(item_row, "id", 0) or 0)
+        matched_item = matches.get(row_id) or {}
+        changes: dict[str, dict[str, object]] = {}
+        matched_listing_id = matched_item.get("listing_id")
+        matched_product_id = matched_item.get("product_id")
+        if getattr(item_row, "listing_id", None) is None and matched_listing_id is not None:
+            changes["listing_id"] = {"before": None, "after": int(matched_listing_id)}
+            item_row.listing_id = int(matched_listing_id)
+        if getattr(item_row, "product_id", None) is None and matched_product_id is not None:
+            changes["product_id"] = {"before": None, "after": int(matched_product_id)}
+            item_row.product_id = int(matched_product_id)
+        if changes:
+            updated += 1
+            record_audit = getattr(repo, "record_audit_event", None)
+            if callable(record_audit):
+                try:
+                    record_audit(
+                        entity_type="order_item",
+                        entity_id=row_id,
+                        action="sync_backfill_links",
+                        actor=actor,
+                        changes=changes,
+                    )
+                except Exception:
+                    if hasattr(repo.db, "rollback"):
+                        repo.db.rollback()
+    if updated:
+        if hasattr(repo.db, "commit"):
+            repo.db.commit()
+        elif hasattr(repo.db, "flush"):
+            repo.db.flush()
+    return updated
 
 
 def _reconcile_listing_status_after_sale_import(
@@ -2316,10 +2983,12 @@ def _upsert_ebay_order_into_local(
     created_sales = 0
     skipped_sales = 0
     updated_sales = 0
+    order_item_links_backfilled = 0
     if existing_sales:
         skipped_sales = len(order_items)
         existing_sales_denominator = sum((_to_decimal(getattr(s, "sold_price", None)) for s in existing_sales), Decimal("0"))
         existing_sales_count = len(existing_sales)
+        matched_order_item_by_sale_id = _match_existing_sales_to_order_items(existing_sales, order_items)
         for sale in existing_sales:
             updates = {}
             sale_price = _to_decimal(getattr(sale, "sold_price", None))
@@ -2346,6 +3015,14 @@ def _upsert_ebay_order_into_local(
                 updates["shipped_at"] = shipping_enrichment["shipped_at"]
             if shipping_enrichment.get("delivered_at") is not None:
                 updates["delivered_at"] = shipping_enrichment["delivered_at"]
+            matched_item = matched_order_item_by_sale_id.get(int(getattr(sale, "id", 0) or 0)) or {}
+            matched_listing_id = matched_item.get("listing_id")
+            matched_product_id = matched_item.get("product_id")
+            if getattr(sale, "listing_id", None) is None and matched_listing_id is not None:
+                updates["listing_id"] = int(matched_listing_id)
+                imported_listing_ids.add(int(matched_listing_id))
+            if getattr(sale, "product_id", None) is None and matched_product_id is not None:
+                updates["product_id"] = int(matched_product_id)
             if updates:
                 repo.update_sale(sale.id, updates, actor=actor)
                 updated_sales += 1
@@ -2431,21 +3108,45 @@ def _upsert_ebay_order_into_local(
             },
             actor=actor,
         )
+    if existing_order is not None:
+        order_item_links_backfilled = _backfill_existing_order_item_links(
+            repo=repo,
+            order_id=int(order.id),
+            order_items=order_items,
+            actor=actor,
+        )
 
     listings_marked_sold = _reconcile_listing_status_after_sale_import(
         repo=repo,
         listing_ids=imported_listing_ids,
         actor=actor,
     )
+    customer = repo.db.get(Customer, int(order.customer_id)) if getattr(order, "customer_id", None) else None
+    customer_order_count = int(getattr(customer, "order_count", 0) or 0) if customer is not None else 0
+    customer_total_spend = float(getattr(customer, "total_spend", 0) or 0) if customer is not None else 0.0
+    customer_notes_preview = (
+        " ".join(str(getattr(customer, "notes", "") or "").strip().split())
+        if customer is not None
+        else ""
+    )
+    if len(customer_notes_preview) > 180:
+        customer_notes_preview = customer_notes_preview[:177].rstrip() + "..."
 
     return {
         "orders_created": created_order,
         "orders_updated": updated_order,
+        "customer_id": int(customer.id) if customer is not None else None,
+        "customer_order_count": customer_order_count,
+        "customer_total_spend": customer_total_spend,
+        "customer_notes_preview": customer_notes_preview,
+        "customer_has_internal_notes": bool(customer_notes_preview),
+        "repeat_buyer": bool(getattr(customer, "is_repeat_buyer", False)) if customer is not None else False,
         "sales_created": created_sales,
         "sales_skipped": skipped_sales,
         "sales_updated": updated_sales,
         "listings_created": listings_created,
         "line_items_with_listing_link": listing_link_count,
+        "order_item_links_backfilled": order_item_links_backfilled,
         "line_items_unmapped_sku": unmapped_sku_count,
         "listings_marked_sold": listings_marked_sold,
     }
@@ -2505,12 +3206,54 @@ def execute_ebay_orders_pull_import(
             payload = ebay_client.pull_recent_orders(current_access_token, limit=int(limit), offset=int(offset))
         except Exception as pull_exc:
             if _is_ebay_auth_error(pull_exc) and refresh_token:
-                current_access_token, refresh_token = _refresh_ebay_access_token(
-                    repo,
-                    ebay_client=ebay_client,
-                    actor=actor,
-                    refresh_token=refresh_token,
-                )
+                try:
+                    current_access_token, refresh_token = _refresh_ebay_access_token(
+                        repo,
+                        ebay_client=ebay_client,
+                        actor=actor,
+                        refresh_token=refresh_token,
+                    )
+                except Exception as refresh_exc:
+                    error_message = _ebay_refresh_error_message(refresh_exc)
+                    _persist_ebay_refresh_failure_state(repo, actor=actor, error=error_message)
+                    repo.add_sync_error(
+                        sync_run_id=run_id,
+                        code="EBAY_RECONNECT_REQUIRED",
+                        message=error_message,
+                        severity="warning",
+                    )
+                    repo.add_sync_event(
+                        sync_run_id=run_id,
+                        entity_type="ebay_orders",
+                        entity_id="pull",
+                        action="skipped",
+                        status="warn",
+                        message=error_message,
+                    )
+                    repo.update_sync_run(
+                        run_id,
+                        {
+                            "status": "skipped",
+                            "records_processed": 0,
+                            "records_created": 0,
+                            "records_updated": 0,
+                            "records_failed": 0,
+                            "completed_at": utcnow_naive(),
+                            "notes": "eBay reconnect required before order import can continue.",
+                        },
+                        actor=actor,
+                    )
+                    return {
+                        "run_id": run_id,
+                        "status": "skipped",
+                        "processed": 0,
+                        "created": 0,
+                        "updated": 0,
+                        "failed": 0,
+                        "reason": "ebay_reconnect_required",
+                        "order_item_links_backfilled": 0,
+                        "error": error_message[:500],
+                    }
                 payload = ebay_client.pull_recent_orders(current_access_token, limit=int(limit), offset=int(offset))
             elif _is_transient_ebay_network_error(pull_exc):
                 repo.add_sync_error(
@@ -2553,6 +3296,7 @@ def execute_ebay_orders_pull_import(
                     "updated": 0,
                     "failed": 0,
                     "line_items_with_listing_link": 0,
+                    "order_item_links_backfilled": 0,
                     "line_items_unmapped_sku": 0,
                     "auto_listings_created": 0,
                     "reason": "transient_network_unavailable",
@@ -2587,6 +3331,7 @@ def execute_ebay_orders_pull_import(
         failed_count = 0
         processed_count = 0
         line_items_with_listing_link_total = 0
+        order_item_links_backfilled_total = 0
         line_items_unmapped_sku_total = 0
         auto_listings_created_total = 0
 
@@ -2663,6 +3408,7 @@ def execute_ebay_orders_pull_import(
                 )
                 updated_count += int(result["orders_updated"] + result.get("sales_updated", 0))
                 line_items_with_listing_link_total += int(result["line_items_with_listing_link"])
+                order_item_links_backfilled_total += int(result.get("order_item_links_backfilled") or 0)
                 line_items_unmapped_sku_total += int(result["line_items_unmapped_sku"])
                 auto_listings_created_total += int(result["listings_created"])
                 if int(result.get("orders_created") or 0) > 0:
@@ -2670,6 +3416,7 @@ def execute_ebay_orders_pull_import(
                         repo,
                         ebay_order=hydrated_order,
                         actor=actor,
+                        customer_context=result,
                     )
                 repo.add_sync_event(
                     sync_run_id=run_id,
@@ -2683,6 +3430,7 @@ def execute_ebay_orders_pull_import(
                         f"sales_skipped={result['sales_skipped']}, "
                         f"listings_created={result['listings_created']}, "
                         f"line_items_with_listing_link={result['line_items_with_listing_link']}, "
+                        f"order_item_links_backfilled={int(result.get('order_item_links_backfilled') or 0)}, "
                         f"line_items_unmapped_sku={result['line_items_unmapped_sku']}"
                     ),
                     payload_json="{}",
@@ -2728,6 +3476,7 @@ def execute_ebay_orders_pull_import(
                     f"processed={processed_count}, created={created_count}, "
                     f"updated={updated_count}, failed={failed_count}, "
                     f"line_items_with_listing_link={line_items_with_listing_link_total}, "
+                    f"order_item_links_backfilled={order_item_links_backfilled_total}, "
                     f"line_items_unmapped_sku={line_items_unmapped_sku_total}, "
                     f"auto_listings_created={auto_listings_created_total}"
                 ),
@@ -2752,6 +3501,7 @@ def execute_ebay_orders_pull_import(
             "updated": updated_count,
             "failed": failed_count,
             "line_items_with_listing_link": line_items_with_listing_link_total,
+            "order_item_links_backfilled": order_item_links_backfilled_total,
             "line_items_unmapped_sku": line_items_unmapped_sku_total,
             "auto_listings_created": auto_listings_created_total,
         }

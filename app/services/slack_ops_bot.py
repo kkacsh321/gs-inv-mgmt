@@ -9,16 +9,52 @@ from typing import Any
 from app.db.models import IntegrationQueueJob
 from app.services.ai_accountant_monitor import parse_ai_accountant_answer_prompt, record_ai_accountant_answer
 from app.services.runtime_settings import get_runtime_bool, get_runtime_int, get_runtime_str
+from app.services.workflow_contracts import parse_ai_agent_answer_prompt
 from app.utils.time import utcnow_naive
 
 
-SUPPORTED_INTENTS: tuple[str, ...] = ("intake", "comp", "accountant", "accounting", "tax", "ai-accountant", "status", "operations")
+SUPPORTED_INTENTS: tuple[str, ...] = (
+    "intake",
+    "listing",
+    "comp",
+    "accountant",
+    "accounting",
+    "tax",
+    "ai-accountant",
+    "goldie",
+    "kurt",
+    "murdock",
+    "customer",
+    "customers",
+    "repeat-buyer",
+    "repeat-buyers",
+    "repeat_buyers",
+    "business",
+    "business-room",
+    "status",
+    "operations",
+)
 INTENT_ALIASES: dict[str, str] = {
+    "kurt": "intake",
+    "inventory-intake": "intake",
+    "inventory_intake": "intake",
+    "murdock": "listing",
+    "listings": "listing",
+    "draft-listing": "listing",
+    "draft_listing": "listing",
     "accounting": "accountant",
     "tax": "accountant",
     "ai-accountant": "accountant",
     "ai_accountant": "accountant",
     "aiaccountant": "accountant",
+    "goldie": "accountant",
+    "customers": "customer",
+    "repeat-buyer": "customer",
+    "repeat_buyers": "customer",
+    "repeat-buyers": "customer",
+    "business": "status",
+    "business-room": "status",
+    "business_room": "status",
 }
 
 # Canonical command contract for Slack-origin operator requests.
@@ -26,20 +62,38 @@ INTENT_ALIASES: dict[str, str] = {
 # requires elevated operator capability.
 COMMAND_ALLOWLIST: dict[str, dict[str, Any]] = {
     "intake": {"intent": "intake", "write_intent": True},
+    "listing": {"intent": "listing", "write_intent": True},
     "comp": {"intent": "comp", "write_intent": False},
     "accountant": {"intent": "accountant", "write_intent": False},
+    "customer": {"intent": "customer", "write_intent": False},
     "status": {"intent": "status", "write_intent": False},
     "operations": {"intent": "operations", "write_intent": True},
 }
 
 ROLE_INTENT_ALLOWLIST: dict[str, set[str]] = {
-    "admin": {"intake", "comp", "accountant", "status", "operations"},
-    "ops": {"intake", "comp", "accountant", "status", "operations"},
+    "admin": {"intake", "listing", "comp", "accountant", "customer", "status", "operations"},
+    "ops": {"intake", "listing", "comp", "accountant", "customer", "status", "operations"},
     "viewer": {"comp", "status"},
 }
 
 QUEUE_INTEGRATION = "slack_ops"
 QUEUE_ACTION = "command_ingest"
+
+
+def build_slack_ops_help_text() -> str:
+    return "\n".join(
+        [
+            "GoldenStackers Slack Ops commands:",
+            "- `kurt ...` or `intake ...` starts an approval-gated inventory intake draft.",
+            "- `murdock ...`, `listing ...`, or `draft-listing ...` starts an approval-gated listing draft.",
+            "- `comp ...` runs read-only pricing/comparable research.",
+            "- `goldie ...`, `accountant ...`, `accounting ...`, or `tax ...` asks Goldie read-only accounting/tax questions.",
+            "- `customer ...`, `customers ...`, or `repeat-buyer ...` asks read-only customer/repeat-buyer questions.",
+            "- `status ...` or `business-room ...` asks for read-only business status.",
+            "- Answer handoffs with `kurt answer handoff 88 quantity: 20` or `murdock answer draft #321 condition_id: 3000`.",
+            "- Answer-only commands are evidence capture; they do not create products, listings, or publish by themselves.",
+        ]
+    )
 
 
 @dataclass(frozen=True)
@@ -198,6 +252,7 @@ def route_slack_command_request(
             "intent": envelope.intent,
             "idempotency_key": envelope.idempotency_key,
             "supported_intents": list(SUPPORTED_INTENTS),
+            "help_text": build_slack_ops_help_text(),
         }
         repo.record_audit_event(
             entity_type="slack_ops_command",
@@ -215,6 +270,7 @@ def route_slack_command_request(
             "intent": envelope.intent,
             "role": envelope.app_role,
             "idempotency_key": envelope.idempotency_key,
+            "help_text": build_slack_ops_help_text(),
         }
         repo.record_audit_event(
             entity_type="slack_ops_command",
@@ -462,6 +518,7 @@ def ingest_slack_command_request(
                 prompt=envelope.command_text,
                 source="slack",
             )
+    ai_agent_answer = parse_ai_agent_answer_prompt(envelope.command_text)
     queue_payload = {
         "idempotency_key": envelope.idempotency_key,
         "received_at": utcnow_naive().isoformat(timespec="seconds"),
@@ -489,6 +546,8 @@ def ingest_slack_command_request(
     }
     if accountant_answer:
         queue_payload["command"]["ai_accountant_answer"] = accountant_answer
+    if ai_agent_answer:
+        queue_payload["command"]["ai_agent_answer"] = ai_agent_answer
     queued = repo.create_integration_queue_job(
         environment=envelope.environment,
         integration=QUEUE_INTEGRATION,
